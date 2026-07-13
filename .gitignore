@@ -1,0 +1,33 @@
+# Внутренние документы и черновики - не выгружать
+temp/
+
+# Внутреннее от AI-ассистентов (Claude / Codex и пр.)
+.claude/
+.codex/
+.cursor/
+.aider*
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.mcp.json
+
+# Секреты и учётные данные
+.env
+.env.*
+*.secret
+*.token
+secrets/
+credentials*
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# ОС / редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
