@@ -10,7 +10,7 @@ pub use blobs::BlobStore;
 use crate::Result;
 use crate::crypto::{DatabaseKey, StorageCrypto};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqlitePoolOptions};
-use sqlx::{AssertSqlSafe, Connection, SqlitePool};
+use sqlx::{AssertSqlSafe, ConnectOptions, Connection, SqlitePool};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -171,6 +171,7 @@ fn encrypted_options(
         .foreign_keys(true)
         .pragma("secure_delete", "ON")
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .disable_statement_logging()
 }
 
 async fn verify_sqlcipher(pool: &SqlitePool) -> Result<()> {
@@ -219,7 +220,8 @@ async fn migrate_plaintext_database(path: &Path, database_key: &DatabaseKey) -> 
     let plain_options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .foreign_keys(false);
+        .foreign_keys(false)
+        .disable_statement_logging();
     let mut connection = SqliteConnection::connect_with(&plain_options).await?;
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&mut connection)

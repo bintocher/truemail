@@ -344,6 +344,8 @@ Object.assign(wizardText.ru,{codeExpired:'Код истёк или уже был
 Object.assign(wizardText.en,{codeExpired:'The code expired or was already used. Select Connect to get a new code.'});
 Object.assign(wizardText.ru,{storageTitle:'Папка данных',storageSub:'Здесь будут храниться зашифрованная почта, календарь, контакты и индекс.',storagePath:'Путь хранения',chooseFolder:'Выбрать…',storageRequired:'Выберите папку данных.',keyTitle:'Создайте ключи шифрования',keySub:'Водите мышью внутри поля, пока шкала не заполнится. Движения используются один раз и не сохраняются.',keyMove:'Двигайте мышью здесь',createKeys:'Создать защищённое хранилище',creatingStorage:'Создаю ключи и зашифрованную базу…'});
 Object.assign(wizardText.en,{storageTitle:'Data folder',storageSub:'Encrypted mail, calendars, contacts and the search index will be stored here.',storagePath:'Storage path',chooseFolder:'Choose…',storageRequired:'Choose a data folder.',keyTitle:'Create encryption keys',keySub:'Move the mouse inside the area until the bar is full. The movements are used once and are never stored.',keyMove:'Move the mouse here',createKeys:'Create encrypted storage',creatingStorage:'Creating keys and the encrypted database…'});
+Object.assign(wizardText.ru,{securityRecovery:'Не удаляйте системное хранилище ключей: без него локальный архив восстановить нельзя.'});
+Object.assign(wizardText.en,{securityRecovery:'Do not remove the system credential-store keys: the local archive cannot be recovered without them.'});
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
