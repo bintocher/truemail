@@ -1,5 +1,6 @@
 //! Работающий транспортный слой Яндекс Почты через IMAP OAuth2.
 
+mod gmail_api;
 mod imap;
 mod smtp;
 
@@ -45,6 +46,14 @@ pub trait MailBackend: Send + Sync {
         operation: &str,
         payload: &str,
     ) -> Result<()>;
+    async fn rename_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String>;
+    async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()>;
 }
@@ -105,6 +114,20 @@ impl MailBackend for YandexBackend {
         wait_for_yandex_change(email, credential).await
     }
 
+    async fn rename_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        imap::rename_oauth_folder("imap.yandex.ru", email, credential, remote_path, new_name).await
+    }
+
+    async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()> {
+        imap::delete_oauth_folder("imap.yandex.ru", email, credential, remote_path).await
+    }
+
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
         send_yandex(message, credential).await
     }
@@ -117,7 +140,8 @@ impl MailBackend for GmailBackend {
     }
 
     async fn validate(&self, email: &str, credential: &str) -> Result<()> {
-        validate_gmail(email, credential).await
+        let _ = email;
+        gmail_api::validate(credential).await
     }
 
     async fn discover(
@@ -126,7 +150,8 @@ impl MailBackend for GmailBackend {
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
     ) -> Result<ImapDiscovery> {
-        discover_gmail(email, credential, cursors).await
+        let _ = email;
+        gmail_api::discover(credential, cursors).await
     }
 
     async fn discover_folders(
@@ -134,7 +159,8 @@ impl MailBackend for GmailBackend {
         email: &str,
         credential: &str,
     ) -> Result<Vec<DiscoveredFolder>> {
-        discover_gmail_folders(email, credential).await
+        let _ = email;
+        gmail_api::discover_folders(credential).await
     }
 
     async fn discover_inbox(
@@ -143,7 +169,8 @@ impl MailBackend for GmailBackend {
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
     ) -> Result<ImapDiscovery> {
-        discover_gmail_inbox(email, credential, cursors).await
+        let _ = email;
+        gmail_api::discover(credential, cursors).await
     }
 
     async fn apply_operation(
@@ -153,11 +180,32 @@ impl MailBackend for GmailBackend {
         operation: &str,
         payload: &str,
     ) -> Result<()> {
-        apply_gmail_operation(email, credential, operation, payload).await
+        let _ = email;
+        gmail_api::apply_operation(credential, operation, payload).await
     }
 
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()> {
-        wait_for_gmail_change(email, credential).await
+        let _ = (email, credential);
+        // Gmail push требует серверного Cloud Pub/Sub webhook. Для desktop-only
+        // клиента используем короткий REST polling, не зависящий от IMAP:993.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        Ok(())
+    }
+
+    async fn rename_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        let _ = email;
+        gmail_api::rename_label(credential, remote_path, new_name).await
+    }
+
+    async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()> {
+        let _ = email;
+        gmail_api::delete_label(credential, remote_path).await
     }
 
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {

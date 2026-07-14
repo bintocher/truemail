@@ -17,7 +17,7 @@
       <div class="brand">
         <span class="logo"><svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><clipPath id="header-envelope-shape"><rect width="1024" height="768" rx="128"/></clipPath></defs><g transform="translate(0 128)" clip-path="url(#header-envelope-shape)"><rect width="1024" height="768" rx="128" fill="#5B63D3"/><path fill="#fff" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/></g></svg></span>
         <b>truemail</b>
-        <button class="iconbtn iconbtn-28 ml-auto" id="gear" title="Оформление"><i data-i="palette"></i></button>
+        <button class="iconbtn iconbtn-28 ml-auto" id="composeBtn" title="Написать письмо" aria-label="Написать письмо"><i data-i="compose"></i></button>
         <button class="iconbtn iconbtn-28" id="toSettings" title="Настройки"><i data-i="settings"></i></button>
       </div>
 
@@ -37,10 +37,6 @@
       <div class="navlabel">Аккаунты <span class="add" id="addAcct" title="Добавить аккаунт"><i data-i="plus"></i></span></div>
 
       <div class="nav-spacer"></div>
-      <div class="nav-foot">
-        <button class="iconbtn" id="themeBtn" title="Сменить тему"><i data-i="sun"></i></button>
-        <button class="btn primary sm ml-auto" id="composeBtn"><i data-i="compose"></i>Написать</button>
-      </div>
     </aside>
 
     <section class="list">
@@ -64,6 +60,17 @@
           <span class="sp"></span>
           <button class="iconbtn" title="В архив" data-act="archive"><i data-i="archive"></i></button>
           <button class="iconbtn" title="Удалить" data-act="trash"><i data-i="trash"></i></button>
+          <button class="iconbtn thread-more-button" id="threadMoreButton" data-toolbar-persistent title="Ещё действия" aria-haspopup="menu" aria-expanded="false"><i data-i="dots"></i></button>
+          <div class="thread-more-menu" id="threadMoreMenu" role="menu">
+            <button type="button" data-thread-action="unread"><i data-i="inbox"></i><span>Отметить непрочитанным</span></button>
+            <button type="button" data-thread-action="archive"><i data-i="archive"></i><span>В архив</span></button>
+            <button type="button" data-thread-action="trash"><i data-i="trash"></i><span>Удалить</span></button>
+            <div class="thread-menu-separator"></div>
+            <button type="button" data-thread-action="create-rule"><i data-i="filter"></i><span>Создать правило из письма</span></button>
+            <button type="button" data-thread-action="rules"><i data-i="settings"></i><span>Правила обработки</span></button>
+            <div class="thread-menu-separator"></div>
+            <button type="button" data-thread-action="settings"><i data-i="settings"></i><span>Настроить панель письма</span></button>
+          </div>
         </div>
         <div class="labels"><h1 id="tSubject"></h1></div>
       </div>
@@ -74,6 +81,7 @@
       <div class="calhead"><button class="iconbtn"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle">Июль 2026</h2><button class="iconbtn"><i data-i="chevR"></i></button>
         <div class="seg ml-14" id="calViews"><button data-cv="month" class="on">Месяц</button><button data-cv="week">Неделя</button><button data-cv="day">День</button></div>
         <span class="cal-sync-info" id="calSyncInfo"></span>
+        <button class="btn ml-auto" id="newEventBtn"><i data-i="plus"></i>Событие / задача</button>
         </div>
       <div class="calmonth" id="calgrid"></div>
       <div class="calweek" id="calweek"></div>
@@ -81,7 +89,7 @@
     </section>
 
     <section class="contacts">
-      <div class="calhead"><h2 class="ch-title">Контакты</h2><div class="search ct-search"><i data-i="search"></i><input placeholder="Поиск по контактам"></div><span class="ct-count"></span></div>
+      <div class="calhead"><h2 class="ch-title">Контакты</h2><div class="search ct-search"><i data-i="search"></i><input placeholder="Поиск по контактам"></div><span class="ct-count"></span><button class="btn ml-auto" id="newContactBtn"><i data-i="plus"></i>Контакт</button></div>
       <div class="cgrid" id="cgrid"></div>
     </section>
   </div>
@@ -96,6 +104,7 @@
       <div class="sec" data-set="toolbar"><i data-i="grip"></i>Панель письма</div>
       <div class="sec" data-set="accounts"><i data-i="user"></i>Аккаунты</div>
       <div class="sec" data-set="smart"><i data-i="star"></i>Умные папки</div>
+      <div class="sec" data-set="rules"><i data-i="filter"></i>Правила обработки</div>
       <div class="sec" data-set="unified"><i data-i="inbox"></i>Сквозные папки</div>
       <div class="sec" data-set="folders"><i data-i="folder"></i>Сопоставление папок</div>
       <div class="sec" data-set="calendars"><i data-i="cal"></i>Календари</div>
@@ -118,7 +127,7 @@
 
       <div class="setpage" id="set-toolbar">
         <h1>Панель над письмом</h1><p class="lead">Выберите, какие кнопки показывать над открытым письмом и в каком порядке. Тумблер справа - показывать кнопку; стрелки - менять порядок.</p>
-        <div class="card"><div class="cb"><div class="frow"><div class="fl"><div class="t">Расположение</div><div class="d">Слева — рядом с началом письма; справа — у правого края.</div></div><div class="fc"><div class="seg" id="toolbarAlign"><button data-align="left" class="on">Слева</button><button data-align="right">Справа</button></div></div></div><div class="frow"><div class="fl"><div class="t">Подписи кнопок</div></div><div class="fc"><div class="seg" id="toolbarLabels"><button data-labels="text" class="on">Значок + текст</button><button data-labels="icons">Только значки</button></div></div></div></div></div>
+        <div class="card"><div class="cb"><div class="frow"><div class="fl"><div class="t">Расположение</div><div class="d">Слева — рядом с началом письма; справа — у правого края.</div></div><div class="fc"><div class="seg" id="toolbarAlign"><button data-align="left" class="on">Слева</button><button data-align="right">Справа</button></div></div></div></div></div>
         <div class="card"><div class="cb" id="tbList"></div></div>
       </div>
 
@@ -149,6 +158,27 @@
         <div class="card mt-20"><div class="cb" id="smartList"></div></div>
       </div>
 
+      <div class="setpage" id="set-rules">
+        <h1>Правила обработки</h1><p class="lead">Автоматически обрабатывайте новые письма по отправителю или теме: перемещайте в папку, архив, спам или корзину.</p>
+        <button class="btn primary" id="ruleNew"><i data-i="plus"></i>Создать правило</button>
+        <div class="card mt-20 hidden" id="ruleEditor"><div class="ch"><span id="ruleEditorTitle">Новое правило</span></div><div class="cb">
+          <div class="fld"><label>Название</label><input class="inp" id="ruleName" placeholder="Например: Чеки в Финансы"></div>
+          <div class="rule-condition-grid">
+            <div class="fld"><label>Поле</label><select class="sel" id="ruleField"><option value="sender">Отправитель</option><option value="subject">Тема</option></select></div>
+            <div class="fld"><label>Сравнение</label><select class="sel" id="ruleOperator"><option value="contains">содержит</option><option value="equals">равно</option></select></div>
+            <div class="fld rule-value-field"><label>Значение</label><input class="inp" id="ruleValue"></div>
+          </div>
+          <div class="rule-condition-grid rule-action-grid">
+            <div class="fld"><label>Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
+            <div class="fld"><label>Действие</label><select class="sel" id="ruleAction"><option value="move">Переместить в папку</option><option value="archive">В архив</option><option value="spam">В спам</option><option value="trash">Удалить</option></select></div>
+            <div class="fld rule-target-field"><label>Папка</label><select class="sel" id="ruleTarget"></select></div>
+          </div>
+          <label class="aux-check"><input type="checkbox" id="ruleExisting"> Применить также к уже загруженным письмам</label>
+          <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i>Сохранить</button><button class="btn" id="ruleCancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i>Удалить правило</button></div>
+        </div></div>
+        <div class="card mt-20"><div class="cb" id="rulesList"><p class="note-muted">Правил пока нет.</p></div></div>
+      </div>
+
       <div class="setpage" id="set-unified">
         <h1>Сквозные папки</h1><p class="lead">Выберите физические папки почтовых ящиков, из которых умные папки могут собирать письма. По умолчанию участвуют все папки. Например, «Все входящие» дополнительно оставляет только источники с ролью «Входящие».</p>
         <div class="note-muted unified-explanation">Отключённая здесь папка не попадёт ни в одну умную папку. Сами условия — «входящие», «за 24 часа», «с вложениями» — редактируются в разделе «Умные папки».</div>
@@ -169,10 +199,15 @@
             <div class="swatch" data-accent="teal"><span class="sw sw-teal"></span><small>Бирюза</small></div>
             <div class="swatch" data-accent="rose"><span class="sw sw-rose"></span><small>Роза</small></div>
             <div class="swatch" data-accent="amber"><span class="sw sw-amber"></span><small>Янтарь</small></div>
+            <div class="swatch" data-accent="blue"><span class="sw sw-blue"></span><small>Синий</small></div>
+            <div class="swatch" data-accent="violet"><span class="sw sw-violet"></span><small>Фиолет</small></div>
+            <div class="swatch" data-accent="cyan"><span class="sw sw-cyan"></span><small>Голубой</small></div>
+            <div class="swatch" data-accent="green"><span class="sw sw-green"></span><small>Зелёный</small></div>
+            <div class="swatch" data-accent="orange"><span class="sw sw-orange"></span><small>Оранжевый</small></div>
           </div></div></div>
         </div></div>
         <div class="card"><div class="ch"><i data-i="edit"></i>Масштаб</div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t">Размер интерфейсного текста</div><div class="d">От 80% до 150%, применяется сразу.</div></div><div class="fc fc-inline"><input class="inp scale-input" id="uiScale" type="number" min="80" max="150" value="100"><span>%</span><div class="seg" id="scalePresets"><button data-scale="90">90</button><button data-scale="100" class="on">100</button><button data-scale="125">125</button><button data-scale="150">150</button></div></div></div>
+          <div class="frow"><div class="fl"><div class="t">Размер интерфейсного текста</div><div class="d">От 50% до 250%, применяется сразу.</div></div><div class="fc fc-inline"><input class="inp scale-input" id="uiScale" type="number" min="50" max="250" value="100"><span>%</span><div class="seg" id="scalePresets"><button data-scale="50">50</button><button data-scale="75">75</button><button data-scale="100" class="on">100</button><button data-scale="150">150</button><button data-scale="200">200</button><button data-scale="250">250</button></div></div></div>
         </div></div>
         <div class="card"><div class="ch">Предпросмотр</div><div class="cb"><div class="theme-prev"><div class="pn"><div class="bar a"></div><div class="bar"></div><div class="bar"></div></div><div class="pl"><div class="bar w80"></div><div class="bar w65"></div><div class="bar w72"></div></div></div></div></div>
       </div>
@@ -229,9 +264,9 @@
       <button class="iconbtn" title="Свернуть" id="compClose"><i data-i="back"></i></button></div>
     <div class="compbody">
       <div class="cfield"><label>От кого</label><select class="from-sel"></select></div>
-      <div class="cfield"><label>Кому</label><input id="compTo" placeholder="Получатели"></div>
-      <div class="cfield"><label>Копия</label><input id="compCc" placeholder="Копия"></div>
-      <div class="cfield"><label>Скрытая</label><input id="compBcc" placeholder="Скрытая копия"></div>
+      <div class="cfield recipient-field"><label>Кому</label><div class="recipient-input"><input id="compTo" placeholder="Получатели" autocomplete="off"><div class="recipient-suggestions"></div></div><div class="recipient-toggles"><button type="button" data-recipient-toggle="compCc">Копия</button><button type="button" data-recipient-toggle="compBcc">СК</button></div></div>
+      <div class="cfield recipient-field optional-recipient hidden" data-recipient-field="compCc"><label>Копия</label><div class="recipient-input"><input id="compCc" placeholder="Копия" autocomplete="off"><div class="recipient-suggestions"></div></div><button type="button" class="recipient-close" data-recipient-hide="compCc" aria-label="Скрыть поле Копия">×</button></div>
+      <div class="cfield recipient-field optional-recipient hidden" data-recipient-field="compBcc"><label>Скрытая</label><div class="recipient-input"><input id="compBcc" placeholder="Скрытая копия" autocomplete="off"><div class="recipient-suggestions"></div></div><button type="button" class="recipient-close" data-recipient-hide="compBcc" aria-label="Скрыть поле Скрытая копия">×</button></div>
       <div class="cfield"><label>Тема</label><input id="compSubj" placeholder="Тема письма"></div>
       <div class="compedit">
         <div class="compedit-main" id="compEdit" contenteditable="true" spellcheck="true" data-ph="Текст письма..."></div>
@@ -274,6 +309,11 @@
     <span class="dot-accent sw-teal" data-accent="teal"></span>
     <span class="dot-accent sw-rose" data-accent="rose"></span>
     <span class="dot-accent sw-amber" data-accent="amber"></span>
+    <span class="dot-accent sw-blue" data-accent="blue"></span>
+    <span class="dot-accent sw-violet" data-accent="violet"></span>
+    <span class="dot-accent sw-cyan" data-accent="cyan"></span>
+    <span class="dot-accent sw-green" data-accent="green"></span>
+    <span class="dot-accent sw-orange" data-accent="orange"></span>
   </div>
   <h4>Левая панель</h4>
   <input id="sidebarWidthQuick" type="range" min="180" max="420" value="250" title="Ширина левой панели">
@@ -309,10 +349,49 @@
   </div>
 </div>
 
+<!-- calendar/contact editor -->
+<div class="overlay" id="auxOverlay">
+  <div class="modal compact-modal" role="dialog" aria-modal="true" aria-labelledby="auxTitle">
+    <div class="mh"><i data-i="cal" id="auxIcon"></i><h3 id="auxTitle">Событие</h3><button class="iconbtn x" id="auxClose" aria-label="Закрыть"><i data-i="back"></i></button></div>
+    <form id="eventForm">
+      <div class="mb aux-form">
+        <div class="fld"><label>Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
+        <div class="fld"><label>Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
+        <div class="fld"><label>Название</label><input class="inp" id="eventSummary" required></div>
+        <div class="aux-two"><div class="fld"><label>Начало / срок</label><input class="inp" id="eventStart" type="datetime-local" required></div><div class="fld"><label>Окончание</label><input class="inp" id="eventEnd" type="datetime-local"></div></div>
+        <label class="aux-check"><input type="checkbox" id="eventAllDay"> Весь день</label>
+        <div class="fld"><label>Место</label><input class="inp" id="eventLocation"></div>
+        <div class="fld"><label>Описание</label><textarea class="inp" id="eventDescription"></textarea></div>
+        <div class="wz-connect-status" id="eventStatus" aria-live="polite"></div>
+      </div>
+      <div class="mf"><button class="btn primary" type="submit"><i data-i="check"></i>Сохранить</button><button class="btn" type="button" id="eventCancel">Отмена</button><button class="btn danger-btn ml-auto hidden" type="button" id="eventDelete"><i data-i="trash"></i>Удалить</button></div>
+    </form>
+    <form id="contactForm" class="hidden">
+      <div class="mb aux-form">
+        <div class="fld"><label>Аккаунт</label><select class="sel" id="contactAccount" required></select></div>
+        <div class="fld"><label>Отображаемое имя</label><input class="inp" id="contactDisplayName" required></div>
+        <div class="aux-two"><div class="fld"><label>Имя</label><input class="inp" id="contactFirstName"></div><div class="fld"><label>Фамилия</label><input class="inp" id="contactLastName"></div></div>
+        <div class="fld"><label>Организация</label><input class="inp" id="contactOrganization"></div>
+        <div class="fld"><label>Email (по одному в строке)</label><textarea class="inp" id="contactEmails" required></textarea></div>
+        <div class="wz-connect-status" id="contactStatus" aria-live="polite"></div>
+      </div>
+      <div class="mf"><button class="btn primary" type="submit"><i data-i="check"></i>Сохранить</button><button class="btn" type="button" id="contactCancel">Отмена</button><button class="btn danger-btn ml-auto hidden" type="button" id="contactDelete"><i data-i="trash"></i>Удалить</button></div>
+    </form>
+  </div>
+</div>
+
 <div class="ctxmenu" id="ctxsmart">
   <div class="tmi" data-smart-action="open"><i data-i="inbox"></i>Открыть</div>
   <div class="tmi" data-smart-action="edit"><i data-i="edit"></i>Изменить условия</div>
   <div class="tmi" data-smart-action="settings"><i data-i="settings"></i>Настройки умных папок</div>
+</div>
+
+<div class="ctxmenu" id="ctxfolder">
+  <div class="tmi" data-folder-action="open"><i data-i="inbox"></i>Открыть</div>
+  <div class="tmi" data-folder-action="settings"><i data-i="settings"></i>Настроить сопоставление</div>
+  <div class="tmsep"></div>
+  <div class="tmi" data-folder-action="rename"><i data-i="edit"></i>Переименовать</div>
+  <div class="tmi danger-menu-item" data-folder-action="delete"><i data-i="trash"></i>Удалить папку</div>
 </div>
 
 <!-- custom right-click menu -->

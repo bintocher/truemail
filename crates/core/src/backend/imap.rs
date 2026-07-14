@@ -1,6 +1,6 @@
 //! Синхронизация почты через IMAP с OAuth2.
 
-use crate::model::FolderRole;
+use crate::model::{FolderRole, infer_folder_role};
 use crate::{Error, Result};
 use async_imap::{Authenticator, types::NameAttribute};
 use futures::TryStreamExt;
@@ -34,6 +34,7 @@ pub struct FolderSyncCursor {
 pub struct DiscoveredMessage {
     pub folder_path: String,
     pub uid: u32,
+    pub remote_id: Option<String>,
     pub size: Option<u32>,
     pub seen: bool,
     pub flagged: bool,
@@ -128,6 +129,55 @@ async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OA
             message: e.to_string(),
         })?;
     Ok(session)
+}
+
+pub(crate) async fn rename_oauth_folder(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    remote_path: &str,
+    new_name: &str,
+) -> Result<String> {
+    let name = new_name.trim();
+    if name.is_empty() || name.contains(['/', '|']) {
+        return Err(Error::AccountConfig(
+            "имя папки пустое или содержит разделитель".into(),
+        ));
+    }
+    let prefix_len = remote_path.rfind(['/', '|']).map_or(0, |index| index + 1);
+    let target = format!(
+        "{}{}",
+        &remote_path[..prefix_len],
+        encode_modified_utf7(name)
+    );
+    let mut session = connect_oauth(host, email, access_token).await?;
+    session
+        .rename(remote_path, &target)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-rename".into(),
+            message: error.to_string(),
+        })?;
+    let _ = session.logout().await;
+    Ok(target)
+}
+
+pub(crate) async fn delete_oauth_folder(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    remote_path: &str,
+) -> Result<()> {
+    let mut session = connect_oauth(host, email, access_token).await?;
+    session
+        .delete(remote_path)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-delete-folder".into(),
+            message: error.to_string(),
+        })?;
+    let _ = session.logout().await;
+    Ok(())
 }
 
 /// Быстрая проверка токена без скачивания почты.
@@ -301,7 +351,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             } else if name
                 .attributes()
                 .iter()
-                .any(|a| matches!(a, NameAttribute::Archive))
+                .any(|a| matches!(a, NameAttribute::Archive | NameAttribute::All))
             {
                 Some(FolderRole::Archive)
             } else {
@@ -331,6 +381,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             .unwrap_or(&remote_path)
             .to_owned();
         let display_name = decode_modified_utf7(&encoded_name).unwrap_or(encoded_name);
+        let role = role.or_else(|| infer_folder_role(&remote_path, &display_name));
         folders.push(DiscoveredFolder {
             remote_path,
             display_name,
@@ -446,6 +497,7 @@ async fn fetch_incremental_messages(
         messages.push(DiscoveredMessage {
             folder_path: folder.remote_path.clone(),
             uid,
+            remote_id: None,
             size: fetch.size,
             seen: flags
                 .iter()
@@ -642,9 +694,42 @@ fn decode_modified_utf7(value: &str) -> Option<String> {
     Some(out)
 }
 
+fn encode_modified_utf7(value: &str) -> String {
+    use base64::Engine;
+    let mut output = String::new();
+    let mut encoded = Vec::new();
+    let flush = |output: &mut String, encoded: &mut Vec<u8>| {
+        if encoded.is_empty() {
+            return;
+        }
+        let value = base64::engine::general_purpose::STANDARD_NO_PAD
+            .encode(&*encoded)
+            .replace('/', ",");
+        output.push('&');
+        output.push_str(&value);
+        output.push('-');
+        encoded.clear();
+    };
+    for ch in value.chars() {
+        if (' '..='~').contains(&ch) && ch != '&' {
+            flush(&mut output, &mut encoded);
+            output.push(ch);
+        } else if ch == '&' {
+            flush(&mut output, &mut encoded);
+            output.push_str("&-");
+        } else {
+            for unit in ch.encode_utf16(&mut [0_u16; 2]).iter() {
+                encoded.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+    }
+    flush(&mut output, &mut encoded);
+    output
+}
+
 #[cfg(test)]
 mod utf7_tests {
-    use super::{MESSAGE_FETCH_ITEMS, decode_modified_utf7};
+    use super::{MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7};
 
     #[test]
     fn message_fetch_never_marks_mail_as_seen() {
@@ -660,5 +745,14 @@ mod utf7_tests {
             Some("Отправленные")
         );
         assert_eq!(decode_modified_utf7("A&-B").as_deref(), Some("A&B"));
+    }
+
+    #[test]
+    fn encodes_imap_folder_names() {
+        let encoded = encode_modified_utf7("Архив & old");
+        assert_eq!(
+            decode_modified_utf7(&encoded).as_deref(),
+            Some("Архив & old")
+        );
     }
 }

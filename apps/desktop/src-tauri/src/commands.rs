@@ -11,6 +11,10 @@ use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
+use truemail_core::account::{
+    ContactInput, EventInput, RemoteObject, configured_google_client_id,
+    configured_google_client_secret, configured_yandex_client_id,
+};
 use truemail_core::api::{McpTool, mcp_tools};
 use truemail_core::model::{
     Account, Contact, Event, Folder, MessageFull, MessageMeta, SmartFolder,
@@ -199,6 +203,19 @@ pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>
 }
 
 #[tauri::command]
+pub async fn rename_account(
+    state: State<'_, AppState>,
+    account_id: i64,
+    display_name: String,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .rename_account(account_id, &display_name)
+        .await?)
+}
+
+#[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>, account_id: i64) -> CmdResult<Vec<Folder>> {
     Ok(core(&state).await?.db.list_folders(account_id).await?)
 }
@@ -214,6 +231,28 @@ pub async fn set_folder_role(
         .await?
         .db
         .set_folder_role(account_id, &role, folder_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn rename_folder(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    new_name: String,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .rename_folder(folder_id, &new_name)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn delete_folder(state: State<'_, AppState>, folder_id: i64) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .delete_folder(folder_id)
         .await?)
 }
 
@@ -346,6 +385,261 @@ pub async fn search(state: State<'_, AppState>, query: String) -> CmdResult<Vec<
 pub async fn list_calendar_data(state: State<'_, AppState>) -> CmdResult<CalendarData> {
     let (calendars, events) = core(&state).await?.db.list_calendars_and_events().await?;
     Ok(CalendarData { calendars, events })
+}
+
+async fn account_by_id(core: &Core, account_id: i64) -> CmdResult<Account> {
+    core.db
+        .list_accounts()
+        .await?
+        .into_iter()
+        .find(|account| account.id == account_id)
+        .ok_or_else(|| ApiError {
+            message: "Аккаунт не найден".into(),
+        })
+}
+
+async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
+    match account.provider {
+        truemail_core::model::Provider::Yandex => {
+            core.accounts.sync_yandex_dav_account(account).await?;
+        }
+        truemail_core::model::Provider::Gmail => {
+            core.accounts.sync_google_auxiliary_account(account).await?;
+        }
+        _ => {
+            return Err(ApiError {
+                message: "Календарь и контакты этого провайдера пока не поддерживаются".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    calendar_id: i64,
+    input: EventInput,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let account = account_by_id(&core, account_id).await?;
+    let calendar: (i64, String) =
+        sqlx::query_as("SELECT account_id, url FROM calendars WHERE id=?")
+            .bind(calendar_id)
+            .fetch_one(&core.db.pool)
+            .await
+            .map_err(truemail_core::Error::from)?;
+    if calendar.0 != account_id {
+        return Err(ApiError {
+            message: "Календарь принадлежит другому аккаунту".into(),
+        });
+    }
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::write_event(
+        account.provider,
+        &account.email,
+        &token,
+        &calendar.1,
+        RemoteObject {
+            uid: None,
+            remote_url: None,
+            etag: None,
+        },
+        &input,
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    event_id: i64,
+    input: EventInput,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let row: (i64, String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT c.account_id, c.url, e.uid, e.remote_url, e.etag
+         FROM events e JOIN calendars c ON c.id=e.calendar_id WHERE e.id=?",
+    )
+    .bind(event_id)
+    .fetch_one(&core.db.pool)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    let account = account_by_id(&core, row.0).await?;
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::write_event(
+        account.provider,
+        &account.email,
+        &token,
+        &row.1,
+        RemoteObject {
+            uid: row.2.as_deref(),
+            remote_url: row.3.as_deref(),
+            etag: row.4.as_deref(),
+        },
+        &input,
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account.id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    event_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let row: (i64, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT c.account_id, c.url, e.remote_url, e.etag
+         FROM events e JOIN calendars c ON c.id=e.calendar_id WHERE e.id=?",
+    )
+    .bind(event_id)
+    .fetch_one(&core.db.pool)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    let account = account_by_id(&core, row.0).await?;
+    let remote_url = row.2.as_deref().ok_or_else(|| ApiError {
+        message: "У события нет серверного идентификатора".into(),
+    })?;
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::delete_event(
+        account.provider,
+        &account.email,
+        &token,
+        &row.1,
+        remote_url,
+        row.3.as_deref(),
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account.id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_contact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    input: ContactInput,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let account = account_by_id(&core, account_id).await?;
+    let stored_collection: Option<(String,)> = sqlx::query_as(
+        "SELECT url FROM auxiliary_collections WHERE account_id=? AND kind='carddav' LIMIT 1",
+    )
+    .bind(account_id)
+    .fetch_optional(&core.db.pool)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    let collection = if let Some(row) = stored_collection {
+        Some(row.0)
+    } else {
+        // Совместимость с базой, которая ещё не успела пройти новую DAV-синхронизацию.
+        let remote_sample: Option<(String,)> = sqlx::query_as(
+            "SELECT remote_url FROM contacts WHERE account_id=? AND remote_url LIKE 'http%' LIMIT 1",
+        )
+        .bind(account_id)
+        .fetch_optional(&core.db.pool)
+        .await
+        .map_err(truemail_core::Error::from)?;
+        remote_sample
+            .as_ref()
+            .and_then(|row| url::Url::parse(&row.0).ok())
+            .and_then(|url| url.join(".").ok())
+            .map(String::from)
+    };
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::write_contact(
+        account.provider,
+        &account.email,
+        &token,
+        collection.as_deref(),
+        RemoteObject {
+            uid: None,
+            remote_url: None,
+            etag: None,
+        },
+        &input,
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_contact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact_id: i64,
+    input: ContactInput,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let row: (i64, Option<String>, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT account_id, uid, remote_url, etag FROM contacts WHERE id=?")
+            .bind(contact_id)
+            .fetch_one(&core.db.pool)
+            .await
+            .map_err(truemail_core::Error::from)?;
+    let account = account_by_id(&core, row.0).await?;
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::write_contact(
+        account.provider,
+        &account.email,
+        &token,
+        None,
+        RemoteObject {
+            uid: row.1.as_deref(),
+            remote_url: row.2.as_deref(),
+            etag: row.3.as_deref(),
+        },
+        &input,
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account.id);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_contact(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    contact_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let row: (i64, Option<String>, Option<String>) =
+        sqlx::query_as("SELECT account_id, remote_url, etag FROM contacts WHERE id=?")
+            .bind(contact_id)
+            .fetch_one(&core.db.pool)
+            .await
+            .map_err(truemail_core::Error::from)?;
+    let account = account_by_id(&core, row.0).await?;
+    let remote_url = row.1.as_deref().ok_or_else(|| ApiError {
+        message: "У контакта нет серверного идентификатора".into(),
+    })?;
+    let token = core.accounts.oauth_access_token(&account).await?;
+    truemail_core::account::delete_contact(
+        account.provider,
+        &account.email,
+        &token,
+        remote_url,
+        row.2.as_deref(),
+    )
+    .await?;
+    refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account.id);
+    Ok(())
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {
@@ -631,12 +925,15 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
     Ok(())
 }
 
-/// Периодически обновляет DAV-данные отдельно от почты.
+/// Периодически обновляет календари, контакты и задачи отдельно от почты.
 #[tauri::command]
 pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
     for account in core.db.list_accounts().await? {
-        if account.provider != truemail_core::model::Provider::Yandex {
+        if !matches!(
+            account.provider,
+            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+        ) {
             continue;
         }
         let mut syncing = state.syncing.lock().await;
@@ -649,17 +946,29 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         let sync_app = app.clone();
         let _ = app.emit(
             "truemail-sync-state",
-            serde_json::json!({"account_id": account.id, "scope": "dav", "status": "syncing"}),
+            serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "syncing"}),
         );
         tokio::spawn(async move {
-            let state = match sync_core.accounts.sync_yandex_dav_account(&account).await {
+            let sync_result = match account.provider {
+                truemail_core::model::Provider::Yandex => {
+                    sync_core.accounts.sync_yandex_dav_account(&account).await
+                }
+                truemail_core::model::Provider::Gmail => {
+                    sync_core
+                        .accounts
+                        .sync_google_auxiliary_account(&account)
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            let state = match sync_result {
                 Ok((calendars, events, contacts)) => {
-                    tracing::info!(account = %account.email, calendars, events, contacts, "календарь и контакты обновлены");
-                    serde_json::json!({"account_id": account.id, "scope": "dav", "status": "ready", "calendars": calendars, "events": events, "contacts": contacts})
+                    tracing::info!(account = %account.email, calendars, events, contacts, "календари, задачи и контакты обновлены");
+                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready", "calendars": calendars, "events": events, "contacts": contacts})
                 }
                 Err(error) => {
-                    tracing::error!(account = %account.email, %error, "синхронизация календаря и контактов не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "dav", "status": "error", "error": error.to_string()})
+                    tracing::error!(account = %account.email, %error, "синхронизация календаря, задач и контактов не удалась");
+                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "error", "error": error.to_string()})
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -917,6 +1226,7 @@ pub async fn message_action(
     let role = match action.as_str() {
         "archive" => "archive",
         "trash" => "trash",
+        "spam" => "spam",
         _ => {
             return Err(ApiError {
                 message: "Неизвестное действие с письмом".into(),
@@ -927,6 +1237,24 @@ pub async fn message_action(
         .await?
         .db
         .queue_message_action(&message_ids, role)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn move_messages_to_folder(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    folder_id: i64,
+) -> CmdResult<truemail_core::storage::repo::QueuedAction> {
+    if message_ids.is_empty() {
+        return Err(ApiError {
+            message: "Не выбрано ни одного письма".into(),
+        });
+    }
+    Ok(core(&state)
+        .await?
+        .db
+        .queue_message_move(&message_ids, folder_id)
         .await?)
 }
 
@@ -953,23 +1281,21 @@ pub async fn set_setting(state: State<'_, AppState>, key: String, value: String)
 }
 
 fn yandex_client_id() -> CmdResult<String> {
-    std::env::var("TRUEMAIL_YANDEX_CLIENT_ID")
-        .ok()
-        .or_else(|| option_env!("TRUEMAIL_YANDEX_CLIENT_ID").map(str::to_owned))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError {
-            message: "Подключение к Яндексу пока не настроено в этой сборке truemail.".into(),
-        })
+    configured_yandex_client_id().ok_or_else(|| ApiError {
+        message: "Подключение к Яндексу пока не настроено в этой сборке truemail.".into(),
+    })
 }
 
-fn google_client_id() -> CmdResult<String> {
-    std::env::var("TRUEMAIL_GOOGLE_CLIENT_ID")
-        .ok()
-        .or_else(|| option_env!("TRUEMAIL_GOOGLE_CLIENT_ID").map(str::to_owned))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError {
-            message: "Gmail OAuth не настроен в этой сборке: создайте в Google Cloud OAuth Client типа Desktop app и задайте TRUEMAIL_GOOGLE_CLIENT_ID. Client secret для desktop-приложения не нужен.".into(),
-        })
+fn google_client_credentials() -> CmdResult<(String, String)> {
+    let client_id = configured_google_client_id().ok_or_else(|| ApiError {
+        message: "Gmail OAuth не настроен в этой сборке: не задан TRUEMAIL_GOOGLE_CLIENT_ID."
+            .into(),
+    })?;
+    let client_secret = configured_google_client_secret().ok_or_else(|| ApiError {
+        message: "Gmail OAuth не настроен в этой сборке: не задан TRUEMAIL_GOOGLE_CLIENT_SECRET."
+            .into(),
+    })?;
+    Ok((client_id, client_secret))
 }
 
 async fn receive_google_callback(
@@ -1178,7 +1504,7 @@ pub async fn begin_account_connection(
             })
         }
         truemail_core::model::Provider::Gmail => {
-            let client_id = google_client_id()?;
+            let (client_id, client_secret) = google_client_credentials()?;
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .map_err(|error| ApiError {
@@ -1202,6 +1528,7 @@ pub async fn begin_account_connection(
             let code = receive_google_callback(listener, &oauth_state).await?;
             let token = truemail_core::account::exchange_google_code(
                 &client_id,
+                &client_secret,
                 &code,
                 &pkce.verifier,
                 &redirect_uri,

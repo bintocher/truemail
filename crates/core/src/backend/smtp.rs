@@ -24,21 +24,7 @@ pub struct OutgoingMessage {
     pub attachments: Vec<OutgoingAttachment>,
 }
 
-fn mailbox(value: &str) -> Result<Mailbox> {
-    value
-        .trim()
-        .parse()
-        .map_err(|error| Error::AccountConfig(format!("некорректный адрес {value:?}: {error}")))
-}
-
-/// Отправить письмо через официальный SMTP endpoint Яндекса с тем же OAuth
-/// access token, что используется для IMAP.
-pub async fn send_oauth(
-    message: OutgoingMessage,
-    access_token: &str,
-    host: &str,
-    port: u16,
-) -> Result<()> {
+fn build_message(message: OutgoingMessage) -> Result<Message> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
@@ -48,7 +34,6 @@ pub async fn send_oauth(
             "суммарный размер вложений превышает 25 МБ".into(),
         ));
     }
-
     let mut builder = Message::builder()
         .from(mailbox(&message.from)?)
         .subject(message.subject);
@@ -61,7 +46,6 @@ pub async fn send_oauth(
     for address in &message.bcc {
         builder = builder.bcc(mailbox(address)?);
     }
-
     let alternative = if let Some(html) = message.body_html.filter(|html| !html.trim().is_empty()) {
         MultiPart::alternative()
             .singlepart(SinglePart::plain(message.body_text))
@@ -77,12 +61,30 @@ pub async fn send_oauth(
             .unwrap_or(ContentType::parse("application/octet-stream").expect("valid MIME"));
         mixed = mixed.singlepart(Attachment::new(item.filename).body(item.data, content_type));
     }
-    let email = builder.multipart(mixed).map_err(|error| Error::Backend {
+    builder.multipart(mixed).map_err(|error| Error::Backend {
         backend: "smtp-message".into(),
         message: error.to_string(),
-    })?;
+    })
+}
 
-    let credentials = Credentials::new(message.from, access_token.to_owned());
+fn mailbox(value: &str) -> Result<Mailbox> {
+    value
+        .trim()
+        .parse()
+        .map_err(|error| Error::AccountConfig(format!("некорректный адрес {value:?}: {error}")))
+}
+
+/// Отправить письмо через официальный SMTP endpoint Яндекса с тем же OAuth
+/// access token, что используется для IMAP.
+pub async fn send_oauth(
+    message: OutgoingMessage,
+    access_token: &str,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    let from = message.from.clone();
+    let email = build_message(message)?;
+    let credentials = Credentials::new(from, access_token.to_owned());
     let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
         .map_err(|error| Error::Backend {
             backend: "smtp".into(),
@@ -108,7 +110,28 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
-    send_oauth(message, access_token, "smtp.gmail.com", 465).await
+    use base64::Engine as _;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(build_message(message)?.formatted());
+    let response = reqwest::Client::new()
+        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({"raw":raw}))
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "gmail-send".into(),
+            message: error.to_string(),
+        })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::Backend {
+            backend: "gmail-send".into(),
+            message: format!("HTTP {status}: {body}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

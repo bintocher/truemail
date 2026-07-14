@@ -1,12 +1,20 @@
 //! Менеджер аккаунтов и автоконфигурация провайдеров.
 
 mod autoconfig;
+mod auxiliary;
 mod dav;
+mod google_services;
 mod oauth;
 pub use autoconfig::{ProviderConfig, autoconfig, discover_provider};
+pub use auxiliary::{
+    ContactInput, EventInput, RemoteObject, delete_contact, delete_event, write_contact,
+    write_event,
+};
 pub use dav::{DavSyncResult, sync_yandex_dav, validate_yandex_dav};
+pub use google_services::sync_google_services;
 pub use oauth::{
-    GOOGLE_MAIL_SCOPE, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
+    GOOGLE_SCOPES, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
+    configured_google_client_id, configured_google_client_secret, configured_yandex_client_id,
     exchange_google_code, exchange_yandex_code, generate_pkce, generate_state,
     google_authorize_url, refresh_google_token, refresh_yandex_token, yandex_authorize_url,
 };
@@ -33,6 +41,52 @@ pub struct ConnectedAccountSync {
 impl AccountManager {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    pub async fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
+        let folder = self.db.folder(folder_id).await?;
+        if folder.role.is_some() {
+            return Err(crate::Error::AccountConfig(
+                "системную папку нельзя переименовать".into(),
+            ));
+        }
+        let account = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|account| account.id == folder.account_id)
+            .ok_or_else(|| crate::Error::AccountConfig("аккаунт папки не найден".into()))?;
+        let token = self.oauth_access_token(&account).await?;
+        let backend = Self::mail_backend(account.provider)?;
+        let remote = backend
+            .rename_folder(&account.email, &token, &folder.remote_path, new_name)
+            .await?;
+        self.db
+            .rename_folder_local(folder.id, &remote, new_name.trim())
+            .await
+    }
+
+    pub async fn delete_folder(&self, folder_id: i64) -> Result<()> {
+        let folder = self.db.folder(folder_id).await?;
+        if folder.role.is_some() {
+            return Err(crate::Error::AccountConfig(
+                "системную папку нельзя удалить".into(),
+            ));
+        }
+        let account = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|account| account.id == folder.account_id)
+            .ok_or_else(|| crate::Error::AccountConfig("аккаунт папки не найден".into()))?;
+        let token = self.oauth_access_token(&account).await?;
+        let backend = Self::mail_backend(account.provider)?;
+        backend
+            .delete_folder(&account.email, &token, &folder.remote_path)
+            .await?;
+        self.db.delete_folder_local(folder.id).await
     }
 
     pub async fn list(&self) -> Result<Vec<Account>> {
@@ -72,39 +126,36 @@ impl AccountManager {
             let refresh_token = credential.refresh_token.clone().ok_or_else(|| {
                 crate::Error::AccountConfig("OAuth-токен истёк и не содержит refresh_token".into())
             })?;
-            let (environment_name, compiled_client_id) = match account.provider {
-                Provider::Yandex => (
-                    "TRUEMAIL_YANDEX_CLIENT_ID",
-                    option_env!("TRUEMAIL_YANDEX_CLIENT_ID").map(str::to_owned),
-                ),
-                Provider::Gmail => (
-                    "TRUEMAIL_GOOGLE_CLIENT_ID",
-                    option_env!("TRUEMAIL_GOOGLE_CLIENT_ID").map(str::to_owned),
-                ),
+            let refreshed = match account.provider {
+                Provider::Yandex => {
+                    let client_id = configured_yandex_client_id().ok_or_else(|| {
+                        crate::Error::AccountConfig(
+                            "для обновления OAuth-токена не задан TRUEMAIL_YANDEX_CLIENT_ID".into(),
+                        )
+                    })?;
+                    refresh_yandex_token(&client_id, &refresh_token).await?
+                }
+                Provider::Gmail => {
+                    let client_id = configured_google_client_id().ok_or_else(|| {
+                        crate::Error::AccountConfig(
+                            "для обновления OAuth-токена не задан TRUEMAIL_GOOGLE_CLIENT_ID".into(),
+                        )
+                    })?;
+                    let client_secret = configured_google_client_secret().ok_or_else(|| {
+                        crate::Error::AccountConfig(
+                            "для обновления OAuth-токена не задан TRUEMAIL_GOOGLE_CLIENT_SECRET"
+                                .into(),
+                        )
+                    })?;
+                    refresh_google_token(&client_id, &client_secret, &refresh_token).await?
+                }
                 _ => {
                     return Err(crate::Error::AccountConfig(
                         "обновление OAuth-токена для провайдера не настроено".into(),
                     ));
                 }
             };
-            let client_id = std::env::var(environment_name)
-                .ok()
-                .or(compiled_client_id)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| {
-                    crate::Error::AccountConfig(format!(
-                        "для обновления OAuth-токена не задан {environment_name}"
-                    ))
-                })?;
-            let refreshed = match account.provider {
-                Provider::Yandex => refresh_yandex_token(&client_id, &refresh_token).await?,
-                Provider::Gmail => refresh_google_token(&client_id, &refresh_token).await?,
-                _ => unreachable!(),
-            };
-            let mut updated = StoredOAuthCredential::from(refreshed);
-            if updated.refresh_token.is_none() {
-                updated.refresh_token = Some(refresh_token);
-            }
+            let updated = StoredOAuthCredential::from_refresh(refreshed, refresh_token);
             entry
                 .set_password(&serde_json::to_string(&updated)?)
                 .map_err(|e| crate::Error::Keyring(e.to_string()))?;
@@ -141,6 +192,16 @@ impl AccountManager {
         let access_token = self.oauth_access_token(account).await?;
         let dav = sync_yandex_dav(&account.email, &access_token).await?;
         self.db.save_yandex_dav(account.id, &dav).await
+    }
+
+    /// Обновить Google Calendar, Contacts и Tasks отдельно от IMAP.
+    pub async fn sync_google_auxiliary_account(
+        &self,
+        account: &Account,
+    ) -> Result<(usize, usize, usize)> {
+        let access_token = self.oauth_access_token(account).await?;
+        let data = sync_google_services(&access_token).await?;
+        self.db.save_google_services(account.id, &data).await
     }
 
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
@@ -268,6 +329,19 @@ impl AccountManager {
         display_name: &str,
         token: OAuthToken,
     ) -> Result<ConnectedAccountSync> {
+        if let Some(granted) = token.scope.as_deref() {
+            let granted: std::collections::HashSet<_> = granted.split_whitespace().collect();
+            let missing: Vec<_> = GOOGLE_SCOPES
+                .split_whitespace()
+                .filter(|scope| !granted.contains(scope))
+                .collect();
+            if !missing.is_empty() {
+                return Err(crate::Error::AccountConfig(format!(
+                    "Google не выдал все разрешения truemail. Повторите подключение и подтвердите доступ к Gmail, Календарю, Контактам и Задачам. Не выданы: {}",
+                    missing.join(", ")
+                )));
+            }
+        }
         let access_token = token.access_token.clone();
         let secret_ref = format!("google-oauth:{}", email.to_lowercase());
         let entry = keyring::Entry::new("truemail", &secret_ref)
@@ -383,16 +457,19 @@ impl AccountManager {
                 0
             }
         };
-        let dav_result = if account.provider == Provider::Yandex {
-            Some(sync_yandex_dav(&account.email, &access_token).await)
-        } else {
-            None
+        let dav_result = match account.provider {
+            Provider::Yandex => Some((
+                "caldav",
+                sync_yandex_dav(&account.email, &access_token).await,
+            )),
+            Provider::Gmail => Some(("google", sync_google_services(&access_token).await)),
+            _ => None,
         };
         let (calendars, events, contacts) = match dav_result {
             None => (0, 0, 0),
-            Some(Ok(dav)) => self
+            Some((source_kind, Ok(dav))) => self
                 .db
-                .save_yandex_dav(account.id, &dav)
+                .save_auxiliary_data(account.id, source_kind, &dav)
                 .await
                 .unwrap_or_else(|error| {
                     warnings.push(format!(
@@ -400,7 +477,7 @@ impl AccountManager {
                     ));
                     (0, 0, 0)
                 }),
-            Some(Err(error)) => {
+            Some((_, Err(error))) => {
                 warnings.push(format!(
                     "Календарь и контакты: первая синхронизация отложена: {error}"
                 ));

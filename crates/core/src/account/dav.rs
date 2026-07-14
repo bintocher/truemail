@@ -9,6 +9,9 @@ use url::Url;
 pub struct DavSyncResult {
     pub calendars: Vec<DavCalendar>,
     pub contacts: Vec<DavContact>,
+    /// Доступные CardDAV-коллекции. Нужны для создания первого контакта,
+    /// когда адресная книга ещё пуста и URL нельзя вывести из vCard.
+    pub contact_collections: Vec<String>,
     /// CardDAV-коллекция действительно была доступна и прочитана. Если Яндекс
     /// ещё не создал адресную книгу и вернул 404, локальные контакты удалять нельзя.
     pub contacts_available: bool,
@@ -24,6 +27,7 @@ pub struct DavCalendar {
 
 #[derive(Debug)]
 pub struct DavEvent {
+    pub remote_url: Option<String>,
     pub uid: String,
     pub summary: String,
     pub description: Option<String>,
@@ -41,6 +45,7 @@ pub struct DavEvent {
 
 #[derive(Debug)]
 pub struct DavContact {
+    pub remote_url: Option<String>,
     pub uid: String,
     pub display_name: String,
     pub first_name: Option<String>,
@@ -265,7 +270,7 @@ fn prop(raw: &str, name: &str) -> Option<String> {
     })
 }
 
-fn parse_events(raw: String, etag: Option<String>) -> Vec<DavEvent> {
+fn parse_events(raw: String, etag: Option<String>, remote_url: Option<String>) -> Vec<DavEvent> {
     let mut events = Vec::new();
     let mut rest = raw.as_str();
     while let Some(relative_start) = rest.find("BEGIN:VEVENT") {
@@ -277,6 +282,7 @@ fn parse_events(raw: String, etag: Option<String>) -> Vec<DavEvent> {
         let event = rest[..end].to_owned();
         if let (Some(uid), Some(dtstart)) = (prop(&event, "UID"), prop(&event, "DTSTART")) {
             events.push(DavEvent {
+                remote_url: remote_url.clone(),
                 uid,
                 summary: prop(&event, "SUMMARY").unwrap_or_default(),
                 description: prop(&event, "DESCRIPTION"),
@@ -297,7 +303,11 @@ fn parse_events(raw: String, etag: Option<String>) -> Vec<DavEvent> {
     events
 }
 
-fn parse_contact(raw: String, etag: Option<String>) -> Option<DavContact> {
+fn parse_contact(
+    raw: String,
+    etag: Option<String>,
+    remote_url: Option<String>,
+) -> Option<DavContact> {
     let name = prop(&raw, "N").unwrap_or_default();
     let mut names = name.split(';');
     let last_name = names.next().filter(|v| !v.is_empty()).map(str::to_owned);
@@ -313,6 +323,7 @@ fn parse_contact(raw: String, etag: Option<String>) -> Option<DavContact> {
         })
         .collect();
     Some(DavContact {
+        remote_url,
         uid: prop(&raw, "UID")?,
         display_name: prop(&raw, "FN").unwrap_or_else(|| name.replace(';', " ").trim().to_owned()),
         first_name,
@@ -392,7 +403,10 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
             dav_request(&client, "REPORT", &url, "1", report, email, access_token).await?;
         let events = response_parts(&event_xml, "calendar-data")?
             .into_iter()
-            .flat_map(|(_, etag, raw)| parse_events(raw, etag))
+            .flat_map(|(href, etag, raw)| {
+                let remote_url = resolve(cal_base, &href).ok();
+                parse_events(raw, etag, remote_url)
+            })
             .collect();
         calendars.push(DavCalendar {
             url,
@@ -415,6 +429,7 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
         return Ok(DavSyncResult {
             calendars,
             contacts: Vec::new(),
+            contact_collections: Vec::new(),
             contacts_available: false,
         });
     };
@@ -446,11 +461,11 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
     }
     let contacts_report = r#"<?xml version="1.0"?><a:addressbook-query xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><a:address-data/></d:prop></a:addressbook-query>"#;
     let mut contacts = Vec::new();
-    for addressbook in addressbooks {
+    for addressbook in &addressbooks {
         let Some(contact_xml) = dav_request_optional(
             &client,
             "REPORT",
-            &addressbook,
+            addressbook,
             "1",
             contacts_report,
             email,
@@ -463,12 +478,16 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
         contacts.extend(
             response_parts(&contact_xml, "address-data")?
                 .into_iter()
-                .filter_map(|(_, etag, raw)| parse_contact(raw, etag)),
+                .filter_map(|(href, etag, raw)| {
+                    let remote_url = resolve(card_base, &href).ok();
+                    parse_contact(raw, etag, remote_url)
+                }),
         );
     }
     Ok(DavSyncResult {
         calendars,
         contacts,
+        contact_collections: addressbooks,
         contacts_available: true,
     })
 }
@@ -480,7 +499,7 @@ mod tests {
     #[test]
     fn parses_every_vevent_and_recurrence_override() {
         let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260714T100000Z\r\nSUMMARY:Base\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260715T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID:20260716T100000Z\r\nDTSTART:20260716T120000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR";
-        let events = parse_events(raw.to_owned(), Some("etag".to_owned()));
+        let events = parse_events(raw.to_owned(), Some("etag".to_owned()), None);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].exdates.as_deref(), Some("20260715T100000Z"));
         assert_eq!(events[1].recurrence_id.as_deref(), Some("20260716T100000Z"));
@@ -489,7 +508,7 @@ mod tests {
     #[test]
     fn decodes_vcard_quoted_printable_properties() {
         let raw = "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:1\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=D0=98=D0=B2=D0=B0=D0=BD\r\nEMAIL:test@example.com\r\nEND:VCARD";
-        let contact = parse_contact(raw.to_owned(), None).expect("valid contact");
+        let contact = parse_contact(raw.to_owned(), None, None).expect("valid contact");
         assert_eq!(contact.display_name, "Иван");
         assert_eq!(contact.emails, ["test@example.com"]);
     }

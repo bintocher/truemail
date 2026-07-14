@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="truemail is a privacy-first desktop email client.">
+  <title>truemail — private desktop email</title>
+  <style>
+    :root { color-scheme: light; --ink:#111827; --muted:#667085; --line:#e4e7ec; --brand:#5b63da; --soft:#f7f8fc; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:#fff; font:16px/1.6 Inter,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header,main,footer { width:min(920px,calc(100% - 40px)); margin:auto; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:24px 0; border-bottom:1px solid var(--line); }
+    .brand { display:flex; align-items:center; gap:10px; font-size:20px; font-weight:750; }
+    .mark { width:34px; height:34px; border-radius:10px; background:var(--brand); display:grid; place-items:center; color:#fff; font-weight:800; }
+    nav { display:flex; gap:20px; }
+    a { color:var(--brand); text-decoration:none; }
+    nav a { color:var(--ink); }
+    .hero { padding:84px 0 60px; }
+    h1 { max-width:760px; margin:0 0 24px; font-size:clamp(42px,7vw,72px); line-height:1.04; letter-spacing:-.045em; }
+    .lead { max-width:680px; color:var(--muted); font-size:21px; }
+    .pill { display:inline-block; margin-top:20px; padding:9px 14px; border-radius:999px; background:#eef0ff; color:#3f46b7; font-weight:650; }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:18px; padding:20px 0 72px; }
+    .card { padding:24px; border:1px solid var(--line); border-radius:18px; background:var(--soft); }
+    h2 { margin:0 0 8px; font-size:20px; }
+    .card p { margin:0; color:var(--muted); }
+    .details { padding:54px 0; border-top:1px solid var(--line); }
+    .details p { max-width:760px; color:var(--muted); }
+    footer { display:flex; justify-content:space-between; gap:20px; padding:28px 0 48px; border-top:1px solid var(--line); color:var(--muted); }
+    @media (max-width:720px) { .grid{grid-template-columns:1fr}.hero{padding-top:56px}nav{display:none}footer{flex-direction:column} }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="mark">T</span>truemail</div>
+    <nav><a href="#about">About</a><a href="privacy/">Privacy</a><a href="terms/">Terms</a></nav>
+  </header>
+  <main>
+    <section class="hero">
+      <h1>Your mail stays on your computer.</h1>
+      <p class="lead">truemail is a desktop email client for managing multiple mailboxes in one place. It connects directly to your provider and keeps synchronized mail data locally on your device.</p>
+      <span class="pill">Desktop application · in active development</span>
+    </section>
+    <section class="grid" aria-label="Key features">
+      <article class="card"><h2>Full email client</h2><p>Read, compose, send, search, organize and delete messages, attachments and folders.</p></article>
+      <article class="card"><h2>Direct connection</h2><p>OAuth, IMAP and SMTP connections go directly from the desktop app to the selected mail provider.</p></article>
+      <article class="card"><h2>Local-first privacy</h2><p>Mailbox content is not uploaded to a truemail cloud service. Credentials are kept in the operating system keychain.</p></article>
+    </section>
+    <section class="details" id="about">
+      <h2>How truemail uses Google data</h2>
+      <p>When a user connects Gmail, truemail requests access needed to operate as an email client: synchronizing folders and messages, displaying attachments, composing and sending mail, and applying user-requested mailbox changes. Google user data is processed locally by the desktop application and is not used for advertising, profiling, or training AI models.</p>
+      <p>Read the complete <a href="privacy/">Privacy Policy</a>. For support or privacy requests, contact <a href="mailto:schernov1@gmail.com">schernov1@gmail.com</a>.</p>
+    </section>
+  </main>
+  <footer><span>© 2026 truemail</span><span><a href="privacy/">Privacy Policy</a> · <a href="terms/">Terms of Service</a></span></footer>
+</body>
+</html>

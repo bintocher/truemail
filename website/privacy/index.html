@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy — truemail</title>
+  <style>
+    :root { --ink:#111827; --muted:#667085; --line:#e4e7ec; --brand:#5b63da; }
+    * { box-sizing:border-box; } body { margin:0; color:var(--ink); font:16px/1.7 Inter,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header,main,footer { width:min(820px,calc(100% - 40px)); margin:auto; } header { padding:24px 0; border-bottom:1px solid var(--line); }
+    main { padding:56px 0 72px; } h1 { margin:0 0 8px; font-size:44px; letter-spacing:-.035em; } h2 { margin:42px 0 10px; font-size:23px; }
+    p,li { color:var(--muted); } a { color:var(--brand); text-decoration:none; } .date { margin:0; } footer { padding:28px 0 48px; border-top:1px solid var(--line); color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header><a href="../">← truemail</a></header>
+  <main>
+    <h1>Privacy Policy</h1>
+    <p class="date">Effective date: July 14, 2026</p>
+    <p>This policy explains how the truemail desktop application accesses and handles information when you connect an email account.</p>
+
+    <h2>Data the application accesses</h2>
+    <p>When you connect Gmail, truemail may access mailbox folders and labels, message headers and bodies, sender and recipient addresses, attachments, drafts, sent mail, and message state. It also receives OAuth access and refresh tokens required to maintain the connection. Access is initiated only after you choose to connect an account and approve Google's consent screen.</p>
+
+    <h2>Why this access is required</h2>
+    <p>truemail uses Gmail data solely to provide user-facing email-client functions: synchronize and display mail, search messages locally, download attachments, compose and send messages, maintain drafts, and carry out mailbox actions explicitly requested by the user, including moving, archiving, marking, and deleting messages. A narrower send-only or metadata-only scope cannot support a general-purpose desktop email client that must read, synchronize, organize, compose, send, and delete mail through IMAP and SMTP using OAuth.</p>
+
+    <h2>Local processing and storage</h2>
+    <p>truemail is a local-first desktop application. Gmail data is transferred directly between your computer and Google's mail servers. truemail does not operate a third-party backend that receives or stores your Gmail content. Synchronized application data is stored locally in encrypted application storage. OAuth credentials are stored using the operating system's protected credential store. Local backups or operating-system synchronization configured by you remain under your control.</p>
+
+    <h2>Sharing, advertising and AI</h2>
+    <p>truemail does not sell Google user data, share it with advertisers or data brokers, use it for advertising, build advertising profiles, or use it to train generalized artificial-intelligence or machine-learning models. Data is not transferred to third parties except when necessary for a user-requested email operation, such as sending a message to its recipients.</p>
+
+    <h2>Google API Services User Data Policy</h2>
+    <p>truemail's use and transfer to any other app of information received from Google APIs will adhere to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+
+    <h2>Retention and deletion</h2>
+    <p>Local Gmail data is retained while the account remains connected and according to the storage settings selected by the user. You can stop further access by removing the account from truemail or revoking truemail under <a href="https://myaccount.google.com/connections">Google Account connections</a>. You can delete locally retained application data from truemail's storage settings or by deleting the truemail data directory. Removing the application also prevents future access, but Google authorization should be revoked separately if you want the token invalidated immediately.</p>
+
+    <h2>Security</h2>
+    <p>truemail uses OAuth with PKCE and loopback redirects for Gmail authorization, TLS for provider connections, an encrypted local database, and the operating system credential store for OAuth tokens. No security measure is absolute; users should keep their operating system and truemail installation updated and protect access to their device.</p>
+
+    <h2>Children</h2>
+    <p>truemail is not directed to children under 13 and does not knowingly collect children's personal information through a truemail-operated service.</p>
+
+    <h2>Changes</h2>
+    <p>Material changes will be published on this page with a new effective date before they apply.</p>
+
+    <h2>Contact</h2>
+    <p>Questions, privacy requests and deletion requests: <a href="mailto:schernov1@gmail.com">schernov1@gmail.com</a>.</p>
+  </main>
+  <footer><a href="../">truemail home</a> · <a href="../terms/">Terms of Service</a></footer>
+</body>
+</html>

@@ -10,7 +10,38 @@ use url::Url;
 
 pub const YANDEX_SCOPES: &str = "mail:imap_full mail:smtp calendar:all \
 directory:read_external_contacts directory:write_external_contacts";
-pub const GOOGLE_MAIL_SCOPE: &str = "https://mail.google.com/";
+pub const GOOGLE_SCOPES: &str = "https://mail.google.com/ \
+https://www.googleapis.com/auth/calendar \
+https://www.googleapis.com/auth/contacts \
+https://www.googleapis.com/auth/tasks";
+
+pub fn configured_yandex_client_id() -> Option<String> {
+    configured_oauth_value(
+        "TRUEMAIL_YANDEX_CLIENT_ID",
+        option_env!("TRUEMAIL_YANDEX_CLIENT_ID"),
+    )
+}
+
+pub fn configured_google_client_id() -> Option<String> {
+    configured_oauth_value(
+        "TRUEMAIL_GOOGLE_CLIENT_ID",
+        option_env!("TRUEMAIL_GOOGLE_CLIENT_ID"),
+    )
+}
+
+pub fn configured_google_client_secret() -> Option<String> {
+    configured_oauth_value(
+        "TRUEMAIL_GOOGLE_CLIENT_SECRET",
+        option_env!("TRUEMAIL_GOOGLE_CLIENT_SECRET"),
+    )
+}
+
+fn configured_oauth_value(environment_name: &str, compiled: Option<&str>) -> Option<String> {
+    std::env::var(environment_name)
+        .ok()
+        .or_else(|| compiled.map(str::to_owned))
+        .filter(|value| !value.trim().is_empty())
+}
 
 #[derive(Debug, Clone)]
 pub struct PkcePair {
@@ -109,10 +140,11 @@ pub fn google_authorize_url(
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
-        .append_pair("scope", GOOGLE_MAIL_SCOPE)
+        .append_pair("scope", GOOGLE_SCOPES)
         .append_pair("login_hint", email_hint)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
+        .append_pair("include_granted_scopes", "true")
         .append_pair("state", state)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256");
@@ -144,6 +176,7 @@ pub async fn exchange_yandex_code(
 
 pub async fn exchange_google_code(
     client_id: &str,
+    client_secret: &str,
     code: &str,
     verifier: &str,
     redirect_uri: &str,
@@ -154,6 +187,7 @@ pub async fn exchange_google_code(
             ("grant_type", "authorization_code"),
             ("code", code.trim()),
             ("client_id", client_id),
+            ("client_secret", client_secret),
             ("code_verifier", verifier),
             ("redirect_uri", redirect_uri),
         ])
@@ -184,13 +218,18 @@ pub async fn refresh_yandex_token(client_id: &str, refresh_token: &str) -> Resul
     parse_token_response(response, "yandex-oauth").await
 }
 
-pub async fn refresh_google_token(client_id: &str, refresh_token: &str) -> Result<OAuthToken> {
+pub async fn refresh_google_token(
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<OAuthToken> {
     let response = oauth_client("google-oauth")?
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
             ("client_id", client_id),
+            ("client_secret", client_secret),
         ])
         .send()
         .await
@@ -256,6 +295,19 @@ impl From<OAuthToken> for StoredOAuthCredential {
     }
 }
 
+impl StoredOAuthCredential {
+    /// Построить сохранённый токен после refresh grant. Google обычно не
+    /// возвращает новый refresh_token, поэтому сохраняем предыдущий. Если
+    /// провайдер ротировал токен, используем новое значение.
+    pub fn from_refresh(token: OAuthToken, previous_refresh_token: String) -> Self {
+        let mut credential = Self::from(token);
+        if credential.refresh_token.is_none() {
+            credential.refresh_token = Some(previous_refresh_token);
+        }
+        credential
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,10 +352,12 @@ mod tests {
         .expect("url");
         let parsed = Url::parse(&url).expect("parse");
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
-        assert_eq!(
-            params.get("scope").map(|v| v.as_ref()),
-            Some(GOOGLE_MAIL_SCOPE)
-        );
+        assert_eq!(params.get("scope").map(|v| v.as_ref()), Some(GOOGLE_SCOPES));
+        let scopes = params.get("scope").expect("scope");
+        assert!(scopes.contains("https://mail.google.com/"));
+        assert!(scopes.contains("https://www.googleapis.com/auth/calendar"));
+        assert!(scopes.contains("https://www.googleapis.com/auth/contacts"));
+        assert!(scopes.contains("https://www.googleapis.com/auth/tasks"));
         assert_eq!(
             params.get("redirect_uri").map(|v| v.as_ref()),
             Some("http://127.0.0.1:49152/oauth/google/callback")
@@ -312,5 +366,55 @@ mod tests {
             params.get("code_challenge_method").map(|v| v.as_ref()),
             Some("S256")
         );
+        assert_eq!(
+            params.get("access_type").map(|v| v.as_ref()),
+            Some("offline")
+        );
+        assert_eq!(params.get("prompt").map(|v| v.as_ref()), Some("consent"));
+        assert_eq!(
+            params.get("include_granted_scopes").map(|v| v.as_ref()),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_previous_refresh_token_when_provider_omits_it() {
+        let token = OAuthToken {
+            access_token: "new-access".into(),
+            token_type: String::new(),
+            expires_in: Some(3600),
+            refresh_token: None,
+            scope: None,
+        };
+
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+
+        assert_eq!(refreshed.access_token, "new-access");
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("old-refresh"));
+        assert_eq!(refreshed.token_type, "bearer");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs() as i64;
+        assert!(
+            refreshed
+                .expires_at
+                .is_some_and(|value| { (now + 3_599..=now + 3_601).contains(&value) })
+        );
+    }
+
+    #[test]
+    fn refresh_uses_rotated_refresh_token_when_provider_returns_one() {
+        let token = OAuthToken {
+            access_token: "new-access".into(),
+            token_type: "Bearer".into(),
+            expires_in: Some(3600),
+            refresh_token: Some("rotated-refresh".into()),
+            scope: None,
+        };
+
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+
+        assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
     }
 }

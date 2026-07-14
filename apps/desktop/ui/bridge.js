@@ -15,8 +15,11 @@
     initializeStorage: (dataDir, locale, entropy) => invoke("initialize_storage", { dataDir, locale, entropy }),
     chooseDataDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
     listAccounts: () => invoke("list_accounts"),
+    renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
     listFolders: (accountId) => invoke("list_folders", { accountId }),
     setFolderRole: (accountId, role, folderId) => invoke("set_folder_role", { accountId, role, folderId }),
+    renameFolder: (folderId, newName) => invoke("rename_folder", { folderId, newName }),
+    deleteFolder: (folderId) => invoke("delete_folder", { folderId }),
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
@@ -24,6 +27,12 @@
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
+    createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
+    updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
+    deleteEvent: (eventId) => invoke("delete_event", { eventId }),
+    createContact: (accountId, input) => invoke("create_contact", { accountId, input }),
+    updateContact: (contactId, input) => invoke("update_contact", { contactId, input }),
+    deleteContact: (contactId) => invoke("delete_contact", { contactId }),
     storageStatus: () => invoke("storage_status"),
     moveStorage: (target) => invoke("move_storage", { target }),
     openDataDir: () => invoke("open_data_dir"),
@@ -35,6 +44,7 @@
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
     messageAction: (messageIds, action) => invoke("message_action", { messageIds, action }),
+    moveMessagesToFolder: (messageIds, folderId) => invoke("move_messages_to_folder", { messageIds, folderId }),
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
     getSetting: (key) => invoke("get_setting", { key }),
     setSetting: (key, value) => invoke("set_setting", { key, value }),
@@ -91,7 +101,7 @@
       }
       const accounts = await window.tm.listAccounts();
       const onboardingCompleted = await window.tm.getSetting("onboarding_completed");
-      const settingKeys = ["locale", "theme", "density", "accent", "expert_mode", "sidebar_width", "ui_scale", "toolbar_layout", "smart_folders_ui", "composer_draft", "search_history"];
+      const settingKeys = ["locale", "theme", "density", "accent", "expert_mode", "sidebar_width", "ui_scale", "toolbar_layout", "smart_folders_ui", "mail_rules_ui", "composer_draft", "search_history"];
       const settingValues = await Promise.all(settingKeys.map(key => window.tm.getSetting(key)));
       const settings = Object.fromEntries(settingKeys.map((key, index) => [key, settingValues[index]]));
       const savedLocale = settings.locale;
