@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>truemail</title>
+<script src="theme-init.js"></script>
+<link rel="stylesheet" href="styles.css?v=20260713-3">
+</head>
+<body>
+
+<!-- ================= MAIL ================= -->
+<div class="view" id="mailView">
+  <div class="app" id="app">
+    <aside class="nav">
+      <div class="nav-resizer" id="navResizer" title="Изменить ширину панели"></div>
+      <div class="brand">
+        <span class="logo"><svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><clipPath id="header-envelope-shape"><rect width="1024" height="768" rx="128"/></clipPath></defs><g transform="translate(0 128)" clip-path="url(#header-envelope-shape)"><rect width="1024" height="768" rx="128" fill="#5B63D3"/><path fill="#fff" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/></g></svg></span>
+        <b>truemail</b>
+        <button class="iconbtn iconbtn-28 ml-auto" id="gear" title="Оформление"><i data-i="palette"></i></button>
+        <button class="iconbtn iconbtn-28" id="toSettings" title="Настройки"><i data-i="settings"></i></button>
+      </div>
+
+      <div class="navitem topnav" data-nav="calendar"><i data-i="cal"></i>Календарь<span class="count">3</span></div>
+      <div class="navitem topnav" data-nav="contacts"><i data-i="people"></i>Контакты</div>
+
+      <div class="navlabel">Умные папки <span class="add" id="addSmart" title="Создать умную папку"><i data-i="plus"></i></span></div>
+      <div class="navitem active" data-nav="mail"><i data-i="inbox"></i>Все входящие<span class="count"></span></div>
+      <div class="navitem" data-nav="mail"><i data-i="star"></i>Все важные<span class="count"></span></div>
+      <div class="navitem" data-nav="mail"><i data-i="send"></i>Все отправленные</div>
+      <div class="navitem" data-nav="mail"><i data-i="draft"></i>Все черновики<span class="count"></span></div>
+      <div class="navitem" data-nav="mail"><i data-i="cal"></i>Сегодня<span class="count"></span></div>
+      <div class="navitem" data-nav="mail"><i data-i="search"></i>Непрочитанные (все)<span class="count"></span></div>
+      <div class="navitem" data-nav="mail"><i data-i="paperclip"></i>С вложениями</div>
+      <div class="navitem" data-nav="mail"><i data-i="flag"></i>Ждут ответа<span class="count"></span></div>
+
+      <div class="navlabel">Аккаунты <span class="add" id="addAcct" title="Добавить аккаунт"><i data-i="plus"></i></span></div>
+
+      <div class="nav-spacer"></div>
+      <div class="nav-foot">
+        <button class="iconbtn" id="themeBtn" title="Сменить тему"><i data-i="sun"></i></button>
+        <button class="btn primary sm ml-auto" id="composeBtn"><i data-i="compose"></i>Написать</button>
+      </div>
+    </aside>
+
+    <section class="list">
+      <div class="listhead">
+        <div class="row1"><div><h2 class="d-inline">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
+          <div class="fields-inline"><button class="iconbtn" id="filterBtn" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" title="Сортировка"><i data-i="sort"></i></button></div></div>
+        <div class="list-options hidden" id="filterMenu"><label><input type="checkbox" data-filter="unread"> Только непрочитанные</label><label><input type="checkbox" data-filter="attachments"> С вложениями</label><label><input type="checkbox" data-filter="flagged"> Важные</label></div>
+        <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc">Сначала новые</button><button data-sort="date-asc">Сначала старые</button><button data-sort="sender">По отправителю</button><button data-sort="subject">По теме</button></div>
+        <div class="search" id="searchBox"><i data-i="search"></i><input placeholder="Поиск по всем ящикам" readonly><span class="kbd">Ctrl K</span></div>
+      </div>
+      <div class="msgs" id="msgs"></div>
+    </section>
+
+    <section class="thread">
+      <div class="thead">
+        <div class="actions">
+          <button class="btn primary" data-act="reply"><i data-i="reply"></i>Ответить</button>
+          <button class="btn" data-act="replyall"><i data-i="replyall"></i>Ответить всем</button>
+          <button class="btn" data-act="forward"><i data-i="forward"></i>Переслать</button>
+          <span class="sp"></span>
+          <button class="iconbtn" title="В архив" data-act="archive"><i data-i="archive"></i></button>
+          <button class="iconbtn" title="Удалить" data-act="trash"><i data-i="trash"></i></button>
+        </div>
+        <div class="labels"><h1 id="tSubject"></h1></div>
+      </div>
+      <div class="tbody" id="tbody"></div>
+    </section>
+
+    <section class="cal" id="calSection" data-cv="month">
+      <div class="calhead"><button class="iconbtn"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle">Июль 2026</h2><button class="iconbtn"><i data-i="chevR"></i></button>
+        <div class="seg ml-14" id="calViews"><button data-cv="month" class="on">Месяц</button><button data-cv="week">Неделя</button><button data-cv="day">День</button></div>
+        <span class="cal-sync-info" id="calSyncInfo"></span>
+        </div>
+      <div class="calmonth" id="calgrid"></div>
+      <div class="calweek" id="calweek"></div>
+      <div class="calday" id="calday"></div>
+    </section>
+
+    <section class="contacts">
+      <div class="calhead"><h2 class="ch-title">Контакты</h2><div class="search ct-search"><i data-i="search"></i><input placeholder="Поиск по контактам"></div><span class="ct-count"></span></div>
+      <div class="cgrid" id="cgrid"></div>
+    </section>
+  </div>
+</div>
+
+<!-- ================= SETTINGS ================= -->
+<div class="view" id="settingsView">
+  <div class="settings">
+    <nav class="setnav">
+      <div class="back" id="backToMail"><i data-i="back"></i>Назад к почте</div>
+      <div class="sec active" data-set="general"><i data-i="settings"></i>Общие</div>
+      <div class="sec" data-set="toolbar"><i data-i="grip"></i>Панель письма</div>
+      <div class="sec" data-set="accounts"><i data-i="user"></i>Аккаунты</div>
+      <div class="sec" data-set="smart"><i data-i="star"></i>Умные папки</div>
+      <div class="sec" data-set="unified"><i data-i="inbox"></i>Сквозные папки</div>
+      <div class="sec" data-set="folders"><i data-i="folder"></i>Сопоставление папок</div>
+      <div class="sec" data-set="calendars"><i data-i="cal"></i>Календари</div>
+      <div class="sec" data-set="storage"><i data-i="storage"></i>Хранилище и кэш</div>
+      <div class="sec" data-set="themes"><i data-i="palette"></i>Темы и оформление</div>
+      <div class="sec" data-set="privacy"><i data-i="shield"></i>Приватность</div>
+      <div class="sec" data-set="keys"><i data-i="keyboard"></i>Горячие клавиши</div>
+    </nav>
+    <div class="setbody">
+
+      <div class="setpage active" id="set-general">
+        <h1>Общие</h1><p class="lead">Основные параметры программы.</p>
+        <div class="card"><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Режим эксперта</div><div class="d">Показывать продвинутые настройки и поля (большинству не нужны). По умолчанию - только необходимое для работы.</div></div><div class="fc"><div class="toggle" id="expertToggle"></div></div></div>
+          <div class="frow"><div class="fl"><div class="t">Язык интерфейса</div></div><div class="fc"><select class="sel" id="languageSetting"><option value="ru">Русский</option><option value="en">English</option></select></div></div>
+          <div class="frow"><div class="fl"><div class="t">Ширина левой панели</div><div class="d">Её также можно менять мышью за правый край панели.</div></div><div class="fc"><input id="sidebarWidth" type="range" min="180" max="420" value="200"><span id="sidebarWidthValue">200 px</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Мастер настройки</div><div class="d">Повторно выбрать язык и подключить аккаунт.</div></div><div class="fc"><button class="btn" id="restartWizard"><i data-i="user"></i>Запустить</button></div></div>
+        </div></div>
+      </div>
+
+      <div class="setpage" id="set-toolbar">
+        <h1>Панель над письмом</h1><p class="lead">Выберите, какие кнопки показывать над открытым письмом и в каком порядке. Тумблер справа - показывать кнопку; стрелки - менять порядок.</p>
+        <div class="card"><div class="cb"><div class="frow"><div class="fl"><div class="t">Расположение</div><div class="d">Слева — рядом с началом письма; справа — у правого края.</div></div><div class="fc"><div class="seg" id="toolbarAlign"><button data-align="left" class="on">Слева</button><button data-align="right">Справа</button></div></div></div><div class="frow"><div class="fl"><div class="t">Подписи кнопок</div></div><div class="fc"><div class="seg" id="toolbarLabels"><button data-labels="text" class="on">Значок + текст</button><button data-labels="icons">Только значки</button></div></div></div></div></div>
+        <div class="card"><div class="cb" id="tbList"></div></div>
+      </div>
+
+      <div class="setpage" id="set-accounts">
+        <h1>Аккаунты</h1><p class="lead">Подключённые почтовые ящики. Клик - настройки аккаунта, подпись и серверы.</p>
+        <button class="btn mt-6" id="settingsAddAccount"><i data-i="plus"></i>Добавить аккаунт</button>
+      </div>
+
+      <div class="setpage" id="set-addacct">
+        <h1>Мастер подключения аккаунта</h1><p class="lead">Введите любой адрес — truemail определит провайдера и выберет способ входа.</p>
+        <div class="card"><div class="ch"><i data-i="lock"></i>Безопасный вход OAuth</div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Адрес почты</div></div><div class="fc"><input class="inp inp-w280" id="accountEmail" type="email" placeholder="you@example.com"></div></div>
+          <div class="frow"><div class="fl"><div class="t">Подключение</div><div class="d">Провайдер и доступные сервисы определятся автоматически.</div></div><div class="fc"><button class="btn primary" id="accountOauthStart"><i data-i="lock"></i>Подключить</button></div></div>
+          <div class="frow hidden" id="accountCodeRow"><div class="fl"><div class="t">Код подтверждения</div><div class="d">Скопируйте код со страницы Яндекс ID после входа.</div></div><div class="fc"><input class="inp inp-w280 mb-10" id="accountOauthCode" autocomplete="one-time-code" placeholder="Код"><button class="btn primary" id="accountOauthConfirm"><i data-i="check"></i>Подтвердить</button></div></div>
+          <div class="wz-connect-status" id="accountOauthStatus" aria-live="polite"></div>
+        </div></div>
+        <div class="btn-row"><button class="btn" id="accountWizardCancel">Отмена</button></div>
+      </div>
+
+      <div class="setpage" id="set-folders">
+        <h1>Сопоставление папок</h1><p class="lead">Сопоставьте папки ящика с ролями truemail - чтобы сквозные "Отправленные", "Черновики" и т.д. работали одинаково для всех аккаунтов.</p>
+        <p class="note-muted">Спецпапки определяются автоматически, но их можно переназначить вручную.</p>
+      </div>
+
+      <div class="setpage" id="set-smart">
+        <h1>Умные папки</h1><p class="lead">Папки, которые сами собирают письма по условиям (все входящие, с вложениями, за сегодня и любые ваши). Меняйте порядок, показывайте/скрывайте, редактируйте условия.</p>
+        <button class="btn primary" id="smartNew2"><i data-i="plus"></i>Создать умную папку</button>
+        <div class="card mt-20"><div class="cb" id="smartList"></div></div>
+      </div>
+
+      <div class="setpage" id="set-unified">
+        <h1>Сквозные папки</h1><p class="lead">Что попадает в объединённые папки вроде «Все входящие». Включайте или исключайте папки конкретных ящиков - можно собрать только нужное.</p>
+      </div>
+
+      <div class="setpage" id="set-calendars">
+        <h1>Календари</h1><p class="lead">Календари теперь настраиваются внутри соответствующего аккаунта: truemail сам определяет CalDAV, Exchange или iCal.</p>
+        <button class="btn" data-set="accounts"><i data-i="user"></i>Перейти к аккаунтам</button>
+      </div>
+
+      <div class="setpage" id="set-themes">
+        <h1>Темы и оформление</h1><p class="lead">Темы применяются на лету и меняют не только цвет, но и размеры элементов. Можно импортировать чужие темы.</p>
+        <div class="card"><div class="ch"><i data-i="palette"></i>Тема</div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Режим</div></div><div class="fc"><div class="seg" id="setTheme"><button data-theme="light" class="on">Светлая</button><button data-theme="dark">Тёмная</button><button data-theme="auto">Системная</button></div></div></div>
+          <div class="frow"><div class="fl"><div class="t">Плотность</div><div class="d">Меняет высоту строк и отступы</div></div><div class="fc"><div class="seg" id="setDensity"><button data-density="compact">Плотно</button><button data-density="normal" class="on">Обычно</button><button data-density="spacious">Просторно</button></div></div></div>
+          <div class="frow row-top"><div class="fl"><div class="t">Акцент</div></div><div class="fc"><div class="swatch-row" id="setAccent">
+            <div class="swatch on" data-accent="indigo"><span class="sw sw-indigo"></span><small>Индиго</small></div>
+            <div class="swatch" data-accent="teal"><span class="sw sw-teal"></span><small>Бирюза</small></div>
+            <div class="swatch" data-accent="rose"><span class="sw sw-rose"></span><small>Роза</small></div>
+            <div class="swatch" data-accent="amber"><span class="sw sw-amber"></span><small>Янтарь</small></div>
+          </div></div></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="edit"></i>Масштаб</div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Размер интерфейсного текста</div><div class="d">От 80% до 150%, применяется сразу.</div></div><div class="fc fc-inline"><input class="inp scale-input" id="uiScale" type="number" min="80" max="150" value="100"><span>%</span><div class="seg" id="scalePresets"><button data-scale="90">90</button><button data-scale="100" class="on">100</button><button data-scale="125">125</button><button data-scale="150">150</button></div></div></div>
+        </div></div>
+        <div class="card"><div class="ch">Предпросмотр</div><div class="cb"><div class="theme-prev"><div class="pn"><div class="bar a"></div><div class="bar"></div><div class="bar"></div></div><div class="pl"><div class="bar w80"></div><div class="bar w65"></div><div class="bar w72"></div></div></div></div></div>
+      </div>
+
+      <div class="setpage" id="set-storage">
+        <h1>Хранилище</h1><p class="lead">truemail держит зашифрованную локальную копию почты для скорости и работы без сети. Здесь видно, что занимает место, где оно лежит и как настроено хранение.</p>
+        <div class="card"><div class="ch"><i data-i="storage"></i>Занято на диске</div><div class="cb">
+          <div class="baseline"><span class="storage-big">0 Б</span><span class="storage-sub">локальных данных</span></div>
+          <div class="usebar" aria-label="Распределение локальных данных"><span class="seg-db" title="Зашифрованная база"></span><span class="seg-blob" title="Зашифрованные файлы"></span></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="folder"></i>Расположение и шифрование</div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Папка для хранения данных <span class="help" data-tip="Где truemail держит зашифрованную локальную копию почты, вложений и индекса. Можно вынести на отдельный или зашифрованный диск.">?</span></div><div class="d mono"></div></div><div class="fc"><button class="btn sm" id="changeDataDir">Изменить</button></div></div>
+          <div class="frow"><div class="fl"><div class="t">Открыть папку</div></div><div class="fc"><button class="btn sm" id="openDataDir"><i data-i="openext"></i>В проводнике</button></div></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="trash"></i>Освободить место</div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Вложения старше года</div><div class="d">Останутся на сервере, скачаются при открытии</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="old_attachments">Очистить</button></div></div>
+          <div class="frow"><div class="fl"><div class="t">Локальные данные корзины и спама</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="trash_spam">Очистить</button></div></div>
+          <div class="frow"><div class="fl"><div class="t">Полностью очистить локальные данные</div><div class="d">Письма перекачаются с серверов заново</div></div><div class="fc"><button class="btn sm danger-btn" data-clear="all"><i data-i="trash"></i>Очистить всё</button></div></div>
+        </div></div>
+      </div>
+
+      <div class="setpage" id="set-privacy">
+        <h1>Приватность и безопасность</h1><p class="lead">Безопасные настройки уже действуют. Здесь - только то, где выбор реально за вами.</p>
+        <div class="card"><div class="ch"><i data-i="shield"></i>Защита включена</div><div class="cb"><p class="note-muted">HTML-письма открываются без скриптов в изолированном контейнере. Удалённые изображения блокируются; разрешение можно дать отдельно для конкретного отправителя. База и локальные файлы зашифрованы.</p></div></div>
+      </div>
+
+      <div class="setpage" id="set-keys">
+        <h1>Горячие клавиши</h1><p class="lead">Текущие рабочие сочетания клавиш.</p>
+        <div class="card"><div class="ch"><i data-i="settings"></i>Глобальные (работают даже когда окно свёрнуто) <span class="help" data-tip="Системные горячие клавиши: срабатывают во всей ОС, даже если truemail свёрнут или вы в другой программе. Например, быстро написать письмо или показать окно, не открывая приложение мышью.">?</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Показать / скрыть truemail</div></div><div class="fc"><span class="kbd keybind">Ctrl+Shift+M</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Написать письмо (из любого места)</div></div><div class="fc"><span class="kbd keybind">Ctrl+Shift+C</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Быстрый поиск по почте</div></div><div class="fc"><span class="kbd keybind">Ctrl+Shift+F</span></div></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="inbox"></i>Локальные (внутри приложения) <span class="help" data-tip="Действуют, когда открыто окно truemail. Классические почтовые сочетания для быстрой работы без мыши.">?</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Поиск и команды</div></div><div class="fc"><span class="kbd keybind">Ctrl+K</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Написать письмо</div></div><div class="fc"><span class="kbd keybind">C</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Ответить</div></div><div class="fc"><span class="kbd keybind">R</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Ответить всем</div></div><div class="fc"><span class="kbd keybind">A</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Переслать</div></div><div class="fc"><span class="kbd keybind">F</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">В архив</div></div><div class="fc"><span class="kbd keybind">E</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Следующее / предыдущее письмо</div></div><div class="fc"><span class="kbd keybind">J</span> <span class="kbd keybind">K</span></div></div>
+          <div class="frow"><div class="fl"><div class="t">Удалить</div></div><div class="fc"><span class="kbd keybind">Del</span></div></div>
+        </div></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- ================= COMPOSE ================= -->
+<div class="view" id="composeView">
+  <div class="compose">
+    <div class="comphead"><h2 id="compTitle">Новое письмо</h2><span class="sp"></span>
+      <button class="iconbtn" title="Свернуть" id="compClose"><i data-i="back"></i></button></div>
+    <div class="compbody">
+      <div class="cfield"><label>От кого</label><select class="from-sel"></select></div>
+      <div class="cfield"><label>Кому</label><input id="compTo" placeholder="Получатели"></div>
+      <div class="cfield"><label>Копия</label><input id="compCc" placeholder="Копия"></div>
+      <div class="cfield"><label>Скрытая</label><input id="compBcc" placeholder="Скрытая копия"></div>
+      <div class="cfield"><label>Тема</label><input id="compSubj" placeholder="Тема письма"></div>
+      <div class="compedit">
+        <div class="compedit-main" id="compEdit" contenteditable="true" spellcheck="true" data-ph="Текст письма..."></div>
+        <div class="sig"></div>
+      </div>
+      <div class="comp-att" id="compAtt"></div>
+    </div>
+    <div class="comptool">
+      <button class="iconbtn" title="Жирный" data-format="bold"><i data-i="bold"></i></button>
+      <button class="iconbtn" title="Курсив" data-format="italic"><i data-i="italic"></i></button>
+      <button class="iconbtn" title="Подчёркнутый" data-format="underline"><i data-i="underline"></i></button>
+      <span class="div"></span>
+      <button class="iconbtn" title="Список" data-format="insertUnorderedList"><i data-i="list"></i></button>
+      <button class="iconbtn" title="Ссылка" id="compLink"><i data-i="link"></i></button>
+      <button class="iconbtn" title="Упомянуть"><i data-i="at"></i></button>
+      <span class="div"></span>
+      <button class="iconbtn" title="Вложение" id="compAttach"><i data-i="paperclip"></i></button>
+      <input type="file" id="compFile" multiple hidden>
+    </div>
+    <div class="compfoot">
+      <button class="btn primary" id="compSend"><i data-i="send"></i>Отправить</button>
+      <button class="btn" id="compSendLater"><i data-i="snooze"></i>Отправить позже</button>
+      <input class="inp comp-send-at hidden" id="compSendAt" type="datetime-local" aria-label="Дата и время отправки">
+      <span class="compose-status" id="composeStatus" aria-live="polite"></span>
+      <span class="sp sp-grow"></span>
+      <button class="iconbtn" title="Удалить черновик" id="compDeleteDraft"><i data-i="trash"></i></button>
+    </div>
+  </div>
+</div>
+
+<!-- popovers -->
+<div class="pop" id="pop">
+  <h4>Тема</h4>
+  <div class="seg" id="segTheme"><button data-theme="light" class="on">Светлая</button><button data-theme="dark">Тёмная</button><button data-theme="auto">Системная</button></div>
+  <h4>Плотность</h4>
+  <div class="seg" id="segDensity"><button data-density="compact">Плотно</button><button data-density="normal" class="on">Обычно</button><button data-density="spacious">Просторно</button></div>
+  <h4>Акцент</h4>
+  <div class="accents" id="accents">
+    <span class="dot-accent on sw-indigo" data-accent="indigo"></span>
+    <span class="dot-accent sw-teal" data-accent="teal"></span>
+    <span class="dot-accent sw-rose" data-accent="rose"></span>
+    <span class="dot-accent sw-amber" data-accent="amber"></span>
+  </div>
+  <h4>Левая панель</h4>
+  <input id="sidebarWidthQuick" type="range" min="180" max="420" value="250" title="Ширина левой панели">
+  <button class="btn sm more" id="toThemes">Все настройки тем</button>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="cmd" role="dialog" aria-label="Поиск и команды">
+    <div class="cmdsearch"><i data-i="search"></i><input id="cmdInput" placeholder="Поиск: письма, контакты, команды, настройки - на любой раскладке" autocomplete="off"></div>
+    <div class="cmdlist" id="cmdlist"></div>
+  </div>
+</div>
+
+<!-- smart folder modal -->
+<div class="overlay" id="smartOverlay">
+  <div class="modal">
+    <div class="mh"><i data-i="search"></i><h3>Новая умная папка</h3><button class="iconbtn x" id="smartClose"><i data-i="back"></i></button></div>
+    <div class="mb">
+      <div class="fld"><label>Название и значок</label>
+        <div class="name-row"><input class="inp" id="smartName" placeholder="Например: Важное от коллег">
+          <button class="btn" id="smartIconButton" type="button"><i data-i="star"></i>Изменить значок</button></div>
+          <div class="icons icon-picker hidden" id="smartIcons"></div>
+      </div>
+      <div class="fld"><label>Условия отбора</label>
+        <div class="logic" id="smartLogic"><button class="on" data-l="all">Все условия (И)</button><button data-l="any">Любое из (ИЛИ)</button></div>
+        <div class="conds" id="conds"></div>
+        <span class="addcond" id="addCond"><i data-i="plus"></i>Добавить условие</span>
+        <span class="addcond" id="addCondGroup"><i data-i="plus"></i>Добавить группу ИЛИ</span>
+      </div>
+    </div>
+    <div class="mf"><button class="btn primary" id="smartCreate"><i data-i="check"></i>Создать умную папку</button><button class="btn" id="smartCancel">Отмена</button></div>
+  </div>
+</div>
+
+<div class="ctxmenu" id="ctxsmart">
+  <div class="tmi" data-smart-action="open"><i data-i="inbox"></i>Открыть</div>
+  <div class="tmi" data-smart-action="edit"><i data-i="edit"></i>Изменить условия</div>
+  <div class="tmi" data-smart-action="settings"><i data-i="settings"></i>Настройки умных папок</div>
+</div>
+
+<!-- custom right-click menu -->
+<div class="ctxmenu" id="ctxmenu">
+  <div class="tmi" data-context-action="reply"><i data-i="reply"></i>Ответить</div>
+  <div class="tmi" data-context-action="forward"><i data-i="forward"></i>Переслать</div>
+  <div class="tmsep"></div>
+  <div class="tmi" data-context-action="archive"><i data-i="archive"></i>В архив</div>
+  <div class="tmi" data-context-action="trash"><i data-i="trash"></i>Удалить</div>
+</div>
+
+<!-- welcome wizard (первый запуск) -->
+<div class="view active" id="welcomeView">
+  <div class="wz">
+    <div class="wzcard">
+      <div class="wzstep active" id="wz1">
+        <div class="wz-logo"><i data-i="globe"></i></div>
+        <h1 data-i18n="languageTitle">Choose your language</h1>
+        <p class="sub" data-i18n="languageSub">You can change it later in Settings.</p>
+        <div class="left">
+          <button class="wz-opt" type="button" data-wlang="ru"><span class="pv" style="background:#5B63D3">RU</span><div><div class="nm">Русский</div><div class="ds">Русский язык</div></div></button>
+          <button class="wz-opt" type="button" data-wlang="en"><span class="pv" style="background:#17181C">EN</span><div><div class="nm">English</div><div class="ds">English language</div></div></button>
+        </div>
+        <div class="wznav"><button class="btn primary" id="wzLanguageNext" data-wz="2" disabled data-i18n="next">Continue</button></div>
+      </div>
+      <div class="wzstep" id="wz2">
+        <div class="wz-logo"><i data-i="folder"></i></div>
+        <h1 data-i18n="storageTitle">Папка данных</h1>
+        <p class="sub" data-i18n="storageSub">Здесь будут храниться зашифрованная почта, календарь, контакты и индекс.</p>
+        <div class="left">
+          <label class="wz-field-label" for="wzDataDir" data-i18n="storagePath">Путь хранения</label>
+          <div class="wz-path-row"><input class="inp" id="wzDataDir" autocomplete="off"><button class="btn" id="wzChooseDataDir" type="button" data-i18n="chooseFolder">Выбрать…</button></div>
+          <div class="wz-connect-status" id="wzStorageStatus" aria-live="polite"></div>
+        </div>
+        <div class="wznav"><button class="btn" data-wz="1"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzStorageNext" data-i18n="next">Далее</button></div>
+      </div>
+      <div class="wzstep" id="wz3">
+        <div class="wz-logo"><i data-i="shield"></i></div>
+        <h1 data-i18n="keyTitle">Создайте ключ шифрования</h1>
+        <p class="sub" data-i18n="keySub">Водите мышью внутри поля, пока шкала не заполнится. Движения используются только один раз и не сохраняются.</p>
+        <div class="entropy-pad" id="entropyPad">
+          <div class="entropy-cursor" id="entropyCursor"></div>
+          <div class="entropy-hint" id="entropyHint" data-i18n="keyMove">Двигайте мышью здесь</div>
+        </div>
+        <div class="entropy-progress"><span id="entropyProgress"></span></div>
+        <div class="entropy-caption" id="entropyCaption">0%</div>
+        <div class="wz-connect-status" id="wzEntropyStatus" aria-live="polite"></div>
+        <div class="wznav"><button class="btn" data-wz="2"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzCreateKeys" disabled data-i18n="createKeys">Создать защищённое хранилище</button></div>
+      </div>
+      <div class="wzstep" id="wz4">
+        <div class="wz-logo brand-mark"><svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><clipPath id="wizard-envelope-shape"><rect width="1024" height="768" rx="128"/></clipPath></defs><g transform="translate(0 128)" clip-path="url(#wizard-envelope-shape)"><rect width="1024" height="768" rx="128" fill="#5B63D3"/><path fill="#fff" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/></g></svg></div>
+        <h1 data-i18n="welcome">Добро пожаловать в truemail</h1>
+        <p class="sub" data-i18n="welcomeSub">Быстрый, удобный и красивый почтовый клиент. Вся почта хранится локально на вашем устройстве.</p>
+        <div class="wznav"><button class="btn" data-wz="3"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" data-wz="5" data-i18n="start">Начать настройку</button><button class="wz-skip-btn" id="wzSkipMain" data-i18n="skip">Пропустить</button></div>
+      </div>
+      <div class="wzstep" id="wz5">
+        <div class="wz-logo"><i data-i="user"></i></div>
+        <h1 data-i18n="connectTitle">Подключите почту</h1>
+        <p class="sub" data-i18n="connectSub">Введите любой адрес — truemail определит провайдера и выберет способ входа.</p>
+        <div class="left"><input class="inp mb-10" id="wzEmail" type="email" placeholder="you@example.com" data-i18n-placeholder="emailPlaceholder">
+          <button class="btn primary btn-full" id="wzConnect"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button>
+          <div id="wzCodeBox" class="hidden"><input class="inp mb-10" id="wzOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codePlaceholder" placeholder="Код подтверждения">
+            <button class="btn primary btn-full" id="wzConfirm"><i data-i="check"></i><span data-i18n="confirm">Подтвердить подключение</span></button></div>
+          <div class="wz-connect-status" id="wzConnectStatus" aria-live="polite"></div>
+        </div>
+        <div class="wznav"><button class="btn" data-wz="4"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzAccountNext" data-wz="6" disabled data-i18n="next">Далее</button><button class="wz-skip-btn" data-wz="6" data-i18n="skip">Пропустить</button></div>
+      </div>
+      <div class="wzstep" id="wz6">
+        <div class="wz-logo"><i data-i="palette"></i></div>
+        <h1 data-i18n="themeTitle">Оформление</h1>
+        <p class="sub" data-i18n="themeSub">Тему, плотность и акцент можно поменять в любой момент.</p>
+        <div class="left">
+          <div class="wz-opt sel" data-wtheme="light"><span class="pv pv-light">Aa</span><div><div class="nm" data-i18n="themeLight">Светлая</div><div class="ds" data-i18n="themeDefault">По умолчанию</div></div></div>
+          <div class="wz-opt" data-wtheme="dark"><span class="pv pv-dark">Aa</span><div><div class="nm" data-i18n="themeDark">Тёмная</div><div class="ds" data-i18n="themeDarkSub">Для тёмного окружения</div></div></div>
+          <div class="wz-opt" data-wtheme="auto"><span class="pv pv-auto">Aa</span><div><div class="nm" data-i18n="themeSystem">Системная</div><div class="ds" data-i18n="themeSystemSub">Следовать за ОС</div></div></div>
+        </div>
+        <div class="wznav"><button class="btn" data-wz="5"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" data-wz="7" data-i18n="next">Далее</button></div>
+      </div>
+      <div class="wzstep" id="wz7">
+        <div class="wz-logo"><i data-i="shield"></i></div>
+        <h1 data-i18n="securityTitle">Всё под защитой</h1>
+        <p class="sub" data-i18n="securitySub">Настраивать ничего не нужно — безопасные значения уже действуют.</p>
+        <div class="left">
+          <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityLocal">Вся почта хранится локально на устройстве</span></div>
+          <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityTokens">OAuth-токены — в системном хранилище паролей</span></div>
+          <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityTracking">Трекинг-пиксели и UTM-метки блокируются</span></div>
+        </div>
+        <div class="wznav"><button class="btn" data-wz="6"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" data-wz="8" data-i18n="next">Далее</button></div>
+      </div>
+      <div class="wzstep" id="wz8">
+        <div class="wz-logo ok"><i data-i="check"></i></div>
+        <h1 data-i18n="done">Всё готово!</h1>
+        <div class="wznav"><button class="btn primary" id="wzFinish" data-i18n="openMail">Открыть почту</button></div>
+      </div>
+      <div class="wzdots"><span class="wzdot on"></span><span class="wzdot"></span><span class="wzdot"></span><span class="wzdot"></span><span class="wzdot"></span><span class="wzdot"></span><span class="wzdot"></span><span class="wzdot"></span></div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=20260713-4"></script>
+<script src="bridge.js?v=20260713-4"></script>
+</body>
+</html>

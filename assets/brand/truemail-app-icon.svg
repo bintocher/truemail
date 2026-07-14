@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">truemail app icon</title>
+  <desc id="desc">A white letter T formed from an indigo envelope on a transparent square canvas.</desc>
+  <defs>
+    <clipPath id="envelope-shape">
+      <rect width="1024" height="768" rx="128"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(0 128)" clip-path="url(#envelope-shape)">
+    <rect width="1024" height="768" rx="128" fill="#5B63D3"/>
+    <path fill="#FFFFFF" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/>
+  </g>
+</svg>

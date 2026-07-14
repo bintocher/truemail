@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["chernov <bintocher@yandex.ru>"]
+repository = "https://gitverse.ru/chernov/truemail"
+rust-version = "1.85"
+
+[workspace.dependencies]
+tokio = { version = "1.52.3", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+anyhow = "1.0.103"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+rfd = "0.17.2"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
+# Последняя версия, совместимая с диапазоном sqlx 0.9 (`<0.38`). Фича
+# статически собирает SQLCipher и OpenSSL для одинакового поведения на платформах.
+libsqlite3-sys = { version = "0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.23.5", features = ["v4", "serde"] }
+
+# почтовые протоколы и парсинг (см. docs/04-tech-stack.md)
+async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio"] }
+mail-parser = "0.11.5"
+lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "pool", "builder", "hostname", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs"] }
+futures = "0.3.32"
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.8"
+rustls-native-certs = "0.8.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form", "query"] }
+url = "2.5.8"
+sha2 = "0.11.0"
+hkdf = "0.13.0"
+zeroize = { version = "1.8.2", features = ["derive"] }
+base64 = "0.22.1"
+roxmltree = "0.21.1"
+quoted_printable = "0.5.2"
+
+# крипто и секреты
+keyring = "4.1.4"
+chacha20poly1305 = "0.11.0"
+rand = "0.10.2"
+
+# локализация (Fluent, см. docs/10-design.md)
+fluent = "0.17.0"
+unic-langid = { version = "0.9.6", features = ["macros"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

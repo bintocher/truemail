@@ -1,0 +1,45 @@
+[package]
+name = "truemail-core"
+description = "Ядро truemail: модели RFC, транспорт, хранилище, поиск, крипто"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "truemail_core"
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+async-trait = "0.1.89"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+sqlx.workspace = true
+libsqlite3-sys.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+async-imap.workspace = true
+futures.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+rustls-native-certs.workspace = true
+reqwest.workspace = true
+url.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+roxmltree.workspace = true
+quoted_printable.workspace = true
+mail-parser.workspace = true
+lettre.workspace = true
+keyring.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+fluent.workspace = true
+unic-langid.workspace = true

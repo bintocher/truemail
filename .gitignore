@@ -15,6 +15,7 @@ GEMINI.md
 # Секреты и учётные данные
 .env
 .env.*
+!.env.example
 *.secret
 *.token
 secrets/
@@ -24,6 +25,15 @@ credentials*
 /target/
 **/*.rs.bk
 *.pdb
+
+# Локальная база разработки и данные
+*.db
+*.db-wal
+*.db-shm
+apps/desktop/src-tauri/gen/
+
+# Tauri
+apps/desktop/src-tauri/target/
 
 # ОС / редакторы
 .DS_Store
