@@ -459,7 +459,7 @@ function closeAccountWizard(){document.querySelector('.settings').classList.remo
 window.showAccountWizard=showAccountWizard;
 document.getElementById('addAcct').onclick=showAccountWizard;
 document.getElementById('settingsAddAccount').onclick=showAccountWizard;
-document.querySelector('[data-set="addacct"]').addEventListener('click',showAccountWizard);
+document.querySelector('[data-set="addacct"]')?.addEventListener('click',showAccountWizard);
 document.getElementById('accountWizardCancel').onclick=closeAccountWizard;
 
 window.clearDemoData=function(preserveMessage=false){
