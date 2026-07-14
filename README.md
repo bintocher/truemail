@@ -11,8 +11,8 @@
 ---
 
 A standalone desktop application built on IMAP/SMTP/MIME, iCalendar, vCard,
-CalDAV and CardDAV. The current working provider is Yandex; other providers and
-the external automation API are roadmap items. Local data is encrypted.
+CalDAV and CardDAV. Yandex and Gmail mail connect through OAuth; calendar and
+contacts currently sync for Yandex. Local data is encrypted.
 
 ## Development
 
@@ -51,6 +51,29 @@ No app secret is embedded in the desktop client: authorization uses
 Authorization Code with PKCE. OAuth tokens are stored in the system keychain,
 and IMAP, CalDAV, and CardDAV are verified immediately on first connection.
 
+### Gmail OAuth
+
+1. Create a project in [Google Cloud Console](https://console.cloud.google.com/).
+2. Enable `Gmail API` under `APIs & Services` → `Library`.
+3. Configure `Branding` and `Audience` in `Google Auth Platform`. During
+   development keep the app in `Testing` and add your Gmail addresses as test users.
+4. Add the `https://mail.google.com/` scope in `Data Access`; IMAP and SMTP
+   XOAUTH2 require this scope.
+5. Create an OAuth client of type `Desktop app` in `Clients`. Do not add a
+   redirect URI manually: truemail uses Google's installed-app loopback flow on
+   a random `http://127.0.0.1:<port>` callback.
+6. Put only the Client ID in `.env`:
+
+```dotenv
+TRUEMAIL_GOOGLE_CLIENT_ID=123456789-example.apps.googleusercontent.com
+```
+
+Do not ship the client secret in the repository or desktop app. Public use of
+`https://mail.google.com/` requires Google's restricted-scope verification and
+typically an annual security assessment. Testing mode is limited to configured
+test users until verification is complete, and an external Testing app's refresh
+token expires after 7 days.
+
 ### Local storage
 
 In the first-run wizard the user picks a language, a data folder, and
@@ -66,7 +89,7 @@ encrypts the blobs.
 crates/core/            core: RFC models, transport, storage, search, crypto, API
   migrations/           database schema (sqlx migrations)
   src/model/             canonical model (message, event, contact, account, folder)
-  src/backend/            MailBackend trait + Yandex IMAP/SMTP adapter
+  src/backend/            MailBackend trait + Yandex/Gmail IMAP/SMTP adapters
   src/storage/            SQLCipher + encrypted blob store
   src/crypto/             storage encryption (keys in the keychain)
   src/search/              FTS5 search + layout-independent matching
@@ -82,11 +105,11 @@ locales/                 translations: ru.ftl / en.ftl
 ## Highlights
 
 - Standalone: local storage, full at-rest encryption, secrets in the keychain.
-- Instant Yandex mail delivery over IMAP IDLE with incremental catch-up.
+- Instant Yandex and Gmail mail delivery over IMAP IDLE with incremental catch-up.
 - Yandex calendars and contacts over CalDAV/CardDAV.
 - Simple / Expert modes; RU+EN localization; live dark and light themes.
 - Real SMTP sending, encrypted drafts, attachments and scheduled outbox delivery.
-- Provider-neutral `MailBackend` boundary for future adapters; Yandex is implemented now.
+- Provider-neutral `MailBackend` boundary; Yandex and Gmail are implemented now.
 
 ## License
 

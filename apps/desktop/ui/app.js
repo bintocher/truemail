@@ -28,6 +28,7 @@ const ic={
   plus:S('<path d="M12 5v14M5 12h14"/>',15), folder:S('<path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5l2 3h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z"/>'),
   keyboard:S('<rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M6 14h12"/>'),
   back:S('<path d="M19 12H5M12 19l-7-7 7-7"/>'), check:S('<path d="M20 6 9 17l-5-5"/>'),
+  close:S('<path d="M18 6 6 18M6 6l12 12"/>'),
   lock:S('<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>'),
   key:S('<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>'),
   server:S('<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/>'),
@@ -84,6 +85,14 @@ const folderHasMore=new Map();
 let loadingMoreMessages=false;
 const selectedMessageIds=new Set();
 let lastSelectedMessageIndex=-1;
+let selectionDragMode=null;
+function updateSelectionUi(){
+  document.querySelectorAll('.msg').forEach(row=>{const selected=selectedMessageIds.has(Number(row.dataset.messageId)),control=row.querySelector('.msg-check');row.classList.toggle('selected',selected);if(control){control.setAttribute('aria-pressed',String(selected));control.title=selected?'Снять выделение':'Выбрать письмо';}});
+  const count=selectedMessageIds.size,bar=document.getElementById('selectionBar');bar.classList.toggle('hidden',count===0);document.getElementById('selectionCount').textContent=`${count} выбрано`;
+}
+function clearMessageSelection(){selectedMessageIds.clear();lastSelectedMessageIndex=-1;updateSelectionUi();}
+function selectMessageRange(index,preserve=false){if(lastSelectedMessageIndex<0){selectedMessageIds.add(currentMessageRows[index].id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(!preserve)selectedMessageIds.clear();const from=Math.min(index,lastSelectedMessageIndex),to=Math.max(index,lastSelectedMessageIndex);for(let i=from;i<=to;i++)selectedMessageIds.add(currentMessageRows[i].id);updateSelectionUi();}
+document.addEventListener('pointerup',()=>{selectionDragMode=null;});
 function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i];if(s)e.innerHTML=s;});}
 
 const msgsEl=document.getElementById('msgs');
@@ -398,8 +407,8 @@ function renderSmartManagement(){smartListEl.innerHTML='';smartFolders.forEach((
   smartListEl.appendChild(r);});}
 renderSmartManagement();
 document.getElementById('smartNew2').onclick=()=>openSmart();
-function bindSmartNavigation(){document.querySelectorAll('.custom-smart').forEach(row=>row.remove());const nav=document.querySelector('.nav'),accountLabel=[...nav.querySelectorAll('.navlabel')].find(label=>label.textContent.includes('Аккаунты'));smartFolders.forEach((folder,index)=>{let row=folder.builtin?nav.querySelector(`[data-smart-id="${folder.id}"]`):null;if(!row){row=document.createElement('div');row.className='navitem custom-smart';row.dataset.nav='mail';row.innerHTML='<i></i><span></span>';}
-    row.dataset.smartIndex=index;row.dataset.smartId=folder.id;const icon=row.querySelector('i');icon.dataset.i=folder.i;icon.innerHTML=ic[folder.i]||ic.star;let label=row.querySelector('span:not(.count)');if(!label){label=document.createElement('span');row.appendChild(label);}label.textContent=folder.t;row.style.display=folder.on?'':'none';row.onclick=()=>{goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');filterSmart(index);};accountLabel.before(row);});}
+function bindSmartNavigation(){document.querySelectorAll('.custom-smart').forEach(row=>row.remove());const nav=document.querySelector('.nav'),accountLabel=[...nav.querySelectorAll('.navlabel')].find(label=>label.textContent.includes('Аккаунты'));smartFolders.forEach((folder,index)=>{let row=folder.builtin?nav.querySelector(`[data-smart-id="${folder.id}"]`):null;if(!row){row=document.createElement('div');row.className='navitem custom-smart';row.dataset.nav='mail';row.innerHTML='<i></i><span class="smart-label"></span>';}
+    row.dataset.smartIndex=index;row.dataset.smartId=folder.id;const icon=row.querySelector('i');icon.dataset.i=folder.i;icon.innerHTML=ic[folder.i]||ic.star;const label=row.querySelector('.smart-label');label.textContent=folder.t;row.style.display=folder.on?'':'none';row.onclick=()=>{clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');filterSmart(index);};accountLabel.before(row);});}
 bindSmartNavigation();
 ctxsmart.querySelector('[data-smart-action="open"]').onclick=()=>filterSmart(+ctxsmart.dataset.index);
 ctxsmart.querySelector('[data-smart-action="edit"]').onclick=()=>openSmart(+ctxsmart.dataset.index);
@@ -575,20 +584,20 @@ async function renderHtmlMessage(container,html,sender){
   const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title='Содержимое HTML-письма';frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;}catch(_){frame.style.height='480px';}};container.appendChild(frame);
 }
 function renderMessageList(rows,title){
-  currentMessageRows=[...rows];const list=document.getElementById('msgs');list.innerHTML='';
+  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;const list=document.getElementById('msgs');list.innerHTML='';
   const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||'Письма';
   rows.forEach(message=>{
     const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread');row.dataset.messageId=message.id;
     const initial=(message.from?.name||message.from?.email||'?').trim()[0].toUpperCase();
-    row.innerHTML=`<div class="avawrap"><span class="ava ava-c2"></span><input class="msg-check" type="checkbox" aria-label="Выбрать письмо"></div><div class="body"><div class="l1"><span class="from"></span></div><div class="subj"></div><div class="prev"></div></div><div class="meta"><span class="time"></span></div>`;
+    row.innerHTML=`<div class="avawrap"><span class="ava ava-c2"></span><button type="button" class="msg-check" aria-label="Выбрать письмо" aria-pressed="false"><i data-i="check"></i></button></div><div class="body"><div class="l1"><span class="from"></span></div><div class="subj"></div><div class="prev"></div></div><div class="meta"><span class="time"></span></div>`;
     row.querySelector('.ava').textContent=initial;row.querySelector('.from').textContent=message.from?.name||message.from?.email||'';
     row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
     row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
-    const checkbox=row.querySelector('.msg-check');checkbox.checked=selectedMessageIds.has(message.id);row.classList.toggle('selected',checkbox.checked);
-    const select=(checked,range=false)=>{if(range&&lastSelectedMessageIndex>=0){const index=currentMessageRows.findIndex(item=>item.id===message.id),from=Math.min(index,lastSelectedMessageIndex),to=Math.max(index,lastSelectedMessageIndex);for(let i=from;i<=to;i++)selectedMessageIds.add(currentMessageRows[i].id);}else if(checked)selectedMessageIds.add(message.id);else selectedMessageIds.delete(message.id);lastSelectedMessageIndex=currentMessageRows.findIndex(item=>item.id===message.id);document.querySelectorAll('.msg').forEach(item=>{const on=selectedMessageIds.has(Number(item.dataset.messageId));item.classList.toggle('selected',on);item.querySelector('.msg-check').checked=on;});};
-    checkbox.onclick=e=>{e.stopPropagation();select(checkbox.checked,e.shiftKey);};
-    row.onclick=e=>{if(e.ctrlKey||e.metaKey||e.shiftKey){select(!selectedMessageIds.has(message.id),e.shiftKey);return;}showMessage(message);};list.appendChild(row);
+    const index=currentMessageRows.findIndex(item=>item.id===message.id),checkbox=row.querySelector('.msg-check');checkbox.onpointerdown=e=>{e.preventDefault();e.stopPropagation();if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);selectionDragMode=true;return;}const selected=!selectedMessageIds.has(message.id);selected?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);lastSelectedMessageIndex=index;selectionDragMode=selected;updateSelectionUi();};checkbox.onclick=e=>{e.preventDefault();e.stopPropagation();};
+    row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
+    row.onclick=e=>{if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();lastSelectedMessageIndex=index;showMessage(message);};renderIcons(row);list.appendChild(row);
   });
+  updateSelectionUi();
   if(!rows.length)document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;
   else if(activeMessage&&rows.some(message=>message.id===activeMessage.id))document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`)?.classList.add('active');
   else document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
@@ -657,8 +666,8 @@ document.getElementById('accountOauthStart').onclick=async()=>{
   const email=document.getElementById('accountEmail').value.trim(),status=document.getElementById('accountOauthStatus');
   const button=document.getElementById('accountOauthStart');
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent='Введите корректный адрес почты.';status.dataset.kind='error';return;}
-  if(!window.tm?.beginYandexOauth){status.textContent='OAuth доступен внутри приложения truemail.';status.dataset.kind='error';return;}
-  try{button.disabled=true;status.textContent='Открываю Яндекс ID в браузере…';status.dataset.kind='';const pending=await window.tm.beginYandexOauth(email);accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent='После входа скопируйте сюда код подтверждения.';document.getElementById('accountOauthCode').focus();}
+  if(!window.tm?.beginAccountConnection){status.textContent='OAuth доступен внутри приложения truemail.';status.dataset.kind='error';return;}
+  try{button.disabled=true;status.textContent='Определяю провайдера и открываю безопасный вход…';status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):'Аккаунт подключён.';status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent='После входа скопируйте сюда код подтверждения.';document.getElementById('accountOauthCode').focus();}
   catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
 };
 document.getElementById('accountOauthConfirm').onclick=async()=>{
@@ -670,8 +679,8 @@ document.getElementById('wzConnect').onclick=async()=>{
   const email=document.getElementById('wzEmail').value.trim(),status=document.getElementById('wzConnectStatus');
   const button=document.getElementById('wzConnect');
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=wt('invalidEmail');status.dataset.kind='error';return;}
-  if(!window.tm?.beginYandexOauth){status.textContent=wt('oauthUnavailable');status.dataset.kind='error';return;}
-  try{button.disabled=true;status.textContent=wt('openingYandex');status.dataset.kind='';const pending=await window.tm.beginYandexOauth(email);pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();}
+  if(!window.tm?.beginAccountConnection){status.textContent=wt('oauthUnavailable');status.dataset.kind='error';return;}
+  try{button.disabled=true;status.textContent=wizardLocale==='en'?'Detecting provider and opening secure sign-in…':'Определяю провайдера и открываю безопасный вход…';status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();}
   catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
 };
 document.getElementById('wzConfirm').onclick=async()=>{
@@ -691,6 +700,11 @@ function openComposerForMessage(action){if(!activeMessage)return;resetComposer()
 function showToast(message,actionLabel,action){document.querySelector('.app-toast')?.remove();const toast=document.createElement('div');toast.className='app-toast';const text=document.createElement('span');text.textContent=message;toast.appendChild(text);if(action){const button=document.createElement('button');button.type='button';button.textContent=actionLabel;button.onclick=async()=>{button.disabled=true;await action();toast.remove();};toast.appendChild(button);}document.body.appendChild(toast);setTimeout(()=>toast.remove(),9000);}
 window.handleSyncState=function(state){if(!state)return;const info=document.getElementById('calSyncInfo');if(info&&state.scope==='dav'){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars and contacts…':'Синхронизация календарей и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar and contacts sync error':'Ошибка синхронизации календаря и контактов';}if(state.status==='error')showToast(state.error||'Ошибка синхронизации');else if(state.warnings?.length)showToast(state.warnings.join(' '));};
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];if(!ids.length){showToast('Сначала выберите письмо');return;}try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;await window.reloadCoreData();showToast(action==='archive'?'Письмо перемещено в архив':'Письмо перемещено в корзину','Отменить',async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
+document.getElementById('bulkSelectAll').onclick=()=>{currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();};
+document.getElementById('bulkClear').onclick=clearMessageSelection;
+document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');
+document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
+document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await Promise.all(ids.map(id=>window.tm.markSeen(id,true)));clearMessageSelection();await window.reloadCoreData();showToast('Письма отмечены прочитанными');}catch(error){showToast(error.message||String(error));}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
 async function addCompFile(file){const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data:Array.from(new Uint8Array(await file.arrayBuffer()))};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});

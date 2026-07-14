@@ -38,6 +38,7 @@
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
     getSetting: (key) => invoke("get_setting", { key }),
     setSetting: (key, value) => invoke("set_setting", { key, value }),
+    beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
     apiTools: () => invoke("api_tools"),

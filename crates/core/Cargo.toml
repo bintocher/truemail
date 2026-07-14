@@ -29,6 +29,7 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 rustls-native-certs.workspace = true
 reqwest.workspace = true
+hickory-resolver.workspace = true
 url.workspace = true
 sha2.workspace = true
 hkdf.workspace = true

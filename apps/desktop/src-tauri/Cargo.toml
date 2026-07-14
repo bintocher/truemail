@@ -30,3 +30,4 @@ rfd.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 tokio-rustls.workspace = true
+url.workspace = true

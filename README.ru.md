@@ -11,8 +11,8 @@
 ---
 
 Автономная десктоп-программа на IMAP/SMTP/MIME, iCalendar, vCard,
-CalDAV/CardDAV. Сейчас полностью подключается Яндекс; остальные провайдеры и
-внешний API находятся в планах. Локальные данные зашифрованы.
+CalDAV/CardDAV. Почта Яндекса и Gmail подключается через OAuth; календари и
+контакты сейчас синхронизируются для Яндекса. Локальные данные зашифрованы.
 
 ## Запуск разработки
 
@@ -51,6 +51,29 @@ Authorization Code + PKCE.
 Authorization Code с PKCE. OAuth-токены хранятся в системном keychain, а при
 первом подключении сразу проверяются IMAP, CalDAV и CardDAV.
 
+### OAuth Gmail
+
+1. В [Google Cloud Console](https://console.cloud.google.com/) создайте проект.
+2. В `APIs & Services` → `Library` включите `Gmail API`.
+3. В `Google Auth Platform` заполните `Branding` и `Audience`. Для разработки
+   оставьте режим `Testing` и добавьте свои Gmail-адреса в `Test users`.
+4. В `Data Access` добавьте scope `https://mail.google.com/`. Он необходим для
+   IMAP и SMTP XOAUTH2.
+5. В `Clients` создайте OAuth client с типом `Desktop app`. Redirect URI вручную
+   не добавляется: truemail поднимает временный callback на случайном порту
+   `http://127.0.0.1:<port>` согласно installed-app flow Google.
+6. Скопируйте только `Client ID` в `.env`:
+
+```dotenv
+TRUEMAIL_GOOGLE_CLIENT_ID=123456789-example.apps.googleusercontent.com
+```
+
+`Client secret` в репозиторий и desktop-приложение добавлять не нужно. Для
+публичного выпуска scope `https://mail.google.com/` требует Google OAuth
+restricted-scope verification и, как правило, ежегодной security assessment.
+До верификации режим Testing ограничен добавленными тестовыми пользователями,
+а refresh token внешнего приложения действует 7 дней.
+
 ### Локальное хранилище
 
 В первом визарде пользователь выбирает язык, папку данных и создаёт ключи,
@@ -65,7 +88,7 @@ SQLite-базу, включая метаданные, FTS и WAL; ChaCha20-Poly1
 crates/core/            ядро: модели RFC, транспорт, хранилище, поиск, крипто, API
   migrations/           схема БД (миграции sqlx)
   src/model/              каноническая модель (message, event, contact, account, folder)
-  src/backend/             трейт MailBackend + адаптер Яндекс IMAP/SMTP
+  src/backend/             трейт MailBackend + адаптеры Яндекс/Gmail IMAP/SMTP
   src/storage/             SQLCipher + зашифрованный blob-store
   src/crypto/              шифрование хранилища (ключи в keychain)
   src/search/               FTS5-поиск + раскладко-независимое сопоставление
@@ -81,11 +104,11 @@ locales/                 переводы ru.ftl / en.ftl
 ## Ключевое
 
 - Автономность: локальное хранение, шифрование всего на диске, секреты в keychain.
-- Мгновенная доставка писем Яндекса через IMAP IDLE с инкрементальной дозагрузкой.
+- Мгновенная доставка писем Яндекса и Gmail через IMAP IDLE с инкрементальной дозагрузкой.
 - Календари и контакты Яндекса через CalDAV/CardDAV.
 - Простой / Эксперт режим; локализация RU+EN; тёмная и светлая темы на лету.
 - Реальная SMTP-отправка, зашифрованные черновики, вложения и отложенная отправка.
-- Нейтральный трейт `MailBackend` для будущих адаптеров; сейчас реализован Яндекс.
+- Нейтральный трейт `MailBackend`; сейчас реализованы Яндекс и Gmail.
 
 ## Лицензия
 

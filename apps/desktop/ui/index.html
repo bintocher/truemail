@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js"></script>
-<link rel="stylesheet" href="styles.css?v=20260714-2">
+  <link rel="stylesheet" href="styles.css?v=20260714-3">
 </head>
 <body>
 
@@ -25,14 +25,14 @@
       <div class="navitem topnav" data-nav="contacts"><i data-i="people"></i>Контакты</div>
 
       <div class="navlabel">Умные папки <span class="add" id="addSmart" title="Создать умную папку"><i data-i="plus"></i></span></div>
-      <div class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i>Все входящие<span class="count"></span></div>
-      <div class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i>Все важные<span class="count"></span></div>
-      <div class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i>Все отправленные</div>
-      <div class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i>Все черновики<span class="count"></span></div>
-      <div class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i>Сегодня<span class="count"></span></div>
-      <div class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i>Непрочитанные (все)<span class="count"></span></div>
-      <div class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i>С вложениями</div>
-      <div class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i>Ждут ответа<span class="count"></span></div>
+      <div class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label">Все входящие</span><span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i><span class="smart-label">Все важные</span><span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i><span class="smart-label">Все отправленные</span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i><span class="smart-label">Все черновики</span><span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i><span class="smart-label">Сегодня</span><span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i><span class="smart-label">Непрочитанные (все)</span><span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i><span class="smart-label">С вложениями</span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i><span class="smart-label">Ждут ответа</span><span class="count"></span></div>
 
       <div class="navlabel">Аккаунты <span class="add" id="addAcct" title="Добавить аккаунт"><i data-i="plus"></i></span></div>
 
@@ -49,6 +49,7 @@
           <div class="fields-inline"><button class="iconbtn" id="filterBtn" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" title="Сортировка"><i data-i="sort"></i></button></div></div>
         <div class="list-options hidden" id="filterMenu"><label><input type="checkbox" data-filter="unread"> Только непрочитанные</label><label><input type="checkbox" data-filter="attachments"> С вложениями</label><label><input type="checkbox" data-filter="flagged"> Важные</label></div>
         <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc">Сначала новые</button><button data-sort="date-asc">Сначала старые</button><button data-sort="sender">По отправителю</button><button data-sort="subject">По теме</button></div>
+        <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i>Выбрать все</button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i>Прочитать</button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i>В архив</button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i>Удалить</button><button class="iconbtn ml-auto" id="bulkClear" title="Снять выделение"><i data-i="close"></i></button></div>
         <div class="search" id="searchBox"><i data-i="search"></i><input placeholder="Поиск по всем ящикам" readonly><span class="kbd">Ctrl K</span></div>
       </div>
       <div class="msgs" id="msgs"></div>
@@ -412,7 +413,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20260714-2"></script>
+<script src="app.js?v=20260714-3"></script>
 <script src="bridge.js?v=20260713-4"></script>
 </body>
 </html>

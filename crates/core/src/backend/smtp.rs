@@ -33,7 +33,12 @@ fn mailbox(value: &str) -> Result<Mailbox> {
 
 /// Отправить письмо через официальный SMTP endpoint Яндекса с тем же OAuth
 /// access token, что используется для IMAP.
-pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
+pub async fn send_oauth(
+    message: OutgoingMessage,
+    access_token: &str,
+    host: &str,
+    port: u16,
+) -> Result<()> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
@@ -78,12 +83,12 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
     })?;
 
     let credentials = Credentials::new(message.from, access_token.to_owned());
-    let transport = AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.yandex.com")
+    let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
         .map_err(|error| Error::Backend {
             backend: "smtp".into(),
             message: error.to_string(),
         })?
-        .port(465)
+        .port(port)
         .credentials(credentials)
         .authentication(vec![Mechanism::Xoauth2])
         .timeout(Some(std::time::Duration::from_secs(30)))
@@ -96,6 +101,14 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
             message: error.to_string(),
         })?;
     Ok(())
+}
+
+pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
+    send_oauth(message, access_token, "smtp.yandex.com", 465).await
+}
+
+pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
+    send_oauth(message, access_token, "smtp.gmail.com", 465).await
 }
 
 #[cfg(test)]

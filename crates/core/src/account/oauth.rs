@@ -10,6 +10,7 @@ use url::Url;
 
 pub const YANDEX_SCOPES: &str = "mail:imap_full mail:smtp calendar:all \
 directory:read_external_contacts directory:write_external_contacts";
+pub const GOOGLE_MAIL_SCOPE: &str = "https://mail.google.com/";
 
 #[derive(Debug, Clone)]
 pub struct PkcePair {
@@ -89,12 +90,41 @@ pub fn yandex_authorize_url(
     Ok(url.into())
 }
 
+pub fn google_authorize_url(
+    client_id: &str,
+    email_hint: &str,
+    state: &str,
+    challenge: &str,
+    redirect_uri: &str,
+) -> Result<String> {
+    if client_id.trim().is_empty() {
+        return Err(Error::AccountConfig(
+            "не задан TRUEMAIL_GOOGLE_CLIENT_ID".into(),
+        ));
+    }
+
+    let mut url = Url::parse("https://accounts.google.com/o/oauth2/v2/auth")
+        .map_err(|e| Error::Other(format!("OAuth URL: {e}")))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", GOOGLE_MAIL_SCOPE)
+        .append_pair("login_hint", email_hint)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.into())
+}
+
 pub async fn exchange_yandex_code(
     client_id: &str,
     code: &str,
     verifier: &str,
 ) -> Result<OAuthToken> {
-    let response = oauth_client()?
+    let response = oauth_client("yandex-oauth")?
         .post("https://oauth.yandex.ru/token")
         .form(&[
             ("grant_type", "authorization_code"),
@@ -109,12 +139,36 @@ pub async fn exchange_yandex_code(
             message: e.to_string(),
         })?;
 
-    parse_token_response(response).await
+    parse_token_response(response, "yandex-oauth").await
+}
+
+pub async fn exchange_google_code(
+    client_id: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthToken> {
+    let response = oauth_client("google-oauth")?
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.trim()),
+            ("client_id", client_id),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await
+        .map_err(|e| Error::Backend {
+            backend: "google-oauth".into(),
+            message: e.to_string(),
+        })?;
+    parse_token_response(response, "google-oauth").await
 }
 
 /// Продлить OAuth-токен без участия пользователя.
 pub async fn refresh_yandex_token(client_id: &str, refresh_token: &str) -> Result<OAuthToken> {
-    let response = oauth_client()?
+    let response = oauth_client("yandex-oauth")?
         .post("https://oauth.yandex.ru/token")
         .form(&[
             ("grant_type", "refresh_token"),
@@ -127,21 +181,38 @@ pub async fn refresh_yandex_token(client_id: &str, refresh_token: &str) -> Resul
             backend: "yandex-oauth".into(),
             message: e.to_string(),
         })?;
-    parse_token_response(response).await
+    parse_token_response(response, "yandex-oauth").await
 }
 
-fn oauth_client() -> Result<reqwest::Client> {
+pub async fn refresh_google_token(client_id: &str, refresh_token: &str) -> Result<OAuthToken> {
+    let response = oauth_client("google-oauth")?
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .map_err(|e| Error::Backend {
+            backend: "google-oauth".into(),
+            message: e.to_string(),
+        })?;
+    parse_token_response(response, "google-oauth").await
+}
+
+fn oauth_client(backend: &str) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|error| Error::Backend {
-            backend: "yandex-oauth".into(),
+            backend: backend.into(),
             message: format!("не удалось создать HTTP-клиент: {error}"),
         })
 }
 
-async fn parse_token_response(response: reqwest::Response) -> Result<OAuthToken> {
+async fn parse_token_response(response: reqwest::Response, backend: &str) -> Result<OAuthToken> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -155,13 +226,13 @@ async fn parse_token_response(response: reqwest::Response) -> Result<OAuthToken>
             })
             .unwrap_or_else(|_| format!("HTTP {status}: {body}"));
         return Err(Error::Backend {
-            backend: "yandex-oauth".into(),
+            backend: backend.into(),
             message,
         });
     }
 
     response.json().await.map_err(|e| Error::Backend {
-        backend: "yandex-oauth".into(),
+        backend: backend.into(),
         message: format!("не удалось разобрать токен: {e}"),
     })
 }
@@ -215,5 +286,31 @@ mod tests {
         assert!(scopes.contains("calendar:all"));
         assert!(scopes.contains("directory:read_external_contacts"));
         assert!(scopes.contains("directory:write_external_contacts"));
+    }
+
+    #[test]
+    fn google_authorize_url_uses_pkce_and_loopback_redirect() {
+        let url = google_authorize_url(
+            "client",
+            "me@gmail.com",
+            "state",
+            "challenge",
+            "http://127.0.0.1:49152/oauth/google/callback",
+        )
+        .expect("url");
+        let parsed = Url::parse(&url).expect("parse");
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        assert_eq!(
+            params.get("scope").map(|v| v.as_ref()),
+            Some(GOOGLE_MAIL_SCOPE)
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|v| v.as_ref()),
+            Some("http://127.0.0.1:49152/oauth/google/callback")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(|v| v.as_ref()),
+            Some("S256")
+        );
     }
 }

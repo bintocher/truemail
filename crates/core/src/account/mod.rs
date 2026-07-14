@@ -3,15 +3,16 @@
 mod autoconfig;
 mod dav;
 mod oauth;
-pub use autoconfig::{ProviderConfig, autoconfig};
+pub use autoconfig::{ProviderConfig, autoconfig, discover_provider};
 pub use dav::{DavSyncResult, sync_yandex_dav, validate_yandex_dav};
 pub use oauth::{
-    OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES, exchange_yandex_code,
-    generate_pkce, generate_state, refresh_yandex_token, yandex_authorize_url,
+    GOOGLE_MAIL_SCOPE, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
+    exchange_google_code, exchange_yandex_code, generate_pkce, generate_state,
+    google_authorize_url, refresh_google_token, refresh_yandex_token, yandex_authorize_url,
 };
 
 use crate::Result;
-use crate::backend::{MailBackend, YandexBackend};
+use crate::backend::{GmailBackend, MailBackend, YandexBackend};
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
 
@@ -20,7 +21,7 @@ pub struct AccountManager {
 }
 
 #[derive(Debug)]
-pub struct ConnectedYandex {
+pub struct ConnectedAccountSync {
     pub account: Account,
     pub mail_folders: usize,
     pub calendars: usize,
@@ -38,8 +39,18 @@ impl AccountManager {
         self.db.list_accounts().await
     }
 
+    fn mail_backend(provider: Provider) -> Result<Box<dyn MailBackend>> {
+        match provider {
+            Provider::Yandex => Ok(Box::new(YandexBackend)),
+            Provider::Gmail => Ok(Box::new(GmailBackend)),
+            _ => Err(crate::Error::AccountConfig(
+                "почтовый OAuth-транспорт для провайдера не настроен".into(),
+            )),
+        }
+    }
+
     /// Прочитать сохранённый OAuth access token из системного keychain.
-    pub async fn yandex_access_token(&self, account: &Account) -> Result<String> {
+    pub async fn oauth_access_token(&self, account: &Account) -> Result<String> {
         let secret_ref = account
             .secret_ref
             .as_deref()
@@ -61,16 +72,35 @@ impl AccountManager {
             let refresh_token = credential.refresh_token.clone().ok_or_else(|| {
                 crate::Error::AccountConfig("OAuth-токен истёк и не содержит refresh_token".into())
             })?;
-            let client_id = std::env::var("TRUEMAIL_YANDEX_CLIENT_ID")
+            let (environment_name, compiled_client_id) = match account.provider {
+                Provider::Yandex => (
+                    "TRUEMAIL_YANDEX_CLIENT_ID",
+                    option_env!("TRUEMAIL_YANDEX_CLIENT_ID").map(str::to_owned),
+                ),
+                Provider::Gmail => (
+                    "TRUEMAIL_GOOGLE_CLIENT_ID",
+                    option_env!("TRUEMAIL_GOOGLE_CLIENT_ID").map(str::to_owned),
+                ),
+                _ => {
+                    return Err(crate::Error::AccountConfig(
+                        "обновление OAuth-токена для провайдера не настроено".into(),
+                    ));
+                }
+            };
+            let client_id = std::env::var(environment_name)
                 .ok()
-                .or_else(|| option_env!("TRUEMAIL_YANDEX_CLIENT_ID").map(str::to_owned))
+                .or(compiled_client_id)
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
-                    crate::Error::AccountConfig(
-                        "для обновления OAuth-токена не задан TRUEMAIL_YANDEX_CLIENT_ID".into(),
-                    )
+                    crate::Error::AccountConfig(format!(
+                        "для обновления OAuth-токена не задан {environment_name}"
+                    ))
                 })?;
-            let refreshed = refresh_yandex_token(&client_id, &refresh_token).await?;
+            let refreshed = match account.provider {
+                Provider::Yandex => refresh_yandex_token(&client_id, &refresh_token).await?,
+                Provider::Gmail => refresh_google_token(&client_id, &refresh_token).await?,
+                _ => unreachable!(),
+            };
             let mut updated = StoredOAuthCredential::from(refreshed);
             if updated.refresh_token.is_none() {
                 updated.refresh_token = Some(refresh_token);
@@ -84,10 +114,11 @@ impl AccountManager {
     }
 
     /// Дозагрузить только последние входящие после события IMAP IDLE.
-    pub async fn sync_yandex_inbox(&self, account: &Account) -> Result<usize> {
-        let access_token = self.yandex_access_token(account).await?;
+    pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
+        let access_token = self.oauth_access_token(account).await?;
+        let backend = Self::mail_backend(account.provider)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
-        let discovery = YandexBackend
+        let discovery = backend
             .discover_inbox(&account.email, &access_token, &cursors)
             .await?;
         self.db
@@ -107,24 +138,25 @@ impl AccountManager {
         &self,
         account: &Account,
     ) -> Result<(usize, usize, usize)> {
-        let access_token = self.yandex_access_token(account).await?;
+        let access_token = self.oauth_access_token(account).await?;
         let dav = sync_yandex_dav(&account.email, &access_token).await?;
         self.db.save_yandex_dav(account.id, &dav).await
     }
 
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
-    pub async fn process_yandex_outbox(&self, account: &Account) -> Result<usize> {
-        let token = self.yandex_access_token(account).await?;
+    pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
+        let token = self.oauth_access_token(account).await?;
+        let backend = Self::mail_backend(account.provider)?;
         let operations = self.db.claim_outbox_operations(account.id, 50).await?;
         let mut completed = 0;
         for operation in operations {
             let applied = if operation.op_kind == "send" {
                 match serde_json::from_str::<crate::backend::OutgoingMessage>(&operation.payload) {
-                    Ok(message) => YandexBackend.send(message, &token).await,
+                    Ok(message) => backend.send(message, &token).await,
                     Err(error) => Err(crate::Error::Json(error)),
                 }
             } else {
-                YandexBackend
+                backend
                     .apply_operation(
                         &account.email,
                         &token,
@@ -161,7 +193,7 @@ impl AccountManager {
         email: &str,
         display_name: &str,
         token: OAuthToken,
-    ) -> Result<ConnectedYandex> {
+    ) -> Result<ConnectedAccountSync> {
         let access_token = token.access_token.clone();
         let secret_ref = format!("yandex-oauth:{}", email.to_lowercase());
         let entry = keyring::Entry::new("truemail", &secret_ref)
@@ -219,7 +251,69 @@ impl AccountManager {
             warnings.push(format!("Проверка календаря и контактов: {error}"));
         }
 
-        Ok(ConnectedYandex {
+        Ok(ConnectedAccountSync {
+            account,
+            mail_folders: 0,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
+            warnings,
+        })
+    }
+
+    /// Сохранить Gmail-аккаунт после desktop OAuth PKCE. Токены остаются в keychain.
+    pub async fn add_gmail_oauth(
+        &self,
+        email: &str,
+        display_name: &str,
+        token: OAuthToken,
+    ) -> Result<ConnectedAccountSync> {
+        let access_token = token.access_token.clone();
+        let secret_ref = format!("google-oauth:{}", email.to_lowercase());
+        let entry = keyring::Entry::new("truemail", &secret_ref)
+            .map_err(|e| crate::Error::Keyring(e.to_string()))?;
+        let credential = StoredOAuthCredential::from(token);
+        entry
+            .set_password(&serde_json::to_string(&credential)?)
+            .map_err(|e| crate::Error::Keyring(e.to_string()))?;
+
+        let account = match self
+            .db
+            .save_account(&NewAccount {
+                email: email.to_owned(),
+                display_name: display_name.to_owned(),
+                provider: Provider::Gmail,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "imap.gmail.com".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: Some(ServerConfig {
+                    host: "smtp.gmail.com".into(),
+                    port: 465,
+                    security: Security::Ssl,
+                }),
+                ews_url: None,
+                username: Some(email.to_owned()),
+                secret_ref: secret_ref.clone(),
+                color: Some("#4285F4".into()),
+            })
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = entry.delete_credential();
+                return Err(error);
+            }
+        };
+
+        let mut warnings = Vec::new();
+        if let Err(error) = GmailBackend.validate(email, &access_token).await {
+            warnings.push(format!("Проверка доступа к Gmail: {error}"));
+        }
+        Ok(ConnectedAccountSync {
             account,
             mail_folders: 0,
             calendars: 0,
@@ -230,23 +324,23 @@ impl AccountManager {
     }
 
     /// Полная синхронизация уже сохранённого аккаунта; предназначена для фоновой задачи.
-    pub async fn sync_yandex_account(&self, account: &Account) -> Result<ConnectedYandex> {
-        let access_token = self.yandex_access_token(account).await?;
+    pub async fn sync_mail_account(&self, account: &Account) -> Result<ConnectedAccountSync> {
+        let access_token = self.oauth_access_token(account).await?;
+        let backend = Self::mail_backend(account.provider)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
         let mut warnings = Vec::new();
         // Имена и счётчики папок появляются в UI сразу, пока тела писем и DAV
         // коллекции загружаются параллельно.
-        if let Ok(folders) = YandexBackend
+        if let Ok(folders) = backend
             .discover_folders(&account.email, &access_token)
             .await
             && let Err(error) = self.db.save_discovered_folders(account.id, &folders).await
         {
             warnings.push(format!("Папки почты не сохранились: {error}"));
         }
-        let (imap_result, dav_result) = tokio::join!(
-            YandexBackend.discover(&account.email, &access_token, &cursors),
-            sync_yandex_dav(&account.email, &access_token)
-        );
+        let imap_result = backend
+            .discover(&account.email, &access_token, &cursors)
+            .await;
         let mail_folders = match imap_result {
             Ok(imap) => {
                 let saved = match self
@@ -289,8 +383,14 @@ impl AccountManager {
                 0
             }
         };
+        let dav_result = if account.provider == Provider::Yandex {
+            Some(sync_yandex_dav(&account.email, &access_token).await)
+        } else {
+            None
+        };
         let (calendars, events, contacts) = match dav_result {
-            Ok(dav) => self
+            None => (0, 0, 0),
+            Some(Ok(dav)) => self
                 .db
                 .save_yandex_dav(account.id, &dav)
                 .await
@@ -300,14 +400,14 @@ impl AccountManager {
                     ));
                     (0, 0, 0)
                 }),
-            Err(error) => {
+            Some(Err(error)) => {
                 warnings.push(format!(
                     "Календарь и контакты: первая синхронизация отложена: {error}"
                 ));
                 (0, 0, 0)
             }
         };
-        Ok(ConnectedYandex {
+        Ok(ConnectedAccountSync {
             account: account.clone(),
             mail_folders,
             calendars,

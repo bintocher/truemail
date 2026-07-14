@@ -9,6 +9,7 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_shell::ShellExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::api::{McpTool, mcp_tools};
 use truemail_core::model::{
@@ -34,7 +35,9 @@ pub struct PendingOAuth {
 
 #[derive(Serialize)]
 pub struct PendingOAuthResponse {
-    state: String,
+    mode: String,
+    state: Option<String>,
+    connected: Option<ConnectedAccount>,
 }
 
 #[derive(Serialize)]
@@ -592,7 +595,10 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
 pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
     for account in core.db.list_accounts().await? {
-        if account.provider != truemail_core::model::Provider::Yandex {
+        if !matches!(
+            account.provider,
+            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+        ) {
             continue;
         }
         let mut syncing = state.syncing.lock().await;
@@ -608,7 +614,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
         );
         tokio::spawn(async move {
-            let state = match sync_core.accounts.sync_yandex_account(&account).await {
+            let state = match sync_core.accounts.sync_mail_account(&account).await {
                 Ok(result) => {
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
@@ -669,7 +675,10 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
 pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
     for account in core.db.list_accounts().await? {
-        if account.provider != truemail_core::model::Provider::Yandex {
+        if !matches!(
+            account.provider,
+            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+        ) {
             continue;
         }
         let mut watching = state.watching.lock().await;
@@ -690,11 +699,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 if watch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     break;
                 }
-                let token = match watch_core
-                    .accounts
-                    .yandex_access_token(&watch_account)
-                    .await
-                {
+                let token = match watch_core.accounts.oauth_access_token(&watch_account).await {
                     Ok(token) => token,
                     Err(error) => {
                         tracing::error!(account = %watch_account.email, %error, "не удалось прочитать OAuth-токен для IMAP IDLE");
@@ -702,9 +707,18 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         continue;
                     }
                 };
-                match truemail_core::backend::wait_for_yandex_change(&watch_account.email, &token)
-                    .await
-                {
+                let wait = match watch_account.provider {
+                    truemail_core::model::Provider::Yandex => {
+                        truemail_core::backend::wait_for_yandex_change(&watch_account.email, &token)
+                            .await
+                    }
+                    truemail_core::model::Provider::Gmail => {
+                        truemail_core::backend::wait_for_gmail_change(&watch_account.email, &token)
+                            .await
+                    }
+                    _ => unreachable!(),
+                };
+                match wait {
                     Ok(()) => {
                         let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "syncing"}));
                         retry_delay = std::time::Duration::from_secs(2);
@@ -716,7 +730,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             drop(syncing);
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
-                        match watch_core.accounts.sync_yandex_inbox(&watch_account).await {
+                        match watch_core.accounts.sync_mail_inbox(&watch_account).await {
                             Ok(messages) => tracing::info!(
                                 account = %watch_account.email,
                                 messages,
@@ -754,7 +768,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 }
                 match outbox_core
                     .accounts
-                    .process_yandex_outbox(&outbox_account)
+                    .process_mail_outbox(&outbox_account)
                     .await
                 {
                     Ok(count) if count > 0 => {
@@ -790,14 +804,25 @@ pub async fn send_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if account.provider != truemail_core::model::Provider::Yandex {
+    if !matches!(
+        account.provider,
+        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+    ) {
         return Err(ApiError {
             message: "Отправка для этого провайдера ещё не настроена".into(),
         });
     }
-    let token = core.accounts.yandex_access_token(&account).await?;
+    let token = core.accounts.oauth_access_token(&account).await?;
     let outgoing = outgoing_message(&account, request);
-    truemail_core::backend::send_yandex(outgoing, &token).await?;
+    match account.provider {
+        truemail_core::model::Provider::Yandex => {
+            truemail_core::backend::send_yandex(outgoing, &token).await?
+        }
+        truemail_core::model::Provider::Gmail => {
+            truemail_core::backend::send_gmail(outgoing, &token).await?
+        }
+        _ => unreachable!(),
+    }
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
 }
@@ -842,7 +867,10 @@ pub async fn schedule_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if account.provider != truemail_core::model::Provider::Yandex {
+    if !matches!(
+        account.provider,
+        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+    ) {
         return Err(ApiError {
             message: "Отложенная отправка для этого провайдера не настроена".into(),
         });
@@ -934,6 +962,142 @@ fn yandex_client_id() -> CmdResult<String> {
         })
 }
 
+fn google_client_id() -> CmdResult<String> {
+    std::env::var("TRUEMAIL_GOOGLE_CLIENT_ID")
+        .ok()
+        .or_else(|| option_env!("TRUEMAIL_GOOGLE_CLIENT_ID").map(str::to_owned))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError {
+            message: "Gmail OAuth не настроен в этой сборке: создайте в Google Cloud OAuth Client типа Desktop app и задайте TRUEMAIL_GOOGLE_CLIENT_ID. Client secret для desktop-приложения не нужен.".into(),
+        })
+}
+
+async fn receive_google_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+) -> CmdResult<String> {
+    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        loop {
+            let (mut stream, _) = listener.accept().await.map_err(|error| ApiError {
+                message: format!("не удалось принять OAuth callback: {error}"),
+            })?;
+            let mut request = vec![0_u8; 16 * 1024];
+            let size = stream.read(&mut request).await.map_err(|error| ApiError {
+                message: format!("не удалось прочитать OAuth callback: {error}"),
+            })?;
+            let request = String::from_utf8_lossy(&request[..size]);
+            let target = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("/");
+            let parsed = url::Url::parse(&format!("http://127.0.0.1{target}"));
+            let params = parsed
+                .ok()
+                .map(|url| url.query_pairs().into_owned().collect::<HashMap<_, _>>())
+                .unwrap_or_default();
+            let valid_state = params.get("state").is_some_and(|state| state == expected_state);
+            let code = params.get("code").cloned();
+            let error = params.get("error").cloned();
+            let success = valid_state && code.is_some();
+            let (status, title, body) = if success {
+                (
+                    "200 OK",
+                    "Gmail подключён",
+                    "Авторизация завершена. Можно закрыть эту вкладку и вернуться в truemail.",
+                )
+            } else {
+                (
+                    "400 Bad Request",
+                    "Не удалось подключить Gmail",
+                    "Вернитесь в truemail и повторите подключение.",
+                )
+            };
+            let html = format!(
+                "<!doctype html><meta charset=utf-8><title>{title}</title><style>body{{font:16px system-ui;max-width:620px;margin:12vh auto;padding:32px;color:#171923}}h1{{font-size:28px}}</style><h1>{title}</h1><p>{body}</p>"
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            if !valid_state {
+                return Err(ApiError {
+                    message: "Google OAuth вернул неверный state; подключение отменено".into(),
+                });
+            }
+            if let Some(error) = error {
+                return Err(ApiError {
+                    message: format!("Google OAuth: {error}"),
+                });
+            }
+            if let Some(code) = code {
+                return Ok(code);
+            }
+        }
+    })
+    .await
+    .map_err(|_| ApiError {
+        message: "Время ожидания входа в Google истекло. Нажмите «Подключить» ещё раз.".into(),
+    })?
+}
+
+fn connected_response(connected: truemail_core::account::ConnectedAccountSync) -> ConnectedAccount {
+    ConnectedAccount {
+        account: connected.account,
+        mail_folders: connected.mail_folders,
+        calendars: connected.calendars,
+        events: connected.events,
+        contacts: connected.contacts,
+        warnings: connected.warnings,
+    }
+}
+
+async fn spawn_initial_mail_sync(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    core: Arc<Core>,
+    account: Account,
+) {
+    let mut syncing = state.syncing.lock().await;
+    if !syncing.insert(account.id) {
+        return;
+    }
+    drop(syncing);
+    let sync_set = state.syncing.clone();
+    let sync_app = app.clone();
+    tokio::spawn(async move {
+        match core.accounts.sync_mail_account(&account).await {
+            Ok(result) => {
+                tracing::info!(account = %account.email, folders = result.mail_folders, calendars = result.calendars, events = result.events, contacts = result.contacts, "фоновая синхронизация завершена")
+            }
+            Err(error) => {
+                tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась")
+            }
+        }
+        sync_set.lock().await.remove(&account.id);
+        let _ = sync_app.emit("truemail-data-changed", account.id);
+    });
+}
+
+fn unsupported_provider_message(config: &truemail_core::account::ProviderConfig) -> String {
+    let provider = format!("{:?}", config.provider);
+    let imap = config
+        .imap
+        .as_ref()
+        .map(|server| format!("{}:{}", server.host, server.port))
+        .unwrap_or_else(|| "не найден".into());
+    let smtp = config
+        .smtp
+        .as_ref()
+        .map(|server| format!("{}:{}", server.host, server.port))
+        .unwrap_or_else(|| "не найден".into());
+    format!(
+        "Определён провайдер {provider}, но OAuth для него в truemail пока не реализован. IMAP: {imap}; SMTP: {smtp}. Для Mail.ru и iCloud нужен отдельный пароль приложения; обычный пароль аккаунта использовать не следует."
+    )
+}
+
 fn open_in_yandex_browser(app: &AppHandle, url: &str) -> CmdResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -982,37 +1146,85 @@ pub async fn begin_account_connection(
     state: State<'_, AppState>,
     email: String,
 ) -> CmdResult<PendingOAuthResponse> {
-    let _ = core(&state).await?;
-    if truemail_core::account::autoconfig(email.trim()).provider
-        != truemail_core::model::Provider::Yandex
-    {
-        return Err(ApiError {
-            message:
-                "Адрес распознан, но для этого провайдера ещё не настроен OAuth-клиент truemail."
-                    .into(),
-        });
-    }
-    let client_id = yandex_client_id()?;
+    let core = core(&state).await?;
+    let email = email.trim().to_lowercase();
+    let config = truemail_core::account::discover_provider(&email).await;
     let pkce = truemail_core::account::generate_pkce();
     let oauth_state = truemail_core::account::generate_state();
-    let url = truemail_core::account::yandex_authorize_url(
-        &client_id,
-        email.trim(),
-        &oauth_state,
-        &pkce.challenge,
-    )?;
-    open_in_yandex_browser(&app, &url)?;
-    let mut oauth = state.oauth.lock().await;
-    oauth.clear();
-    oauth.insert(
-        oauth_state.clone(),
-        PendingOAuth {
-            email,
-            verifier: pkce.verifier,
-            client_id,
-        },
-    );
-    Ok(PendingOAuthResponse { state: oauth_state })
+    match config.provider {
+        truemail_core::model::Provider::Yandex => {
+            let client_id = yandex_client_id()?;
+            let url = truemail_core::account::yandex_authorize_url(
+                &client_id,
+                &email,
+                &oauth_state,
+                &pkce.challenge,
+            )?;
+            open_in_yandex_browser(&app, &url)?;
+            let mut oauth = state.oauth.lock().await;
+            oauth.clear();
+            oauth.insert(
+                oauth_state.clone(),
+                PendingOAuth {
+                    email,
+                    verifier: pkce.verifier,
+                    client_id,
+                },
+            );
+            Ok(PendingOAuthResponse {
+                mode: "verification_code".into(),
+                state: Some(oauth_state),
+                connected: None,
+            })
+        }
+        truemail_core::model::Provider::Gmail => {
+            let client_id = google_client_id()?;
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| ApiError {
+                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                })?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| ApiError {
+                    message: format!("не удалось определить OAuth callback: {error}"),
+                })?
+                .port();
+            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/google/callback");
+            let url = truemail_core::account::google_authorize_url(
+                &client_id,
+                &email,
+                &oauth_state,
+                &pkce.challenge,
+                &redirect_uri,
+            )?;
+            open_in_yandex_browser(&app, &url)?;
+            let code = receive_google_callback(listener, &oauth_state).await?;
+            let token = truemail_core::account::exchange_google_code(
+                &client_id,
+                &code,
+                &pkce.verifier,
+                &redirect_uri,
+            )
+            .await?;
+            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+            let connected = core
+                .accounts
+                .add_gmail_oauth(&email, &display_name, token)
+                .await?;
+            let account = connected.account.clone();
+            let response = connected_response(connected);
+            spawn_initial_mail_sync(&app, &state, core, account).await;
+            Ok(PendingOAuthResponse {
+                mode: "connected".into(),
+                state: None,
+                connected: Some(response),
+            })
+        }
+        _ => Err(ApiError {
+            message: unsupported_provider_message(&config),
+        }),
+    }
 }
 
 #[tauri::command]
@@ -1043,33 +1255,9 @@ pub async fn complete_yandex_oauth(
         .add_yandex_oauth(&email, &display_name, token)
         .await?;
     let account = connected.account.clone();
-    let mut syncing = state.syncing.lock().await;
-    if syncing.insert(account.id) {
-        drop(syncing);
-        let sync_core = core.clone();
-        let sync_set = state.syncing.clone();
-        let sync_app = app.clone();
-        tokio::spawn(async move {
-            match sync_core.accounts.sync_yandex_account(&account).await {
-                Ok(result) => {
-                    tracing::info!(account = %account.email, folders = result.mail_folders, calendars = result.calendars, events = result.events, contacts = result.contacts, "фоновая синхронизация завершена")
-                }
-                Err(error) => {
-                    tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась")
-                }
-            }
-            sync_set.lock().await.remove(&account.id);
-            let _ = sync_app.emit("truemail-data-changed", account.id);
-        });
-    }
-    Ok(ConnectedAccount {
-        account: connected.account,
-        mail_folders: connected.mail_folders,
-        calendars: connected.calendars,
-        events: connected.events,
-        contacts: connected.contacts,
-        warnings: connected.warnings,
-    })
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
 }
 
 /// Список инструментов внешнего API (для справки/настроек).

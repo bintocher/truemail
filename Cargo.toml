@@ -38,6 +38,7 @@ tokio-rustls = "0.26.4"
 webpki-roots = "1.0.8"
 rustls-native-certs = "0.8.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "form", "query"] }
+hickory-resolver = "0.26.1"
 url = "2.5.8"
 sha2 = "0.11.0"
 hkdf = "0.13.0"

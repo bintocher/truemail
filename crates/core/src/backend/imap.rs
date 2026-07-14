@@ -1,4 +1,4 @@
-//! Синхронизация Яндекс Почты через IMAP с OAuth2.
+//! Синхронизация почты через IMAP с OAuth2.
 
 use crate::model::FolderRole;
 use crate::{Error, Result};
@@ -42,7 +42,7 @@ pub struct DiscoveredMessage {
     pub raw: Vec<u8>,
 }
 
-type YandexSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
+type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
 const MESSAGE_FETCH_ITEMS: &str = "(UID BODY.PEEK[] FLAGS RFC822.SIZE)";
 
 #[derive(Debug)]
@@ -70,9 +70,7 @@ impl Authenticator for OAuth2<'_> {
     }
 }
 
-/// Проверить OAuth на реальном IMAP Яндекса и получить папки с SPECIAL-USE.
-async fn connect_yandex(email: &str, access_token: &str) -> Result<YandexSession> {
-    let host = "imap.yandex.com";
+async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OAuthSession> {
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         TcpStream::connect((host, 993)),
@@ -133,8 +131,8 @@ async fn connect_yandex(email: &str, access_token: &str) -> Result<YandexSession
 }
 
 /// Быстрая проверка токена без скачивания почты.
-pub async fn validate_yandex(email: &str, access_token: &str) -> Result<()> {
-    let mut session = connect_yandex(email, access_token).await?;
+pub async fn validate_oauth(host: &str, email: &str, access_token: &str) -> Result<()> {
+    let mut session = connect_oauth(host, email, access_token).await?;
     session.noop().await.map_err(|e| Error::Backend {
         backend: "imap-auth".into(),
         message: e.to_string(),
@@ -143,9 +141,18 @@ pub async fn validate_yandex(email: &str, access_token: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn validate_yandex(email: &str, access_token: &str) -> Result<()> {
+    validate_oauth("imap.yandex.com", email, access_token).await
+}
+
+pub async fn validate_gmail(email: &str, access_token: &str) -> Result<()> {
+    validate_oauth("imap.gmail.com", email, access_token).await
+}
+
 /// Применить одну локально поставленную в очередь операцию к IMAP-серверу.
 /// Payload содержит полный устойчивый адрес письма: mailbox + UID.
-pub async fn apply_yandex_operation(
+pub async fn apply_oauth_operation(
+    host: &str,
     email: &str,
     access_token: &str,
     op_kind: &str,
@@ -158,7 +165,7 @@ pub async fn apply_yandex_operation(
     let uid = payload["uid"]
         .as_u64()
         .ok_or_else(|| Error::AccountConfig("outbox: нет uid".into()))?;
-    let mut session = connect_yandex(email, access_token).await?;
+    let mut session = connect_oauth(host, email, access_token).await?;
     session
         .select(folder)
         .await
@@ -213,6 +220,24 @@ pub async fn apply_yandex_operation(
     Ok(())
 }
 
+pub async fn apply_yandex_operation(
+    email: &str,
+    access_token: &str,
+    op_kind: &str,
+    payload: &str,
+) -> Result<()> {
+    apply_oauth_operation("imap.yandex.com", email, access_token, op_kind, payload).await
+}
+
+pub async fn apply_gmail_operation(
+    email: &str,
+    access_token: &str,
+    op_kind: &str,
+    payload: &str,
+) -> Result<()> {
+    apply_oauth_operation("imap.gmail.com", email, access_token, op_kind, payload).await
+}
+
 fn imap_outbox_error(error: async_imap::error::Error) -> Error {
     Error::Backend {
         backend: "imap-outbox".into(),
@@ -220,7 +245,7 @@ fn imap_outbox_error(error: async_imap::error::Error) -> Error {
     }
 }
 
-async fn mark_deleted(session: &mut YandexSession, uid: u64) -> Result<()> {
+async fn mark_deleted(session: &mut OAuthSession, uid: u64) -> Result<()> {
     session
         .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
         .await
@@ -238,7 +263,7 @@ async fn mark_deleted(session: &mut YandexSession, uid: u64) -> Result<()> {
     Ok(())
 }
 
-async fn list_yandex_folders(session: &mut YandexSession) -> Result<Vec<DiscoveredFolder>> {
+async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<DiscoveredFolder>> {
     let names = session
         .list(Some(""), Some("*"))
         .await
@@ -321,18 +346,33 @@ async fn list_yandex_folders(session: &mut YandexSession) -> Result<Vec<Discover
 }
 
 /// Быстро получить папки и счётчики. Используется до тяжёлой загрузки писем.
-pub async fn discover_yandex_folders(
+pub async fn discover_oauth_folders(
+    host: &str,
     email: &str,
     access_token: &str,
 ) -> Result<Vec<DiscoveredFolder>> {
-    let mut session = connect_yandex(email, access_token).await?;
-    let folders = list_yandex_folders(&mut session).await?;
+    let mut session = connect_oauth(host, email, access_token).await?;
+    let folders = list_oauth_folders(&mut session).await?;
     let _ = session.logout().await;
     Ok(folders)
 }
 
+pub async fn discover_yandex_folders(
+    email: &str,
+    access_token: &str,
+) -> Result<Vec<DiscoveredFolder>> {
+    discover_oauth_folders("imap.yandex.com", email, access_token).await
+}
+
+pub async fn discover_gmail_folders(
+    email: &str,
+    access_token: &str,
+) -> Result<Vec<DiscoveredFolder>> {
+    discover_oauth_folders("imap.gmail.com", email, access_token).await
+}
+
 async fn fetch_incremental_messages(
-    session: &mut YandexSession,
+    session: &mut OAuthSession,
     folder: &mut DiscoveredFolder,
     cursor: Option<&FolderSyncCursor>,
     limit: usize,
@@ -426,13 +466,14 @@ async fn fetch_incremental_messages(
 }
 
 /// Быстрая дозагрузка входящих после IMAP IDLE-события.
-pub async fn discover_yandex_inbox(
+pub async fn discover_oauth_inbox(
+    host: &str,
     email: &str,
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let mut session = connect_yandex(email, access_token).await?;
-    let mut folders = list_yandex_folders(&mut session).await?;
+    let mut session = connect_oauth(host, email, access_token).await?;
+    let mut folders = list_oauth_folders(&mut session).await?;
     let inbox = folders
         .iter_mut()
         .find(|folder| folder.role == Some(FolderRole::Inbox))
@@ -452,9 +493,25 @@ pub async fn discover_yandex_inbox(
     })
 }
 
+pub async fn discover_yandex_inbox(
+    email: &str,
+    access_token: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    discover_oauth_inbox("imap.yandex.com", email, access_token, cursors).await
+}
+
+pub async fn discover_gmail_inbox(
+    email: &str,
+    access_token: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    discover_oauth_inbox("imap.gmail.com", email, access_token, cursors).await
+}
+
 /// Держать отдельное IDLE-соединение до первого изменения INBOX.
-pub async fn wait_for_yandex_change(email: &str, access_token: &str) -> Result<()> {
-    let mut session = connect_yandex(email, access_token).await?;
+pub async fn wait_for_oauth_change(host: &str, email: &str, access_token: &str) -> Result<()> {
+    let mut session = connect_oauth(host, email, access_token).await?;
     let capabilities = session
         .capabilities()
         .await
@@ -491,13 +548,22 @@ pub async fn wait_for_yandex_change(email: &str, access_token: &str) -> Result<(
     })
 }
 
-pub async fn discover_yandex(
+pub async fn wait_for_yandex_change(email: &str, access_token: &str) -> Result<()> {
+    wait_for_oauth_change("imap.yandex.com", email, access_token).await
+}
+
+pub async fn wait_for_gmail_change(email: &str, access_token: &str) -> Result<()> {
+    wait_for_oauth_change("imap.gmail.com", email, access_token).await
+}
+
+pub async fn discover_oauth(
+    host: &str,
     email: &str,
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let mut session = connect_yandex(email, access_token).await?;
-    let mut folders = list_yandex_folders(&mut session).await?;
+    let mut session = connect_oauth(host, email, access_token).await?;
+    let mut folders = list_oauth_folders(&mut session).await?;
     let mut messages = Vec::new();
     let mut server_uids = Vec::new();
     let mut reset_folders = Vec::new();
@@ -523,6 +589,22 @@ pub async fn discover_yandex(
         server_uids,
         reset_folders,
     })
+}
+
+pub async fn discover_yandex(
+    email: &str,
+    access_token: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    discover_oauth("imap.yandex.com", email, access_token, cursors).await
+}
+
+pub async fn discover_gmail(
+    email: &str,
+    access_token: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    discover_oauth("imap.gmail.com", email, access_token, cursors).await
 }
 
 /// IMAP использует modified UTF-7 для имён папок (RFC 3501, раздел 5.1.3).
