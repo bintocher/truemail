@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js"></script>
-<link rel="stylesheet" href="styles.css?v=20260713-3">
+<link rel="stylesheet" href="styles.css?v=20260714-2">
 </head>
 <body>
 
@@ -25,14 +25,14 @@
       <div class="navitem topnav" data-nav="contacts"><i data-i="people"></i>Контакты</div>
 
       <div class="navlabel">Умные папки <span class="add" id="addSmart" title="Создать умную папку"><i data-i="plus"></i></span></div>
-      <div class="navitem active" data-nav="mail"><i data-i="inbox"></i>Все входящие<span class="count"></span></div>
-      <div class="navitem" data-nav="mail"><i data-i="star"></i>Все важные<span class="count"></span></div>
-      <div class="navitem" data-nav="mail"><i data-i="send"></i>Все отправленные</div>
-      <div class="navitem" data-nav="mail"><i data-i="draft"></i>Все черновики<span class="count"></span></div>
-      <div class="navitem" data-nav="mail"><i data-i="cal"></i>Сегодня<span class="count"></span></div>
-      <div class="navitem" data-nav="mail"><i data-i="search"></i>Непрочитанные (все)<span class="count"></span></div>
-      <div class="navitem" data-nav="mail"><i data-i="paperclip"></i>С вложениями</div>
-      <div class="navitem" data-nav="mail"><i data-i="flag"></i>Ждут ответа<span class="count"></span></div>
+      <div class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i>Все входящие<span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i>Все важные<span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i>Все отправленные</div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i>Все черновики<span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i>Сегодня<span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i>Непрочитанные (все)<span class="count"></span></div>
+      <div class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i>С вложениями</div>
+      <div class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i>Ждут ответа<span class="count"></span></div>
 
       <div class="navlabel">Аккаунты <span class="add" id="addAcct" title="Добавить аккаунт"><i data-i="plus"></i></span></div>
 
@@ -149,7 +149,8 @@
       </div>
 
       <div class="setpage" id="set-unified">
-        <h1>Сквозные папки</h1><p class="lead">Что попадает в объединённые папки вроде «Все входящие». Включайте или исключайте папки конкретных ящиков - можно собрать только нужное.</p>
+        <h1>Сквозные папки</h1><p class="lead">Выберите физические папки почтовых ящиков, из которых умные папки могут собирать письма. По умолчанию участвуют все папки. Например, «Все входящие» дополнительно оставляет только источники с ролью «Входящие».</p>
+        <div class="note-muted unified-explanation">Отключённая здесь папка не попадёт ни в одну умную папку. Сами условия — «входящие», «за 24 часа», «с вложениями» — редактируются в разделе «Умные папки».</div>
       </div>
 
       <div class="setpage" id="set-calendars">
@@ -296,13 +297,14 @@
           <div class="icons icon-picker hidden" id="smartIcons"></div>
       </div>
       <div class="fld"><label>Условия отбора</label>
-        <div class="logic" id="smartLogic"><button class="on" data-l="all">Все условия (И)</button><button data-l="any">Любое из (ИЛИ)</button></div>
+        <div class="smart-logic-help">Внутри каждой группы выберите «И» или «ИЛИ». Между группами всегда действует «ИЛИ».</div>
         <div class="conds" id="conds"></div>
         <span class="addcond" id="addCond"><i data-i="plus"></i>Добавить условие</span>
         <span class="addcond" id="addCondGroup"><i data-i="plus"></i>Добавить группу ИЛИ</span>
+        <div class="prevbox"><i data-i="inbox"></i>Сейчас подходит писем: <b id="smartPreview">0</b></div>
       </div>
     </div>
-    <div class="mf"><button class="btn primary" id="smartCreate"><i data-i="check"></i>Создать умную папку</button><button class="btn" id="smartCancel">Отмена</button></div>
+    <div class="mf"><button class="btn primary" id="smartCreate"><i data-i="check"></i>Создать умную папку</button><button class="btn" id="smartCancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="smartDelete"><i data-i="trash"></i>Удалить</button></div>
   </div>
 </div>
 
@@ -410,7 +412,7 @@
   </div>
 </div>
 
-<script src="app.js?v=20260714-1"></script>
+<script src="app.js?v=20260714-2"></script>
 <script src="bridge.js?v=20260713-4"></script>
 </body>
 </html>
