@@ -329,7 +329,7 @@ fn run() -> anyhow::Result<()> {
             commands::get_autostart,
             commands::notify_open,
             commands::notify_close,
-            commands::notify_open_url,
+            commands::open_external_url,
             commands::notify_resize,
             commands::set_notify_position,
         ])

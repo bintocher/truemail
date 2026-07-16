@@ -1,24 +1,25 @@
 name: Rust CI
 
+# Проверки идут в dev, где ведётся разработка, и в master - там они последняя
+# защита перед сборкой релиза. Плюс на каждый pull request dev -> master.
 on:
   push:
+    branches: [dev, master]
   pull_request:
+    branches: [master]
   workflow_dispatch:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # Свой раннер: зависимости и кэш сборки уже на месте, а у облачного жёсткий
+    # лимит времени на задачу, в который сборка truemail не укладывается.
+    runs-on: [self-hosted, linux, x64]
+    env:
+      # Системный OpenSSL вместо vendored: иначе он собирается из исходников
+      # при каждом изменении окружения и съедает минуты на пустом месте.
+      OPENSSL_NO_VENDOR: 1
     steps:
       - uses: actions/checkout@v4
-      - name: Install Tauri system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config perl libssl-dev libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy

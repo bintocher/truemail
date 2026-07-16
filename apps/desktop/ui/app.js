@@ -531,8 +531,8 @@ function embeddedUnsubscribeUrl(message){
   return null;
 }
 async function executeToolbarAction(action){if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='unread'){if(activeMessage){await window.tm?.markSeen(activeMessage.id,false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
-  if(uns?.one_click_url){showToast(L('Отправляю запрос на отписку…','Sending unsubscribe request…'));try{const status=await window.tm.unsubscribeOneClick(uns.one_click_url);if(status>=200&&status<300)showToast(L('Готово: вы отписаны от рассылки (сервер подтвердил, код '+status+')','Done: you have been unsubscribed (server confirmed, code '+status+')'));else showToast(L('Сервер отписки ответил кодом '+status+'. Открываю страницу отписки…','The unsubscribe server responded with code '+status+'. Opening the unsubscribe page…'),null,null),window.open(uns.http||uns.one_click_url,'_blank','noopener');}catch(error){showToast(L('Автоотписка не удалась: '+(error.message||error)+'. Открываю страницу…','Automatic unsubscribe failed: '+(error.message||error)+'. Opening the page…'));window.open(uns.http||uns.one_click_url,'_blank','noopener');}return;}
-  const target=uns?.http||embeddedUnsubscribeUrl(activeFullMessage);if(target){window.open(target,'_blank','noopener');showToast(L('Открыл страницу отписки в браузере — завершите отписку там','Opened the unsubscribe page in your browser — finish there'));return;}
+  if(uns?.one_click_url){showToast(L('Отправляю запрос на отписку…','Sending unsubscribe request…'));const fallback=()=>window.tm?.openExternal(uns.http||uns.one_click_url).catch(error=>showToast(error.message||String(error)));try{const status=await window.tm.unsubscribeOneClick(uns.one_click_url);if(status>=200&&status<300)showToast(L('Готово: вы отписаны от рассылки (сервер подтвердил, код '+status+')','Done: you have been unsubscribed (server confirmed, code '+status+')'));else{showToast(L('Сервер отписки ответил кодом '+status+'. Открываю страницу отписки…','The unsubscribe server responded with code '+status+'. Opening the unsubscribe page…'));fallback();}}catch(error){showToast(L('Автоотписка не удалась: '+(error.message||error)+'. Открываю страницу…','Automatic unsubscribe failed: '+(error.message||error)+'. Opening the page…'));fallback();}return;}
+  const target=uns?.http||embeddedUnsubscribeUrl(activeFullMessage);if(target){try{await window.tm.openExternal(target);showToast(L('Открыл страницу отписки в браузере — завершите отписку там','Opened the unsubscribe page in your browser — finish there'));}catch(error){showToast(error.message||String(error));}return;}
   const mailto=uns?.mailto;if(mailto){resetComposer();setRecipients('compTo',[String(mailto).replace(/^mailto:/i,'').split('?')[0]]);document.getElementById('compSubj').value=L('Отписаться','Unsubscribe');showView('composeView');showToast(L('Отправьте это письмо, чтобы отписаться','Send this message to unsubscribe'));return;}
   showToast(L('В письме нет ссылки для автоматической отписки','This message has no automatic unsubscribe link'));}}
 document.querySelector('.thread .actions').addEventListener('click',e=>{const button=e.target.closest('[data-toolbar-generated]');if(button)executeToolbarAction(button.dataset.act);});
@@ -1009,6 +1009,20 @@ function renderContacts(contacts=coreContacts){const query=(document.querySelect
 document.querySelector('.ct-search input')?.addEventListener('input',()=>renderContacts());
 const contactViewSwitch=document.getElementById('contactViewSwitch');
 if(contactViewSwitch){contactViewSwitch.querySelectorAll('button').forEach(button=>button.onclick=()=>{contactViewSwitch.querySelectorAll('button').forEach(other=>other.classList.toggle('on',other===button));const view=button.dataset.cview;document.getElementById('cgrid')?.classList.toggle('table-view',view==='table');window.tm?.setSetting('contacts_view',view).catch(console.error);});}
+/* Ссылки из письма открываем в системном браузере: внутри webview target="_blank"
+   означает попап, Tauri его блокирует, и клик молча не делает ничего. */
+function bindExternalLinks(scope){
+  if(!scope)return;
+  scope.addEventListener('click',event=>{
+    const link=event.target?.closest?.('a[href]');
+    if(!link)return;
+    const href=link.href||'';
+    if(!/^https?:/i.test(href))return;
+    event.preventDefault();
+    window.tm?.openExternal(href).catch(error=>showToast(error.message||String(error)));
+  });
+}
+
 async function renderHtmlMessage(container,html,sender){
   const trustKey=`remote_images_sender:${String(sender||'').trim().toLocaleLowerCase()}`;
   const allowRemote=Boolean(sender)&&await window.tm?.getSetting(trustKey).catch(()=>null)==='true';
@@ -1021,7 +1035,7 @@ async function renderHtmlMessage(container,html,sender){
   parsed.querySelectorAll('img,source').forEach(image=>{const src=image.getAttribute('src')||image.getAttribute('srcset')||'';if(/^https?:/i.test(src)&&!allowRemote){blocked=true;image.removeAttribute('src');image.removeAttribute('srcset');image.setAttribute('alt',image.getAttribute('alt')||L('Удалённое изображение заблокировано','Remote image blocked'));}image.setAttribute('loading','lazy');image.setAttribute('referrerpolicy','no-referrer');image.style.maxWidth='100%';image.style.height='auto';});
   container.classList.add('html');
   if(blocked){const notice=document.createElement('div');notice.className='blocked';const text=document.createElement('span');text.textContent=L('Удалённые изображения заблокированы для защиты от отслеживания.','Remote images are blocked to prevent tracking.');const button=document.createElement('button');button.type='button';button.textContent=L(`Показывать от ${sender}`,`Always show from ${sender}`);button.onclick=async()=>{await window.tm?.setSetting(trustKey,'true');container.replaceChildren();await renderHtmlMessage(container,html,sender);};notice.append(text,button);container.appendChild(notice);}
-  const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title=L('Содержимое HTML-письма','HTML message content');frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;}catch(_){frame.style.height='480px';}};container.appendChild(frame);
+  const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title=L('Содержимое HTML-письма','HTML message content');frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};container.appendChild(frame);
 }
 // Беседы (threading): гибрид по цепочке ответов (thread_id) и нормализованной теме,
 // в пределах аккаунта. Одна строка на беседу со счётчиком, разворот показывает письма.

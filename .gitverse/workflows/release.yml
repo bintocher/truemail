@@ -1,0 +1,57 @@
+name: Release
+
+# Только master: разработка ведётся в dev, в master попадает через pull request.
+# Релиз публикуется, когда версия в Cargo.toml выросла - иначе сборка просто
+# проверяет, что master собирается.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: [self-hosted, linux, x64]
+    env:
+      OPENSSL_NO_VENDOR: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Версия: $version"
+
+      - name: Сборка пакетов
+        # deb и rpm - для Debian/Ubuntu и Fedora/CentOS, AppImage - для всех
+        # остальных дистрибутивов, включая Arch.
+        run: |
+          cd apps/desktop/src-tauri
+          cargo tauri build --bundles deb,rpm,appimage
+
+      - name: Собрать список пакетов
+        id: artifacts
+        run: |
+          out=dist
+          rm -rf "$out" && mkdir -p "$out"
+          find target/release/bundle -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            -exec cp {} "$out"/ \;
+          ls -lh "$out"
+
+      - name: Публикация релиза
+        # Токен - Настройки репозитория -> Секреты и переменные. Префикс
+        # GITVERSE_ в именах секретов занят платформой, отсюда TRUEMAIL_.
+        env:
+          TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: bash scripts/publish-release.sh "$TAG" dist
+
+      - name: Убрать за собой
+        # Готовые пакеты уже в релизе, а bundle пересобирается каждый раз.
+        # Кэш cargo и target не трогаем: на нём держится инкрементальная сборка.
+        if: always()
+        run: |
+          rm -rf dist target/release/bundle
