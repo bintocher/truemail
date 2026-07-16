@@ -13,7 +13,8 @@ DIR="${2:?не указан каталог с файлами}"
 OWNER="chernov"
 REPO="truemail"
 API="https://api.gitverse.ru"
-ACCEPT="Accept: application/vnd.gitverse.object+json;version=latest"
+# Без этого заголовка API отвечает 400 с пустым телом. version=1 - рабочая версия.
+ACCEPT="Accept: application/vnd.gitverse.object+json;version=1"
 
 if [ -z "${TOKEN:-}" ]; then
   echo "TOKEN не задан: добавьте секрет GITVERSE_TOKEN в настройках репозитория" >&2
