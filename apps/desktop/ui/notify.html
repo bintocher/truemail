@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>truemail</title>
+<style>
+  :root{
+    --n-bg:#ffffff; --n-fg:#1c1d22; --n-sub:#6b6d78; --n-border:rgba(0,0,0,.08);
+    --n-accent:#5b5bd6; --n-accent-fg:#ffffff; --n-chip:#f2f2f6; --n-chip-hover:#e7e7ef;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --n-bg:#26272e; --n-fg:#f0f0f4; --n-sub:#a2a4b0; --n-border:rgba(255,255,255,.09);
+      --n-accent:#6d6df0; --n-accent-fg:#ffffff; --n-chip:#34353d; --n-chip-hover:#3f4049;
+    }
+  }
+  *{box-sizing:border-box;margin:0;padding:0;font-family:"Segoe UI",system-ui,-apple-system,sans-serif}
+  html,body{background:var(--n-bg);overflow:hidden}
+  /* Карточки заполняют окно вплотную: любые поля вокруг них проступали бы
+     фоном окна как подложка. Скругление и тень даёт сама ОС.
+     Высота по контенту: окно подгоняется под стек, лишняя площадь
+     перехватывала бы клики по окнам под ней. */
+  #stack{display:flex;flex-direction:column}
+  .card{
+    background:var(--n-bg);color:var(--n-fg);padding:13px 14px 11px;
+    animation:slidein .22s ease;overflow:hidden
+  }
+  .card + .card{border-top:1px solid var(--n-border)}
+  @keyframes slidein{from{opacity:0}to{opacity:1}}
+  .card.leaving{animation:slideout .18s ease forwards}
+  @keyframes slideout{to{opacity:0}}
+  .head{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+  .brand{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--n-sub);font-weight:600;flex:1;min-width:0}
+  .brand .dot{width:16px;height:16px;border-radius:5px;background:var(--n-accent);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-size:10px;flex:none}
+  .close-x{border:0;background:transparent;color:var(--n-sub);font-size:17px;line-height:1;cursor:pointer;padding:2px 5px;border-radius:6px}
+  .close-x:hover{background:var(--n-chip)}
+  .title{font-weight:700;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .subject{font-size:13px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .preview{font-size:12px;color:var(--n-sub);margin-top:3px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .btn{border:0;border-radius:8px;padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;background:var(--n-chip);color:var(--n-fg);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .btn:hover{background:var(--n-chip-hover)}
+  .btn.primary{background:var(--n-accent);color:var(--n-accent-fg)}
+  .btn.primary:hover{filter:brightness(1.06)}
+</style>
+</head>
+<body>
+<div id="stack"></div>
+<script src="notify.js"></script>
+</body>
+</html>

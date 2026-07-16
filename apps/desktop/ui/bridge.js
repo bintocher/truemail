@@ -14,8 +14,18 @@
     bootstrapStatus: () => invoke("bootstrap_status"),
     initializeStorage: (dataDir, locale, entropy) => invoke("initialize_storage", { dataDir, locale, entropy }),
     chooseDataDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
+    chooseDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
+    saveFileDialog: (defaultPath) => tauri.dialog.save({ defaultPath }),
     listAccounts: () => invoke("list_accounts"),
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
+    setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
+    setAccountRetention: (accountId, days) => invoke("set_account_retention", { accountId, days }),
+    listLabels: () => invoke("list_labels"),
+    createLabel: (name, color) => invoke("create_label", { name, color }),
+    updateLabel: (id, name, color) => invoke("update_label", { id, name, color }),
+    deleteLabel: (id) => invoke("delete_label", { id }),
+    toggleMessageLabel: (messageId, labelId, on) => invoke("toggle_message_label", { messageId, labelId, on }),
+    messageLabelIds: (messageId) => invoke("message_label_ids", { messageId }),
     listFolders: (accountId) => invoke("list_folders", { accountId }),
     setFolderRole: (accountId, role, folderId) => invoke("set_folder_role", { accountId, role, folderId }),
     renameFolder: (folderId, newName) => invoke("rename_folder", { folderId, newName }),
@@ -23,6 +33,13 @@
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
+    messageRaw: (messageId) => invoke("message_raw", { messageId }),
+    unsubscribeOneClick: (url) => invoke("unsubscribe_one_click", { url }),
+    setAutostart: (enabled) => invoke("set_autostart", { enabled }),
+    getAutostart: () => invoke("get_autostart"),
+    attachmentContent: (messageId, attachmentId) => invoke("attachment_content", { messageId, attachmentId }),
+    saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
+    saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
     listSmartFolders: () => invoke("list_smart_folders"),
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
@@ -48,6 +65,8 @@
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
     getSetting: (key) => invoke("get_setting", { key }),
     setSetting: (key, value) => invoke("set_setting", { key, value }),
+    allSettings: () => invoke("all_settings"),
+    setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
@@ -58,6 +77,14 @@
     const action = event.payload;
     if (action === "compose") document.getElementById("composeBtn")?.click();
     else if (action === "search") document.getElementById("searchBox")?.click();
+  }).catch(console.error);
+
+  // Открытие письма по клику "Открыть" в своём уведомлении.
+  tauri.event?.listen("truemail-open-message", async event => {
+    const id = Number(event.payload);
+    if (!Number.isFinite(id)) return;
+    await window.reloadCoreData?.().catch(() => {});
+    window.openMessageById?.(id);
   }).catch(console.error);
 
   let reloadTimer = null;
@@ -100,10 +127,11 @@
         return;
       }
       const accounts = await window.tm.listAccounts();
-      const onboardingCompleted = await window.tm.getSetting("onboarding_completed");
-      const settingKeys = ["locale", "theme", "density", "accent", "expert_mode", "sidebar_width", "ui_scale", "toolbar_layout", "smart_folders_ui", "mail_rules_ui", "composer_draft", "search_history"];
-      const settingValues = await Promise.all(settingKeys.map(key => window.tm.getSetting(key)));
-      const settings = Object.fromEntries(settingKeys.map((key, index) => [key, settingValues[index]]));
+      // Все настройки разом. Перечислять ключи здесь нельзя: забытый ключ -
+      // молча не восстановленная настройка (так терялись show_conversations,
+      // preview_lines, contacts_view, notify_position).
+      const settings = await window.tm.allSettings();
+      const onboardingCompleted = settings.onboarding_completed;
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
       if (savedLocale && window.applyUiCatalog) window.applyUiCatalog(await window.tm.localizationCatalog(savedLocale));
@@ -116,11 +144,15 @@
       if (accounts.length) {
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
+        // Календарь/контакты/задачи тянем сразу при старте, а не только в 5-минутном
+        // интервале ниже - иначе они не появляются до нескольких минут после запуска.
+        window.tm.syncAuxiliaryAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере
         // появления данных, не перезагружая весь WebView.
         [3000, 10000, 30000].forEach(delay => setTimeout(() => window.reloadCoreData().catch(console.error), delay));
         // DAV не имеет push-канала: обновляем календарь и контакты отдельно,
-        // не перекачивая почту. Письма приходят через постоянный IMAP IDLE.
+        // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE,
+        // Gmail подтягивается этим 5-минутным sync (IMAP 993 у Gmail часто закрыт).
         setInterval(() => {
           window.tm.syncAccounts().catch(console.error);
           window.tm.syncAuxiliaryAccounts().catch(console.error);

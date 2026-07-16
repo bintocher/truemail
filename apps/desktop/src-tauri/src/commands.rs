@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
@@ -26,8 +26,61 @@ pub struct AppState {
     pub core: tokio::sync::RwLock<Option<Arc<Core>>>,
     pub oauth: tokio::sync::Mutex<HashMap<String, PendingOAuth>>,
     pub syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
+    // Отдельный флаг занятости для aux-синхронизации (календарь/контакты/задачи),
+    // чтобы тяжёлый почтовый sync Gmail не блокировал обновление календаря и наоборот.
+    pub syncing_aux: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
+    // действительно завершает приложение, а не сворачивает в трей.
+    pub quitting: Arc<std::sync::atomic::AtomicBool>,
+    // Гарантирует единственный фоновый цикл напоминаний о встречах.
+    pub reminders_started: Arc<std::sync::atomic::AtomicBool>,
+    // Куда прижимать окно уведомлений; кэш настройки notify_position,
+    // чтобы позиционирование не лезло в БД (оно синхронное).
+    pub notify_anchor: Arc<std::sync::Mutex<NotifyAnchor>>,
+}
+
+/// Угол экрана для окна уведомлений.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NotifyAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+impl NotifyAnchor {
+    /// Привычное для платформы место: Windows/Linux - правый нижний угол,
+    /// macOS - правый верхний (там уведомления системы живут именно там).
+    pub fn platform_default() -> Self {
+        if cfg!(target_os = "macos") {
+            NotifyAnchor::TopRight
+        } else {
+            NotifyAnchor::BottomRight
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "top-left" => NotifyAnchor::TopLeft,
+            "top-center" => NotifyAnchor::TopCenter,
+            "top-right" => NotifyAnchor::TopRight,
+            "bottom-left" => NotifyAnchor::BottomLeft,
+            "bottom-center" => NotifyAnchor::BottomCenter,
+            "bottom-right" => NotifyAnchor::BottomRight,
+            _ => NotifyAnchor::platform_default(),
+        }
+    }
+
+    fn is_top(self) -> bool {
+        matches!(
+            self,
+            NotifyAnchor::TopLeft | NotifyAnchor::TopCenter | NotifyAnchor::TopRight
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -112,6 +165,311 @@ async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
     state.core.read().await.clone().ok_or_else(|| ApiError {
         message: "Хранилище ещё не создано. Завершите первоначальную настройку.".into(),
     })
+}
+
+/// Показать собственное уведомление (кросс-платформенное окно в стиле софта).
+/// Данные уходят в webview-окно "notify", которое рисует карточку с кнопками.
+fn push_notification(app: &AppHandle, payload: serde_json::Value) {
+    position_notify_window(app);
+    let _ = app.emit_to("notify", "notify-push", payload);
+    if let Some(window) = app.get_webview_window("notify") {
+        // Пока окно показано, курсор ему нужен - иначе кнопки карточки не нажать.
+        let _ = window.set_ignore_cursor_events(false);
+        let _ = window.show();
+    }
+}
+
+/// Прижать окно уведомлений к выбранному пользователем углу основного монитора.
+pub fn position_notify_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("notify") else {
+        return;
+    };
+    // primary_monitor может не отдать монитор (RDP, смена конфигурации) -
+    // тогда окно осталось бы в дефолтной позиции поверх главного.
+    let monitor = window
+        .primary_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.current_monitor().ok().flatten())
+        .or_else(|| {
+            window
+                .available_monitors()
+                .ok()
+                .and_then(|list| list.into_iter().next())
+        });
+    let Some(monitor) = monitor else {
+        return;
+    };
+    let anchor = app
+        .state::<AppState>()
+        .notify_anchor
+        .lock()
+        .map(|value| *value)
+        .unwrap_or_else(|_| NotifyAnchor::platform_default());
+    let screen = monitor.size();
+    let origin = monitor.position();
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let margin = 16i32;
+    // Запас под панель задач/док, чтобы карточка не пряталась под ней.
+    let reserved = 48i32;
+    let free_w = (screen.width as i32 - size.width as i32).max(0);
+    let free_h = (screen.height as i32 - size.height as i32).max(0);
+    let x = match anchor {
+        NotifyAnchor::TopLeft | NotifyAnchor::BottomLeft => margin.min(free_w),
+        NotifyAnchor::TopCenter | NotifyAnchor::BottomCenter => free_w / 2,
+        NotifyAnchor::TopRight | NotifyAnchor::BottomRight => (free_w - margin).max(0),
+    };
+    let y = if anchor.is_top() {
+        margin.min(free_h)
+    } else {
+        (free_h - margin - reserved).max(0)
+    };
+    let _ = window.set_position(tauri::PhysicalPosition::new(origin.x + x, origin.y + y));
+}
+
+/// Подогнать высоту окна уведомлений под стек карточек: лишняя прозрачная
+/// площадь всё равно ловит курсор и съедает клики по окнам под ней.
+#[tauri::command]
+pub fn notify_resize(app: AppHandle, height: f64) -> CmdResult<()> {
+    if let Some(window) = app.get_webview_window("notify") {
+        let height = height.clamp(1.0, 640.0);
+        let _ = window.set_size(tauri::LogicalSize::new(380.0, height));
+        position_notify_window(&app);
+    }
+    Ok(())
+}
+
+/// Сменить угол показа уведомлений: сохраняем в БД и в кэш состояния.
+#[tauri::command]
+pub async fn set_notify_position(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    value: String,
+) -> CmdResult<()> {
+    if let Ok(mut anchor) = state.notify_anchor.lock() {
+        *anchor = NotifyAnchor::parse(&value);
+    }
+    core(&state)
+        .await?
+        .db
+        .set_setting("notify_position", &value)
+        .await?;
+    position_notify_window(&app);
+    Ok(())
+}
+
+/// Уведомление о новых письмах: отправитель, тема и превью последнего письма.
+async fn notify_new_mail(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    account: &truemail_core::model::Account,
+    count: usize,
+) {
+    let meta = core.db.latest_inbox_message(account.id).await.ok().flatten();
+    let payload = match meta {
+        Some((id, from, subject, preview)) => serde_json::json!({
+            "kind": "mail",
+            "title": if from.trim().is_empty() { account.email.clone() } else { from },
+            "subject": if subject.trim().is_empty() { "(без темы)".to_owned() } else { subject },
+            "preview": preview.trim(),
+            "count": count,
+            "account_id": account.id,
+            "message_id": id,
+        }),
+        None => serde_json::json!({
+            "kind": "mail",
+            "title": account.email.clone(),
+            "subject": match count { 1 => "1 новое письмо".to_owned(), n => format!("{n} новых писем") },
+            "preview": "",
+            "count": count,
+            "account_id": account.id,
+            "message_id": serde_json::Value::Null,
+        }),
+    };
+    push_notification(app, payload);
+}
+
+/// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
+/// уведомление и дозагрузка при появлении новых (IMAP IDLE к Gmail недоступен).
+async fn gmail_realtime_loop(
+    core: Arc<Core>,
+    app: AppHandle,
+    syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
+) {
+    let mut notified: HashSet<String> = HashSet::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+        let accounts = match core.db.list_accounts().await {
+            Ok(accounts) => accounts,
+            Err(_) => continue,
+        };
+        for account in accounts {
+            if account.provider != truemail_core::model::Provider::Gmail {
+                continue;
+            }
+            let new_ids = match core.accounts.gmail_new_message_ids(&account).await {
+                Ok(ids) => ids,
+                Err(_) => continue,
+            };
+            // Уведомляем только о письмах, о которых ещё не сообщали (до тех пор,
+            // пока дозагрузка не запишет их в БД и они не перестанут быть "новыми").
+            let fresh: Vec<String> = new_ids
+                .into_iter()
+                .filter(|id| !notified.contains(id))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            for id in &fresh {
+                notified.insert(id.clone());
+            }
+            // Сначала дозагружаем (если свободно), чтобы уведомление показало
+            // отправителя и тему нового письма, а не общий счётчик.
+            let free = {
+                let mut guard = syncing.lock().await;
+                guard.insert(account.id)
+            };
+            if free {
+                let _ = core.accounts.sync_mail_inbox(&account).await;
+                syncing.lock().await.remove(&account.id);
+                let _ = app.emit("truemail-data-changed", account.id);
+            }
+            notify_new_mail(&app, &core, &account, fresh.len()).await;
+        }
+        if notified.len() > 500 {
+            notified.clear();
+        }
+    }
+}
+
+/// Найти начало ближайшего http/https URL в тексте.
+fn find_url_start(text: &str) -> Option<usize> {
+    match (text.find("http://"), text.find("https://")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Извлечь все ссылки (уникальные) из места и описания встречи - для
+/// кликабельных кнопок "Присоединиться" в уведомлении.
+fn extract_meeting_urls(location: &str, description: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::new();
+    for text in [location, description] {
+        let mut search = text;
+        while let Some(pos) = find_url_start(search) {
+            let tail = &search[pos..];
+            let end = tail
+                .char_indices()
+                .find(|(_, c)| {
+                    c.is_whitespace() || matches!(c, '<' | '>' | '"' | ')' | ']' | '}' | ',')
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(tail.len());
+            let url = tail[..end].trim_end_matches(['.', ';', ':']).to_owned();
+            if url.len() > 8 && !urls.contains(&url) {
+                urls.push(url);
+            }
+            search = &tail[end..];
+        }
+    }
+    urls
+}
+
+/// Открыть ссылку из уведомления в браузере по умолчанию.
+#[tauri::command]
+pub fn notify_open_url(app: AppHandle, url: String) -> CmdResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|error| ApiError {
+            message: format!("не удалось открыть ссылку: {error}"),
+        })
+}
+
+/// Разобрать время начала события (ISO 8601, с таймзоной или без).
+fn parse_event_start(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::TimeZone;
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y%m%dT%H%M%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+        }
+    }
+    None
+}
+
+/// Фоновый цикл: уведомляет о встречах, начинающихся в ближайшие 10 минут.
+async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
+    let mut notified: HashSet<String> = HashSet::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let events = match core.db.list_calendars_and_events().await {
+            Ok((_, events)) => events,
+            Err(_) => continue,
+        };
+        let now = chrono::Utc::now();
+        for event in events {
+            // Напоминания только если они заданы в самой встрече (alarms).
+            if event.all_day || event.alarms.is_empty() {
+                continue;
+            }
+            let Some(start) = parse_event_start(&event.dtstart) else {
+                continue;
+            };
+            let minutes = (start - now).num_minutes();
+            for alarm in &event.alarms {
+                let trigger = alarm.trigger_minutes.max(0) as i64;
+                // Момент напоминания настал: до начала осталось не больше trigger.
+                if minutes > trigger || minutes < -1 {
+                    continue;
+                }
+                let key = format!(
+                    "{}|{}|{}",
+                    event.uid.as_deref().unwrap_or(&event.summary),
+                    event.dtstart,
+                    trigger
+                );
+                if !notified.insert(key) {
+                    continue;
+                }
+                let when = if minutes <= 0 {
+                    "сейчас".to_owned()
+                } else {
+                    format!("через {minutes} мин")
+                };
+                let urls = extract_meeting_urls(
+                    event.location.as_deref().unwrap_or(""),
+                    event.description.as_deref().unwrap_or(""),
+                );
+                push_notification(
+                    &app,
+                    serde_json::json!({
+                        "kind": "event",
+                        "title": format!("Встреча {when}"),
+                        "subject": event.summary.clone(),
+                        "preview": event.location.clone().unwrap_or_default(),
+                        "urls": urls,
+                        "count": 1,
+                        "account_id": serde_json::Value::Null,
+                        "message_id": serde_json::Value::Null,
+                    }),
+                );
+            }
+        }
+        // Не даём множеству бесконечно расти между перезапусками.
+        if notified.len() > 1000 {
+            notified.clear();
+        }
+    }
 }
 
 #[tauri::command]
@@ -215,6 +573,99 @@ pub async fn rename_account(
         .await?)
 }
 
+#[derive(Serialize)]
+pub struct LabelInfo {
+    id: i64,
+    name: String,
+    color: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_labels(state: State<'_, AppState>) -> CmdResult<Vec<LabelInfo>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_labels()
+        .await?
+        .into_iter()
+        .map(|(id, name, color)| LabelInfo { id, name, color })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn create_label(
+    state: State<'_, AppState>,
+    name: String,
+    color: String,
+) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.create_label(&name, &color).await?)
+}
+
+#[tauri::command]
+pub async fn update_label(
+    state: State<'_, AppState>,
+    id: i64,
+    name: String,
+    color: String,
+) -> CmdResult<()> {
+    Ok(core(&state).await?.db.update_label(id, &name, &color).await?)
+}
+
+#[tauri::command]
+pub async fn delete_label(state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    Ok(core(&state).await?.db.delete_label(id).await?)
+}
+
+#[tauri::command]
+pub async fn toggle_message_label(
+    state: State<'_, AppState>,
+    message_id: i64,
+    label_id: i64,
+    on: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .toggle_message_label(message_id, label_id, on)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn message_label_ids(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<Vec<i64>> {
+    Ok(core(&state).await?.db.message_label_ids(message_id).await?)
+}
+
+/// Задать цвет аккаунта (аватары писем, сайдбар).
+#[tauri::command]
+pub async fn set_account_color(
+    state: State<'_, AppState>,
+    account_id: i64,
+    color: String,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_account_color(account_id, &color)
+        .await?)
+}
+
+/// Глубина локального кэша аккаунта в днях (0 - без ограничений).
+#[tauri::command]
+pub async fn set_account_retention(
+    state: State<'_, AppState>,
+    account_id: i64,
+    days: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_account_retention(account_id, days)
+        .await?)
+}
+
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>, account_id: i64) -> CmdResult<Vec<Folder>> {
     Ok(core(&state).await?.db.list_folders(account_id).await?)
@@ -291,7 +742,166 @@ pub async fn list_messages_page(
 
 #[tauri::command]
 pub async fn get_message(state: State<'_, AppState>, message_id: i64) -> CmdResult<MessageFull> {
-    Ok(core(&state).await?.db.get_message(message_id).await?)
+    let core = core(&state).await?;
+    // Если письмо вне кэша (raw вычищен по глубине хранения) - докачиваем с сервера.
+    if let Err(error) = core.accounts.ensure_message_raw(message_id).await {
+        tracing::warn!(message_id, %error, "докачка письма с сервера не удалась");
+    }
+    Ok(core.db.get_message(message_id).await?)
+}
+
+/// Сырой MIME-исходник письма - для окна "Исходный текст".
+#[tauri::command]
+pub async fn message_raw(state: State<'_, AppState>, message_id: i64) -> CmdResult<String> {
+    let core = core(&state).await?;
+    if let Err(error) = core.accounts.ensure_message_raw(message_id).await {
+        tracing::warn!(message_id, %error, "докачка исходника письма не удалась");
+    }
+    Ok(core.db.message_raw(message_id).await?)
+}
+
+/// Одношаговая отписка (RFC 8058) - POST на List-Unsubscribe URL.
+#[tauri::command]
+pub async fn unsubscribe_one_click(url: String) -> CmdResult<u16> {
+    truemail_core::backend::unsubscribe_one_click(&url)
+        .await
+        .map_err(|error| ApiError {
+            message: error.to_string(),
+        })
+}
+
+/// Кнопка "Открыть" в уведомлении: показать главное окно и открыть письмо.
+#[tauri::command]
+pub fn notify_open(app: AppHandle, message_id: Option<i64>) -> CmdResult<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    if let Some(id) = message_id {
+        let _ = app.emit("truemail-open-message", id);
+    }
+    Ok(())
+}
+
+/// Кнопка "Закрыть"/пустая очередь: спрятать окно уведомлений.
+#[tauri::command]
+pub fn notify_close(app: AppHandle, has_more: bool) -> CmdResult<()> {
+    if !has_more {
+        if let Some(window) = app.get_webview_window("notify") {
+            let _ = window.hide();
+            // Скрытое прозрачное окно поверх всех не должно ловить курсор.
+            let _ = window.set_ignore_cursor_events(true);
+        }
+    }
+    Ok(())
+}
+
+/// Включить/выключить запуск truemail при старте системы.
+#[tauri::command]
+pub fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<()> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|error| ApiError {
+        message: format!("не удалось изменить автозапуск: {error}"),
+    })
+}
+
+/// Текущее состояние автозапуска.
+#[tauri::command]
+pub fn get_autostart(app: AppHandle) -> CmdResult<bool> {
+    use tauri_plugin_autostart::ManagerExt;
+    Ok(app.autolaunch().is_enabled().unwrap_or(false))
+}
+
+#[derive(Serialize)]
+pub struct AttachmentContent {
+    filename: String,
+    mime_type: Option<String>,
+    base64: String,
+}
+
+/// Содержимое вложения в base64 - для предпросмотра (картинки, галерея).
+#[tauri::command]
+pub async fn attachment_content(
+    state: State<'_, AppState>,
+    message_id: i64,
+    attachment_id: i64,
+) -> CmdResult<AttachmentContent> {
+    use base64::Engine as _;
+    let (filename, mime_type, bytes) = core(&state)
+        .await?
+        .db
+        .attachment_bytes(message_id, attachment_id)
+        .await?;
+    Ok(AttachmentContent {
+        filename,
+        mime_type,
+        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// Сохранить одно вложение по абсолютному пути (путь выбирает пользователь в диалоге).
+#[tauri::command]
+pub async fn save_attachment(
+    state: State<'_, AppState>,
+    message_id: i64,
+    attachment_id: i64,
+    dest_path: String,
+) -> CmdResult<()> {
+    let (_, _, bytes) = core(&state)
+        .await?
+        .db
+        .attachment_bytes(message_id, attachment_id)
+        .await?;
+    std::fs::write(&dest_path, bytes).map_err(|error| ApiError {
+        message: format!("не удалось сохранить файл: {error}"),
+    })?;
+    Ok(())
+}
+
+/// Сохранить все вложения письма в выбранную папку. Возвращает список записанных имён.
+#[tauri::command]
+pub async fn save_all_attachments(
+    state: State<'_, AppState>,
+    message_id: i64,
+    dest_dir: String,
+) -> CmdResult<Vec<String>> {
+    let core = core(&state).await?;
+    let full = core.db.get_message(message_id).await?;
+    let mut saved = Vec::new();
+    for attachment in &full.attachments {
+        let (filename, _, bytes) = core
+            .db
+            .attachment_bytes(message_id, attachment.id)
+            .await?;
+        // Защита от коллизий имён: при повторе добавляем индекс.
+        let mut target = std::path::Path::new(&dest_dir).join(&filename);
+        let mut counter = 1;
+        while target.exists() {
+            let stem = std::path::Path::new(&filename)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("attachment");
+            let ext = std::path::Path::new(&filename)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| format!(".{value}"))
+                .unwrap_or_default();
+            target = std::path::Path::new(&dest_dir).join(format!("{stem} ({counter}){ext}"));
+            counter += 1;
+        }
+        std::fs::write(&target, bytes).map_err(|error| ApiError {
+            message: format!("не удалось сохранить {filename}: {error}"),
+        })?;
+        saved.push(target.file_name().and_then(|v| v.to_str()).unwrap_or(&filename).to_owned());
+    }
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -725,15 +1335,19 @@ pub async fn move_storage(
             message: "Дождитесь окончания текущей синхронизации и повторите перенос".into(),
         });
     }
-    let checkpoint_core = core(&state).await?;
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&checkpoint_core.db.pool)
-        .await
-        .map_err(truemail_core::Error::from)?;
     let old_core = state.core.write().await.take().ok_or_else(|| ApiError {
         message: "Хранилище ещё не создано".into(),
     })?;
+    // Порядок важен. wal_checkpoint(TRUNCATE) требует, чтобы читателей не было:
+    // сначала закрываем пул чтения, только потом сливаем WAL в основной файл.
     old_core.db.pool.close().await;
+    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(&old_core.db.write_pool)
+        .await
+        .map_err(truemail_core::Error::from)?;
+    // Файл БД копируется дальше: writer тоже должен отпустить его, иначе на
+    // Windows копирование упрётся в удерживаемый соединением файл.
+    old_core.db.write_pool.close().await;
     let copy_result = std::fs::copy(source.join("truemail.db"), target.join("truemail.db"))
         .map(|_| ())
         .map_err(|e| ApiError {
@@ -833,15 +1447,10 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
     let core = core(&state).await?;
     match scope.as_str() {
         "trash_spam" => {
-            sqlx::query("DELETE FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE role IN ('trash','spam'))").execute(&core.db.pool).await.map_err(truemail_core::Error::from)?;
+            sqlx::query("DELETE FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE role IN ('trash','spam'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
         }
         "all" => {
-            let mut tx = core
-                .db
-                .pool
-                .begin()
-                .await
-                .map_err(truemail_core::Error::from)?;
+            let mut tx = core.db.begin_write().await?;
             sqlx::query("DELETE FROM outbox_ops")
                 .execute(&mut *tx)
                 .await
@@ -874,7 +1483,7 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
             core.db.blobs.clear()?;
         }
         "old_attachments" => {
-            sqlx::query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE date < datetime('now','-1 year'))").execute(&core.db.pool).await.map_err(truemail_core::Error::from)?;
+            sqlx::query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE date < datetime('now','-1 year'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
         }
         _ => {
             return Err(ApiError {
@@ -908,8 +1517,10 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
         );
         tokio::spawn(async move {
+            tracing::info!(account = %account.email, provider = ?account.provider, "mail-sync начат");
             let state = match sync_core.accounts.sync_mail_account(&account).await {
                 Ok(result) => {
+                    tracing::info!(account = %account.email, "mail-sync завершён");
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
                 Err(error) => {
@@ -936,19 +1547,20 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         ) {
             continue;
         }
-        let mut syncing = state.syncing.lock().await;
+        let mut syncing = state.syncing_aux.lock().await;
         if !syncing.insert(account.id) {
             continue;
         }
         drop(syncing);
         let sync_core = core.clone();
-        let sync_set = state.syncing.clone();
+        let sync_set = state.syncing_aux.clone();
         let sync_app = app.clone();
         let _ = app.emit(
             "truemail-sync-state",
             serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "syncing"}),
         );
         tokio::spawn(async move {
+            tracing::info!(account = %account.email, provider = ?account.provider, "aux-sync начат");
             let sync_result = match account.provider {
                 truemail_core::model::Provider::Yandex => {
                     sync_core.accounts.sync_yandex_dav_account(&account).await
@@ -983,6 +1595,26 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
 #[tauri::command]
 pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
+    // Единый фоновый цикл напоминаний о встречах (не зависит от аккаунтов почты).
+    if !state
+        .reminders_started
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        let reminder_core = core.clone();
+        let reminder_app = app.clone();
+        tokio::spawn(async move { reminders_loop(reminder_core, reminder_app).await });
+        // Очистка кэша по глубине хранения - один раз при старте сессии.
+        let prune_core = core.clone();
+        tokio::spawn(async move {
+            let _ = prune_core.accounts.prune_all_caches_on_start().await;
+        });
+        // Почти реалтайм-уведомления о новых письмах Gmail (IMAP IDLE к Gmail
+        // недоступен, поэтому лёгкий поллинг ID Входящих каждые ~25 секунд).
+        let gmail_core = core.clone();
+        let gmail_app = app.clone();
+        let gmail_syncing = state.syncing.clone();
+        tokio::spawn(async move { gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing).await });
+    }
     for account in core.db.list_accounts().await? {
         if !matches!(
             account.provider,
@@ -996,6 +1628,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         }
         drop(watching);
 
+        // IMAP IDLE держим только для Yandex. У Gmail IMAP-порт 993 часто
+        // недоступен по сети (провайдерская блокировка), поэтому IDLE зацикливался
+        // на тайм-аутах подключения. Синхронизация Gmail всё равно идёт через
+        // Gmail API (периодический sync_accounts каждые 5 минут), а IMAP-discover
+        // для Gmail тяжёлый (maxResults=500 без курсора) и не годится для polling.
+        if matches!(account.provider, truemail_core::model::Provider::Yandex) {
         let watch_core = core.clone();
         let watch_syncing = state.syncing.clone();
         let watch_app = app.clone();
@@ -1040,10 +1678,22 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                         }
                         match watch_core.accounts.sync_mail_inbox(&watch_account).await {
-                            Ok(messages) => tracing::info!(
+                            // Плановая переустановка IDLE без новых писем (messages=0)
+                            // происходит каждые ~90с - это debug, чтобы не шуметь.
+                            // Реальные новые письма логируем на info.
+                            Ok(messages) if messages > 0 => {
+                                tracing::info!(
+                                    account = %watch_account.email,
+                                    messages,
+                                    "IMAP IDLE: входящие обновлены"
+                                );
+                                notify_new_mail(&watch_app, &watch_core, &watch_account, messages)
+                                    .await;
+                            }
+                            Ok(messages) => tracing::debug!(
                                 account = %watch_account.email,
                                 messages,
-                                "IMAP IDLE: входящие обновлены"
+                                "IMAP IDLE: переустановлен, новых писем нет"
                             ),
                             Err(error) => tracing::error!(
                                 account = %watch_account.email,
@@ -1056,7 +1706,21 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         let _ = watch_app.emit("truemail-data-changed", watch_account.id);
                     }
                     Err(error) => {
-                        tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                        // Разрыв простаивающего IDLE сервером/NAT (10054, close_notify,
+                        // unexpected eof, connection reset) - ожидаемое поведение, а не
+                        // сбой: логируем на debug, чтобы не пугать в логе. Остальные
+                        // ошибки (авторизация, TLS-хендшейк и т.п.) остаются на warn.
+                        let text = error.to_string();
+                        let routine = text.contains("10054")
+                            || text.contains("close_notify")
+                            || text.contains("unexpected eof")
+                            || text.contains("reset")
+                            || text.contains("принудительно разорвал");
+                        if routine {
+                            tracing::debug!(account = %watch_account.email, %error, "IMAP IDLE переустанавливается");
+                        } else {
+                            tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                        }
                         let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
                         tokio::time::sleep(retry_delay).await;
                         retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
@@ -1064,6 +1728,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 }
             }
         });
+        }
 
         let outbox_core = core.clone();
         let outbox_account = account.clone();
@@ -1273,6 +1938,12 @@ pub async fn undo_message_action(
 #[tauri::command]
 pub async fn get_setting(state: State<'_, AppState>, key: String) -> CmdResult<Option<String>> {
     Ok(core(&state).await?.db.setting(&key).await?)
+}
+
+/// Все настройки разом: UI восстанавливает из них состояние при старте.
+#[tauri::command]
+pub async fn all_settings(state: State<'_, AppState>) -> CmdResult<HashMap<String, String>> {
+    Ok(core(&state).await?.db.all_settings().await?)
 }
 
 #[tauri::command]
