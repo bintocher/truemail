@@ -42,9 +42,10 @@ jobs:
           ls -lh "$out"
 
       - name: Публикация релиза
-        # Токен - Настройки репозитория -> Секреты и переменные.
+        # Токен - Настройки репозитория -> Секреты и переменные. Префикс
+        # GITVERSE_ в именах секретов занят платформой, отсюда TRUEMAIL_.
         env:
-          TOKEN: ${{ secrets.GITVERSE_TOKEN }}
+          TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: bash scripts/publish-release.sh "$TAG" dist
 

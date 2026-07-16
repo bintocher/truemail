@@ -17,7 +17,7 @@ API="https://api.gitverse.ru"
 ACCEPT="Accept: application/vnd.gitverse.object+json;version=1"
 
 if [ -z "${TOKEN:-}" ]; then
-  echo "TOKEN не задан: добавьте секрет GITVERSE_TOKEN в настройках репозитория" >&2
+  echo "TOKEN не задан: добавьте секрет TRUEMAIL_GITVERSE_TOKEN в настройках репозитория" >&2
   exit 1
 fi
 
