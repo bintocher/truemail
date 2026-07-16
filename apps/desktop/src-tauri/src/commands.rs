@@ -384,9 +384,20 @@ fn extract_meeting_urls(location: &str, description: &str) -> Vec<String> {
     urls
 }
 
-/// Открыть ссылку из уведомления в браузере по умолчанию.
+/// Открыть ссылку в браузере по умолчанию: из уведомления, письма, отписки.
+///
+/// Webview сам ссылку не откроет: target="_blank" в нём означает попап, а Tauri
+/// его блокирует, и клик молча ничего не делает. Наружу - только через опенер.
 #[tauri::command]
-pub fn notify_open_url(app: AppHandle, url: String) -> CmdResult<()> {
+pub fn open_external_url(app: AppHandle, url: String) -> CmdResult<()> {
+    // Наружу отдаём только веб-ссылки: file:// и прочие схемы из письма
+    // запускали бы произвольные обработчики в системе.
+    let allowed = url.starts_with("https://") || url.starts_with("http://");
+    if !allowed {
+        return Err(ApiError {
+            message: "ссылку такого вида открывать нельзя".into(),
+        });
+    }
     use tauri_plugin_opener::OpenerExt;
     app.opener()
         .open_url(url, None::<&str>)

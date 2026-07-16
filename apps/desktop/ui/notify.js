@@ -59,7 +59,7 @@
       const urls = Array.isArray(data.urls) ? data.urls : [];
       urls.forEach((url, i) => {
         const label = urls.length === 1 ? "Присоединиться" : linkLabel(url);
-        const b = mkBtn(label, i === 0, () => { invoke("notify_open_url", { url }).catch(() => {}); });
+        const b = mkBtn(label, i === 0, () => { invoke("open_external_url", { url }).catch(() => {}); });
         b.title = url;
         actions.appendChild(b);
       });

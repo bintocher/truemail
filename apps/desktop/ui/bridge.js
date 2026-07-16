@@ -67,6 +67,7 @@
     setSetting: (key, value) => invoke("set_setting", { key, value }),
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
+    openExternal: (url) => invoke("open_external_url", { url }),
     beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
