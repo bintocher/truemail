@@ -10,7 +10,7 @@ By submitting a contribution, you confirm that:
 1. You are legally entitled to submit it and to grant the rights below.
 2. The contribution is your original work, or you have clearly identified any
    third-party work and complied with its license.
-3. You grant the project owner, chernov <bintocher@yandex.ru>, a perpetual,
+3. You grant the project owner, chernov <bintocher@yandex.com>, a perpetual,
    worldwide, non-exclusive, irrevocable, royalty-free copyright license to
    reproduce, modify, distribute, publicly perform and display, sublicense and
    relicense the contribution, including as part of proprietary/commercial

@@ -5,117 +5,115 @@
 </p>
 
 <p align="center">
-  A fast, beautiful, cross-platform open-source mail client written in Rust.
+  An open-source desktop mail client written in Rust.
 </p>
 
 ---
 
-A standalone desktop application built on IMAP/SMTP/MIME, iCalendar, vCard,
-CalDAV and CardDAV. Yandex and Gmail mail connect through OAuth; calendar and
-contacts currently sync for Yandex. Local data is encrypted.
+The program runs on your own computer: mail, calendars and contacts are stored
+locally in an encrypted database. Yandex and Gmail are supported.
 
-## Development
+## What it does
+
+Mail:
+
+- Connects Yandex and Gmail over OAuth, without entering your mailbox password.
+- Receives mail over IMAP; new messages arrive immediately, without waiting for a poll.
+- Sends over SMTP, with drafts, attachments and scheduled sending.
+- Sending queue: with no network, a message goes out on the next connection.
+- Groups a thread into a conversation.
+- Smart folders by conditions, folders spanning every mailbox, processing rules, labels.
+- Search across mail, including text typed in the wrong keyboard layout.
+
+Calendars and contacts:
+
+- Yandex: calendars and contacts over CalDAV and CardDAV.
+- Gmail: calendars, contacts and tasks through Google services.
+- Meeting reminders.
+
+Interface:
+
+- Russian and English.
+- Light and dark themes, accent colour, three list densities.
+- Two modes: normal and expert, the latter with additional settings.
+- Built-in new-mail notifications, a system tray icon, start on system startup.
+
+## Build and run
 
 ```sh
-make setup     # install tauri-cli and sqlx-cli (one-time)
-make dev       # run the desktop application (Tauri v2)
+make setup     # install tauri-cli and sqlx-cli (once)
+make dev       # run the program
 ```
 
-SQLCipher database migrations are applied automatically on startup. On
-Windows, the first SQLCipher build downloads a verified portable Strawberry
-Perl build into `temp/` if a full Perl installation is not on `PATH`.
+The database schema updates automatically on startup. On Windows the first build
+downloads a verified portable Strawberry Perl into `temp/` if a full Perl is not
+on `PATH` — it is only needed while building.
 
-After `make dev` stops, cargo-sweep removes only build artifacts that have
-been unused for 30 days; the active build cache is preserved. Preview the
-list with `make sweep-preview`.
+After `make dev` stops, only build files unused for 30 days are removed. To see
+the list beforehand: `make sweep-preview`.
 
-### Yandex OAuth
+## Connecting mail
 
-Create a Yandex OAuth application of type `Web services`, callback URL
-`https://oauth.yandex.ru/verification_code`, and scopes `mail:imap_full`,
-`mail:smtp`, `calendar:all`, `directory:read_external_contacts`,
-`directory:write_external_contacts`. Set the public OAuth `client_id` when
-building or running a development copy:
+A released build connects mailboxes on its own. If you build from source, you
+need to register your own application with Yandex and Google and provide the
+identifiers they issue: the repository does not contain them.
 
-```powershell
-$env:TRUEMAIL_YANDEX_CLIENT_ID="your_application_id"
-make dev
-```
-
-Or copy `.env.example` to `.env`, paste the public `client_id`, and run
-`make dev`. The Makefile loads `.env` before building Tauri. `.env` is not
-tracked by Git. The desktop app does not need a `client_secret`: OAuth uses
-Authorization Code + PKCE.
-
-No app secret is embedded in the desktop client: authorization uses
-Authorization Code with PKCE. OAuth tokens are stored in the system keychain,
-and IMAP, CalDAV, and CardDAV are verified immediately on first connection.
-
-### Gmail OAuth
-
-1. Create a project in [Google Cloud Console](https://console.cloud.google.com/).
-2. Enable `Gmail API` under `APIs & Services` → `Library`.
-3. Configure `Branding` and `Audience` in `Google Auth Platform`. During
-   development keep the app in `Testing` and add your Gmail addresses as test users.
-4. Add the `https://mail.google.com/` scope in `Data Access`; IMAP and SMTP
-   XOAUTH2 require this scope.
-5. Create an OAuth client of type `Desktop app` in `Clients`. Do not add a
-   redirect URI manually: truemail uses Google's installed-app loopback flow on
-   a random `http://127.0.0.1:<port>` callback.
-6. Put only the Client ID in `.env`:
+Copy `.env.example` to `.env` and fill in the values. `.env` stays out of Git,
+and `make dev` reads it while building.
 
 ```dotenv
-TRUEMAIL_GOOGLE_CLIENT_ID=123456789-example.apps.googleusercontent.com
+TRUEMAIL_YANDEX_CLIENT_ID=your_yandex_application_id
+TRUEMAIL_GOOGLE_CLIENT_ID=your_google_application_id
+TRUEMAIL_GOOGLE_CLIENT_SECRET=the_string_google_issues
 ```
 
-Do not ship the client secret in the repository or desktop app. Public use of
-`https://mail.google.com/` requires Google's restricted-scope verification and
-typically an annual security assessment. Testing mode is limited to configured
-test users until verification is complete, and an external Testing app's refresh
-token expires after 7 days.
+Yandex needs no application password. Google issues one even for programs on a
+computer and requires it when connecting, so it is listed here.
 
-### Local storage
+Yandex: an application of type `Web services`, callback URL
+`https://oauth.yandex.ru/verification_code`, permissions `mail:imap_full`,
+`mail:smtp`, `calendar:all`, `directory:read_external_contacts`,
+`directory:write_external_contacts`.
 
-In the first-run wizard the user picks a language, a data folder, and
-generates keys by moving the mouse. The persistent SQLCipher and blob-store
-keys are derived from that input combined with the OS CSPRNG through HKDF,
-and are stored in the keychain. SQLCipher encrypts the entire SQLite
-database, including metadata, FTS, and WAL; ChaCha20-Poly1305 separately
-encrypts the blobs.
+Google: a project in [Google Cloud Console](https://console.cloud.google.com/),
+with `Gmail API` enabled, access permission `https://mail.google.com/` and an
+application of type `Desktop app`. No callback URL is needed: the program
+receives the answer on a temporary `http://127.0.0.1` address on a random port.
+
+## How data is stored
+
+On first run you choose a language, a folder for the data, and create the
+encryption keys by moving the mouse. Those random movements are mixed with
+random numbers from the operating system, so the key cannot be predicted. Keys
+are kept in the system password store.
+
+The whole database is encrypted, including internal data and the search index.
+Message texts and attachments are encrypted separately. The program neither
+stores nor sees mailbox passwords: access is granted over OAuth.
 
 ## Structure
 
 ```
-crates/core/            core: RFC models, transport, storage, search, crypto, API
-  migrations/           database schema (sqlx migrations)
-  src/model/             canonical model (message, event, contact, account, folder)
-  src/backend/            MailBackend trait + Yandex/Gmail IMAP/SMTP adapters
-  src/storage/            SQLCipher + encrypted blob store
-  src/crypto/             storage encryption (keys in the keychain)
-  src/search/              FTS5 search + layout-independent matching
-  src/account/             account manager + autoconfiguration
-  src/api/                 capability model for the planned external API
-  src/i18n/                 localization (Fluent)
-apps/desktop/            desktop application (Tauri v2)
-  src-tauri/               application backend (commands -> core)
-  ui/                      frontend (index.html + styles.css + app.js), per the mockups
+crates/core/            core: models, transport, storage, search, encryption
+  migrations/           database schema
+  src/model/              shared model (message, event, contact, account, folder)
+  src/backend/             IMAP and SMTP for Yandex and Gmail
+  src/storage/             encrypted database and attachment store
+  src/crypto/              data encryption, keys in the system store
+  src/search/               search aware of the keyboard layout
+  src/account/              accounts and automatic setup
+  src/i18n/                  translations
+apps/desktop/            desktop program
+  src-tauri/                link between the interface and the core
+  ui/                       interface
 locales/                 translations: ru.ftl / en.ftl
 ```
-
-## Highlights
-
-- Standalone: local storage, full at-rest encryption, secrets in the keychain.
-- Instant Yandex and Gmail mail delivery over IMAP IDLE with incremental catch-up.
-- Yandex calendars and contacts over CalDAV/CardDAV.
-- Simple / Expert modes; RU+EN localization; live dark and light themes.
-- Real SMTP sending, encrypted drafts, attachments and scheduled outbox delivery.
-- Provider-neutral `MailBackend` boundary; Yandex and Gmail are implemented now.
 
 ## License
 
 Dual licensing: [AGPL-3.0](LICENSE) (open) plus a commercial license for those
 who do not want to open their own code. See [LICENSING.md](LICENSING.md) for
-details. For commercial inquiries: bintocher@yandex.ru.
+details. For commercial inquiries: bintocher@yandex.com.
 
 ## Contributing
 

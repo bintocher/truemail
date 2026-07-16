@@ -3,7 +3,7 @@
 # Security policy
 
 Please do not report vulnerabilities in public issues. Send a minimal encrypted
-or plaintext report to `bintocher@yandex.ru` with:
+or plaintext report to `bintocher@yandex.com` with:
 
 - affected version and operating system;
 - reproducible steps or proof of concept;
