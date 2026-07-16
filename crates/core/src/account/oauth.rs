@@ -68,6 +68,11 @@ pub struct StoredOAuthCredential {
     pub refresh_token: Option<String>,
     pub expires_at: Option<i64>,
     pub token_type: String,
+    // Фактически выданные провайдером scope. Нужны для диагностики отказов
+    // вида ACCESS_TOKEN_SCOPE_INSUFFICIENT. serde(default) - для токенов,
+    // сохранённых до появления поля.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,7 +149,10 @@ pub fn google_authorize_url(
         .append_pair("login_hint", email_hint)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
-        .append_pair("include_granted_scopes", "true")
+        // Без инкрементальной авторизации: приложению всегда нужен фиксированный
+        // полный набор GOOGLE_SCOPES. С include_granted_scopes Google переиспользует
+        // прежний grant и на повторном входе показывает урезанный consent, из-за чего
+        // выдаётся токен без части scope (наблюдался токен только с mail без calendar).
         .append_pair("state", state)
         .append_pair("code_challenge", challenge)
         .append_pair("code_challenge_method", "S256");
@@ -291,6 +299,7 @@ impl From<OAuthToken> for StoredOAuthCredential {
             } else {
                 token.token_type
             },
+            scope: token.scope,
         }
     }
 }
@@ -371,10 +380,9 @@ mod tests {
             Some("offline")
         );
         assert_eq!(params.get("prompt").map(|v| v.as_ref()), Some("consent"));
-        assert_eq!(
-            params.get("include_granted_scopes").map(|v| v.as_ref()),
-            Some("true")
-        );
+        // include_granted_scopes намеренно не задаётся: нужен полный набор scope
+        // на каждом входе, инкрементальная авторизация давала урезанный токен.
+        assert_eq!(params.get("include_granted_scopes"), None);
     }
 
     #[test]

@@ -29,7 +29,7 @@ impl SearchIndex for Fts5Index {
         sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
             .bind(body_text)
             .bind(message_id)
-            .execute(&self.db.pool)
+            .execute(&self.db.write_pool)
             .await?;
         Ok(())
     }

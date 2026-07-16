@@ -1,7 +1,9 @@
 use super::{DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery};
 use crate::model::FolderRole;
 use crate::{Error, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::Engine as _;
+use base64::alphabet::URL_SAFE;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use futures::{StreamExt, stream};
 use reqwest::{Client, Method, Response, Url};
 use serde::Deserialize;
@@ -10,6 +12,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 
 const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
+
+// Gmail отдаёт поле raw как base64url, но для части писем - с padding '='.
+// Строгий NO_PAD-декодер на них падает с "Invalid padding" и письмо теряется,
+// поэтому padding делаем необязательным (Indifferent).
+const GMAIL_RAW_B64: GeneralPurpose = GeneralPurpose::new(
+    &URL_SAFE,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,9 +92,12 @@ async fn request(
     body: Option<serde_json::Value>,
 ) -> Result<Response> {
     let mut request = client.request(method, url).bearer_auth(token);
-    if let Some(body) = body {
-        request = request.json(&body);
-    }
+    // Gmail отклоняет POST без Content-Length (HTTP 411). Операции trash/modify
+    // без тела (move в корзину и т.п.) иначе зацикливаются на ретраях.
+    request = match body {
+        Some(body) => request.json(&body),
+        None => request.header(reqwest::header::CONTENT_LENGTH, 0),
+    };
     let response = request.send().await.map_err(|error| Error::Backend {
         backend: "gmail-api".into(),
         message: error.to_string(),
@@ -136,6 +149,48 @@ fn visible_label(label: &Label) -> bool {
 fn stable_uid(remote_id: &str) -> u32 {
     let digest = Sha256::digest(remote_id.as_bytes());
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).max(1)
+}
+
+/// Лёгкая проверка: ID последних писем во Входящих (без загрузки тел).
+/// Используется для почти реалтайм-уведомлений о новых письмах Gmail.
+pub async fn latest_message_ids(access_token: &str, limit: u32) -> Result<Vec<String>> {
+    let client = client()?;
+    let mut list_url = url(&["messages"])?;
+    list_url
+        .query_pairs_mut()
+        .append_pair("maxResults", &limit.to_string())
+        .append_pair("labelIds", "INBOX");
+    let listed: MessageList = request(&client, Method::GET, list_url, access_token, None)
+        .await?
+        .json()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "gmail-messages".into(),
+            message: error.to_string(),
+        })?;
+    Ok(listed.messages.into_iter().map(|item| item.id).collect())
+}
+
+/// Докачать сырой MIME одного письма Gmail по его remote_id (format=raw),
+/// когда локальный кэш вычищен по глубине хранения.
+pub async fn fetch_message_raw(access_token: &str, remote_id: &str) -> Result<Vec<u8>> {
+    let client = client()?;
+    let mut message_url = url(&["messages", remote_id])?;
+    message_url.query_pairs_mut().append_pair("format", "raw");
+    let message: RawMessage = request(&client, Method::GET, message_url, access_token, None)
+        .await?
+        .json()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "gmail-message".into(),
+            message: error.to_string(),
+        })?;
+    GMAIL_RAW_B64
+        .decode(message.raw.as_bytes())
+        .map_err(|error| Error::Backend {
+            backend: "gmail-message".into(),
+            message: format!("raw не декодирован: {error}"),
+        })
 }
 
 pub async fn validate(access_token: &str) -> Result<()> {
@@ -245,7 +300,7 @@ pub async fn discover(
         .await;
     let mut messages = Vec::new();
     for message in fetched {
-        let raw = match URL_SAFE_NO_PAD.decode(message.raw.as_bytes()) {
+        let raw = match GMAIL_RAW_B64.decode(message.raw.as_bytes()) {
             Ok(raw) => raw,
             Err(error) => {
                 tracing::warn!(message_id = %message.id, %error, "Gmail raw не декодирован");

@@ -26,6 +26,9 @@ use crate::storage::Db;
 
 pub struct AccountManager {
     db: Db,
+    // Сериализует обновление OAuth-токена: параллельные mail/aux-sync иначе
+    // одновременно видят "истёк" и рефрешат по нескольку раз за минуту.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -40,7 +43,10 @@ pub struct ConnectedAccountSync {
 
 impl AccountManager {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        Self {
+            db,
+            refresh_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub async fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
@@ -123,6 +129,20 @@ impl AccountManager {
             .expires_at
             .is_some_and(|expires| expires <= now + 60)
         {
+            // Под мьютексом перечитываем токен: пока ждали блокировку, другой
+            // поток мог уже обновить его - тогда повторный refresh не нужен.
+            let _guard = self.refresh_lock.lock().await;
+            if let Ok(serialized) = entry.get_password() {
+                if let Ok(fresh) = serde_json::from_str::<StoredOAuthCredential>(&serialized) {
+                    credential = fresh;
+                }
+            }
+            if !credential
+                .expires_at
+                .is_some_and(|expires| expires <= now + 60)
+            {
+                return Ok(credential.access_token);
+            }
             let refresh_token = credential.refresh_token.clone().ok_or_else(|| {
                 crate::Error::AccountConfig("OAuth-токен истёк и не содержит refresh_token".into())
             })?;
@@ -155,16 +175,33 @@ impl AccountManager {
                     ));
                 }
             };
-            let updated = StoredOAuthCredential::from_refresh(refreshed, refresh_token);
+            let mut updated = StoredOAuthCredential::from_refresh(refreshed, refresh_token);
+            // Google при refresh обычно не возвращает scope - сохраняем прежний,
+            // иначе информация о выданных разрешениях теряется.
+            if updated.scope.is_none() {
+                updated.scope = credential.scope.clone();
+            }
             entry
                 .set_password(&serde_json::to_string(&updated)?)
                 .map_err(|e| crate::Error::Keyring(e.to_string()))?;
+            tracing::info!(email = %account.email, provider = ?account.provider, scope = ?updated.scope, "OAuth-токен обновлён через refresh");
             credential = updated;
         }
         Ok(credential.access_token)
     }
 
     /// Дозагрузить только последние входящие после события IMAP IDLE.
+    /// Лёгкая проверка новых писем Gmail (ID Входящих, которых ещё нет в БД).
+    /// Для почти реалтайм-уведомлений без тяжёлой полной синхронизации.
+    pub async fn gmail_new_message_ids(&self, account: &Account) -> Result<Vec<String>> {
+        if account.provider != Provider::Gmail {
+            return Ok(Vec::new());
+        }
+        let token = self.oauth_access_token(account).await?;
+        let ids = crate::backend::gmail_latest_ids(&token, 25).await?;
+        self.db.unknown_remote_ids(account.id, &ids).await
+    }
+
     pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
         let access_token = self.oauth_access_token(account).await?;
         let backend = Self::mail_backend(account.provider)?;
@@ -182,6 +219,71 @@ impl AccountManager {
             .save_discovered_messages(account.id, &discovery.messages)
             .await?;
         Ok(discovery.messages.len())
+    }
+
+    /// Гарантировать наличие сырого MIME письма локально. Если кэш был вычищен
+    /// по глубине хранения, письмо докачивается с сервера и сохраняется, чтобы
+    /// открыться мгновенно в этой сессии (prune действует только на старте).
+    pub async fn ensure_message_raw(&self, message_id: i64) -> Result<()> {
+        let Some((account_id, folder_path, uid, remote_id, has_raw)) =
+            self.db.message_fetch_locator(message_id).await?
+        else {
+            return Ok(());
+        };
+        if has_raw {
+            return Ok(());
+        }
+        let Some(account) = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|item| item.id == account_id)
+        else {
+            return Ok(());
+        };
+        let access_token = self.oauth_access_token(&account).await?;
+        let backend = Self::mail_backend(account.provider)?;
+        let raw = backend
+            .fetch_message_raw(
+                &account.email,
+                &access_token,
+                &folder_path,
+                uid as u32,
+                remote_id.as_deref(),
+            )
+            .await?;
+        self.db.store_fetched_raw(message_id, &raw).await?;
+        tracing::info!(message_id, account = %account.email, "письмо докачано с сервера (вне кэша)");
+        Ok(())
+    }
+
+    /// Очистить кэш всех аккаунтов по их глубине хранения. Вызывается ОДИН РАЗ
+    /// при старте приложения: в течение сессии свежие письма не удаляются, а
+    /// письма за рамками периода при открытии докачиваются с сервера.
+    pub async fn prune_all_caches_on_start(&self) -> Result<()> {
+        for account in self.db.list_accounts().await? {
+            if account.retention_days <= 0 {
+                continue;
+            }
+            match self
+                .db
+                .prune_cached_messages(account.id, account.retention_days)
+                .await
+            {
+                Ok(pruned) if pruned > 0 => tracing::info!(
+                    account = %account.email,
+                    pruned,
+                    retention_days = account.retention_days,
+                    "кэш очищен по глубине хранения (старт)"
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(account = %account.email, %error, "автоочистка кэша не удалась")
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Обновить календарь и контакты, не запуская тяжёлую IMAP-синхронизацию.
@@ -329,6 +431,7 @@ impl AccountManager {
         display_name: &str,
         token: OAuthToken,
     ) -> Result<ConnectedAccountSync> {
+        tracing::info!(email, scope = ?token.scope, "Gmail OAuth: провайдер вернул scope");
         if let Some(granted) = token.scope.as_deref() {
             let granted: std::collections::HashSet<_> = granted.split_whitespace().collect();
             let missing: Vec<_> = GOOGLE_SCOPES
@@ -336,11 +439,14 @@ impl AccountManager {
                 .filter(|scope| !granted.contains(scope))
                 .collect();
             if !missing.is_empty() {
+                tracing::warn!(email, missing = ?missing, "Gmail OAuth: Google выдал не все запрошенные scope");
                 return Err(crate::Error::AccountConfig(format!(
                     "Google не выдал все разрешения truemail. Повторите подключение и подтвердите доступ к Gmail, Календарю, Контактам и Задачам. Не выданы: {}",
                     missing.join(", ")
                 )));
             }
+        } else {
+            tracing::warn!(email, "Gmail OAuth: провайдер не вернул поле scope, проверку разрешений пропускаем");
         }
         let access_token = token.access_token.clone();
         let secret_ref = format!("google-oauth:{}", email.to_lowercase());

@@ -117,7 +117,7 @@ impl Db {
         .bind(input.username.as_deref())
         .bind(&input.secret_ref)
         .bind(input.color.as_deref())
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
 
         self.list_accounts()
@@ -131,7 +131,7 @@ impl Db {
         let rows = sqlx::query_as::<_, AccountRow>(
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, username, secret_ref, include_in_unified, color, enabled
+                ews_url, username, secret_ref, include_in_unified, color, retention_days, enabled
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
@@ -151,11 +151,170 @@ impl Db {
         )
         .bind(name)
         .bind(account_id)
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         if changed.rows_affected() != 1 {
             return Err(crate::Error::Other("аккаунт не найден".into()));
         }
+        Ok(())
+    }
+
+    /// Все пользовательские метки (флажки): (id, имя, цвет).
+    pub async fn list_labels(&self) -> Result<Vec<(i64, String, Option<String>)>> {
+        Ok(
+            sqlx::query_as("SELECT id, name, color FROM labels ORDER BY name COLLATE NOCASE")
+                .fetch_all(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Создать метку, вернуть её id (или id существующей с тем же именем).
+    pub async fn create_label(&self, name: &str, color: &str) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(crate::Error::Other("имя метки не может быть пустым".into()));
+        }
+        sqlx::query("INSERT OR IGNORE INTO labels(name, color) VALUES(?, ?)")
+            .bind(name)
+            .bind(color)
+            .execute(&self.write_pool)
+            .await?;
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM labels WHERE name = ?")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await?;
+        sqlx::query("UPDATE labels SET color = ? WHERE id = ?")
+            .bind(color)
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(id)
+    }
+
+    /// Обновить имя и цвет метки.
+    pub async fn update_label(&self, id: i64, name: &str, color: &str) -> Result<()> {
+        sqlx::query("UPDATE labels SET name = ?, color = ? WHERE id = ?")
+            .bind(name.trim())
+            .bind(color)
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Удалить метку (и её связи с письмами каскадно).
+    pub async fn delete_label(&self, id: i64) -> Result<()> {
+        sqlx::query("DELETE FROM labels WHERE id = ?")
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Поставить/снять метку на письмо.
+    pub async fn toggle_message_label(
+        &self,
+        message_id: i64,
+        label_id: i64,
+        on: bool,
+    ) -> Result<()> {
+        if on {
+            sqlx::query(
+                "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
+            )
+            .bind(message_id)
+            .bind(label_id)
+            .execute(&self.write_pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM message_labels WHERE message_id = ? AND label_id = ?")
+                .bind(message_id)
+                .bind(label_id)
+                .execute(&self.write_pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// id меток, назначенных письму.
+    pub async fn message_label_ids(&self, message_id: i64) -> Result<Vec<i64>> {
+        let rows: Vec<(i64,)> =
+            sqlx::query_as("SELECT label_id FROM message_labels WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    /// Задать глубину локального кэша аккаунта в днях (0 - без ограничений).
+    pub async fn set_account_retention(&self, account_id: i64, days: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE accounts SET retention_days=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        )
+        .bind(days.max(0))
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Автоочистка кэша: удалить письма аккаунта старше retention_days вместе с
+    /// их raw и blob-вложениями. days=0 - без ограничений (ничего не чистим).
+    /// Возвращает число удалённых писем.
+    pub async fn prune_cached_messages(&self, account_id: i64, days: i64) -> Result<usize> {
+        if days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = format!("-{days} days");
+        // Чистим только входящие/архив/спам/корзину и папки без роли. Отправленные,
+        // черновики и исходящие - пользовательский контент, их не трогаем никогда.
+        let old: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.raw_blob_ref FROM messages m \
+             JOIN folders f ON f.id = m.folder_id \
+             WHERE m.account_id = ? AND m.date IS NOT NULL AND m.date < datetime('now', ?) \
+             AND (f.role IS NULL OR f.role NOT IN ('sent','drafts','outbox'))",
+        )
+        .bind(account_id)
+        .bind(&cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        if old.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.begin_write().await?;
+        for (id, raw_ref) in &old {
+            let atts: Vec<(Option<String>,)> =
+                sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id = ?")
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for (blob,) in atts {
+                if let Some(reference) = blob {
+                    let _ = self.blobs.remove(&reference);
+                }
+            }
+            if let Some(reference) = raw_ref {
+                let _ = self.blobs.remove(reference);
+            }
+            // Удаляем запись письма (attachments/labels уйдут по ON DELETE CASCADE).
+            sqlx::query("DELETE FROM messages WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(old.len())
+    }
+
+    /// Задать цвет аккаунта (для аватаров писем и сайдбара).
+    pub async fn set_account_color(&self, account_id: i64, color: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE accounts SET color=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        )
+        .bind(color)
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 
@@ -192,7 +351,7 @@ impl Db {
             .bind(remote_path)
             .bind(display_name)
             .bind(folder_id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -200,7 +359,7 @@ impl Db {
     pub async fn delete_folder_local(&self, folder_id: i64) -> Result<()> {
         sqlx::query("DELETE FROM folders WHERE id=?")
             .bind(folder_id)
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
         Ok(())
     }
@@ -215,7 +374,7 @@ impl Db {
         if !ROLES.contains(&role) {
             return Err(crate::Error::Other("неизвестная роль папки".into()));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
             .bind(account_id)
             .bind(role)
@@ -241,7 +400,7 @@ impl Db {
         account_id: i64,
         folders: &[crate::backend::DiscoveredFolder],
     ) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
             sqlx::query(
@@ -308,7 +467,7 @@ impl Db {
     ) -> Result<usize> {
         use std::collections::HashSet;
         let reset: HashSet<&str> = reset_folders.iter().map(String::as_str).collect();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut delete_ids = Vec::new();
         let mut blob_refs = Vec::new();
         for (path, server_uids) in snapshots {
@@ -413,7 +572,7 @@ impl Db {
         }
 
         let save_result: Result<(usize, usize, usize)> = async {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             let existing_calendars: Vec<(i64,)> =
                 sqlx::query_as("SELECT id FROM calendars WHERE account_id=? AND kind=?")
                     .bind(account_id)
@@ -738,7 +897,7 @@ impl Db {
         let mut active_refs = HashSet::new();
         let mut stale_refs = Vec::new();
         let save_result: Result<()> = async {
-            let mut tx = self.pool.begin().await?;
+            let mut tx = self.begin_write().await?;
             for (
                 source,
                 message_id,
@@ -923,7 +1082,7 @@ impl Db {
         .into_iter()
         .map(|row| row.0)
         .collect();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut inserted = 0;
         for (email, display_name) in candidates {
             if existing.contains(&email) {
@@ -1054,6 +1213,36 @@ impl Db {
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
+    /// Данные для докачки письма с сервера, когда локальный raw удалён прунингом:
+    /// (account_id, remote_path папки, uid, remote_id, есть ли локальный raw).
+    pub async fn message_fetch_locator(
+        &self,
+        message_id: i64,
+    ) -> Result<Option<(i64, String, i64, Option<String>, bool)>> {
+        let row: Option<(i64, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT m.account_id, f.remote_path, m.uid, m.remote_id, m.raw_blob_ref \
+             FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(account_id, path, uid, remote_id, raw_ref)| {
+            (account_id, path, uid, remote_id, raw_ref.is_some())
+        }))
+    }
+
+    /// Сохранить докачанный с сервера сырой MIME и пометить тело загруженным.
+    /// Свежий blob не удаляется прунингом текущей сессии (prune только на старте).
+    pub async fn store_fetched_raw(&self, message_id: i64, raw: &[u8]) -> Result<()> {
+        let reference = self.blobs.put(raw)?;
+        sqlx::query("UPDATE messages SET raw_blob_ref = ?, body_fetched = 1 WHERE id = ?")
+            .bind(&reference)
+            .bind(message_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_message(&self, message_id: i64) -> Result<MessageFull> {
         use base64::Engine as _;
         use mail_parser::{MessageParser, MimeHeaders, PartType};
@@ -1132,7 +1321,10 @@ impl Db {
             .as_ref()
             .is_some_and(|message| message.header("List-Unsubscribe").is_some());
         let unsubscribe = parsed.as_ref().and_then(|message| {
-            let value = message.header("List-Unsubscribe")?.as_text()?;
+            // Берём сырое значение заголовка: mail_parser типизирует List-Unsubscribe
+            // (в нём есть mailto:), из-за чего as_text() возвращает None и стандартная
+            // ссылка отписки терялась. RFC 2369: несколько <URL> через запятую.
+            let value = message.header_raw("List-Unsubscribe")?;
             let targets = value
                 .split(',')
                 .map(|item| item.trim().trim_start_matches('<').trim_end_matches('>'))
@@ -1145,9 +1337,9 @@ impl Db {
                 .iter()
                 .find(|item| item.starts_with("mailto:"))
                 .map(|item| (*item).to_owned());
+            // RFC 8058: одношаговая отписка, если сервер прислал этот заголовок.
             let one_click = message
-                .header("List-Unsubscribe-Post")
-                .and_then(|header| header.as_text())
+                .header_raw("List-Unsubscribe-Post")
                 .is_some_and(|value| value.to_ascii_lowercase().contains("one-click"));
             Some(Unsubscribe {
                 one_click_url: one_click.then(|| http.clone()).flatten(),
@@ -1166,6 +1358,120 @@ impl Db {
             is_newsletter,
             unsubscribe,
         })
+    }
+
+    /// Последнее письмо во Входящих аккаунта: (id, отправитель, тема, превью).
+    /// Для содержательных уведомлений о новой почте.
+    pub async fn latest_inbox_message(
+        &self,
+        account_id: i64,
+    ) -> Result<Option<(i64, String, String, String)>> {
+        let row: Option<(i64, Option<String>, Option<String>, String, Option<String>)> =
+            sqlx::query_as(
+                "SELECT m.id, m.from_name, m.from_addr, m.subject, m.preview \
+                 FROM messages m JOIN folders f ON f.id = m.folder_id \
+                 WHERE m.account_id = ? AND (f.role = 'inbox' OR f.role IS NULL) \
+                 ORDER BY m.date DESC LIMIT 1",
+            )
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(id, name, addr, subject, preview)| {
+            let from = name
+                .filter(|value| !value.trim().is_empty())
+                .or(addr)
+                .unwrap_or_default();
+            (id, from, subject, preview.unwrap_or_default())
+        }))
+    }
+
+    /// Из набора remote_id вернуть те, которых ещё нет в БД (новые письма).
+    pub async fn unknown_remote_ids(
+        &self,
+        account_id: i64,
+        ids: &[String],
+    ) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT remote_id FROM messages WHERE account_id = ? AND remote_id IN ({placeholders})"
+        );
+        // Плейсхолдеры формируются только из числа id (не из пользовательских
+        // данных), сами значения передаются через bind - инъекция невозможна.
+        let mut query =
+            sqlx::query_as::<_, (Option<String>,)>(sqlx::AssertSqlSafe(sql)).bind(account_id);
+        for id in ids {
+            query = query.bind(id);
+        }
+        let existing = query.fetch_all(&self.pool).await?;
+        let known: std::collections::HashSet<String> =
+            existing.into_iter().filter_map(|row| row.0).collect();
+        Ok(ids
+            .iter()
+            .filter(|id| !known.contains(*id))
+            .cloned()
+            .collect())
+    }
+
+    /// Сырой MIME-исходник письма (для просмотра "как есть" и диагностики).
+    pub async fn message_raw(&self, message_id: i64) -> Result<String> {
+        let (raw_ref,): (Option<String>,) =
+            sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let raw = raw_ref
+            .as_deref()
+            .map(|reference| self.blobs.get(reference))
+            .transpose()?
+            .ok_or_else(|| crate::Error::Other("исходник письма недоступен".into()))?;
+        Ok(String::from_utf8_lossy(&raw).into_owned())
+    }
+
+    /// Извлечь содержимое вложения по индексу (Attachment.id) из raw-MIME письма.
+    /// Возвращает (имя файла, mime-тип, байты).
+    pub async fn attachment_bytes(
+        &self,
+        message_id: i64,
+        attachment_id: i64,
+    ) -> Result<(String, Option<String>, Vec<u8>)> {
+        use mail_parser::{MessageParser, MimeHeaders, PartType};
+        let (raw_ref,): (Option<String>,) =
+            sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&self.pool)
+                .await?;
+        let raw = raw_ref
+            .as_deref()
+            .map(|reference| self.blobs.get(reference))
+            .transpose()?
+            .ok_or_else(|| crate::Error::Other("raw письма недоступно".into()))?;
+        let parsed = MessageParser::default()
+            .parse(&raw)
+            .ok_or_else(|| crate::Error::Other("не удалось разобрать письмо".into()))?;
+        let part = parsed
+            .attachments()
+            .nth(attachment_id as usize)
+            .ok_or_else(|| crate::Error::Other("вложение не найдено".into()))?;
+        let bytes = match &part.body {
+            PartType::Binary(value) | PartType::InlineBinary(value) => value.to_vec(),
+            PartType::Text(value) | PartType::Html(value) => value.as_bytes().to_vec(),
+            _ => return Err(crate::Error::Other("вложение без содержимого".into())),
+        };
+        let mime_type = part.content_type().map(|content_type| {
+            format!(
+                "{}/{}",
+                content_type.c_type,
+                content_type.c_subtype.as_deref().unwrap_or("octet-stream")
+            )
+        });
+        let filename = part
+            .attachment_name()
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("attachment-{}", attachment_id + 1));
+        Ok((filename, mime_type, bytes))
     }
 
     pub async fn list_calendars_and_events(&self) -> Result<(Vec<CalendarSummary>, Vec<Event>)> {
@@ -1198,7 +1504,7 @@ impl Db {
 
     /// Отметить письмо прочитанным (локально; в outbox уйдёт синхронизация флага).
     pub async fn mark_seen(&self, message_id: i64, seen: bool) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let locator: (i64, i64, String, Option<String>) = sqlx::query_as(
             "SELECT m.account_id, m.uid, f.remote_path, m.remote_id FROM messages m
              JOIN folders f ON f.id=m.folder_id WHERE m.id=?",
@@ -1242,7 +1548,7 @@ impl Db {
         message_ids: &[i64],
         target_role: &str,
     ) -> Result<QueuedAction> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let mut operation_ids = Vec::new();
         for message_id in message_ids {
             let locator: (i64, i64, i64, String, Option<String>, Option<String>) = sqlx::query_as(
@@ -1322,7 +1628,7 @@ impl Db {
         message_ids: &[i64],
         target_folder_id: i64,
     ) -> Result<QueuedAction> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let target: (i64, String) =
             sqlx::query_as("SELECT account_id, remote_path FROM folders WHERE id=?")
                 .bind(target_folder_id)
@@ -1375,7 +1681,7 @@ impl Db {
             removed +=
                 sqlx::query("DELETE FROM outbox_ops WHERE id=? AND status IN ('pending','retry')")
                     .bind(id)
-                    .execute(&self.pool)
+                    .execute(&self.write_pool)
                     .await?
                     .rows_affected() as usize;
         }
@@ -1399,7 +1705,9 @@ impl Db {
         )
         .bind(account_id)
         .bind(limit)
-        .fetch_all(&self.pool)
+        // UPDATE ... RETURNING - это запись, несмотря на fetch_all: только через
+        // очередь записи, иначе конкурирует с ней за блокировку писателя.
+        .fetch_all(&self.write_pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
@@ -1417,13 +1725,13 @@ impl Db {
         .bind(account_id)
         .bind(payload)
         .bind(send_at)
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         Ok(result.last_insert_rowid())
     }
 
     pub async fn complete_outbox_operation(&self, operation: &OutboxOperation) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         if matches!(operation.op_kind.as_str(), "move" | "delete")
             && let Some(message_id) = operation.message_id
         {
@@ -1457,7 +1765,7 @@ impl Db {
         .bind(status)
         .bind(format!("+{delay} seconds"))
         .bind(id)
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         Ok(())
     }
@@ -1576,6 +1884,7 @@ struct AccountRow {
     secret_ref: Option<String>,
     include_in_unified: i64,
     color: Option<String>,
+    retention_days: i64,
     enabled: i64,
 }
 
@@ -1626,6 +1935,7 @@ impl From<AccountRow> for Account {
             secret_ref: r.secret_ref,
             include_in_unified: r.include_in_unified != 0,
             color: r.color,
+            retention_days: r.retention_days,
             enabled: r.enabled != 0,
         }
     }

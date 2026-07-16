@@ -25,6 +25,7 @@ chrono.workspace = true
 uuid.workspace = true
 async-imap.workspace = true
 futures.workspace = true
+socket2.workspace = true
 tokio-rustls.workspace = true
 webpki-roots.workspace = true
 rustls-native-certs.workspace = true

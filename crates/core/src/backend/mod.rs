@@ -12,6 +12,34 @@ pub use imap::{
 };
 pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_yandex};
 
+/// ID последних писем Gmail Входящих - для быстрых уведомлений о новой почте.
+pub async fn gmail_latest_ids(access_token: &str, limit: u32) -> Result<Vec<String>> {
+    gmail_api::latest_message_ids(access_token, limit).await
+}
+
+/// Одношаговая отписка (RFC 8058): POST на List-Unsubscribe URL с телом
+/// "List-Unsubscribe=One-Click". Возвращает HTTP-код ответа сервера.
+pub async fn unsubscribe_one_click(url: &str) -> Result<u16> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: error.to_string(),
+        })?;
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("List-Unsubscribe=One-Click")
+        .send()
+        .await
+        .map_err(|error| crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: error.to_string(),
+        })?;
+    Ok(response.status().as_u16())
+}
+
 use crate::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -56,6 +84,15 @@ pub trait MailBackend: Send + Sync {
     async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()>;
+    /// Докачать сырой MIME письма с сервера (кэш вычищен по глубине хранения).
+    async fn fetch_message_raw(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        uid: u32,
+        remote_id: Option<&str>,
+    ) -> Result<Vec<u8>>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -130,6 +167,17 @@ impl MailBackend for YandexBackend {
 
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
         send_yandex(message, credential).await
+    }
+
+    async fn fetch_message_raw(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        uid: u32,
+        _remote_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        imap::fetch_oauth_message_raw("imap.yandex.com", email, credential, folder_path, uid).await
     }
 }
 
@@ -210,5 +258,21 @@ impl MailBackend for GmailBackend {
 
     async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
         send_gmail(message, credential).await
+    }
+
+    async fn fetch_message_raw(
+        &self,
+        email: &str,
+        credential: &str,
+        _folder_path: &str,
+        _uid: u32,
+        remote_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let _ = email;
+        let id = remote_id.ok_or_else(|| crate::Error::Backend {
+            backend: "gmail-message".into(),
+            message: "нет remote_id для докачки письма".into(),
+        })?;
+        gmail_api::fetch_message_raw(credential, id).await
     }
 }

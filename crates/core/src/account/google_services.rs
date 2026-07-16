@@ -45,7 +45,11 @@ struct GoogleEvent {
     description: Option<String>,
     location: Option<String>,
     status: Option<String>,
-    start: GoogleDateTime,
+    // Служебные события (дни рождения, "рабочее место" и т.п.) приходят без start.
+    // Делаем поле необязательным, чтобы такое событие пропускалось штатно, а не
+    // ломало разбор всей страницы и не сыпало предупреждениями.
+    #[serde(default)]
+    start: Option<GoogleDateTime>,
     end: Option<GoogleDateTime>,
     #[serde(default)]
     recurrence: Vec<String>,
@@ -189,7 +193,7 @@ fn recurrence_value(lines: &[String], name: &str) -> Option<String> {
 }
 
 fn event_from_google(event: GoogleEvent) -> Option<DavEvent> {
-    let start = event.start.value()?;
+    let start = event.start.as_ref().and_then(GoogleDateTime::value)?;
     let uid = event
         .recurring_event_id
         .clone()

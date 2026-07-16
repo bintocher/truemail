@@ -2,7 +2,7 @@
 
 use crate::model::{FolderRole, infer_folder_role};
 use crate::{Error, Result};
-use async_imap::{Authenticator, types::NameAttribute};
+use async_imap::{Authenticator, types::Name, types::NameAttribute};
 use futures::TryStreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -71,6 +71,30 @@ impl Authenticator for OAuth2<'_> {
     }
 }
 
+/// TLS-конфиг строим один раз и переиспользуем: системные корневые сертификаты
+/// не меняются в рамках сессии, а грузились они при каждом IMAP-подключении
+/// (десятки раз в минуту из-за IDLE/поллинга) - это было и дорого, и шумело в лог.
+fn tls_client_config() -> Arc<ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let native = rustls_native_certs::load_native_certs();
+            for error in native.errors {
+                tracing::warn!(%error, "не удалось загрузить часть системных TLS-сертификатов");
+            }
+            let mut roots = RootCertStore::empty();
+            let (added, ignored) = roots.add_parsable_certificates(native.certs);
+            tracing::debug!(added, ignored, "загружены системные TLS-сертификаты");
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            )
+        })
+        .clone()
+}
+
 async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OAuthSession> {
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -81,24 +105,22 @@ async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OA
         backend: "imap".into(),
         message: "тайм-аут подключения".into(),
     })??;
-    let native = rustls_native_certs::load_native_certs();
-    for error in native.errors {
-        tracing::warn!(%error, "не удалось загрузить часть системных TLS-сертификатов");
+    // TCP keepalive держит канал живым на уровне ОС, чтобы простаивающее IDLE
+    // не закрывалось промежуточным NAT по таймауту неактивности.
+    {
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(45))
+            .with_interval(std::time::Duration::from_secs(15));
+        if let Err(error) = socket2::SockRef::from(&tcp).set_tcp_keepalive(&keepalive) {
+            tracing::debug!(%error, "не удалось включить TCP keepalive для IMAP");
+        }
     }
-    let mut roots = RootCertStore::empty();
-    let (added, ignored) = roots.add_parsable_certificates(native.certs);
-    tracing::debug!(added, ignored, "загружены системные TLS-сертификаты");
-    // WebPKI остаётся переносимым дополнением для чистых систем без полного
-    // root-store; на Windows сначала доверяем системному хранилищу сертификатов.
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = tls_client_config();
     let server_name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Backend {
         backend: "imap".into(),
         message: e.to_string(),
     })?;
-    let tls = TlsConnector::from(Arc::new(config))
+    let tls = TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
         .map_err(|e| Error::Backend {
@@ -169,14 +191,86 @@ pub(crate) async fn delete_oauth_folder(
     remote_path: &str,
 ) -> Result<()> {
     let mut session = connect_oauth(host, email, access_token).await?;
-    session
-        .delete(remote_path)
+    tracing::info!(remote_path, "imap-delete: запрос удаления папки");
+
+    // Шаг 1: узнаём разделитель иерархии для этой папки (у Яндекса это '|').
+    let self_entries: Vec<Name> = session
+        .list(Some(""), Some(remote_path))
         .await
         .map_err(|error| Error::Backend {
-            backend: "imap-delete-folder".into(),
+            backend: "imap-delete-list".into(),
+            message: error.to_string(),
+        })?
+        .try_collect()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-delete-list".into(),
             message: error.to_string(),
         })?;
+    for entry in &self_entries {
+        tracing::debug!(
+            name = entry.name(),
+            delimiter = entry.delimiter().unwrap_or("?"),
+            attributes = ?entry.attributes(),
+            "imap-delete: цель"
+        );
+    }
+    if self_entries.is_empty() {
+        tracing::warn!(remote_path, "imap-delete: папка не найдена на сервере (LIST пуст)");
+    }
+    let delimiter = self_entries
+        .iter()
+        .find_map(|entry| entry.delimiter())
+        .unwrap_or("|")
+        .to_string();
+
+    // Шаг 2: ищем подпапки. Яндекс отказывает в DELETE, если у папки есть дети.
+    let child_pattern = format!("{remote_path}{delimiter}*");
+    let children: Vec<Name> = session
+        .list(Some(""), Some(&child_pattern))
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-delete-list".into(),
+            message: error.to_string(),
+        })?
+        .try_collect()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-delete-list".into(),
+            message: error.to_string(),
+        })?;
+    let child_names: Vec<&str> = children.iter().map(Name::name).collect();
+    tracing::info!(
+        remote_path,
+        delimiter = delimiter.as_str(),
+        child_count = children.len(),
+        children = ?child_names,
+        "imap-delete: проверка подпапок перед удалением"
+    );
+    if !children.is_empty() {
+        let _ = session.logout().await;
+        return Err(Error::AccountConfig(format!(
+            "у папки есть вложенные подпапки ({}), сначала удалите или перенесите их: {}",
+            children.len(),
+            child_names.join(", ")
+        )));
+    }
+
+    // Шаг 3: собственно удаление.
+    let result = session.delete(remote_path).await;
+    match &result {
+        Ok(()) => tracing::info!(remote_path, "imap-delete: папка удалена"),
+        Err(error) => tracing::error!(
+            remote_path,
+            error = %error,
+            "imap-delete: сервер отклонил DELETE"
+        ),
+    }
     let _ = session.logout().await;
+    result.map_err(|error| Error::Backend {
+        backend: "imap-delete-folder".into(),
+        message: error.to_string(),
+    })?;
     Ok(())
 }
 
@@ -587,17 +681,26 @@ pub async fn wait_for_oauth_change(host: &str, email: &str, access_token: &str) 
         backend: "imap-idle".into(),
         message: error.to_string(),
     })?;
-    let response = {
+    let outcome = {
         let (wait, interrupt) = idle.wait();
-        let response = wait.await;
+        // Плановая переустановка IDLE раз в ~90 секунд. Яндекс/промежуточный узел
+        // рвут простаивающее соединение уже через ~2 минуты (os error 10054 /
+        // peer closed without close_notify). Переустанавливая IDLE проактивно и
+        // чаще, чем сервер закрывает, мы держим канал активным и делаем цикл
+        // штатным, а не гонкой "ждём, пока оборвут".
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(90), wait).await;
         drop(interrupt);
-        response
+        outcome
     };
     let _ = idle.done().await;
-    response.map(|_| ()).map_err(|error| Error::Backend {
-        backend: "imap-idle".into(),
-        message: error.to_string(),
-    })
+    match outcome {
+        // Таймаут: событий не было, тихо переустанавливаем IDLE в watcher.
+        Err(_elapsed) => Ok(()),
+        Ok(response) => response.map(|_| ()).map_err(|error| Error::Backend {
+            backend: "imap-idle".into(),
+            message: error.to_string(),
+        }),
+    }
 }
 
 pub async fn wait_for_yandex_change(email: &str, access_token: &str) -> Result<()> {
@@ -657,6 +760,48 @@ pub async fn discover_gmail(
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
     discover_oauth("imap.gmail.com", email, access_token, cursors).await
+}
+
+/// Докачать сырой MIME одного письма по UID из конкретной папки. Нужно, когда
+/// локальный кэш вычищен по глубине хранения, а пользователь открыл старое письмо.
+pub async fn fetch_oauth_message_raw(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<Vec<u8>> {
+    let mut session = connect_oauth(host, email, access_token).await?;
+    session
+        .select(folder_path)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-select".into(),
+            message: format!("{folder_path}: {error}"),
+        })?;
+    let fetched = session
+        .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-fetch".into(),
+            message: error.to_string(),
+        })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-fetch".into(),
+            message: error.to_string(),
+        })?;
+    let raw = fetched
+        .iter()
+        .find(|fetch| fetch.uid == Some(uid))
+        .and_then(|fetch| fetch.body())
+        .map(<[u8]>::to_vec);
+    let _ = session.logout().await;
+    raw.ok_or_else(|| Error::Backend {
+        backend: "imap-fetch".into(),
+        message: format!("письмо uid={uid} не найдено на сервере"),
+    })
 }
 
 /// IMAP использует modified UTF-7 для имён папок (RFC 3501, раздел 5.1.3).

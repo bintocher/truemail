@@ -17,7 +17,13 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Db {
+    /// Пул для чтения. Читатели в WAL друг другу не мешают и идут параллельно.
     pub pool: SqlitePool,
+    /// Пул для записи, ровно одно соединение. SQLite физически допускает только
+    /// одного писателя: пул сам выстраивает конкурирующие записи в очередь и
+    /// отдаёт соединение по мере освобождения. Без него параллельные mail-sync
+    /// и aux-sync дрались за блокировку и падали с "database is locked".
+    pub write_pool: SqlitePool,
     pub blobs: BlobStore,
     crypto: Arc<StorageCrypto>,
 }
@@ -38,11 +44,24 @@ impl Db {
     ) -> Result<Self> {
         let db_path = data_dir.join("truemail.db");
         prepare_encrypted_database(&db_path, database_key).await?;
-        let opts = encrypted_options(&db_path, database_key, true);
 
+        // Читателей столько, сколько ядер реально может читать параллельно.
+        // Больше смысла нет: чтение упирается в CPU и диск, а каждое лишнее
+        // соединение SQLCipher стоит дорогого key derivation при открытии.
+        // Меньше двух - параллельные чтения UI выстраиваются в очередь.
+        let readers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .clamp(2, 8) as u32;
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
-            .connect_with(opts)
+            .max_connections(readers)
+            .connect_with(encrypted_options(&db_path, database_key, true))
+            .await?;
+        // Единственное соединение = очередь записи. Ждать в ней можно сколько
+        // угодно: это ожидание своей очереди, а не блокировки, и оно не падает.
+        let write_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(encrypted_options(&db_path, database_key, true))
             .await?;
 
         verify_sqlcipher(&pool).await?;
@@ -50,15 +69,33 @@ impl Db {
         let blobs = BlobStore::new(data_dir.join("blobs"), crypto.clone())?;
         Ok(Self {
             pool,
+            write_pool,
             blobs,
             crypto,
         })
     }
 
+    /// Закрыть оба пула и отпустить файл БД. Закрывать только `pool` мало:
+    /// writer-соединение продолжит удерживать файл.
+    pub async fn close(&self) {
+        self.pool.close().await;
+        self.write_pool.close().await;
+    }
+
+    /// Транзакция для записи. Всегда начинать записи через неё.
+    ///
+    /// Идёт через `write_pool`, поэтому писатель всегда один, а остальные ждут
+    /// своей очереди в пуле. `BEGIN IMMEDIATE` вместо обычного deferred `BEGIN`:
+    /// deferred стартует читателем и берёт снимок БД, а если к первой записи
+    /// снимок устарел, SQLite отдаёт SQLITE_BUSY сразу, не дожидаясь ничего.
+    pub async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        Ok(self.write_pool.begin_with("BEGIN IMMEDIATE").await?)
+    }
+
     /// Прогнать все миграции из crates/core/migrations.
     pub async fn migrate(&self) -> Result<()> {
         sqlx::migrate!("./migrations")
-            .run(&self.pool)
+            .run(&self.write_pool)
             .await
             .map_err(|e| crate::Error::Other(format!("миграции: {e}")))?;
         self.encrypt_legacy_settings().await?;
@@ -75,6 +112,19 @@ impl Db {
         row.map(|(value,)| self.decrypt_setting(&value)).transpose()
     }
 
+    /// Прочитать и расшифровать все настройки разом.
+    ///
+    /// UI восстанавливает состояние именно так: перечислять ключи на его стороне
+    /// нельзя - забытый в списке ключ означает молча не восстановленную настройку.
+    pub async fn all_settings(&self) -> Result<std::collections::HashMap<String, String>> {
+        let rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|(key, value)| Ok((key, self.decrypt_setting(&value)?)))
+            .collect()
+    }
+
     /// Зашифровать и записать настройку. Открытое значение в SQLite не попадает.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let encrypted = self.encrypt_setting(value)?;
@@ -84,7 +134,7 @@ impl Db {
         )
         .bind(key)
         .bind(encrypted)
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         Ok(())
     }
@@ -112,7 +162,7 @@ impl Db {
         let rows: Vec<(String, Vec<u8>)> = sqlx::query_as("SELECT key, value FROM settings")
             .fetch_all(&self.pool)
             .await?;
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         for (key, value) in rows {
             if value.starts_with(ENCRYPTED_SETTING_PREFIX) {
                 continue;
@@ -145,13 +195,13 @@ impl Db {
         }
 
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&self.pool)
+            .execute(&self.write_pool)
             .await?;
-        sqlx::query("VACUUM").execute(&self.pool).await?;
+        sqlx::query("VACUUM").execute(&self.write_pool).await?;
         sqlx::query(
             "INSERT INTO storage_meta(key, value) VALUES('settings_encryption_v1_vacuumed', '1')",
         )
-        .execute(&self.pool)
+        .execute(&self.write_pool)
         .await?;
         Ok(())
     }
@@ -171,6 +221,12 @@ fn encrypted_options(
         .foreign_keys(true)
         .pragma("secure_delete", "ON")
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        // Никаких ожиданий блокировки: писатель ровно один (см. Db::write_pool),
+        // читатели в WAL ему не мешают, конкурировать некому. Если SQLite всё же
+        // ответит "database is locked" - это баг очереди, и он должен падать
+        // громко, а не прятаться за таймаутом. Ноль обязателен явно: у sqlx
+        // значение по умолчанию - 5 секунд.
+        .busy_timeout(std::time::Duration::ZERO)
         .disable_statement_logging()
 }
 
@@ -395,7 +451,7 @@ mod tests {
         assert!(stored.starts_with(ENCRYPTED_SETTING_PREFIX));
         assert!(!String::from_utf8_lossy(&stored).contains("never-store-this-in-plaintext"));
 
-        db.pool.close().await;
+        db.close().await;
         drop(db);
         let database_path = root.join("truemail.db");
         assert!(!has_plaintext_sqlite_header(&database_path).expect("read database header"));
@@ -444,7 +500,7 @@ mod tests {
             .expect("read migrated user version");
         assert_eq!(value, "preserved");
         assert_eq!(user_version, 7);
-        db.pool.close().await;
+        db.close().await;
         assert!(!has_plaintext_sqlite_header(&database_path).expect("read encrypted header"));
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
@@ -460,10 +516,10 @@ mod tests {
             .await
             .expect("create encrypted database");
         sqlx::query("CREATE TABLE protected(value TEXT)")
-            .execute(&db.pool)
+            .execute(&db.write_pool)
             .await
             .expect("write encrypted database");
-        db.pool.close().await;
+        db.close().await;
 
         let wrong_key = DatabaseKey::from_key(random_key());
         assert!(
@@ -519,14 +575,14 @@ mod tests {
         assert_eq!(indexes.len(), 3);
 
         sqlx::query("INSERT INTO folders(account_id, remote_path, display_name, role) VALUES(?, 'INBOX', 'Inbox', 'inbox')")
-            .bind(account.id).execute(&db.pool).await.expect("insert folder");
+            .bind(account.id).execute(&db.write_pool).await.expect("insert folder");
         let (folder_id,): (i64,) = sqlx::query_as("SELECT id FROM folders WHERE account_id=?")
             .bind(account.id)
             .fetch_one(&db.pool)
             .await
             .expect("folder id");
         sqlx::query("INSERT INTO messages(account_id, folder_id, uid, subject, preview) VALUES(?, ?, 1, 'secret subject', 'secret preview')")
-            .bind(account.id).bind(folder_id).execute(&db.pool).await.expect("insert message");
+            .bind(account.id).bind(folder_id).execute(&db.write_pool).await.expect("insert message");
         let (before,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages_fts")
             .fetch_one(&db.pool)
             .await
@@ -534,7 +590,7 @@ mod tests {
         assert_eq!(before, 1);
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)
-            .execute(&db.pool)
+            .execute(&db.write_pool)
             .await
             .expect("delete account");
         let (after,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages_fts")
@@ -543,7 +599,7 @@ mod tests {
             .expect("fts count after cascade");
         assert_eq!(after, 0);
 
-        db.pool.close().await;
+        db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 }

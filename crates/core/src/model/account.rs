@@ -64,6 +64,8 @@ pub struct Account {
     pub secret_ref: Option<String>,
     pub include_in_unified: bool,
     pub color: Option<String>,
+    /// Глубина локального кэша писем в днях; 0 - без ограничений.
+    pub retention_days: i64,
     pub enabled: bool,
 }
 
