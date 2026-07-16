@@ -137,9 +137,10 @@ impl AccountManager {
                     credential = fresh;
                 }
             }
-            if !credential
+            // Токен ещё живой (или бессрочный) - обновлять нечего.
+            if credential
                 .expires_at
-                .is_some_and(|expires| expires <= now + 60)
+                .is_none_or(|expires| expires > now + 60)
             {
                 return Ok(credential.access_token);
             }
@@ -446,7 +447,10 @@ impl AccountManager {
                 )));
             }
         } else {
-            tracing::warn!(email, "Gmail OAuth: провайдер не вернул поле scope, проверку разрешений пропускаем");
+            tracing::warn!(
+                email,
+                "Gmail OAuth: провайдер не вернул поле scope, проверку разрешений пропускаем"
+            );
         }
         let access_token = token.access_token.clone();
         let secret_ref = format!("google-oauth:{}", email.to_lowercase());

@@ -9,6 +9,12 @@ pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
 }
 
+/// Строка локатора письма: account_id, remote_path папки, uid, remote_id, raw_blob_ref.
+type MessageLocatorRow = (i64, String, i64, Option<String>, Option<String>);
+
+/// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
+type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
+
 #[derive(Debug, Clone)]
 pub struct OutboxOperation {
     pub id: i64,
@@ -219,13 +225,11 @@ impl Db {
         on: bool,
     ) -> Result<()> {
         if on {
-            sqlx::query(
-                "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
-            )
-            .bind(message_id)
-            .bind(label_id)
-            .execute(&self.write_pool)
-            .await?;
+            sqlx::query("INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)")
+                .bind(message_id)
+                .bind(label_id)
+                .execute(&self.write_pool)
+                .await?;
         } else {
             sqlx::query("DELETE FROM message_labels WHERE message_id = ? AND label_id = ?")
                 .bind(message_id)
@@ -1219,7 +1223,7 @@ impl Db {
         &self,
         message_id: i64,
     ) -> Result<Option<(i64, String, i64, Option<String>, bool)>> {
-        let row: Option<(i64, String, i64, Option<String>, Option<String>)> = sqlx::query_as(
+        let row: Option<MessageLocatorRow> = sqlx::query_as(
             "SELECT m.account_id, f.remote_path, m.uid, m.remote_id, m.raw_blob_ref \
              FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
         )
@@ -1366,16 +1370,15 @@ impl Db {
         &self,
         account_id: i64,
     ) -> Result<Option<(i64, String, String, String)>> {
-        let row: Option<(i64, Option<String>, Option<String>, String, Option<String>)> =
-            sqlx::query_as(
-                "SELECT m.id, m.from_name, m.from_addr, m.subject, m.preview \
+        let row: Option<LatestInboxRow> = sqlx::query_as(
+            "SELECT m.id, m.from_name, m.from_addr, m.subject, m.preview \
                  FROM messages m JOIN folders f ON f.id = m.folder_id \
                  WHERE m.account_id = ? AND (f.role = 'inbox' OR f.role IS NULL) \
                  ORDER BY m.date DESC LIMIT 1",
-            )
-            .bind(account_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(id, name, addr, subject, preview)| {
             let from = name
                 .filter(|value| !value.trim().is_empty())
@@ -1386,11 +1389,7 @@ impl Db {
     }
 
     /// Из набора remote_id вернуть те, которых ещё нет в БД (новые письма).
-    pub async fn unknown_remote_ids(
-        &self,
-        account_id: i64,
-        ids: &[String],
-    ) -> Result<Vec<String>> {
+    pub async fn unknown_remote_ids(&self, account_id: i64, ids: &[String]) -> Result<Vec<String>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }

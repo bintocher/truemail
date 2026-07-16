@@ -267,7 +267,12 @@ async fn notify_new_mail(
     account: &truemail_core::model::Account,
     count: usize,
 ) {
-    let meta = core.db.latest_inbox_message(account.id).await.ok().flatten();
+    let meta = core
+        .db
+        .latest_inbox_message(account.id)
+        .await
+        .ok()
+        .flatten();
     let payload = match meta {
         Some((id, from, subject, preview)) => serde_json::json!({
             "kind": "mail",
@@ -608,7 +613,11 @@ pub async fn update_label(
     name: String,
     color: String,
 ) -> CmdResult<()> {
-    Ok(core(&state).await?.db.update_label(id, &name, &color).await?)
+    Ok(core(&state)
+        .await?
+        .db
+        .update_label(id, &name, &color)
+        .await?)
 }
 
 #[tauri::command]
@@ -631,10 +640,7 @@ pub async fn toggle_message_label(
 }
 
 #[tauri::command]
-pub async fn message_label_ids(
-    state: State<'_, AppState>,
-    message_id: i64,
-) -> CmdResult<Vec<i64>> {
+pub async fn message_label_ids(state: State<'_, AppState>, message_id: i64) -> CmdResult<Vec<i64>> {
     Ok(core(&state).await?.db.message_label_ids(message_id).await?)
 }
 
@@ -876,10 +882,7 @@ pub async fn save_all_attachments(
     let full = core.db.get_message(message_id).await?;
     let mut saved = Vec::new();
     for attachment in &full.attachments {
-        let (filename, _, bytes) = core
-            .db
-            .attachment_bytes(message_id, attachment.id)
-            .await?;
+        let (filename, _, bytes) = core.db.attachment_bytes(message_id, attachment.id).await?;
         // Защита от коллизий имён: при повторе добавляем индекс.
         let mut target = std::path::Path::new(&dest_dir).join(&filename);
         let mut counter = 1;
@@ -899,7 +902,13 @@ pub async fn save_all_attachments(
         std::fs::write(&target, bytes).map_err(|error| ApiError {
             message: format!("не удалось сохранить {filename}: {error}"),
         })?;
-        saved.push(target.file_name().and_then(|v| v.to_str()).unwrap_or(&filename).to_owned());
+        saved.push(
+            target
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or(&filename)
+                .to_owned(),
+        );
     }
     Ok(saved)
 }
@@ -1613,7 +1622,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         let gmail_core = core.clone();
         let gmail_app = app.clone();
         let gmail_syncing = state.syncing.clone();
-        tokio::spawn(async move { gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing).await });
+        tokio::spawn(
+            async move { gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing).await },
+        );
     }
     for account in core.db.list_accounts().await? {
         if !matches!(
@@ -1634,100 +1645,111 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         // Gmail API (периодический sync_accounts каждые 5 минут), а IMAP-discover
         // для Gmail тяжёлый (maxResults=500 без курсора) и не годится для polling.
         if matches!(account.provider, truemail_core::model::Provider::Yandex) {
-        let watch_core = core.clone();
-        let watch_syncing = state.syncing.clone();
-        let watch_app = app.clone();
-        let watch_account = account.clone();
-        let watch_generation = state.generation.clone();
-        let generation = watch_generation.load(std::sync::atomic::Ordering::SeqCst);
-        tokio::spawn(async move {
-            let mut retry_delay = std::time::Duration::from_secs(2);
-            loop {
-                if watch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                    break;
-                }
-                let token = match watch_core.accounts.oauth_access_token(&watch_account).await {
-                    Ok(token) => token,
-                    Err(error) => {
-                        tracing::error!(account = %watch_account.email, %error, "не удалось прочитать OAuth-токен для IMAP IDLE");
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                        continue;
+            let watch_core = core.clone();
+            let watch_syncing = state.syncing.clone();
+            let watch_app = app.clone();
+            let watch_account = account.clone();
+            let watch_generation = state.generation.clone();
+            let generation = watch_generation.load(std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut retry_delay = std::time::Duration::from_secs(2);
+                loop {
+                    if watch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                        break;
                     }
-                };
-                let wait = match watch_account.provider {
-                    truemail_core::model::Provider::Yandex => {
-                        truemail_core::backend::wait_for_yandex_change(&watch_account.email, &token)
-                            .await
-                    }
-                    truemail_core::model::Provider::Gmail => {
-                        truemail_core::backend::wait_for_gmail_change(&watch_account.email, &token)
-                            .await
-                    }
-                    _ => unreachable!(),
-                };
-                match wait {
-                    Ok(()) => {
-                        let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "syncing"}));
-                        retry_delay = std::time::Duration::from_secs(2);
-                        loop {
-                            let mut syncing = watch_syncing.lock().await;
-                            if syncing.insert(watch_account.id) {
-                                break;
-                            }
-                            drop(syncing);
-                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let token = match watch_core.accounts.oauth_access_token(&watch_account).await {
+                        Ok(token) => token,
+                        Err(error) => {
+                            tracing::error!(account = %watch_account.email, %error, "не удалось прочитать OAuth-токен для IMAP IDLE");
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            continue;
                         }
-                        match watch_core.accounts.sync_mail_inbox(&watch_account).await {
-                            // Плановая переустановка IDLE без новых писем (messages=0)
-                            // происходит каждые ~90с - это debug, чтобы не шуметь.
-                            // Реальные новые письма логируем на info.
-                            Ok(messages) if messages > 0 => {
-                                tracing::info!(
+                    };
+                    let wait = match watch_account.provider {
+                        truemail_core::model::Provider::Yandex => {
+                            truemail_core::backend::wait_for_yandex_change(
+                                &watch_account.email,
+                                &token,
+                            )
+                            .await
+                        }
+                        truemail_core::model::Provider::Gmail => {
+                            truemail_core::backend::wait_for_gmail_change(
+                                &watch_account.email,
+                                &token,
+                            )
+                            .await
+                        }
+                        _ => unreachable!(),
+                    };
+                    match wait {
+                        Ok(()) => {
+                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "syncing"}));
+                            retry_delay = std::time::Duration::from_secs(2);
+                            loop {
+                                let mut syncing = watch_syncing.lock().await;
+                                if syncing.insert(watch_account.id) {
+                                    break;
+                                }
+                                drop(syncing);
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            }
+                            match watch_core.accounts.sync_mail_inbox(&watch_account).await {
+                                // Плановая переустановка IDLE без новых писем (messages=0)
+                                // происходит каждые ~90с - это debug, чтобы не шуметь.
+                                // Реальные новые письма логируем на info.
+                                Ok(messages) if messages > 0 => {
+                                    tracing::info!(
+                                        account = %watch_account.email,
+                                        messages,
+                                        "IMAP IDLE: входящие обновлены"
+                                    );
+                                    notify_new_mail(
+                                        &watch_app,
+                                        &watch_core,
+                                        &watch_account,
+                                        messages,
+                                    )
+                                    .await;
+                                }
+                                Ok(messages) => tracing::debug!(
                                     account = %watch_account.email,
                                     messages,
-                                    "IMAP IDLE: входящие обновлены"
-                                );
-                                notify_new_mail(&watch_app, &watch_core, &watch_account, messages)
-                                    .await;
+                                    "IMAP IDLE: переустановлен, новых писем нет"
+                                ),
+                                Err(error) => tracing::error!(
+                                    account = %watch_account.email,
+                                    %error,
+                                    "IMAP IDLE: не удалось дозагрузить входящие"
+                                ),
                             }
-                            Ok(messages) => tracing::debug!(
-                                account = %watch_account.email,
-                                messages,
-                                "IMAP IDLE: переустановлен, новых писем нет"
-                            ),
-                            Err(error) => tracing::error!(
-                                account = %watch_account.email,
-                                %error,
-                                "IMAP IDLE: не удалось дозагрузить входящие"
-                            ),
+                            watch_syncing.lock().await.remove(&watch_account.id);
+                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let _ = watch_app.emit("truemail-data-changed", watch_account.id);
                         }
-                        watch_syncing.lock().await.remove(&watch_account.id);
-                        let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
-                        let _ = watch_app.emit("truemail-data-changed", watch_account.id);
-                    }
-                    Err(error) => {
-                        // Разрыв простаивающего IDLE сервером/NAT (10054, close_notify,
-                        // unexpected eof, connection reset) - ожидаемое поведение, а не
-                        // сбой: логируем на debug, чтобы не пугать в логе. Остальные
-                        // ошибки (авторизация, TLS-хендшейк и т.п.) остаются на warn.
-                        let text = error.to_string();
-                        let routine = text.contains("10054")
-                            || text.contains("close_notify")
-                            || text.contains("unexpected eof")
-                            || text.contains("reset")
-                            || text.contains("принудительно разорвал");
-                        if routine {
-                            tracing::debug!(account = %watch_account.email, %error, "IMAP IDLE переустанавливается");
-                        } else {
-                            tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                        Err(error) => {
+                            // Разрыв простаивающего IDLE сервером/NAT (10054, close_notify,
+                            // unexpected eof, connection reset) - ожидаемое поведение, а не
+                            // сбой: логируем на debug, чтобы не пугать в логе. Остальные
+                            // ошибки (авторизация, TLS-хендшейк и т.п.) остаются на warn.
+                            let text = error.to_string();
+                            let routine = text.contains("10054")
+                                || text.contains("close_notify")
+                                || text.contains("unexpected eof")
+                                || text.contains("reset")
+                                || text.contains("принудительно разорвал");
+                            if routine {
+                                tracing::debug!(account = %watch_account.email, %error, "IMAP IDLE переустанавливается");
+                            } else {
+                                tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                            }
+                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
                         }
-                        let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
-                        tokio::time::sleep(retry_delay).await;
-                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
                     }
                 }
-            }
-        });
+            });
         }
 
         let outbox_core = core.clone();

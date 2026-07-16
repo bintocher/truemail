@@ -230,7 +230,9 @@
 
   /* calendar */
   .cal{display:none;grid-column:2/4;flex-direction:column;background:var(--bg);min-height:0;}
-  .app.calmode{grid-template-columns:var(--nav-w) 1fr;} .app.calmode .list,.app.calmode .thread{display:none;} .app.calmode .cal{display:flex;}
+  /* Разделитель списка - position:fixed, сам по себе он не исчезнет вместе с
+     .list: календарю и контактам список не показывают, тянуть там нечего. */
+  .app.calmode{grid-template-columns:var(--nav-w) 1fr;} .app.calmode .list,.app.calmode .thread,.app.calmode .list-resizer{display:none;} .app.calmode .cal{display:flex;}
   .calhead{padding:13px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;}
   .cal-sync-info{color:var(--text-3);font-size:12px;white-space:nowrap;}
   .cal-sync-info.clickable{color:var(--accent);cursor:pointer;text-decoration:underline;text-underline-offset:2px;}
@@ -242,7 +244,7 @@
   .ev.g{background:var(--good-weak);color:var(--good);} .ev.a{background:var(--warn-weak);color:var(--warn);}
 
   /* contacts */
-  .app.contactsmode{grid-template-columns:var(--nav-w) 1fr;} .app.contactsmode .list,.app.contactsmode .thread{display:none;} .app.contactsmode .contacts{display:flex;}
+  .app.contactsmode{grid-template-columns:var(--nav-w) 1fr;} .app.contactsmode .list,.app.contactsmode .thread,.app.contactsmode .list-resizer{display:none;} .app.contactsmode .contacts{display:flex;}
   .contacts{display:none;grid-column:2/4;flex-direction:column;background:var(--bg);min-width:0;min-height:0;overflow:hidden;}
   .cgrid{padding:16px 20px;min-width:0;min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;align-content:start;}
   .ccard{border:1px solid var(--border);border-radius:12px;padding:14px;display:flex;gap:12px;align-items:center;min-width:0;}

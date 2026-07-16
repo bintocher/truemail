@@ -216,7 +216,10 @@ pub(crate) async fn delete_oauth_folder(
         );
     }
     if self_entries.is_empty() {
-        tracing::warn!(remote_path, "imap-delete: папка не найдена на сервере (LIST пуст)");
+        tracing::warn!(
+            remote_path,
+            "imap-delete: папка не найдена на сервере (LIST пуст)"
+        );
     }
     let delimiter = self_entries
         .iter()

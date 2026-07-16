@@ -114,7 +114,11 @@ fn run() -> anyhow::Result<()> {
     // Куда показывать уведомления - читаем до старта: позиционирование окна синхронное.
     let notify_anchor = core
         .as_ref()
-        .and_then(|core| rt.block_on(core.db.setting("notify_position")).ok().flatten())
+        .and_then(|core| {
+            rt.block_on(core.db.setting("notify_position"))
+                .ok()
+                .flatten()
+        })
         .map(|value| commands::NotifyAnchor::parse(&value))
         .unwrap_or_else(commands::NotifyAnchor::platform_default);
     let state = AppState {
