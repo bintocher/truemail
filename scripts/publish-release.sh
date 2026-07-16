@@ -42,7 +42,13 @@ if [ -z "$release_id" ]; then
   exit 1
 fi
 
+# deb и rpm GitVerse не принимает как файлы релиза (400), поэтому пакуем их
+# в tar.gz. AppImage заливается как есть.
 shopt -s nullglob
+for pkg in "$DIR"/*.deb "$DIR"/*.rpm; do
+  (cd "$DIR" && tar czf "$(basename "$pkg").tar.gz" "$(basename "$pkg")" && rm -f "$(basename "$pkg")")
+done
+
 files=("$DIR"/*)
 if [ ${#files[@]} -eq 0 ]; then
   echo "В каталоге $DIR нет файлов для загрузки" >&2
@@ -50,9 +56,11 @@ if [ ${#files[@]} -eq 0 ]; then
 fi
 
 for file in "${files[@]}"; do
-  echo "Загружаю $(basename "$file")"
+  name=$(basename "$file")
+  echo "Загружаю $name"
+  # name обязателен отдельным полем формы: без него 422, в query-параметре - 400.
   api -X POST "$API/repos/$OWNER/$REPO/releases/$release_id/assets" \
-    -F "attachment=@$file" >/dev/null
+    -F "attachment=@$file" -F "name=$name" >/dev/null
 done
 
 echo "Релиз $TAG опубликован: ${#files[@]} файлов"
