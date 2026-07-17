@@ -476,6 +476,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlx_migrations_are_completed_by_the_application_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "truemail-settings-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+
+        // sqlx applies the structural migration, but 0009 deliberately leaves
+        // legacy values for the application to encrypt with its storage key.
+        sqlx::migrate!("./migrations")
+            .run(&db.write_pool)
+            .await
+            .expect("run structural migrations");
+        let (before,): (Vec<u8>,) = sqlx::query_as("SELECT value FROM settings WHERE key='locale'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read structural migration value");
+        assert_eq!(before, b"ru");
+
+        // Db::migrate is the public contract and safely finishes an already
+        // structurally migrated database.
+        db.migrate().await.expect("complete application migration");
+        let (after,): (Vec<u8>,) = sqlx::query_as("SELECT value FROM settings WHERE key='locale'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read encrypted migration value");
+        assert!(after.starts_with(ENCRYPTED_SETTING_PREFIX));
+        assert_eq!(
+            db.setting("locale").await.expect("decrypt locale"),
+            Some("ru".into())
+        );
+        let (completed,): (String,) = sqlx::query_as(
+            "SELECT value FROM storage_meta WHERE key='settings_encryption_v1_vacuumed'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read completion marker");
+        assert_eq!(completed, "1");
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
     async fn plaintext_database_is_migrated_without_losing_data() {
         let root =
             std::env::temp_dir().join(format!("truemail-migration-{}", uuid::Uuid::new_v4()));
@@ -779,6 +830,34 @@ mod tests {
             .await
             .expect("parse calendar attachment");
         assert!(calendar_message.attachments[0].size.unwrap_or_default() > 0);
+        let (cached,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM message_content_cache WHERE message_id=?")
+                .bind(calendar_message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read MIME cache");
+        assert_eq!(cached, 1);
+        sqlx::query("UPDATE message_content_cache SET body_text='cached body' WHERE message_id=?")
+            .bind(calendar_message_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark cached body");
+        assert_eq!(
+            db.get_message(calendar_message_id)
+                .await
+                .expect("read cached MIME")
+                .body_text
+                .as_deref(),
+            Some("cached body")
+        );
+        use crate::search::{Fts5Index, SearchIndex};
+        assert!(
+            Fts5Index::new(db.clone())
+                .search("Invitation", 10)
+                .await
+                .expect("search indexed MIME body")
+                .contains(&calendar_message_id)
+        );
         assert_eq!(
             db.attachment_bytes(calendar_message_id, 0)
                 .await

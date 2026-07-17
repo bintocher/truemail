@@ -26,6 +26,7 @@ use crate::Result;
 use crate::backend::{EwsBackend, GenericImapBackend, GmailBackend, MailBackend, YandexBackend};
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SyncKind {
@@ -219,7 +220,7 @@ impl AccountManager {
         }
     }
 
-    async fn mail_credential(&self, account: &Account) -> Result<String> {
+    async fn mail_credential(&self, account: &Account) -> Result<Zeroizing<String>> {
         if account.auth_kind == AuthKind::Oauth2 {
             return self.oauth_access_token(account).await;
         }
@@ -230,20 +231,23 @@ impl AccountManager {
         keyring::Entry::new("truemail", secret_ref)
             .map_err(|error| crate::Error::Keyring(error.to_string()))?
             .get_password()
+            .map(Zeroizing::new)
             .map_err(|error| crate::Error::Keyring(error.to_string()))
     }
 
     /// Прочитать сохранённый OAuth access token из системного keychain.
-    pub async fn oauth_access_token(&self, account: &Account) -> Result<String> {
+    pub async fn oauth_access_token(&self, account: &Account) -> Result<Zeroizing<String>> {
         let secret_ref = account
             .secret_ref
             .as_deref()
             .ok_or_else(|| crate::Error::AccountConfig("нет ссылки на OAuth-токен".into()))?;
         let entry = keyring::Entry::new("truemail", secret_ref)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
-        let serialized = entry
-            .get_password()
-            .map_err(|e| crate::Error::Keyring(e.to_string()))?;
+        let serialized = Zeroizing::new(
+            entry
+                .get_password()
+                .map_err(|e| crate::Error::Keyring(e.to_string()))?,
+        );
         let mut credential: StoredOAuthCredential = serde_json::from_str(&serialized)?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -257,6 +261,7 @@ impl AccountManager {
             // поток мог уже обновить его - тогда повторный refresh не нужен.
             let _guard = self.refresh_lock.lock().await;
             if let Ok(serialized) = entry.get_password() {
+                let serialized = Zeroizing::new(serialized);
                 if let Ok(fresh) = serde_json::from_str::<StoredOAuthCredential>(&serialized) {
                     credential = fresh;
                 }
@@ -266,11 +271,14 @@ impl AccountManager {
                 .expires_at
                 .is_none_or(|expires| expires > now + 60)
             {
-                return Ok(credential.access_token);
+                return Ok(Zeroizing::new(credential.access_token.clone()));
             }
-            let refresh_token = credential.refresh_token.clone().ok_or_else(|| {
-                crate::Error::AccountConfig("OAuth-токен истёк и не содержит refresh_token".into())
-            })?;
+            let refresh_token =
+                Zeroizing::new(credential.refresh_token.clone().ok_or_else(|| {
+                    crate::Error::AccountConfig(
+                        "OAuth-токен истёк и не содержит refresh_token".into(),
+                    )
+                })?);
             let refreshed = match account.provider {
                 Provider::Yandex => {
                     let client_id = configured_yandex_client_id().ok_or_else(|| {
@@ -286,12 +294,13 @@ impl AccountManager {
                             "для обновления OAuth-токена не задан TRUEMAIL_GOOGLE_CLIENT_ID".into(),
                         )
                     })?;
-                    let client_secret = configured_google_client_secret().ok_or_else(|| {
-                        crate::Error::AccountConfig(
-                            "для обновления OAuth-токена не задан TRUEMAIL_GOOGLE_CLIENT_SECRET"
-                                .into(),
-                        )
-                    })?;
+                    let client_secret =
+                        Zeroizing::new(configured_google_client_secret().ok_or_else(|| {
+                            crate::Error::AccountConfig(
+                                "для обновления OAuth-токена не задан TRUEMAIL_GOOGLE_CLIENT_SECRET"
+                                    .into(),
+                            )
+                        })?);
                     refresh_google_token(&client_id, &client_secret, &refresh_token).await?
                 }
                 _ => {
@@ -300,19 +309,20 @@ impl AccountManager {
                     ));
                 }
             };
-            let mut updated = StoredOAuthCredential::from_refresh(refreshed, refresh_token);
+            let mut updated = StoredOAuthCredential::from_refresh(refreshed, &refresh_token);
             // Google при refresh обычно не возвращает scope - сохраняем прежний,
             // иначе информация о выданных разрешениях теряется.
             if updated.scope.is_none() {
                 updated.scope = credential.scope.clone();
             }
+            let serialized = Zeroizing::new(serde_json::to_string(&updated)?);
             entry
-                .set_password(&serde_json::to_string(&updated)?)
+                .set_password(&serialized)
                 .map_err(|e| crate::Error::Keyring(e.to_string()))?;
             tracing::info!(email = %account.email, provider = ?account.provider, scope = ?updated.scope, "OAuth-токен обновлён через refresh");
             credential = updated;
         }
-        Ok(credential.access_token)
+        Ok(Zeroizing::new(credential.access_token.clone()))
     }
 
     /// Дозагрузить только последние входящие после события IMAP IDLE.
@@ -669,12 +679,12 @@ impl AccountManager {
         display_name: &str,
         token: OAuthToken,
     ) -> Result<ConnectedAccountSync> {
-        let access_token = token.access_token.clone();
+        let access_token = Zeroizing::new(token.access_token.clone());
         let secret_ref = format!("yandex-oauth:{}", email.to_lowercase());
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
         let credential = StoredOAuthCredential::from(token);
-        let serialized = serde_json::to_string(&credential)?;
+        let serialized = Zeroizing::new(serde_json::to_string(&credential)?);
         entry
             .set_password(&serialized)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
@@ -763,13 +773,14 @@ impl AccountManager {
                 "Gmail OAuth: провайдер не вернул поле scope, проверку разрешений пропускаем"
             );
         }
-        let access_token = token.access_token.clone();
+        let access_token = Zeroizing::new(token.access_token.clone());
         let secret_ref = format!("google-oauth:{}", email.to_lowercase());
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
         let credential = StoredOAuthCredential::from(token);
+        let serialized = Zeroizing::new(serde_json::to_string(&credential)?);
         entry
-            .set_password(&serde_json::to_string(&credential)?)
+            .set_password(&serialized)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
 
         let account = match self

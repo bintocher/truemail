@@ -23,7 +23,7 @@ use truemail_core::model::{
     MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature, SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
 pub struct AppState {
@@ -88,7 +88,7 @@ impl NotifyAnchor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PendingOAuth {
     email: String,
     verifier: String,
@@ -1680,10 +1680,6 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
                 .execute(&mut *tx)
                 .await
                 .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM messages_fts")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
             sqlx::query("DELETE FROM attachments")
                 .execute(&mut *tx)
                 .await
@@ -2509,7 +2505,7 @@ pub async fn begin_account_connection(
                 oauth_state.clone(),
                 PendingOAuth {
                     email,
-                    verifier: pkce.verifier,
+                    verifier: pkce.verifier.clone(),
                     client_id,
                 },
             );
@@ -2522,6 +2518,7 @@ pub async fn begin_account_connection(
         }
         truemail_core::model::Provider::Gmail => {
             let (client_id, client_secret) = google_client_credentials()?;
+            let client_secret = Zeroizing::new(client_secret);
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .map_err(|error| ApiError {
@@ -2542,7 +2539,7 @@ pub async fn begin_account_connection(
                 &redirect_uri,
             )?;
             open_in_yandex_browser(&app, &url)?;
-            let code = receive_google_callback(listener, &oauth_state).await?;
+            let code = Zeroizing::new(receive_google_callback(listener, &oauth_state).await?);
             let token = truemail_core::account::exchange_google_code(
                 &client_id,
                 &client_secret,
@@ -2714,6 +2711,7 @@ pub async fn complete_yandex_oauth(
     oauth_state: String,
     code: String,
 ) -> CmdResult<ConnectedAccount> {
+    let code = Zeroizing::new(code);
     let core = core(&state).await?;
     let pending = state
         .oauth

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const YANDEX_SCOPES: &str = "mail:imap_full mail:smtp calendar:all \
 directory:read_external_contacts directory:write_external_contacts";
@@ -43,13 +44,13 @@ fn configured_oauth_value(environment_name: &str, compiled: Option<&str>) -> Opt
         .filter(|value| !value.trim().is_empty())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PkcePair {
     pub verifier: String,
     pub challenge: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct OAuthToken {
     pub access_token: String,
     #[serde(default)]
@@ -62,7 +63,7 @@ pub struct OAuthToken {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct StoredOAuthCredential {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -291,15 +292,15 @@ impl From<OAuthToken> for StoredOAuthCredential {
             .unwrap_or_default()
             .as_secs() as i64;
         Self {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
+            access_token: token.access_token.clone(),
+            refresh_token: token.refresh_token.clone(),
             expires_at: token.expires_in.map(|seconds| now + seconds),
             token_type: if token.token_type.is_empty() {
                 "bearer".into()
             } else {
-                token.token_type
+                token.token_type.clone()
             },
-            scope: token.scope,
+            scope: token.scope.clone(),
         }
     }
 }
@@ -308,10 +309,10 @@ impl StoredOAuthCredential {
     /// Построить сохранённый токен после refresh grant. Google обычно не
     /// возвращает новый refresh_token, поэтому сохраняем предыдущий. Если
     /// провайдер ротировал токен, используем новое значение.
-    pub fn from_refresh(token: OAuthToken, previous_refresh_token: String) -> Self {
+    pub fn from_refresh(token: OAuthToken, previous_refresh_token: &str) -> Self {
         let mut credential = Self::from(token);
         if credential.refresh_token.is_none() {
-            credential.refresh_token = Some(previous_refresh_token);
+            credential.refresh_token = Some(previous_refresh_token.to_owned());
         }
         credential
     }
@@ -395,7 +396,7 @@ mod tests {
             scope: None,
         };
 
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
 
         assert_eq!(refreshed.access_token, "new-access");
         assert_eq!(refreshed.refresh_token.as_deref(), Some("old-refresh"));
@@ -421,7 +422,7 @@ mod tests {
             scope: None,
         };
 
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
 
         assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
     }

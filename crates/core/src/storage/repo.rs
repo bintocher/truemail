@@ -15,6 +15,14 @@ type MessageLocatorRow = (i64, String, i64, Option<String>, Option<String>);
 /// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
 type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
 type FolderCursorRow = (String, Option<i64>, Option<i64>, Option<String>);
+type MessageContentCacheRow = (
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    Option<String>,
+);
 
 #[derive(Debug, Clone)]
 pub struct OutboxOperation {
@@ -1159,6 +1167,7 @@ impl Db {
         }
         let mut active_refs = HashSet::new();
         let mut stale_refs = Vec::new();
+        let mut indexed_bodies = Vec::new();
         let save_result: Result<()> = async {
             let mut tx = self.begin_write().await?;
             for (
@@ -1256,11 +1265,7 @@ impl Db {
                         }
                     }
                 }
-                sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
-                    .bind(body_text)
-                    .bind(message_row_id)
-                    .execute(&mut *tx)
-                    .await?;
+                indexed_bodies.push((message_row_id, body_text));
             }
             tx.commit().await?;
             Ok(())
@@ -1280,6 +1285,14 @@ impl Db {
         }
         for reference in stale_refs {
             let _ = self.blobs.remove(&reference);
+        }
+        // Импорт не знает, какая реализация поиска выбрана приложением. Даже
+        // SQLite FTS обновляется через единый контракт SearchIndex, поэтому
+        // переход на другой индекс не потребует искать прямые SQL-записи.
+        use crate::search::{Fts5Index, SearchIndex};
+        let index = Fts5Index::new(self.clone());
+        for (message_id, body_text) in indexed_bodies {
+            index.index_body(message_id, &body_text).await?;
         }
         self.sync_contacts_from_messages(account_id).await?;
         Ok(())
@@ -1676,6 +1689,34 @@ impl Db {
                 .bind(message_id)
                 .fetch_one(&self.pool)
                 .await?;
+        if let Some(reference) = raw_ref.as_deref() {
+            let cached: Option<MessageContentCacheRow> = sqlx::query_as(
+                "SELECT body_html, body_text, attachments_json, has_remote_content,
+                        is_newsletter, unsubscribe_json
+                   FROM message_content_cache
+                  WHERE message_id = ? AND raw_blob_ref = ?",
+            )
+            .bind(message_id)
+            .bind(reference)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some((body_html, body_text, attachments, remote, newsletter, unsubscribe)) =
+                cached
+            {
+                return Ok(MessageFull {
+                    meta,
+                    body_html,
+                    body_text,
+                    attachments: serde_json::from_str(&attachments)?,
+                    has_remote_content: remote != 0,
+                    is_newsletter: newsletter != 0,
+                    unsubscribe: unsubscribe
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?,
+                });
+            }
+        }
         let raw = raw_ref
             .as_deref()
             .map(|reference| self.blobs.get(reference))
@@ -1767,11 +1808,41 @@ impl Db {
                 http,
             })
         });
+        let has_remote_content = body_html
+            .as_deref()
+            .is_some_and(|html| html.contains("http://") || html.contains("https://"));
+        if let Some(reference) = raw_ref.as_deref() {
+            sqlx::query(
+                "INSERT INTO message_content_cache(
+                    message_id, raw_blob_ref, body_html, body_text, attachments_json,
+                    has_remote_content, is_newsletter, unsubscribe_json, parsed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    raw_blob_ref=excluded.raw_blob_ref, body_html=excluded.body_html,
+                    body_text=excluded.body_text, attachments_json=excluded.attachments_json,
+                    has_remote_content=excluded.has_remote_content,
+                    is_newsletter=excluded.is_newsletter,
+                    unsubscribe_json=excluded.unsubscribe_json, parsed_at=datetime('now')",
+            )
+            .bind(message_id)
+            .bind(reference)
+            .bind(&body_html)
+            .bind(&body_text)
+            .bind(serde_json::to_string(&attachments)?)
+            .bind(has_remote_content as i64)
+            .bind(is_newsletter as i64)
+            .bind(
+                unsubscribe
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .execute(&self.write_pool)
+            .await?;
+        }
         Ok(MessageFull {
             meta,
-            has_remote_content: body_html
-                .as_deref()
-                .is_some_and(|html| html.contains("http://") || html.contains("https://")),
+            has_remote_content,
             body_html,
             body_text,
             attachments,
