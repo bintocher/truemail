@@ -215,8 +215,9 @@
         // появления данных, не перезагружая весь WebView.
         [3000, 10000, 30000].forEach(delay => setTimeout(() => window.reloadCoreData().catch(console.error), delay));
         // DAV не имеет push-канала: обновляем календарь и контакты отдельно,
-        // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE,
-        // Gmail подтягивается этим 5-минутным sync (IMAP 993 у Gmail часто закрыт).
+        // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE.
+        // Gmail проверяет новые ID каждые 25 секунд, а этот проход подхватывает
+        // изменения ярлыков/удаления, которые не создали новое входящее письмо.
         setInterval(() => {
           window.tm.syncAccounts().catch(console.error);
           window.tm.syncAuxiliaryAccounts().catch(console.error);

@@ -20,7 +20,8 @@ Mail:
 - Connects Yandex, Gmail and Outlook/Microsoft 365 over OAuth, without entering
   your mailbox password.
 - Connects standard JMAP mail servers through RFC autodiscovery or a Session URL.
-- Receives mail over IMAP; new messages arrive immediately, without waiting for a poll.
+- Receives IMAP mail through a persistent server connection; Gmail uses a light
+  25-second API check and incremental `historyId` synchronization.
 - Sends over SMTP, with drafts, attachments and scheduled sending.
 - Sending queue: with no network, a message goes out on the next connection.
 - Groups a thread into a conversation.

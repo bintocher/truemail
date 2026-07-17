@@ -467,7 +467,8 @@ async fn notify_new_mail(
 }
 
 /// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
-/// уведомление и дозагрузка при появлении новых (IMAP IDLE к Gmail недоступен).
+/// уведомление и дозагрузка при появлении новых. Gmail API push требует
+/// внешней Cloud Pub/Sub-инфраструктуры, которой у desktop-only клиента нет.
 async fn gmail_realtime_loop(
     core: Arc<Core>,
     app: AppHandle,
@@ -1979,8 +1980,8 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         tokio::spawn(async move {
             let _ = prune_core.accounts.prune_all_caches_on_start().await;
         });
-        // Почти реалтайм-уведомления о новых письмах Gmail (IMAP IDLE к Gmail
-        // недоступен, поэтому лёгкий поллинг ID Входящих каждые ~25 секунд).
+        // Почти реалтайм-уведомления о новых письмах Gmail без внешнего
+        // Cloud Pub/Sub-сервера: лёгкий polling ID Входящих каждые ~25 секунд.
         let gmail_core = core.clone();
         let gmail_app = app.clone();
         let gmail_syncing = state.syncing.clone();
