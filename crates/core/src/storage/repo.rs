@@ -14,6 +14,7 @@ type MessageLocatorRow = (i64, String, i64, Option<String>, Option<String>);
 
 /// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
 type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
+type FolderCursorRow = (String, Option<i64>, Option<i64>, Option<String>);
 
 #[derive(Debug, Clone)]
 pub struct OutboxOperation {
@@ -466,7 +467,7 @@ impl Db {
         &self,
         account_id: i64,
     ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
-        let rows: Vec<(String, Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+        let rows: Vec<FolderCursorRow> = sqlx::query_as(
             "SELECT f.remote_path, f.uidvalidity, max(m.uid), f.sync_token
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
              WHERE f.account_id=? GROUP BY f.id, f.remote_path, f.uidvalidity, f.sync_token",
@@ -2578,37 +2579,255 @@ impl Db {
 
     pub async fn list_smart_folders(&self) -> Result<Vec<SmartFolder>> {
         let rows = sqlx::query_as::<_, SmartRow>(
-            "SELECT id, name, icon, match_logic, is_builtin, enabled
-             FROM smart_folders WHERE enabled = 1 ORDER BY sort_order, id",
+            "SELECT id, stable_id, name, icon, is_builtin, enabled, sort_order
+             FROM smart_folders ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::new();
         for r in rows {
-            let conditions = sqlx::query_as::<_, CondRow>(
-                "SELECT field, op, value FROM smart_conditions WHERE smart_folder_id = ?",
+            let condition_rows = sqlx::query_as::<_, CondRow>(
+                "SELECT field, op, value, group_index, group_logic, unit, value2
+                 FROM smart_conditions WHERE smart_folder_id = ? ORDER BY group_index, id",
             )
             .bind(r.id)
             .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|c| SmartCondition {
-                field: c.field,
-                op: c.op,
-                value: c.value,
-            })
-            .collect();
+            .await?;
+            let mut groups = Vec::<SmartConditionGroup>::new();
+            for condition in condition_rows {
+                let group_index = condition.group_index.max(0) as usize;
+                while groups.len() <= group_index {
+                    groups.push(SmartConditionGroup {
+                        logic: "all".into(),
+                        conditions: Vec::new(),
+                    });
+                }
+                groups[group_index].logic = condition.group_logic;
+                groups[group_index].conditions.push(SmartCondition {
+                    field: condition.field,
+                    op: condition.op,
+                    value: condition.value,
+                    unit: condition.unit,
+                    value2: condition.value2,
+                });
+            }
             out.push(SmartFolder {
-                id: r.id,
+                id: r.stable_id,
                 name: r.name,
                 icon: r.icon,
-                match_logic: r.match_logic,
                 is_builtin: r.is_builtin != 0,
                 enabled: r.enabled != 0,
-                conditions,
+                sort_order: r.sort_order,
+                groups,
             });
         }
         Ok(out)
+    }
+
+    pub async fn save_smart_folders(&self, folders: &[SmartFolder]) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let mut stable_ids = Vec::new();
+        for (index, folder) in folders.iter().enumerate() {
+            let stable_id = folder.id.trim();
+            if stable_id.is_empty()
+                || !stable_id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+            {
+                return Err(crate::Error::AccountConfig(
+                    "некорректный идентификатор умной папки".into(),
+                ));
+            }
+            if folder.name.trim().is_empty() {
+                return Err(crate::Error::AccountConfig(
+                    "название умной папки не указано".into(),
+                ));
+            }
+            stable_ids.push(stable_id.to_owned());
+            let existing: Option<(i64, i64)> =
+                sqlx::query_as("SELECT id, is_builtin FROM smart_folders WHERE stable_id=?")
+                    .bind(stable_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let database_id = if let Some((id, _)) = existing {
+                sqlx::query(
+                    "UPDATE smart_folders SET name=?, icon=?, enabled=?, sort_order=? WHERE id=?",
+                )
+                .bind(folder.name.trim())
+                .bind(&folder.icon)
+                .bind(folder.enabled)
+                .bind(index as i64)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                id
+            } else {
+                sqlx::query(
+                    "INSERT INTO smart_folders(stable_id, name, icon, is_builtin, enabled, sort_order)
+                     VALUES(?, ?, ?, 0, ?, ?)",
+                )
+                .bind(stable_id)
+                .bind(folder.name.trim())
+                .bind(&folder.icon)
+                .bind(folder.enabled)
+                .bind(index as i64)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid()
+            };
+            sqlx::query("DELETE FROM smart_conditions WHERE smart_folder_id=?")
+                .bind(database_id)
+                .execute(&mut *tx)
+                .await?;
+            for (group_index, group) in folder.groups.iter().enumerate() {
+                let logic = if group.logic == "any" { "any" } else { "all" };
+                for condition in &group.conditions {
+                    sqlx::query(
+                        "INSERT INTO smart_conditions(smart_folder_id, field, op, value, group_index, group_logic, unit, value2)
+                         VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(database_id)
+                    .bind(&condition.field)
+                    .bind(&condition.op)
+                    .bind(&condition.value)
+                    .bind(group_index as i64)
+                    .bind(logic)
+                    .bind(&condition.unit)
+                    .bind(&condition.value2)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+        let custom_rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, stable_id FROM smart_folders WHERE is_builtin=0")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, stable_id) in custom_rows {
+            if !stable_ids.iter().any(|value| value == &stable_id) {
+                sqlx::query("DELETE FROM smart_folders WHERE id=?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_unified_sources(&self) -> Result<Vec<UnifiedSource>> {
+        let (unified_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM unified_folders WHERE role='all'")
+                .fetch_one(&self.pool)
+                .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO unified_sources(unified_id, folder_id, included)
+             SELECT ?, id, 1 FROM folders",
+        )
+        .bind(unified_id)
+        .execute(&self.write_pool)
+        .await?;
+        let rows: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT folder_id, included FROM unified_sources WHERE unified_id=? ORDER BY folder_id",
+        )
+        .bind(unified_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(folder_id, included)| UnifiedSource {
+                folder_id,
+                included,
+            })
+            .collect())
+    }
+
+    pub async fn set_unified_source(&self, folder_id: i64, included: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO unified_sources(unified_id, folder_id, included)
+             SELECT id, ?, ? FROM unified_folders WHERE role='all'
+             ON CONFLICT(unified_id, folder_id) DO UPDATE SET included=excluded.included",
+        )
+        .bind(folder_id)
+        .bind(included)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_smart_folder_messages(
+        &self,
+        stable_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageMeta>> {
+        let folder = self
+            .list_smart_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == stable_id)
+            .ok_or_else(|| crate::Error::Other("умная папка не найдена".into()))?;
+        let included = self
+            .list_unified_sources()
+            .await?
+            .into_iter()
+            .filter(|source| source.included)
+            .map(|source| source.folder_id)
+            .collect::<std::collections::HashSet<_>>();
+        let rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                    from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                    seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+             FROM messages
+             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                   AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+               )
+             ORDER BY COALESCE(date, '') DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let accounts = self
+            .list_accounts()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.email))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut folders = std::collections::HashMap::new();
+        for account_id in accounts.keys() {
+            for folder in self.list_folders(*account_id).await? {
+                folders.insert(folder.id, folder);
+            }
+        }
+        let label_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
+        for (message_id, name) in label_rows {
+            labels.entry(message_id).or_default().push(name);
+        }
+        let mut result = Vec::new();
+        for row in rows {
+            let mut message = MessageMeta::from(row);
+            if !included.contains(&message.folder_id) {
+                continue;
+            }
+            message.labels = labels.remove(&message.id).unwrap_or_default();
+            if smart_folder_matches(
+                &folder,
+                &message,
+                accounts.get(&message.account_id).map(String::as_str),
+                folders.get(&message.folder_id),
+            ) {
+                result.push(message);
+                if result.len() >= limit.clamp(1, 20_000) {
+                    break;
+                }
+            }
+        }
+        Ok(result)
     }
 
     // ---------- Контакты ----------
@@ -2640,6 +2859,169 @@ impl Db {
             }
         }
         Ok(contacts)
+    }
+}
+
+fn smart_folder_matches(
+    folder: &SmartFolder,
+    message: &MessageMeta,
+    account_email: Option<&str>,
+    source_folder: Option<&Folder>,
+) -> bool {
+    folder.groups.iter().any(|group| {
+        let matches = |condition: &SmartCondition| {
+            smart_condition_matches(condition, message, account_email, source_folder)
+        };
+        !group.conditions.is_empty()
+            && if group.logic == "any" {
+                group.conditions.iter().any(matches)
+            } else {
+                group.conditions.iter().all(matches)
+            }
+    })
+}
+
+fn smart_condition_matches(
+    condition: &SmartCondition,
+    message: &MessageMeta,
+    account_email: Option<&str>,
+    source_folder: Option<&Folder>,
+) -> bool {
+    if condition.field == "date" {
+        let Some(raw) = message.date.as_deref() else {
+            return false;
+        };
+        let timestamp = chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                    .map(|value| value.and_utc())
+            });
+        let Ok(timestamp) = timestamp else {
+            return false;
+        };
+        if matches!(condition.op.as_str(), "within_last" | "older_than") {
+            let Ok(amount) = condition.value.parse::<i64>() else {
+                return false;
+            };
+            let seconds = match condition.unit.as_deref().unwrap_or("hours") {
+                "minutes" => 60,
+                "days" => 86_400,
+                "weeks" => 604_800,
+                _ => 3_600,
+            };
+            let threshold = chrono::Utc::now() - chrono::Duration::seconds(amount * seconds);
+            return if condition.op == "within_last" {
+                timestamp >= threshold
+            } else {
+                timestamp < threshold
+            };
+        }
+        let Ok(target) = chrono::NaiveDate::parse_from_str(&condition.value, "%Y-%m-%d") else {
+            return false;
+        };
+        let actual = timestamp.date_naive();
+        return match condition.op.as_str() {
+            "before" => actual < target,
+            "after" => actual > target,
+            _ => actual == target,
+        };
+    }
+
+    if condition.field == "size" {
+        let Some(bytes) = message.size else {
+            return false;
+        };
+        let factor = match condition.unit.as_deref().unwrap_or("mb") {
+            "kb" => 1_024_f64,
+            "gb" => 1_073_741_824_f64,
+            _ => 1_048_576_f64,
+        };
+        let Ok(value) = condition.value.parse::<f64>() else {
+            return false;
+        };
+        let minimum = value * factor;
+        let bytes = bytes as f64;
+        return match condition.op.as_str() {
+            "greater_than" => bytes > minimum,
+            "greater_or_equal" => bytes >= minimum,
+            "less_than" => bytes < minimum,
+            "less_or_equal" => bytes <= minimum,
+            "between" => condition
+                .value2
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|maximum| bytes >= minimum && bytes <= maximum * factor),
+            _ => (bytes - minimum).abs() < f64::EPSILON,
+        };
+    }
+
+    let value = match condition.field.as_str() {
+        "sender" => format!(
+            "{} {}",
+            message.from.name.as_deref().unwrap_or(""),
+            message.from.email
+        ),
+        "recipient" => message
+            .to
+            .iter()
+            .chain(message.cc.iter())
+            .map(|address| {
+                format!(
+                    "{} {}",
+                    address.name.as_deref().unwrap_or(""),
+                    address.email
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        "subject" => message.subject.clone(),
+        "body" => message.preview.clone(),
+        "account" => account_email.unwrap_or_default().to_owned(),
+        "folder" => source_folder
+            .map(|folder| format!("{} {}", folder.display_name, folder.remote_path))
+            .unwrap_or_default(),
+        "folder_role" => source_folder
+            .and_then(|folder| folder.role)
+            .map(|role| role.as_str().to_owned())
+            .unwrap_or_else(|| "other".into()),
+        "read_state" => if message.flags.seen { "read" } else { "unread" }.into(),
+        "importance" => if message.flags.flagged {
+            "flagged"
+        } else {
+            "normal"
+        }
+        .into(),
+        "reply_state" => if message.flags.answered {
+            "answered"
+        } else {
+            "unanswered"
+        }
+        .into(),
+        "draft_state" => if message.flags.draft {
+            "draft"
+        } else {
+            "not_draft"
+        }
+        .into(),
+        "attachment" => if message.has_attachments {
+            "has"
+        } else {
+            "none"
+        }
+        .into(),
+        "label" => message.labels.join(" "),
+        _ => String::new(),
+    };
+    let left = value.to_lowercase();
+    let right = condition.value.to_lowercase();
+    match condition.op.as_str() {
+        "not_contains" => !left.contains(&right),
+        "equals" => left == right,
+        "not_equals" => left != right,
+        "starts_with" => left.starts_with(&right),
+        "ends_with" => left.ends_with(&right),
+        _ => left.contains(&right),
     }
 }
 
@@ -2904,17 +3286,22 @@ struct RuleMessageRow {
 #[derive(sqlx::FromRow)]
 struct SmartRow {
     id: i64,
+    stable_id: String,
     name: String,
     icon: Option<String>,
-    match_logic: String,
     is_builtin: i64,
     enabled: i64,
+    sort_order: i64,
 }
 #[derive(sqlx::FromRow)]
 struct CondRow {
     field: String,
     op: String,
     value: String,
+    group_index: i64,
+    group_logic: String,
+    unit: Option<String>,
+    value2: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

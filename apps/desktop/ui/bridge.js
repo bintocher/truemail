@@ -45,6 +45,10 @@
     saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
     listSmartFolders: () => invoke("list_smart_folders"),
+    saveSmartFolders: (folders) => invoke("save_smart_folders", { folders }),
+    listSmartFolderMessages: (smartFolderId, limit = 5000) => invoke("list_smart_folder_messages", { smartFolderId, limit }),
+    listUnifiedSources: () => invoke("list_unified_sources"),
+    setUnifiedSource: (folderId, included) => invoke("set_unified_source", { folderId, included }),
     listMailRules: () => invoke("list_mail_rules"),
     saveMailRule: (rule, applyExisting) => invoke("save_mail_rule", { rule, applyExisting }),
     setMailRuleEnabled: (id, enabled) => invoke("set_mail_rule_enabled", { id, enabled }),
@@ -121,8 +125,8 @@
   async function loadCoreData(accounts) {
     const folders = await Promise.all(accounts.map(account => window.tm.listFolders(account.id)));
     const allFolders = folders.flat();
-    const unifiedValues = await Promise.all(allFolders.map(folder => window.tm.getSetting(`unified_${folder.id}`)));
-    window.coreUnifiedSettings = Object.fromEntries(allFolders.map((folder,index)=>[folder.id,unifiedValues[index]]));
+    const unifiedSources = await window.tm.listUnifiedSources();
+    window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, 100)));
     const [contacts, calendarData, smartFolders, storage] = await Promise.all([
       window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),

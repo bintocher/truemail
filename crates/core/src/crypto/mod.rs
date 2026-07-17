@@ -398,14 +398,13 @@ pub fn export_key_backup(password: &str) -> Result<String> {
     };
     keys.database = load_key(DATABASE_KEYCHAIN_KEY)?
         .ok_or_else(|| Error::Crypto("ключ SQLCipher ещё не создан".into()))?;
-    let result = seal_backup(
+    seal_backup(
         &keys.storage,
         &keys.database,
         password,
         BACKUP_MEMORY_KIB,
         BACKUP_ITERATIONS,
-    );
-    result
+    )
 }
 
 /// Restore keys into an empty system credential store. Existing installation

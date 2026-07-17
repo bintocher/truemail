@@ -27,11 +27,95 @@ use crate::backend::{EwsBackend, GenericImapBackend, GmailBackend, MailBackend, 
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SyncKind {
+    Mail,
+    Auxiliary,
+}
+
+#[cfg(test)]
+mod sync_registry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serializes_same_account_and_scope_inside_core() {
+        let registry = std::sync::Arc::new(SyncRegistry::default());
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let first_registry = registry.clone();
+        let first_started = started.clone();
+        let first_release = release.clone();
+        let first = tokio::spawn(async move {
+            first_registry
+                .exclusive(7, SyncKind::Mail, async move {
+                    first_started.notify_one();
+                    first_release.notified().await;
+                    Ok::<_, crate::Error>(())
+                })
+                .await
+        });
+        started.notified().await;
+
+        assert!(
+            registry
+                .exclusive(7, SyncKind::Mail, async { Ok::<_, crate::Error>(()) })
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .exclusive(7, SyncKind::Auxiliary, async { Ok::<_, crate::Error>(()) })
+                .await
+                .is_ok()
+        );
+
+        release.notify_one();
+        first.await.expect("join first sync").expect("first sync");
+        assert!(
+            registry
+                .exclusive(7, SyncKind::Mail, async { Ok::<_, crate::Error>(()) })
+                .await
+                .is_ok()
+        );
+    }
+}
+
+#[derive(Default)]
+struct SyncRegistry {
+    locks: tokio::sync::Mutex<
+        std::collections::HashMap<(i64, SyncKind), std::sync::Arc<tokio::sync::Semaphore>>,
+    >,
+}
+
+impl SyncRegistry {
+    async fn exclusive<T>(
+        &self,
+        account_id: i64,
+        kind: SyncKind,
+        operation: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let semaphore = self
+            .locks
+            .lock()
+            .await
+            .entry((account_id, kind))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone();
+        let _permit = semaphore.try_acquire_owned().map_err(|_| {
+            crate::Error::Other(format!(
+                "синхронизация аккаунта {account_id} уже выполняется"
+            ))
+        })?;
+        operation.await
+    }
+}
+
 pub struct AccountManager {
     db: Db,
     // Сериализует обновление OAuth-токена: параллельные mail/aux-sync иначе
     // одновременно видят "истёк" и рефрешат по нескольку раз за минуту.
     refresh_lock: tokio::sync::Mutex<()>,
+    sync_registry: SyncRegistry,
 }
 
 #[derive(Debug)]
@@ -49,6 +133,7 @@ impl AccountManager {
         Self {
             db,
             refresh_lock: tokio::sync::Mutex::new(()),
+            sync_registry: SyncRegistry::default(),
         }
     }
 
@@ -345,6 +430,19 @@ impl AccountManager {
         &self,
         account: &Account,
     ) -> Result<(usize, usize, usize)> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Auxiliary,
+                self.sync_yandex_dav_account_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_yandex_dav_account_inner(
+        &self,
+        account: &Account,
+    ) -> Result<(usize, usize, usize)> {
         let access_token = self.oauth_access_token(account).await?;
         let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
         let dav = sync_yandex_dav(&account.email, &access_token, &cursors).await?;
@@ -353,6 +451,19 @@ impl AccountManager {
 
     /// Обновить Google Calendar, Contacts и Tasks отдельно от IMAP.
     pub async fn sync_google_auxiliary_account(
+        &self,
+        account: &Account,
+    ) -> Result<(usize, usize, usize)> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Auxiliary,
+                self.sync_google_auxiliary_account_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_google_auxiliary_account_inner(
         &self,
         account: &Account,
     ) -> Result<(usize, usize, usize)> {
@@ -689,6 +800,16 @@ impl AccountManager {
 
     /// Полная синхронизация уже сохранённого аккаунта; предназначена для фоновой задачи.
     pub async fn sync_mail_account(&self, account: &Account) -> Result<ConnectedAccountSync> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Mail,
+                self.sync_mail_account_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_mail_account_inner(&self, account: &Account) -> Result<ConnectedAccountSync> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;

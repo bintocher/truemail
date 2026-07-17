@@ -20,17 +20,12 @@ pub struct CollectionCursor {
     pub sync_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SyncScope {
+    #[default]
     Full,
     Delta,
     Unchanged,
-}
-
-impl Default for SyncScope {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 #[derive(Debug, Default)]
@@ -354,11 +349,11 @@ fn parse_duration_minutes(value: &str) -> Option<i32> {
     let value = value.trim();
     let before_start = value.starts_with('-');
     let value = value.trim_start_matches(['-', '+']);
-    let mut chars = value.strip_prefix('P')?.chars().peekable();
+    let chars = value.strip_prefix('P')?.chars();
     let mut in_time = false;
     let mut number = String::new();
     let mut total_seconds: i64 = 0;
-    while let Some(ch) = chars.next() {
+    for ch in chars {
         if ch == 'T' {
             in_time = true;
             continue;

@@ -789,6 +789,59 @@ mod tests {
             "invite.ics"
         );
 
+        let custom_smart = crate::model::SmartFolder {
+            id: "test-subject".into(),
+            name: "Test subject".into(),
+            icon: Some("search".into()),
+            is_builtin: false,
+            enabled: true,
+            sort_order: 99,
+            groups: vec![crate::model::SmartConditionGroup {
+                logic: "all".into(),
+                conditions: vec![crate::model::SmartCondition {
+                    field: "subject".into(),
+                    op: "contains".into(),
+                    value: "secret".into(),
+                    unit: None,
+                    value2: None,
+                }],
+            }],
+        };
+        db.save_smart_folders(std::slice::from_ref(&custom_smart))
+            .await
+            .expect("save smart folder in core");
+        assert!(
+            db.list_smart_folders()
+                .await
+                .expect("list smart folders")
+                .iter()
+                .any(|folder| folder.id == custom_smart.id)
+        );
+        let smart_messages = db
+            .list_smart_folder_messages(&custom_smart.id, 100)
+            .await
+            .expect("execute smart folder in core");
+        assert!(
+            smart_messages
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+        db.set_unified_source(folder_id, false)
+            .await
+            .expect("exclude unified source");
+        assert!(
+            db.list_smart_folder_messages(&custom_smart.id, 100)
+                .await
+                .expect("execute excluded smart source")
+                .is_empty()
+        );
+        db.set_unified_source(folder_id, true)
+            .await
+            .expect("restore unified source");
+        db.save_smart_folders(&[])
+            .await
+            .expect("delete omitted custom smart folder");
+
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)
             .execute(&db.write_pool)

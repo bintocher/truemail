@@ -1049,6 +1049,47 @@ pub async fn list_smart_folders(state: State<'_, AppState>) -> CmdResult<Vec<Sma
 }
 
 #[tauri::command]
+pub async fn save_smart_folders(
+    state: State<'_, AppState>,
+    folders: Vec<SmartFolder>,
+) -> CmdResult<()> {
+    Ok(core(&state).await?.db.save_smart_folders(&folders).await?)
+}
+
+#[tauri::command]
+pub async fn list_smart_folder_messages(
+    state: State<'_, AppState>,
+    smart_folder_id: String,
+    limit: usize,
+) -> CmdResult<Vec<MessageMeta>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_smart_folder_messages(&smart_folder_id, limit)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_unified_sources(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::model::UnifiedSource>> {
+    Ok(core(&state).await?.db.list_unified_sources().await?)
+}
+
+#[tauri::command]
+pub async fn set_unified_source(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    included: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_unified_source(folder_id, included)
+        .await?)
+}
+
+#[tauri::command]
 pub async fn list_mail_rules(state: State<'_, AppState>) -> CmdResult<Vec<MailRule>> {
     Ok(core(&state).await?.db.list_mail_rules().await?)
 }
