@@ -1,5 +1,6 @@
 //! Отправка почты через SMTP XOAUTH2.
 
+use crate::model::Security;
 use crate::{Error, Result};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
@@ -131,6 +132,44 @@ pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<
             message: format!("HTTP {status}: {body}"),
         });
     }
+    Ok(())
+}
+
+pub async fn send_password(
+    message: OutgoingMessage,
+    username: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    security: Security,
+) -> Result<()> {
+    if security == Security::None {
+        return Err(Error::AccountConfig(
+            "незашифрованный SMTP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
+        ));
+    }
+    let email = build_message(message)?;
+    let builder = if security == Security::Starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    }
+    .map_err(|error| Error::Backend {
+        backend: "smtp".into(),
+        message: error.to_string(),
+    })?;
+    let transport = builder
+        .port(port)
+        .credentials(Credentials::new(username.to_owned(), password.to_owned()))
+        .timeout(Some(std::time::Duration::from_secs(30)))
+        .build();
+    transport
+        .send(email)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "smtp".into(),
+            message: error.to_string(),
+        })?;
     Ok(())
 }
 

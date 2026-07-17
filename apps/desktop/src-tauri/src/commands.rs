@@ -17,7 +17,8 @@ use truemail_core::account::{
 };
 use truemail_core::api::{McpTool, mcp_tools};
 use truemail_core::model::{
-    Account, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull, MessageMeta, SmartFolder,
+    Account, AuthKind, BackendKind, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull,
+    MessageMeta, Provider, Security, ServerConfig, SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
 use zeroize::Zeroize;
@@ -96,6 +97,15 @@ pub struct PendingOAuthResponse {
     mode: String,
     state: Option<String>,
     connected: Option<ConnectedAccount>,
+    password_config: Option<PasswordConnectionInfo>,
+}
+
+#[derive(Serialize)]
+pub struct PasswordConnectionInfo {
+    provider: Provider,
+    username: String,
+    imap: ServerConfig,
+    smtp: Option<ServerConfig>,
 }
 
 #[derive(Serialize)]
@@ -2336,6 +2346,7 @@ pub async fn begin_account_connection(
                 mode: "verification_code".into(),
                 state: Some(oauth_state),
                 connected: None,
+                password_config: None,
             })
         }
         truemail_core::model::Provider::Gmail => {
@@ -2381,12 +2392,114 @@ pub async fn begin_account_connection(
                 mode: "connected".into(),
                 state: None,
                 connected: Some(response),
+                password_config: None,
+            })
+        }
+        Provider::Mailru | Provider::Icloud | Provider::Generic => {
+            let domain = email.rsplit('@').next().unwrap_or_default();
+            Ok(PendingOAuthResponse {
+                mode: "password".into(),
+                state: None,
+                connected: None,
+                password_config: Some(PasswordConnectionInfo {
+                    provider: config.provider,
+                    username: email.clone(),
+                    imap: config.imap.unwrap_or(ServerConfig {
+                        host: format!("imap.{domain}"),
+                        port: 993,
+                        security: Security::Ssl,
+                    }),
+                    smtp: config.smtp.or_else(|| {
+                        (!domain.is_empty()).then(|| ServerConfig {
+                            host: format!("smtp.{domain}"),
+                            port: 465,
+                            security: Security::Ssl,
+                        })
+                    }),
+                }),
             })
         }
         _ => Err(ApiError {
             message: unsupported_provider_message(&config),
         }),
     }
+}
+
+fn parse_security(value: &str) -> CmdResult<Security> {
+    match value {
+        "ssl" => Ok(Security::Ssl),
+        "starttls" => Ok(Security::Starttls),
+        _ => Err(ApiError {
+            message: "выберите SSL/TLS или STARTTLS".into(),
+        }),
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_password_imap(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    provider: Provider,
+    imap_host: String,
+    imap_port: u16,
+    imap_security: String,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_security: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() || imap_host.trim().is_empty() {
+        return Err(ApiError {
+            message: "укажите имя пользователя и IMAP-сервер".into(),
+        });
+    }
+    if !matches!(
+        provider,
+        Provider::Mailru | Provider::Icloud | Provider::Generic
+    ) {
+        return Err(ApiError {
+            message: "этот способ входа не подходит выбранному провайдеру".into(),
+        });
+    }
+    let config = truemail_core::account::ProviderConfig {
+        provider,
+        backend_kind: BackendKind::Imap,
+        auth_kind: if provider == Provider::Generic {
+            AuthKind::Password
+        } else {
+            AuthKind::AppPassword
+        },
+        imap: Some(ServerConfig {
+            host: imap_host.trim().to_owned(),
+            port: imap_port,
+            security: parse_security(&imap_security)?,
+        }),
+        smtp: (!smtp_host.trim().is_empty())
+            .then(|| {
+                Ok::<_, ApiError>(ServerConfig {
+                    host: smtp_host.trim().to_owned(),
+                    port: smtp_port,
+                    security: parse_security(&smtp_security)?,
+                })
+            })
+            .transpose()?,
+        ews_url: None,
+    };
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_password_imap(&email, &display_name, username, &password, &config)
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
 }
 
 #[tauri::command]

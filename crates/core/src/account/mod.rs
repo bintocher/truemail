@@ -23,7 +23,7 @@ pub use oauth::{
 };
 
 use crate::Result;
-use crate::backend::{GmailBackend, MailBackend, YandexBackend};
+use crate::backend::{GenericImapBackend, GmailBackend, MailBackend, YandexBackend};
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
 
@@ -66,8 +66,8 @@ impl AccountManager {
             .into_iter()
             .find(|account| account.id == folder.account_id)
             .ok_or_else(|| crate::Error::AccountConfig("аккаунт папки не найден".into()))?;
-        let token = self.oauth_access_token(&account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let token = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
         let remote = backend
             .rename_folder(&account.email, &token, &folder.remote_path, new_name)
             .await?;
@@ -90,8 +90,8 @@ impl AccountManager {
             .into_iter()
             .find(|account| account.id == folder.account_id)
             .ok_or_else(|| crate::Error::AccountConfig("аккаунт папки не найден".into()))?;
-        let token = self.oauth_access_token(&account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let token = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
         backend
             .delete_folder(&account.email, &token, &folder.remote_path)
             .await?;
@@ -102,14 +102,41 @@ impl AccountManager {
         self.db.list_accounts().await
     }
 
-    fn mail_backend(provider: Provider) -> Result<Box<dyn MailBackend>> {
-        match provider {
+    fn mail_backend(account: &Account) -> Result<Box<dyn MailBackend>> {
+        match account.provider {
             Provider::Yandex => Ok(Box::new(YandexBackend)),
             Provider::Gmail => Ok(Box::new(GmailBackend)),
+            Provider::Mailru | Provider::Icloud | Provider::Generic => {
+                let imap = account.imap.clone().ok_or_else(|| {
+                    crate::Error::AccountConfig("для аккаунта не настроен IMAP-сервер".into())
+                })?;
+                Ok(Box::new(GenericImapBackend {
+                    username: account
+                        .username
+                        .clone()
+                        .unwrap_or_else(|| account.email.clone()),
+                    imap,
+                    smtp: account.smtp.clone(),
+                }))
+            }
             _ => Err(crate::Error::AccountConfig(
-                "почтовый OAuth-транспорт для провайдера не настроен".into(),
+                "почтовый транспорт для провайдера не настроен".into(),
             )),
         }
+    }
+
+    async fn mail_credential(&self, account: &Account) -> Result<String> {
+        if account.auth_kind == AuthKind::Oauth2 {
+            return self.oauth_access_token(account).await;
+        }
+        let secret_ref = account
+            .secret_ref
+            .as_deref()
+            .ok_or_else(|| crate::Error::AccountConfig("нет ссылки на пароль аккаунта".into()))?;
+        keyring::Entry::new("truemail", secret_ref)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?
+            .get_password()
+            .map_err(|error| crate::Error::Keyring(error.to_string()))
     }
 
     /// Прочитать сохранённый OAuth access token из системного keychain.
@@ -207,8 +234,8 @@ impl AccountManager {
     }
 
     pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
-        let access_token = self.oauth_access_token(account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let access_token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
         let discovery = backend
             .discover_inbox(&account.email, &access_token, &cursors)
@@ -260,8 +287,8 @@ impl AccountManager {
         else {
             return Ok(());
         };
-        let access_token = self.oauth_access_token(&account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let access_token = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
         let raw = backend
             .fetch_message_raw(
                 &account.email,
@@ -328,8 +355,8 @@ impl AccountManager {
 
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
-        let token = self.oauth_access_token(account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
         let operations = self.db.claim_outbox_operations(account.id, 50).await?;
         let mut completed = 0;
         for operation in operations {
@@ -368,6 +395,72 @@ impl AccountManager {
             }
         }
         Ok(completed)
+    }
+
+    /// Подключить обычный IMAP/SMTP-аккаунт по паролю приложения. Пароль
+    /// проверяется на сервере и хранится только в системном keychain.
+    pub async fn add_password_imap(
+        &self,
+        email: &str,
+        display_name: &str,
+        username: &str,
+        password: &str,
+        config: &ProviderConfig,
+    ) -> Result<ConnectedAccountSync> {
+        if password.is_empty() {
+            return Err(crate::Error::AccountConfig("пароль не указан".into()));
+        }
+        let imap = config.imap.clone().ok_or_else(|| {
+            crate::Error::AccountConfig("сервер IMAP не найден; укажите его вручную".into())
+        })?;
+        let backend = GenericImapBackend {
+            username: username.to_owned(),
+            imap: imap.clone(),
+            smtp: config.smtp.clone(),
+        };
+        backend.validate(email, password).await?;
+
+        let secret_ref = format!("mail-password:{}", email.to_lowercase());
+        let entry = keyring::Entry::new("truemail", &secret_ref)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        let account = match self
+            .db
+            .save_account(&NewAccount {
+                email: email.to_owned(),
+                display_name: display_name.to_owned(),
+                provider: config.provider,
+                backend_kind: BackendKind::Imap,
+                auth_kind: config.auth_kind,
+                imap: Some(imap),
+                smtp: config.smtp.clone(),
+                ews_url: None,
+                username: Some(username.to_owned()),
+                secret_ref: secret_ref.clone(),
+                color: Some("#3F7C85".into()),
+            })
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = entry.delete_credential();
+                return Err(error);
+            }
+        };
+        Ok(ConnectedAccountSync {
+            account,
+            mail_folders: 0,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
+            warnings: if config.smtp.is_none() {
+                vec!["SMTP-сервер не найден: чтение работает, отправку нужно настроить".into()]
+            } else {
+                Vec::new()
+            },
+        })
     }
 
     /// Сохранить авторизованный аккаунт Яндекса. OAuth-токены никогда не попадают в SQLite.
@@ -528,8 +621,8 @@ impl AccountManager {
 
     /// Полная синхронизация уже сохранённого аккаунта; предназначена для фоновой задачи.
     pub async fn sync_mail_account(&self, account: &Account) -> Result<ConnectedAccountSync> {
-        let access_token = self.oauth_access_token(account).await?;
-        let backend = Self::mail_backend(account.provider)?;
+        let access_token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
         let mut warnings = Vec::new();
         // Имена и счётчики папок появляются в UI сразу, пока тела писем и DAV

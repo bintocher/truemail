@@ -328,6 +328,7 @@ fn run() -> anyhow::Result<()> {
             commands::set_setting,
             commands::all_settings,
             commands::begin_account_connection,
+            commands::complete_password_imap,
             commands::complete_yandex_oauth,
             commands::api_tools,
             commands::localization_catalog,

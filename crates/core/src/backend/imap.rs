@@ -1,6 +1,6 @@
 //! Синхронизация почты через IMAP с OAuth2.
 
-use crate::model::{FolderRole, infer_folder_role};
+use crate::model::{FolderRole, Security, infer_folder_role};
 use crate::{Error, Result};
 use async_imap::{Authenticator, types::Name, types::NameAttribute};
 use futures::TryStreamExt;
@@ -102,9 +102,51 @@ fn tls_client_config() -> Arc<ClientConfig> {
 }
 
 async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OAuthSession> {
+    let client = connect_tls_client(host, 993, Security::Ssl).await?;
+    let auth = OAuth2 {
+        email,
+        access_token,
+    };
+    let session = client
+        .authenticate("XOAUTH2", auth)
+        .await
+        .map_err(|(e, _)| Error::Backend {
+            backend: "imap-auth".into(),
+            message: e.to_string(),
+        })?;
+    Ok(session)
+}
+
+async fn connect_password(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+) -> Result<OAuthSession> {
+    let client = connect_tls_client(host, port, security).await?;
+    client
+        .login(username, password)
+        .await
+        .map_err(|(error, _)| Error::Backend {
+            backend: "imap-auth".into(),
+            message: error.to_string(),
+        })
+}
+
+async fn connect_tls_client(
+    host: &str,
+    port: u16,
+    security: Security,
+) -> Result<async_imap::Client<tokio_rustls::client::TlsStream<TcpStream>>> {
+    if security == Security::None {
+        return Err(Error::AccountConfig(
+            "незашифрованный IMAP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
+        ));
+    }
     let tcp = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        TcpStream::connect((host, 993)),
+        TcpStream::connect((host, port)),
     )
     .await
     .map_err(|_| Error::Backend {
@@ -126,6 +168,30 @@ async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OA
         backend: "imap".into(),
         message: e.to_string(),
     })?;
+    let tcp = if security == Security::Starttls {
+        let mut client = async_imap::Client::new(tcp);
+        client
+            .read_response()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap".into(),
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| Error::Backend {
+                backend: "imap".into(),
+                message: "сервер закрыл соединение".into(),
+            })?;
+        client
+            .run_command_and_check_ok("STARTTLS", None)
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-starttls".into(),
+                message: error.to_string(),
+            })?;
+        client.into_inner()
+    } else {
+        tcp
+    };
     let tls = TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
@@ -134,35 +200,48 @@ async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OA
             message: e.to_string(),
         })?;
     let mut client = async_imap::Client::new(tls);
-    client
-        .read_response()
-        .await
-        .map_err(|e| Error::Backend {
-            backend: "imap".into(),
-            message: e.to_string(),
-        })?
-        .ok_or_else(|| Error::Backend {
-            backend: "imap".into(),
-            message: "сервер закрыл соединение".into(),
-        })?;
-    let auth = OAuth2 {
-        email,
-        access_token,
-    };
-    let session = client
-        .authenticate("XOAUTH2", auth)
-        .await
-        .map_err(|(e, _)| Error::Backend {
-            backend: "imap-auth".into(),
-            message: e.to_string(),
-        })?;
-    Ok(session)
+    if security == Security::Ssl {
+        client
+            .read_response()
+            .await
+            .map_err(|e| Error::Backend {
+                backend: "imap".into(),
+                message: e.to_string(),
+            })?
+            .ok_or_else(|| Error::Backend {
+                backend: "imap".into(),
+                message: "сервер закрыл соединение".into(),
+            })?;
+    }
+    Ok(client)
 }
 
 pub(crate) async fn rename_oauth_folder(
     host: &str,
     email: &str,
     access_token: &str,
+    remote_path: &str,
+    new_name: &str,
+) -> Result<String> {
+    let session = connect_oauth(host, email, access_token).await?;
+    rename_folder(session, remote_path, new_name).await
+}
+
+pub(crate) async fn rename_password_folder(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    remote_path: &str,
+    new_name: &str,
+) -> Result<String> {
+    let session = connect_password(host, port, security, username, password).await?;
+    rename_folder(session, remote_path, new_name).await
+}
+
+async fn rename_folder(
+    mut session: OAuthSession,
     remote_path: &str,
     new_name: &str,
 ) -> Result<String> {
@@ -178,7 +257,6 @@ pub(crate) async fn rename_oauth_folder(
         &remote_path[..prefix_len],
         encode_modified_utf7(name)
     );
-    let mut session = connect_oauth(host, email, access_token).await?;
     session
         .rename(remote_path, &target)
         .await
@@ -196,7 +274,23 @@ pub(crate) async fn delete_oauth_folder(
     access_token: &str,
     remote_path: &str,
 ) -> Result<()> {
-    let mut session = connect_oauth(host, email, access_token).await?;
+    let session = connect_oauth(host, email, access_token).await?;
+    delete_folder(session, remote_path).await
+}
+
+pub(crate) async fn delete_password_folder(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    remote_path: &str,
+) -> Result<()> {
+    let session = connect_password(host, port, security, username, password).await?;
+    delete_folder(session, remote_path).await
+}
+
+async fn delete_folder(mut session: OAuthSession, remote_path: &str) -> Result<()> {
     tracing::info!(remote_path, "imap-delete: запрос удаления папки");
 
     // Шаг 1: узнаём разделитель иерархии для этой папки (у Яндекса это '|').
@@ -286,11 +380,29 @@ pub(crate) async fn delete_oauth_folder(
 /// Быстрая проверка токена без скачивания почты.
 pub async fn validate_oauth(host: &str, email: &str, access_token: &str) -> Result<()> {
     let mut session = connect_oauth(host, email, access_token).await?;
+    validate_session(&mut session).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+pub async fn validate_password(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let mut session = connect_password(host, port, security, username, password).await?;
+    validate_session(&mut session).await?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+async fn validate_session(session: &mut OAuthSession) -> Result<()> {
     session.noop().await.map_err(|e| Error::Backend {
         backend: "imap-auth".into(),
         message: e.to_string(),
     })?;
-    let _ = session.logout().await;
     Ok(())
 }
 
@@ -311,6 +423,24 @@ pub async fn apply_oauth_operation(
     op_kind: &str,
     payload: &str,
 ) -> Result<()> {
+    let session = connect_oauth(host, email, access_token).await?;
+    apply_operation(session, op_kind, payload).await
+}
+
+pub async fn apply_password_operation(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    op_kind: &str,
+    payload: &str,
+) -> Result<()> {
+    let session = connect_password(host, port, security, username, password).await?;
+    apply_operation(session, op_kind, payload).await
+}
+
+async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_str(payload)?;
     let folder = payload["folder_path"]
         .as_str()
@@ -318,7 +448,6 @@ pub async fn apply_oauth_operation(
     let uid = payload["uid"]
         .as_u64()
         .ok_or_else(|| Error::AccountConfig("outbox: нет uid".into()))?;
-    let mut session = connect_oauth(host, email, access_token).await?;
     session
         .select(folder)
         .await
@@ -512,6 +641,19 @@ pub async fn discover_oauth_folders(
     Ok(folders)
 }
 
+pub async fn discover_password_folders(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+) -> Result<Vec<DiscoveredFolder>> {
+    let mut session = connect_password(host, port, security, username, password).await?;
+    let folders = list_oauth_folders(&mut session).await?;
+    let _ = session.logout().await;
+    Ok(folders)
+}
+
 pub async fn discover_yandex_folders(
     email: &str,
     access_token: &str,
@@ -628,7 +770,26 @@ pub async fn discover_oauth_inbox(
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let mut session = connect_oauth(host, email, access_token).await?;
+    let session = connect_oauth(host, email, access_token).await?;
+    discover_inbox(session, cursors).await
+}
+
+pub async fn discover_password_inbox(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    let session = connect_password(host, port, security, username, password).await?;
+    discover_inbox(session, cursors).await
+}
+
+async fn discover_inbox(
+    mut session: OAuthSession,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
     let mut folders = list_oauth_folders(&mut session).await?;
     let inbox = folders
         .iter_mut()
@@ -669,7 +830,22 @@ pub async fn discover_gmail_inbox(
 
 /// Держать отдельное IDLE-соединение до первого изменения INBOX.
 pub async fn wait_for_oauth_change(host: &str, email: &str, access_token: &str) -> Result<()> {
-    let mut session = connect_oauth(host, email, access_token).await?;
+    let session = connect_oauth(host, email, access_token).await?;
+    wait_for_change(session).await
+}
+
+pub async fn wait_for_password_change(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    let session = connect_password(host, port, security, username, password).await?;
+    wait_for_change(session).await
+}
+
+async fn wait_for_change(mut session: OAuthSession) -> Result<()> {
     let capabilities = session
         .capabilities()
         .await
@@ -729,7 +905,26 @@ pub async fn discover_oauth(
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let mut session = connect_oauth(host, email, access_token).await?;
+    let session = connect_oauth(host, email, access_token).await?;
+    discover_session(session, cursors).await
+}
+
+pub async fn discover_password(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    let session = connect_password(host, port, security, username, password).await?;
+    discover_session(session, cursors).await
+}
+
+async fn discover_session(
+    mut session: OAuthSession,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
     let mut folders = list_oauth_folders(&mut session).await?;
     let mut messages = Vec::new();
     let mut server_uids = Vec::new();
@@ -785,7 +980,28 @@ pub async fn fetch_oauth_message_raw(
     folder_path: &str,
     uid: u32,
 ) -> Result<Vec<u8>> {
-    let mut session = connect_oauth(host, email, access_token).await?;
+    let session = connect_oauth(host, email, access_token).await?;
+    fetch_message_raw(session, folder_path, uid).await
+}
+
+pub async fn fetch_password_message_raw(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    folder_path: &str,
+    uid: u32,
+) -> Result<Vec<u8>> {
+    let session = connect_password(host, port, security, username, password).await?;
+    fetch_message_raw(session, folder_path, uid).await
+}
+
+async fn fetch_message_raw(
+    mut session: OAuthSession,
+    folder_path: &str,
+    uid: u32,
+) -> Result<Vec<u8>> {
     session
         .select(folder_path)
         .await

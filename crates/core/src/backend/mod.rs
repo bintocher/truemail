@@ -6,11 +6,13 @@ mod smtp;
 
 pub use imap::{
     DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery, apply_gmail_operation,
-    apply_yandex_operation, discover_gmail, discover_gmail_folders, discover_gmail_inbox,
+    apply_password_operation, apply_yandex_operation, discover_gmail, discover_gmail_folders,
+    discover_gmail_inbox, discover_password, discover_password_folders, discover_password_inbox,
     discover_yandex, discover_yandex_folders, discover_yandex_inbox, validate_gmail,
-    validate_yandex, wait_for_gmail_change, wait_for_yandex_change,
+    validate_password, validate_yandex, wait_for_gmail_change, wait_for_password_change,
+    wait_for_yandex_change,
 };
-pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_yandex};
+pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex};
 
 /// ID последних писем Gmail Входящих - для быстрых уведомлений о новой почте.
 pub async fn gmail_latest_ids(access_token: &str, limit: u32) -> Result<Vec<String>> {
@@ -41,6 +43,7 @@ pub async fn unsubscribe_one_click(url: &str) -> Result<u16> {
 }
 
 use crate::Result;
+use crate::model::ServerConfig;
 use async_trait::async_trait;
 use std::collections::HashMap;
 
@@ -100,6 +103,13 @@ pub struct YandexBackend;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GmailBackend;
+
+#[derive(Debug, Clone)]
+pub struct GenericImapBackend {
+    pub username: String,
+    pub imap: ServerConfig,
+    pub smtp: Option<ServerConfig>,
+}
 
 #[async_trait]
 impl MailBackend for YandexBackend {
@@ -274,5 +284,168 @@ impl MailBackend for GmailBackend {
             message: "нет remote_id для докачки письма".into(),
         })?;
         gmail_api::fetch_message_raw(credential, id).await
+    }
+}
+
+#[async_trait]
+impl MailBackend for GenericImapBackend {
+    fn provider_id(&self) -> &'static str {
+        "generic-imap"
+    }
+
+    async fn validate(&self, _email: &str, credential: &str) -> Result<()> {
+        validate_password(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+        )
+        .await
+    }
+
+    async fn discover(
+        &self,
+        _email: &str,
+        credential: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+    ) -> Result<ImapDiscovery> {
+        discover_password(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            cursors,
+        )
+        .await
+    }
+
+    async fn discover_folders(
+        &self,
+        _email: &str,
+        credential: &str,
+    ) -> Result<Vec<DiscoveredFolder>> {
+        discover_password_folders(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+        )
+        .await
+    }
+
+    async fn discover_inbox(
+        &self,
+        _email: &str,
+        credential: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+    ) -> Result<ImapDiscovery> {
+        discover_password_inbox(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            cursors,
+        )
+        .await
+    }
+
+    async fn apply_operation(
+        &self,
+        _email: &str,
+        credential: &str,
+        operation: &str,
+        payload: &str,
+    ) -> Result<()> {
+        apply_password_operation(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            operation,
+            payload,
+        )
+        .await
+    }
+
+    async fn rename_folder(
+        &self,
+        _email: &str,
+        credential: &str,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        imap::rename_password_folder(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            remote_path,
+            new_name,
+        )
+        .await
+    }
+
+    async fn delete_folder(&self, _email: &str, credential: &str, remote_path: &str) -> Result<()> {
+        imap::delete_password_folder(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            remote_path,
+        )
+        .await
+    }
+
+    async fn wait_for_change(&self, _email: &str, credential: &str) -> Result<()> {
+        wait_for_password_change(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+        )
+        .await
+    }
+
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
+        let smtp = self.smtp.as_ref().ok_or_else(|| {
+            crate::Error::AccountConfig("для аккаунта не настроен SMTP-сервер".into())
+        })?;
+        send_password(
+            message,
+            &self.username,
+            credential,
+            &smtp.host,
+            smtp.port,
+            smtp.security,
+        )
+        .await
+    }
+
+    async fn fetch_message_raw(
+        &self,
+        _email: &str,
+        credential: &str,
+        folder_path: &str,
+        uid: u32,
+        _remote_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        imap::fetch_password_message_raw(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            folder_path,
+            uid,
+        )
+        .await
     }
 }
