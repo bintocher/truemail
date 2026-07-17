@@ -2503,6 +2503,40 @@ pub async fn complete_password_imap(
 }
 
 #[tauri::command]
+pub async fn complete_exchange_ews(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    server_hint: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() {
+        return Err(ApiError {
+            message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_exchange_ews(
+            &email,
+            &display_name,
+            username,
+            &password,
+            (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
+        )
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
+}
+
+#[tauri::command]
 pub async fn complete_yandex_oauth(
     app: AppHandle,
     state: State<'_, AppState>,

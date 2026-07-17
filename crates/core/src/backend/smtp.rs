@@ -25,7 +25,7 @@ pub struct OutgoingMessage {
     pub attachments: Vec<OutgoingAttachment>,
 }
 
-fn build_message(message: OutgoingMessage) -> Result<Message> {
+pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }

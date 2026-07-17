@@ -46,3 +46,6 @@ rand.workspace = true
 argon2.workspace = true
 fluent.workspace = true
 unic-langid.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winhttp = { version = "0.1.3", features = ["async"] }

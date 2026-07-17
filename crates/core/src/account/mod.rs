@@ -23,7 +23,7 @@ pub use oauth::{
 };
 
 use crate::Result;
-use crate::backend::{GenericImapBackend, GmailBackend, MailBackend, YandexBackend};
+use crate::backend::{EwsBackend, GenericImapBackend, GmailBackend, MailBackend, YandexBackend};
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
 
@@ -119,6 +119,15 @@ impl AccountManager {
                     smtp: account.smtp.clone(),
                 }))
             }
+            Provider::Exchange => Ok(Box::new(EwsBackend {
+                endpoint: account.ews_url.clone().ok_or_else(|| {
+                    crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
+                })?,
+                username: account
+                    .username
+                    .clone()
+                    .unwrap_or_else(|| account.email.clone()),
+            })),
             _ => Err(crate::Error::AccountConfig(
                 "почтовый транспорт для провайдера не настроен".into(),
             )),
@@ -460,6 +469,65 @@ impl AccountManager {
             } else {
                 Vec::new()
             },
+        })
+    }
+
+    /// Подключить on-premises Exchange через Autodiscover и EWS. WinHTTP
+    /// выполняет Negotiate с откатом на NTLM; пароль остаётся в keychain.
+    pub async fn add_exchange_ews(
+        &self,
+        email: &str,
+        display_name: &str,
+        username: &str,
+        password: &str,
+        server_hint: Option<&str>,
+    ) -> Result<ConnectedAccountSync> {
+        if password.is_empty() {
+            return Err(crate::Error::AccountConfig("пароль не указан".into()));
+        }
+        let endpoint =
+            crate::backend::discover_ews_url(email, username, password, server_hint).await?;
+        let backend = EwsBackend {
+            endpoint: endpoint.clone(),
+            username: username.to_owned(),
+        };
+        backend.validate(email, password).await?;
+        let secret_ref = format!("exchange-password:{}", email.to_lowercase());
+        let entry = keyring::Entry::new("truemail", &secret_ref)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        let account = match self
+            .db
+            .save_account(&NewAccount {
+                email: email.to_owned(),
+                display_name: display_name.to_owned(),
+                provider: Provider::Exchange,
+                backend_kind: BackendKind::Ews,
+                auth_kind: AuthKind::Ntlm,
+                imap: None,
+                smtp: None,
+                ews_url: Some(endpoint),
+                username: Some(username.to_owned()),
+                secret_ref: secret_ref.clone(),
+                color: Some("#0078D4".into()),
+            })
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = entry.delete_credential();
+                return Err(error);
+            }
+        };
+        Ok(ConnectedAccountSync {
+            account,
+            mail_folders: 0,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
+            warnings: Vec::new(),
         })
     }
 

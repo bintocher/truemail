@@ -1,9 +1,11 @@
 //! Работающий транспортный слой Яндекс Почты через IMAP OAuth2.
 
+mod ews;
 mod gmail_api;
 mod imap;
 mod smtp;
 
+pub use ews::{EwsBackend, discover_ews_url};
 pub use imap::{
     DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery, apply_gmail_operation,
     apply_password_operation, apply_yandex_operation, discover_gmail, discover_gmail_folders,

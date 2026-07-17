@@ -77,6 +77,7 @@
     openExternal: (url) => invoke("open_external_url", { url }),
     beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
     completePasswordImap: (config) => invoke("complete_password_imap", config),
+    completeExchangeEws: (config) => invoke("complete_exchange_ews", config),
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
     apiTools: () => invoke("api_tools"),

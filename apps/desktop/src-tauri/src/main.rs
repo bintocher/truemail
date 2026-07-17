@@ -329,6 +329,7 @@ fn run() -> anyhow::Result<()> {
             commands::all_settings,
             commands::begin_account_connection,
             commands::complete_password_imap,
+            commands::complete_exchange_ews,
             commands::complete_yandex_oauth,
             commands::api_tools,
             commands::localization_catalog,
