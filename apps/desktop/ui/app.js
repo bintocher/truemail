@@ -102,10 +102,15 @@ let activeFullMessage=null;
 let mailRules=[];
 let editingRuleId=null;
 const MESSAGE_PAGE_SIZE=100;
+const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
 let loadingSmartCoverage=false;
 let queuedSmartCoverageIndex=null;
+let messageRowHeight=76;
+let messageWindowStart=-1;
+let messageWindowEnd=-1;
+let messageWindowFrame=0;
 const selectedMessageIds=new Set();
 let lastSelectedMessageIndex=-1;
 let selectionDragMode=null;
@@ -124,10 +129,10 @@ async function loadNextMessagePage(){
   loadingMoreMessages=true;
   try{
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}const page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length===MESSAGE_PAGE_SIZE);}
-    if(currentFolderId!==null)renderMessageList(messages.filter(message=>message.folder_id===currentFolderId).sort(byDateDesc),folderTitle(coreFolders.find(folder=>folder.id===currentFolderId)));else if(currentSmartIndex!==null)filterSmart(currentSmartIndex);
+    if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
   }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;}
 }
-msgsEl.addEventListener('scroll',()=>{if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240)loadNextMessagePage();},{passive:true});
+msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240)loadNextMessagePage();},{passive:true});
 
 /* thread action buttons -> compose */
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=()=>{
@@ -366,9 +371,10 @@ document.addEventListener('keydown',e=>{
   const target=e.target;if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){
     const actions={KeyC:()=>document.getElementById('composeBtn').click(),KeyR:()=>openComposerForMessage('reply'),KeyA:()=>openComposerForMessage('replyall'),KeyF:()=>openComposerForMessage('forward'),KeyE:()=>performMessageAction('archive'),KeyU:()=>activeMessage&&window.tm?.markSeen(activeMessage.id,false).then(()=>window.reloadCoreData()),Delete:()=>performMessageAction('trash')};
     if(actions[e.code]){e.preventDefault();actions[e.code]();}
-    if(['KeyJ','KeyK','ArrowDown','ArrowUp'].includes(e.code)){e.preventDefault();const rows=[...document.querySelectorAll('.msg')],active=rows.findIndex(row=>row.classList.contains('active')),forward=e.code==='KeyJ'||e.code==='ArrowDown',next=forward?Math.min(rows.length-1,active+1):Math.max(0,active-1);rows[next]?.click();rows[next]?.scrollIntoView({block:'nearest'});}
+    if(['KeyJ','KeyK','ArrowDown','ArrowUp'].includes(e.code)){e.preventDefault();const active=currentMessageRows.findIndex(message=>message.id===activeMessage?.id),forward=e.code==='KeyJ'||e.code==='ArrowDown',next=forward?Math.min(currentMessageRows.length-1,active+1):Math.max(0,active<0?0:active-1);focusMessageAt(next);}
     if(e.code==='Enter'&&activeMessage){e.preventDefault();const row=document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`);row?.click();}
   }
+  if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyA'&&document.getElementById('mailView').classList.contains('active')&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){e.preventDefault();selectAllCurrentMessages();}
   if(e.key==='Escape'){closeCmd();pop.classList.remove('open');closeSmart();ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');filterMenu?.classList.add('hidden');sortMenu?.classList.add('hidden');}});
 
 /* Keyboard and screen-reader semantics for code-generated controls. */
@@ -1072,28 +1078,32 @@ function collapseConversations(rows){
 }
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-function renderMessageList(rows,title){
+function createMessageRow(message,index){
+  const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;
+  const initial=(message.from?.name||message.from?.email||'?').trim()[0].toUpperCase();
+  row.innerHTML=`<div class="avawrap"><span class="ava" style="background:${accountColorById(message.account_id)}"></span></div><div class="body"><div class="l1"><span class="from"></span></div><div class="subj"></div><div class="prev"></div></div><div class="meta"><span class="time"></span><span class="time-hm"></span></div>`;
+  row.querySelector('.ava').textContent=initial;row.querySelector('.from').textContent=message.from?.name||message.from?.email||'';
+  if(message._convCount>1){const expanded=expandedConversations.has(message._convKey);const badge=document.createElement('button');badge.type='button';badge.className='conv-count'+(expanded?' on':'');badge.textContent=message._convCount;badge.title=expanded?L('Свернуть беседу','Collapse conversation'):L(`Показать письма беседы (${message._convCount})`,`Show conversation messages (${message._convCount})`);badge.onclick=event=>{event.stopPropagation();toggleConversation(message._convKey);};row.querySelector('.l1').appendChild(badge);}
+  row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
+  row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
+  row.querySelector('.time-hm').textContent=message.date?new Date(message.date).toLocaleTimeString(document.documentElement.lang,{hour:'2-digit',minute:'2-digit'}):'';
+  row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
+  row.onclick=e=>{if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();lastSelectedMessageIndex=index;showMessage(message);};renderIcons(row);return row;
+}
+function renderMessageWindow(force=false){
+  const list=msgsEl,total=currentMessageRows.length,viewport=Math.max(list.clientHeight,400),start=Math.max(0,Math.floor(list.scrollTop/messageRowHeight)-MESSAGE_WINDOW_OVERSCAN),end=Math.min(total,Math.ceil((list.scrollTop+viewport)/messageRowHeight)+MESSAGE_WINDOW_OVERSCAN);
+  if(!force&&start===messageWindowStart&&end===messageWindowEnd)return;messageWindowStart=start;messageWindowEnd=end;
+  const fragment=document.createDocumentFragment(),top=document.createElement('div'),bottom=document.createElement('div');top.className='message-list-spacer';bottom.className='message-list-spacer';top.setAttribute('aria-hidden','true');bottom.setAttribute('aria-hidden','true');top.style.height=`${start*messageRowHeight}px`;bottom.style.height=`${Math.max(0,(total-end)*messageRowHeight)}px`;fragment.appendChild(top);for(let index=start;index<end;index++)fragment.appendChild(createMessageRow(currentMessageRows[index],index));fragment.appendChild(bottom);list.replaceChildren(fragment);
+  const sample=list.querySelector('.msg');if(sample)requestAnimationFrame(()=>{if(!sample.isConnected)return;const measured=sample.getBoundingClientRect().height;if(measured>20&&Math.abs(measured-messageRowHeight)>1){const anchor=start,offset=list.scrollTop-start*messageRowHeight;messageRowHeight=measured;list.scrollTop=Math.max(0,anchor*messageRowHeight+offset);messageWindowStart=-1;renderMessageWindow(true);}});
+}
+function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)msgsEl.scrollTop=top;else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)msgsEl.scrollTop=Math.max(0,bottom-msgsEl.clientHeight);renderMessageWindow(true);showMessage(currentMessageRows[index]);}
+function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
-  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;const list=document.getElementById('msgs');list.innerHTML='';
-  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();
-  rows.forEach(message=>{
-    const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'');row.dataset.messageId=message.id;
-    const initial=(message.from?.name||message.from?.email||'?').trim()[0].toUpperCase();
-    row.innerHTML=`<div class="avawrap"><span class="ava" style="background:${accountColorById(message.account_id)}"></span></div><div class="body"><div class="l1"><span class="from"></span></div><div class="subj"></div><div class="prev"></div></div><div class="meta"><span class="time"></span><span class="time-hm"></span></div>`;
-    row.querySelector('.ava').textContent=initial;row.querySelector('.from').textContent=message.from?.name||message.from?.email||'';
-    if(message._convCount>1){const expanded=expandedConversations.has(message._convKey);const badge=document.createElement('button');badge.type='button';badge.className='conv-count'+(expanded?' on':'');badge.textContent=message._convCount;badge.title=expanded?L('Свернуть беседу','Collapse conversation'):L(`Показать письма беседы (${message._convCount})`,`Show conversation messages (${message._convCount})`);badge.onclick=event=>{event.stopPropagation();toggleConversation(message._convKey);};row.querySelector('.l1').appendChild(badge);}
-    row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
-    row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
-    row.querySelector('.time-hm').textContent=message.date?new Date(message.date).toLocaleTimeString(document.documentElement.lang,{hour:'2-digit',minute:'2-digit'}):'';
-    const index=currentMessageRows.findIndex(item=>item.id===message.id);
-    row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
-    row.onclick=e=>{if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();lastSelectedMessageIndex=index;showMessage(message);};renderIcons(row);list.appendChild(row);
-  });
-  updateSelectionUi();
+  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)msgsEl.scrollTop=0;messageWindowStart=-1;messageWindowEnd=-1;
+  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();renderMessageWindow(true);updateSelectionUi();
   if(!rows.length)document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;
-  else if(activeMessage&&rows.some(message=>message.id===activeMessage.id))document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`)?.classList.add('active');
-  else document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
+  else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id))document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
 }
 async function showMessage(message){
   activeMessage=message;
@@ -1122,9 +1132,9 @@ function smartRows(index){return smartRowsForFolder(smartFolders[index]);}
 async function loadCompleteSmartCoverage(index){
   if(loadingSmartCoverage){queuedSmartCoverageIndex=index;return;}const groups=(smartFolders[index]?.groups||[]).map(normalizeSmartGroup),restrictedRoles=[];let everyGroupRestricts=groups.length>0;for(const group of groups){const roles=group.conditions.filter(condition=>condition.f==='folder_role'&&condition.o==='equals').map(condition=>condition.v);if(!roles.length)everyGroupRestricts=false;restrictedRoles.push(...roles);}const allowedRoles=everyGroupRestricts?new Set(restrictedRoles):null,pending=coreFolders.filter(folder=>window.coreUnifiedSettings?.[folder.id]!=='0'&&folderHasMore.get(folder.id)!==false&&(!allowedRoles||allowedRoles.has(folder.role)));if(!pending.length)return;loadingSmartCoverage=true;
   try{const known=new Set(messages.map(message=>message.id));for(const folder of pending){let loaded=messages.filter(message=>message.folder_id===folder.id).sort(byDateDesc),cursor=loaded.at(-1);for(;;){const page=await window.tm?.listMessagesPage(folder.id,cursor?(cursor.date??''):null,cursor?.id||null,200)||[];for(const message of page){if(!known.has(message.id)){known.add(message.id);messages.push(message);}}if(page.length<200){folderHasMore.set(folder.id,false);break;}cursor=page.at(-1);}}
-  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;if(currentSmartIndex===index&&currentFolderId===null)renderMessageList(smartRows(index).sort(byDateDesc),smartFolderTitle(smartFolders[index])||messagesTitle());if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverageIndex;queuedSmartCoverageIndex=null;if(queued!==null&&queued!==index)loadCompleteSmartCoverage(queued);}
+  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;if(currentSmartIndex===index&&currentFolderId===null)applyListOptions(false);if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverageIndex;queuedSmartCoverageIndex=null;if(queued!==null&&queued!==index)loadCompleteSmartCoverage(queued);}
 }
-function filterSmart(index){currentSmartIndex=index;currentFolderId=null;renderMessageList(smartRows(index).sort(byDateDesc),smartFolderTitle(smartFolders[index])||messagesTitle());loadCompleteSmartCoverage(index);}
+function filterSmart(index,resetScroll=true){currentSmartIndex=index;currentFolderId=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadCompleteSmartCoverage(index);}
 
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousSmart=currentSmartIndex,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;
@@ -1148,13 +1158,13 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
       const icon=folderIcon(folder);const depth=Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>${folder.unread_count?'<span class="count"></span>':''}`;
       row.querySelector('.folder-name').textContent=folderTitle(folder);if(folder.unread_count)row.querySelector('.count').textContent=folder.unread_count;
-      const openFolder=()=>{goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;renderMessageList(messages.filter(m=>m.folder_id===folder.id),folderTitle(folder));};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));ctxfolder.style.left=`${Math.min(event.clientX,innerWidth-250)}px`;ctxfolder.style.top=`${Math.min(event.clientY,innerHeight-190)}px`;ctxfolder.classList.add('open');};sub.appendChild(row);});
+      const openFolder=()=>{goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;applyListOptions(true,folderTitle(folder));};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));ctxfolder.style.left=`${Math.min(event.clientX,innerWidth-250)}px`;ctxfolder.style.top=`${Math.min(event.clientY,innerHeight-190)}px`;ctxfolder.classList.add('open');};sub.appendChild(row);});
     anchor.after(sub);anchor=sub;
   });
   renderIcons(document.querySelector('.nav'));
   if(previousFolder!==null&&coreFolders.some(folder=>folder.id===previousFolder)){
-    currentFolderId=previousFolder;currentSmartIndex=null;const folder=coreFolders.find(item=>item.id===previousFolder);document.querySelector(`.folder-row[data-folder-id="${previousFolder}"]`)?.classList.add('active');renderMessageList(messages.filter(message=>message.folder_id===previousFolder).sort(byDateDesc),folderTitle(folder));
-  }else filterSmart(previousSmart??0);
+    currentFolderId=previousFolder;currentSmartIndex=null;const folder=coreFolders.find(item=>item.id===previousFolder);document.querySelector(`.folder-row[data-folder-id="${previousFolder}"]`)?.classList.add('active');applyListOptions(false,folderTitle(folder));
+  }else filterSmart(previousSmart??0,false);
   if(previousMessageId&&messages.some(message=>message.id===previousMessageId)){activeMessage=messages.find(message=>message.id===previousMessageId);document.querySelector(`.msg[data-message-id="${previousMessageId}"]`)?.classList.add('active');}else if(previousMessageId){activeMessage=null;activeFullMessage=null;document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;}
   if(messages.length)document.querySelector('.thread .actions')?.classList.remove('hidden');
   renderContacts(contacts);
@@ -1232,13 +1242,15 @@ document.addEventListener('click',event=>{if(!event.target.closest('.recipient-i
 function showToast(message,actionLabel,action){document.querySelector('.app-toast')?.remove();const toast=document.createElement('div');toast.className='app-toast';const text=document.createElement('span');text.textContent=message;toast.appendChild(text);if(action){const button=document.createElement('button');button.type='button';button.textContent=actionLabel;button.onclick=async()=>{button.disabled=true;await action();toast.remove();};toast.appendChild(button);}document.body.appendChild(toast);setTimeout(()=>toast.remove(),9000);}
 window.handleSyncState=function(state){if(!state)return;const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}const message=state.status==='error'?(state.error||L('Ошибка синхронизации','Sync error')):(state.warnings?.join(' ')||'');if(!message)return;if(/ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes|insufficientPermissions/i.test(message)){const account=coreAccounts.find(item=>item.id===Number(state.account_id));showToast(L('Google не выдал приложению доступ к календарю, контактам и задачам. Переподключите аккаунт и подтвердите все запрошенные разрешения.','Google did not grant access to calendar, contacts and tasks. Reconnect the account and approve all requested permissions.'),L('Переподключить','Reconnect'),()=>showAccountWizard(account?.email||''));return;}showToast(message);};
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
+  if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   let nextId=null;
-  if(activeMessage&&ids.length===1){const row=document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`);let sib=row?.nextElementSibling;if(!sib||!sib.classList.contains('msg'))sib=row?.previousElementSibling;if(sib&&sib.classList.contains('msg'))nextId=Number(sib.dataset.messageId);}
+  if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
   try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;await window.reloadCoreData();
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
     showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
-document.getElementById('bulkSelectAll').onclick=()=>{currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();};
+function selectAllCurrentMessages(){currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();}
+document.getElementById('bulkSelectAll').onclick=selectAllCurrentMessages;
 document.getElementById('bulkClear').onclick=clearMessageSelection;
 document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
@@ -1353,9 +1365,9 @@ function applyStorageStatus(storage){document.querySelector('.storage-big').text
 const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElementById('sortMenu'),filterButton=document.getElementById('filterBtn'),sortButton=document.getElementById('sortBtn');
 filterButton.onclick=e=>{e.stopPropagation();filterMenu.classList.toggle('hidden');sortMenu.classList.add('hidden');};sortButton.onclick=e=>{e.stopPropagation();sortMenu.classList.toggle('hidden');filterMenu.classList.add('hidden');};
 document.addEventListener('click',event=>{if(!filterMenu.contains(event.target)&&!filterButton.contains(event.target))filterMenu.classList.add('hidden');if(!sortMenu.contains(event.target)&&!sortButton.contains(event.target))sortMenu.classList.add('hidden');});
-function applyListOptions(){let rows=currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
-  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,document.querySelector('.listhead h2').textContent);}
-filterMenu.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=applyListOptions);document.getElementById('filterText')?.addEventListener('input',applyListOptions);sortMenu.querySelectorAll('button').forEach(button=>button.onclick=()=>{sortMenu.dataset.sort=button.dataset.sort;sortMenu.classList.add('hidden');applyListOptions();});
+function applyListOptions(resetScroll=false,title=null){let rows=currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
+  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);}
+filterMenu.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=()=>applyListOptions(true));document.getElementById('filterText')?.addEventListener('input',()=>applyListOptions(true));sortMenu.querySelectorAll('button').forEach(button=>button.onclick=()=>{sortMenu.dataset.sort=button.dataset.sort;sortMenu.classList.add('hidden');applyListOptions(true);});
 
 /* Ширины панелей. Пользователь задаёт их только мышью - за край панели;
    значения хранятся скрыто в настройках и восстанавливаются при старте. */
