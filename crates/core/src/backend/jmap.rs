@@ -596,6 +596,7 @@ impl MailBackend for JmapBackend {
         _email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        _retention_days: i64,
     ) -> Result<ImapDiscovery> {
         self.discover_scope(credential, cursors, false).await
     }
@@ -1078,7 +1079,7 @@ mod tests {
         };
 
         let discovered = backend
-            .discover("user@example.test", "app-password", &HashMap::new())
+            .discover("user@example.test", "app-password", &HashMap::new(), 30)
             .await
             .unwrap();
 
@@ -1192,7 +1193,7 @@ mod tests {
             .unwrap();
 
         let discovery = backend
-            .discover("user@example.test", "app-password", &HashMap::new())
+            .discover("user@example.test", "app-password", &HashMap::new(), 30)
             .await
             .unwrap();
         db.save_discovered_folders(account.id, &discovery.folders)

@@ -107,7 +107,9 @@ document.querySelectorAll('.navitem[data-nav]').forEach(n=>n.onclick=()=>{
   const app=document.getElementById('app');app.classList.toggle('calmode',n.dataset.nav==='calendar');app.classList.toggle('contactsmode',n.dataset.nav==='contacts');});
 /* account collapse */
 // Делегирование: работает и для аккаунтов, отрисованных динамически после загрузки.
-document.addEventListener('click',event=>{const h=event.target.closest('.acc-h');if(!h)return;h.classList.toggle('open');h.nextElementSibling?.classList.toggle('open');});
+function accountNavIsOpen(accountId){try{const saved=JSON.parse(localStorage.getItem('account_nav_open')||'{}');return saved[String(accountId)]!==false;}catch(_){return true;}}
+function saveAccountNavOpen(accountId,open){try{const saved=JSON.parse(localStorage.getItem('account_nav_open')||'{}');saved[String(accountId)]=open;localStorage.setItem('account_nav_open',JSON.stringify(saved));}catch(_){}}
+document.addEventListener('click',event=>{const h=event.target.closest('.acc-h');if(!h)return;const open=h.classList.toggle('open');h.nextElementSibling?.classList.toggle('open',open);if(h.dataset.accountId)saveAccountNavOpen(h.dataset.accountId,open);});
 
 /* collapsible sidebar groups */
 document.querySelectorAll('.nav .navlabel').forEach(lbl=>{

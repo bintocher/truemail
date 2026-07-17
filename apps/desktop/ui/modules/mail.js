@@ -175,7 +175,8 @@ function createMessageRow(message,index){
 function renderMessageWindow(force=false){
   const list=msgsEl,total=currentMessageRows.length,viewport=Math.max(list.clientHeight,400),start=Math.max(0,Math.floor(list.scrollTop/messageRowHeight)-MESSAGE_WINDOW_OVERSCAN),end=Math.min(total,Math.ceil((list.scrollTop+viewport)/messageRowHeight)+MESSAGE_WINDOW_OVERSCAN);
   if(!force&&start===messageWindowStart&&end===messageWindowEnd)return;messageWindowStart=start;messageWindowEnd=end;
-  const fragment=document.createDocumentFragment(),top=document.createElement('div'),bottom=document.createElement('div');top.className='message-list-spacer';bottom.className='message-list-spacer';top.setAttribute('aria-hidden','true');bottom.setAttribute('aria-hidden','true');top.style.height=`${start*messageRowHeight}px`;bottom.style.height=`${Math.max(0,(total-end)*messageRowHeight)}px`;fragment.appendChild(top);for(let index=start;index<end;index++)fragment.appendChild(createMessageRow(currentMessageRows[index],index));fragment.appendChild(bottom);list.replaceChildren(fragment);
+  let canvas=list.querySelector(':scope > .message-list-canvas');if(!canvas){canvas=document.createElement('div');canvas.className='message-list-canvas';list.replaceChildren(canvas);}canvas.style.height=`${total*messageRowHeight}px`;
+  const fragment=document.createDocumentFragment(),windowEl=document.createElement('div');windowEl.className='message-list-window';windowEl.style.transform=`translateY(${start*messageRowHeight}px)`;for(let index=start;index<end;index++)windowEl.appendChild(createMessageRow(currentMessageRows[index],index));fragment.appendChild(windowEl);canvas.replaceChildren(fragment);
   const sample=list.querySelector('.msg');if(sample)requestAnimationFrame(()=>{if(!sample.isConnected)return;const measured=sample.getBoundingClientRect().height;if(measured>20&&Math.abs(measured-messageRowHeight)>1){const anchor=start,offset=list.scrollTop-start*messageRowHeight;messageRowHeight=measured;list.scrollTop=Math.max(0,anchor*messageRowHeight+offset);messageWindowStart=-1;renderMessageWindow(true);}});
 }
 function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)msgsEl.scrollTop=top;else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)msgsEl.scrollTop=Math.max(0,bottom-msgsEl.clientHeight);renderMessageWindow(true);showMessage(currentMessageRows[index]);}
@@ -231,12 +232,13 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;
   accounts.forEach((account,index)=>{
-    const header=document.createElement('button');header.type='button';header.className='acc-h open';
+    const accountOpen=accountNavIsOpen(account.id);
+    const header=document.createElement('button');header.type='button';header.className='acc-h'+(accountOpen?' open':'');header.dataset.accountId=account.id;
     const initial=(account.display_name||account.email||'?').trim()[0].toUpperCase();
     header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)}"></span><span class="em"></span><span class="chev"><i data-i="chevR"></i></span>`;
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
     anchor.after(header);anchor=header;
-    const sub=document.createElement('div');sub.className='acc-sub open';
+    const sub=document.createElement('div');sub.className='acc-sub'+(accountOpen?' open':'');
     const accountFolders=sortedFolders(foldersByAccount[index]||[]);
     accountFolders.forEach(folder=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
       const icon=folderIcon(folder);const depth=Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length);row.style.paddingLeft=`${14+depth*14}px`;

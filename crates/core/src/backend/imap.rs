@@ -28,6 +28,7 @@ pub struct DiscoveredFolder {
 #[derive(Debug, Clone, Default)]
 pub struct FolderSyncCursor {
     pub uidvalidity: Option<u32>,
+    pub first_uid: Option<u32>,
     pub last_uid: Option<u32>,
     pub sync_token: Option<String>,
 }
@@ -673,6 +674,7 @@ async fn fetch_incremental_messages(
     folder: &mut DiscoveredFolder,
     cursor: Option<&FolderSyncCursor>,
     limit: usize,
+    retention_days: Option<i64>,
 ) -> Result<(Vec<DiscoveredMessage>, Vec<u32>, bool)> {
     if folder.total_count == 0 {
         return Ok((Vec::new(), Vec::new(), false));
@@ -702,63 +704,98 @@ async fn fetch_incremental_messages(
             && mailbox.uid_validity.is_some()
             && cursor.uidvalidity != mailbox.uid_validity
     });
-    let selected =
-        if !uidvalidity_changed && let Some(last_uid) = cursor.and_then(|cursor| cursor.last_uid) {
-            uids.iter()
-                .copied()
-                .filter(|uid| *uid > last_uid)
-                .take(limit)
-                .collect::<Vec<_>>()
-        } else {
-            uids[uids.len().saturating_sub(limit)..].to_vec()
-        };
+    let retained_uids = match retention_days {
+        Some(days) if days > 0 => {
+            let since = (chrono::Utc::now().date_naive() - chrono::Duration::days(days))
+                .format("%d-%b-%Y")
+                .to_string();
+            let mut retained = session
+                .uid_search(format!("SINCE {since}"))
+                .await
+                .map_err(|error| Error::Backend {
+                    backend: "imap-search".into(),
+                    message: format!("{}: {error}", folder.remote_path),
+                })?
+                .into_iter()
+                .collect::<Vec<_>>();
+            retained.sort_unstable();
+            retained
+        }
+        Some(_) => uids.clone(),
+        None => Vec::new(),
+    };
+    let selected = if !uidvalidity_changed
+        && let Some(cursor) = cursor
+        && let Some(last_uid) = cursor.last_uid
+    {
+        let mut selected = uids
+            .iter()
+            .copied()
+            .filter(|uid| *uid > last_uid)
+            .take(limit)
+            .collect::<Vec<_>>();
+        if retention_days.is_some()
+            && let Some(first_uid) = cursor.first_uid
+        {
+            selected.extend(retained_uids.iter().copied().filter(|uid| *uid < first_uid));
+        }
+        selected.sort_unstable();
+        selected.dedup();
+        selected
+    } else if retention_days.is_some() {
+        retained_uids
+    } else {
+        uids[uids.len().saturating_sub(limit)..].to_vec()
+    };
     if selected.is_empty() {
         return Ok((Vec::new(), uids, uidvalidity_changed));
     }
-    let set = selected
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let fetched = session
-        // BODY.PEEK[] принципиален: обычный RFC822/BODY[] устанавливает
-        // серверный флаг \\Seen и портит состояние ящика при синхронизации.
-        .uid_fetch(set, MESSAGE_FETCH_ITEMS)
-        .await
-        .map_err(|e| Error::Backend {
-            backend: "imap-fetch".into(),
-            message: e.to_string(),
-        })?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|e| Error::Backend {
-            backend: "imap-fetch".into(),
-            message: e.to_string(),
-        })?;
-    let mut messages = Vec::with_capacity(fetched.len());
-    for fetch in fetched {
-        let Some(uid) = fetch.uid else { continue };
-        let Some(raw) = fetch.body() else { continue };
-        let flags: Vec<_> = fetch.flags().collect();
-        messages.push(DiscoveredMessage {
-            folder_path: folder.remote_path.clone(),
-            uid,
-            remote_id: None,
-            size: fetch.size,
-            seen: flags
-                .iter()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
-            flagged: flags
-                .iter()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
-            answered: flags
-                .iter()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Answered)),
-            draft: flags
-                .iter()
-                .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
-            raw: raw.to_vec(),
-        });
+    let mut messages = Vec::with_capacity(selected.len());
+    for chunk in selected.chunks(limit.max(1)) {
+        let set = chunk
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetched = session
+            // BODY.PEEK[] принципиален: обычный RFC822/BODY[] устанавливает
+            // серверный флаг \\Seen и портит состояние ящика при синхронизации.
+            .uid_fetch(set, MESSAGE_FETCH_ITEMS)
+            .await
+            .map_err(|e| Error::Backend {
+                backend: "imap-fetch".into(),
+                message: e.to_string(),
+            })?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| Error::Backend {
+                backend: "imap-fetch".into(),
+                message: e.to_string(),
+            })?;
+        for fetch in fetched {
+            let Some(uid) = fetch.uid else { continue };
+            let Some(raw) = fetch.body() else { continue };
+            let flags: Vec<_> = fetch.flags().collect();
+            messages.push(DiscoveredMessage {
+                folder_path: folder.remote_path.clone(),
+                uid,
+                remote_id: None,
+                size: fetch.size,
+                seen: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                flagged: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                answered: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Answered)),
+                draft: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
+                raw: raw.to_vec(),
+            });
+        }
     }
     Ok((messages, uids, uidvalidity_changed))
 }
@@ -800,7 +837,7 @@ async fn discover_inbox(
         })?;
     let path = inbox.remote_path.clone();
     let (messages, uids, reset) =
-        fetch_incremental_messages(&mut session, inbox, cursors.get(&path), 500).await?;
+        fetch_incremental_messages(&mut session, inbox, cursors.get(&path), 500, None).await?;
     let _ = session.logout().await;
     Ok(ImapDiscovery {
         folders,
@@ -904,9 +941,10 @@ pub async fn discover_oauth(
     email: &str,
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
+    retention_days: i64,
 ) -> Result<ImapDiscovery> {
     let session = connect_oauth(host, email, access_token).await?;
-    discover_session(session, cursors).await
+    discover_session(session, cursors, retention_days).await
 }
 
 pub async fn discover_password(
@@ -916,14 +954,16 @@ pub async fn discover_password(
     username: &str,
     password: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
+    retention_days: i64,
 ) -> Result<ImapDiscovery> {
     let session = connect_password(host, port, security, username, password).await?;
-    discover_session(session, cursors).await
+    discover_session(session, cursors, retention_days).await
 }
 
 async fn discover_session(
     mut session: OAuthSession,
     cursors: &HashMap<String, FolderSyncCursor>,
+    retention_days: i64,
 ) -> Result<ImapDiscovery> {
     let mut folders = list_oauth_folders(&mut session).await?;
     let mut messages = Vec::new();
@@ -931,7 +971,15 @@ async fn discover_session(
     let mut reset_folders = Vec::new();
     for folder in &mut folders {
         let path = folder.remote_path.clone();
-        match fetch_incremental_messages(&mut session, folder, cursors.get(&path), 500).await {
+        match fetch_incremental_messages(
+            &mut session,
+            folder,
+            cursors.get(&path),
+            500,
+            Some(retention_days),
+        )
+        .await
+        {
             Ok((mut folder_messages, uids, reset)) => {
                 messages.append(&mut folder_messages);
                 server_uids.push((path.clone(), uids));
@@ -959,16 +1007,32 @@ pub async fn discover_yandex(
     email: &str,
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
+    retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    discover_oauth("imap.yandex.com", email, access_token, cursors).await
+    discover_oauth(
+        "imap.yandex.com",
+        email,
+        access_token,
+        cursors,
+        retention_days,
+    )
+    .await
 }
 
 pub async fn discover_gmail(
     email: &str,
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
+    retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    discover_oauth("imap.gmail.com", email, access_token, cursors).await
+    discover_oauth(
+        "imap.gmail.com",
+        email,
+        access_token,
+        cursors,
+        retention_days,
+    )
+    .await
 }
 
 /// Докачать сырой MIME одного письма по UID из конкретной папки. Нужно, когда

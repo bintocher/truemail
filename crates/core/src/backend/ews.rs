@@ -826,15 +826,23 @@ impl MailBackend for EwsBackend {
         _email: &str,
         credential: &str,
         _cursors: &HashMap<String, FolderSyncCursor>,
+        _retention_days: i64,
     ) -> Result<ImapDiscovery> {
         let folders = self.folders(credential).await?;
         let mut messages = Vec::new();
-        let mut server_uids = Vec::new();
-        for folder in &folders {
+        // Exchange возвращает вместе с обычными папками множество пустых
+        // служебных папок. Запрос FindItem к каждой из них может ждать до
+        // таймаута, хотя загружать там нечего. Входящие обрабатываем первыми,
+        // остальные пустые папки сразу пропускаем.
+        let mut ordered_folders = folders.iter().collect::<Vec<_>>();
+        ordered_folders.sort_by_key(|folder| folder.role != Some(FolderRole::Inbox));
+        for folder in ordered_folders {
+            if folder.total_count == 0 && folder.role != Some(FolderRole::Inbox) {
+                continue;
+            }
             match self.messages_in_folder(credential, folder, 500).await {
-                Ok((mut found, uids)) => {
+                Ok((mut found, _uids)) => {
                     messages.append(&mut found);
-                    server_uids.push((folder.remote_path.clone(), uids));
                 }
                 Err(error) => {
                     tracing::warn!(folder = %folder.display_name, %error, "EWS: папка пропущена")
@@ -844,7 +852,10 @@ impl MailBackend for EwsBackend {
         Ok(ImapDiscovery {
             folders,
             messages,
-            server_uids,
+            // FindItem загружает ограниченное окно, поэтому его UID нельзя
+            // использовать как полный снимок папки: иначе старые письма будут
+            // ошибочно удалены из локального кэша.
+            server_uids: Vec::new(),
             reset_folders: Vec::new(),
             remote_snapshot: None,
             changed_remote_ids: Vec::new(),
@@ -870,12 +881,13 @@ impl MailBackend for EwsBackend {
             .iter()
             .find(|folder| folder.role == Some(FolderRole::Inbox))
             .ok_or_else(|| backend_error("folders", "папка Входящие не найдена"))?;
-        let (messages, uids) = self.messages_in_folder(credential, inbox, 500).await?;
-        let inbox_path = inbox.remote_path.clone();
+        // Сначала отдаём небольшой свежий срез, чтобы Входящие появились в UI
+        // после одного GetItem, пока полная синхронизация идёт в фоне.
+        let (messages, _uids) = self.messages_in_folder(credential, inbox, 50).await?;
         Ok(ImapDiscovery {
             folders,
             messages,
-            server_uids: vec![(inbox_path, uids)],
+            server_uids: Vec::new(),
             reset_folders: Vec::new(),
             remote_snapshot: None,
             changed_remote_ids: Vec::new(),

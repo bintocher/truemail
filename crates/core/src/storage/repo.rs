@@ -14,7 +14,13 @@ type MessageLocatorRow = (i64, String, i64, Option<String>, Option<String>);
 
 /// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
 type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
-type FolderCursorRow = (String, Option<i64>, Option<i64>, Option<String>);
+type FolderCursorRow = (
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
 type MessageContentCacheRow = (
     Option<String>,
     Option<String>,
@@ -534,7 +540,7 @@ impl Db {
         account_id: i64,
     ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
         let rows: Vec<FolderCursorRow> = sqlx::query_as(
-            "SELECT f.remote_path, f.uidvalidity, max(m.uid), f.sync_token
+            "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid), f.sync_token
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
              WHERE f.account_id=? GROUP BY f.id, f.remote_path, f.uidvalidity, f.sync_token",
         )
@@ -543,11 +549,12 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(path, uidvalidity, last_uid, sync_token)| {
+            .map(|(path, uidvalidity, first_uid, last_uid, sync_token)| {
                 (
                     path,
                     crate::backend::FolderSyncCursor {
                         uidvalidity: uidvalidity.and_then(|value| u32::try_from(value).ok()),
+                        first_uid: first_uid.and_then(|value| u32::try_from(value).ok()),
                         last_uid: last_uid.and_then(|value| u32::try_from(value).ok()),
                         sync_token,
                     },

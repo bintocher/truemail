@@ -62,6 +62,7 @@ pub trait MailBackend: Send + Sync {
         email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
     ) -> Result<ImapDiscovery>;
     async fn discover_folders(
         &self,
@@ -133,8 +134,9 @@ impl MailBackend for YandexBackend {
         email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
     ) -> Result<ImapDiscovery> {
-        discover_yandex(email, credential, cursors).await
+        discover_yandex(email, credential, cursors, retention_days).await
     }
 
     async fn discover_folders(
@@ -214,6 +216,7 @@ impl MailBackend for GmailBackend {
         email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        _retention_days: i64,
     ) -> Result<ImapDiscovery> {
         let _ = email;
         gmail_api::discover(credential, cursors).await
@@ -309,8 +312,16 @@ impl MailBackend for OutlookBackend {
         email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
     ) -> Result<ImapDiscovery> {
-        imap::discover_oauth("outlook.office365.com", email, credential, cursors).await
+        imap::discover_oauth(
+            "outlook.office365.com",
+            email,
+            credential,
+            cursors,
+            retention_days,
+        )
+        .await
     }
 
     async fn discover_folders(
@@ -418,6 +429,7 @@ impl MailBackend for GenericImapBackend {
         _email: &str,
         credential: &str,
         cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
     ) -> Result<ImapDiscovery> {
         discover_password(
             &self.imap.host,
@@ -426,6 +438,7 @@ impl MailBackend for GenericImapBackend {
             &self.username,
             credential,
             cursors,
+            retention_days,
         )
         .await
     }

@@ -1074,7 +1074,12 @@ impl AccountManager {
             warnings.push(format!("Папки почты не сохранились: {error}"));
         }
         let imap_result = backend
-            .discover(&account.email, &access_token, &cursors)
+            .discover(
+                &account.email,
+                &access_token,
+                &cursors,
+                account.retention_days,
+            )
             .await;
         let mail_folders = match imap_result {
             Ok(imap) => {

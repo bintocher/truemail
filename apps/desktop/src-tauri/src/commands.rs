@@ -1958,6 +1958,17 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
         );
         tokio::spawn(async move {
             tracing::info!(account = %account.email, provider = ?account.provider, "mail-sync начат");
+            if account.provider == truemail_core::model::Provider::Exchange {
+                match sync_core.accounts.sync_mail_inbox(&account).await {
+                    Ok(messages) => {
+                        tracing::info!(account = %account.email, messages, "Exchange: свежие входящие загружены");
+                        let _ = sync_app.emit("truemail-data-changed", account.id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(account = %account.email, %error, "Exchange: быстрые входящие не загрузились");
+                    }
+                }
+            }
             let state = match sync_core.accounts.sync_mail_account(&account).await {
                 Ok(result) => {
                     tracing::info!(account = %account.email, "mail-sync завершён");
