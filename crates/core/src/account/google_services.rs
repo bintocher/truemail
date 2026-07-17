@@ -3,6 +3,7 @@
 use super::dav::{
     AuxiliarySyncCursors, DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope,
 };
+use crate::model::{Alarm, Attendee};
 use crate::{Error, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -28,6 +29,8 @@ struct GoogleCalendar {
     summary: String,
     description: Option<String>,
     etag: Option<String>,
+    #[serde(default)]
+    default_reminders: Vec<GoogleReminder>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +61,36 @@ struct GoogleEvent {
     recurrence: Vec<String>,
     recurring_event_id: Option<String>,
     original_start_time: Option<GoogleDateTime>,
+    #[serde(default)]
+    attendees: Vec<GoogleAttendee>,
+    reminders: Option<GoogleReminders>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct GoogleReminder {
+    method: String,
+    minutes: i32,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleReminders {
+    #[serde(default)]
+    use_default: bool,
+    #[serde(default)]
+    overrides: Vec<GoogleReminder>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleAttendee {
+    email: String,
+    display_name: Option<String>,
+    #[serde(default)]
+    organizer: bool,
+    #[serde(default)]
+    optional: bool,
+    response_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -239,13 +272,54 @@ fn recurrence_value(lines: &[String], name: &str) -> Option<String> {
     })
 }
 
-fn event_from_google(event: GoogleEvent) -> Option<DavEvent> {
+fn google_partstat(value: &str) -> String {
+    match value {
+        "needsAction" => "NEEDS-ACTION",
+        "accepted" => "ACCEPTED",
+        "declined" => "DECLINED",
+        "tentative" => "TENTATIVE",
+        other => other,
+    }
+    .into()
+}
+
+fn event_from_google(event: GoogleEvent, default_reminders: &[GoogleReminder]) -> Option<DavEvent> {
     let start = event.start.as_ref().and_then(GoogleDateTime::value)?;
     let uid = event
         .recurring_event_id
         .clone()
         .unwrap_or_else(|| event.id.clone());
     let raw = serde_json::to_string(&event).ok()?;
+    let attendees = event
+        .attendees
+        .iter()
+        .map(|attendee| Attendee {
+            email: attendee.email.clone(),
+            name: attendee.display_name.clone(),
+            role: Some(if attendee.organizer {
+                "CHAIR".into()
+            } else if attendee.optional {
+                "OPT-PARTICIPANT".into()
+            } else {
+                "REQ-PARTICIPANT".into()
+            }),
+            partstat: attendee.response_status.as_deref().map(google_partstat),
+            rsvp: attendee.response_status.as_deref() == Some("needsAction"),
+        })
+        .collect();
+    let reminders = event.reminders.as_ref();
+    let reminder_rows = if reminders.is_some_and(|value| value.use_default) {
+        default_reminders
+    } else {
+        reminders.map_or(&[][..], |value| value.overrides.as_slice())
+    };
+    let alarms = reminder_rows
+        .iter()
+        .map(|reminder| Alarm {
+            trigger_minutes: reminder.minutes,
+            action: reminder.method.to_ascii_uppercase(),
+        })
+        .collect();
     Some(DavEvent {
         remote_url: Some(format!("google-event:{}", event.id)),
         uid,
@@ -259,6 +333,8 @@ fn event_from_google(event: GoogleEvent) -> Option<DavEvent> {
         exdates: recurrence_value(&event.recurrence, "EXDATE"),
         rdates: recurrence_value(&event.recurrence, "RDATE"),
         status: event.status,
+        attendees,
+        alarms,
         raw,
         etag: event.etag,
     })
@@ -324,7 +400,9 @@ async fn fetch_calendars(
                             Ok(event) => {
                                 if event.status.as_deref() == Some("cancelled") {
                                     deleted_event_urls.push(format!("google-event:{}", event.id));
-                                } else if let Some(event) = event_from_google(event) {
+                                } else if let Some(event) =
+                                    event_from_google(event, &calendar.default_reminders)
+                                {
                                     events.push(event);
                                 }
                             }
@@ -482,6 +560,8 @@ fn task_event(list_id: &str, task: GoogleTask) -> Option<DavEvent> {
         exdates: None,
         rdates: None,
         status: task.status,
+        attendees: Vec::new(),
+        alarms: Vec::new(),
         raw,
         etag: task.etag,
     })
@@ -616,12 +696,25 @@ mod tests {
             "end": {"dateTime": "2026-07-14T11:00:00+03:00"},
             "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
             "recurringEventId": null,
-            "originalStartTime": null
+            "originalStartTime": null,
+            "attendees": [{
+                "email": "guest@example.test",
+                "displayName": "Guest",
+                "responseStatus": "accepted"
+            }],
+            "reminders": {
+                "useDefault": false,
+                "overrides": [{"method": "popup", "minutes": 10}]
+            }
         }))
         .expect("event");
-        let mapped = event_from_google(event).expect("mapped event");
+        let mapped = event_from_google(event, &[]).expect("mapped event");
         assert_eq!(mapped.rrule.as_deref(), Some("FREQ=DAILY;COUNT=3"));
         assert_eq!(mapped.dtstart, "2026-07-14T10:00:00+03:00");
+        assert_eq!(mapped.attendees.len(), 1);
+        assert_eq!(mapped.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(mapped.alarms[0].trigger_minutes, 10);
+        assert_eq!(mapped.alarms[0].action, "POPUP");
     }
 
     #[test]

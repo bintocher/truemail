@@ -698,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn auxiliary_deltas_preserve_unchanged_rows_and_commit_cursors() {
         use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
-        use crate::model::{AuthKind, BackendKind, NewAccount, Provider};
+        use crate::model::{Alarm, Attendee, AuthKind, BackendKind, NewAccount, Provider};
 
         fn event(id: &str, summary: &str) -> DavEvent {
             DavEvent {
@@ -714,6 +714,17 @@ mod tests {
                 exdates: None,
                 rdates: None,
                 status: Some("confirmed".into()),
+                attendees: vec![Attendee {
+                    email: format!("guest-{id}@example.test"),
+                    name: Some("Guest".into()),
+                    role: Some("REQ-PARTICIPANT".into()),
+                    partstat: Some("ACCEPTED".into()),
+                    rsvp: false,
+                }],
+                alarms: vec![Alarm {
+                    trigger_minutes: 15,
+                    action: "DISPLAY".into(),
+                }],
                 raw: format!("event:{id}:{summary}"),
                 etag: None,
             }
@@ -816,6 +827,18 @@ mod tests {
             .await
             .expect("read events after delta");
         assert_eq!(events, vec![("One updated".into(),), ("Three".into(),)]);
+        let (_, loaded_events) = db
+            .list_calendars_and_events()
+            .await
+            .expect("load event children");
+        let updated = loaded_events
+            .iter()
+            .find(|event| event.summary == "One updated")
+            .expect("updated event");
+        assert_eq!(updated.attendees.len(), 1);
+        assert_eq!(updated.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(updated.alarms.len(), 1);
+        assert_eq!(updated.alarms[0].trigger_minutes, 15);
         let contacts: Vec<(String,)> = sqlx::query_as(
             "SELECT display_name FROM contacts WHERE uid NOT LIKE 'mail:%' ORDER BY display_name",
         )

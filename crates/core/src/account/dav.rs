@@ -1,5 +1,6 @@
 //! Первичная синхронизация календарей и контактов Яндекса по CalDAV/CardDAV.
 
+use crate::model::{Alarm, Attendee};
 use crate::{Error, Result};
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
@@ -78,6 +79,8 @@ pub struct DavEvent {
     pub exdates: Option<String>,
     pub rdates: Option<String>,
     pub status: Option<String>,
+    pub attendees: Vec<Attendee>,
+    pub alarms: Vec<Alarm>,
     pub raw: String,
     pub etag: Option<String>,
 }
@@ -309,6 +312,103 @@ fn prop(raw: &str, name: &str) -> Option<String> {
     })
 }
 
+fn property_param(key: &str, name: &str) -> Option<String> {
+    key.split(';').skip(1).find_map(|part| {
+        let (param, value) = part.split_once('=')?;
+        param
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim_matches('"').to_owned())
+    })
+}
+
+fn parse_attendees(raw: &str) -> Vec<Attendee> {
+    unfolded(raw)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.split(';')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("ATTENDEE"))
+                .then_some(())?;
+            let value = value.trim();
+            let email = value
+                .get(..7)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("mailto:"))
+                .map(|_| &value[7..])
+                .unwrap_or(value)
+                .trim()
+                .to_owned();
+            (!email.is_empty()).then(|| Attendee {
+                email,
+                name: property_param(key, "CN"),
+                role: property_param(key, "ROLE"),
+                partstat: property_param(key, "PARTSTAT"),
+                rsvp: property_param(key, "RSVP")
+                    .is_some_and(|value| value.eq_ignore_ascii_case("TRUE")),
+            })
+        })
+        .collect()
+}
+
+fn parse_duration_minutes(value: &str) -> Option<i32> {
+    let value = value.trim();
+    let before_start = value.starts_with('-');
+    let value = value.trim_start_matches(['-', '+']);
+    let mut chars = value.strip_prefix('P')?.chars().peekable();
+    let mut in_time = false;
+    let mut number = String::new();
+    let mut total_seconds: i64 = 0;
+    while let Some(ch) = chars.next() {
+        if ch == 'T' {
+            in_time = true;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            number.push(ch);
+            continue;
+        }
+        let amount: i64 = number.parse().ok()?;
+        number.clear();
+        total_seconds += match (ch, in_time) {
+            ('W', false) => amount * 7 * 24 * 60 * 60,
+            ('D', false) => amount * 24 * 60 * 60,
+            ('H', true) => amount * 60 * 60,
+            ('M', true) => amount * 60,
+            ('S', true) => amount,
+            _ => return None,
+        };
+    }
+    if !number.is_empty() {
+        return None;
+    }
+    let minutes = i32::try_from((total_seconds + 59) / 60).ok()?;
+    Some(if before_start { minutes } else { -minutes })
+}
+
+fn parse_alarms(raw: &str) -> Vec<Alarm> {
+    let mut alarms = Vec::new();
+    let mut rest = raw;
+    while let Some(start) = rest.find("BEGIN:VALARM") {
+        rest = &rest[start..];
+        let Some(relative_end) = rest.find("END:VALARM") else {
+            break;
+        };
+        let block = &rest[..relative_end + "END:VALARM".len()];
+        if let Some(trigger_minutes) = prop(block, "TRIGGER").and_then(|value| {
+            // Absolute RFC5545 triggers are retained in raw data but cannot be
+            // represented by the current minute-offset model.
+            parse_duration_minutes(&value)
+        }) {
+            alarms.push(Alarm {
+                trigger_minutes,
+                action: prop(block, "ACTION").unwrap_or_else(|| "DISPLAY".into()),
+            });
+        }
+        rest = &rest[relative_end + "END:VALARM".len()..];
+    }
+    alarms
+}
+
 fn parse_events(raw: String, etag: Option<String>, remote_url: Option<String>) -> Vec<DavEvent> {
     let mut events = Vec::new();
     let mut rest = raw.as_str();
@@ -333,6 +433,8 @@ fn parse_events(raw: String, etag: Option<String>, remote_url: Option<String>) -
                 exdates: prop(&event, "EXDATE"),
                 rdates: prop(&event, "RDATE"),
                 status: prop(&event, "STATUS"),
+                attendees: parse_attendees(&event),
+                alarms: parse_alarms(&event),
                 raw: event,
                 etag: etag.clone(),
             });
@@ -598,10 +700,13 @@ mod tests {
 
     #[test]
     fn parses_every_vevent_and_recurrence_override() {
-        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260714T100000Z\r\nSUMMARY:Base\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260715T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID:20260716T100000Z\r\nDTSTART:20260716T120000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260714T100000Z\r\nSUMMARY:Base\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260715T100000Z\r\nATTENDEE;CN=Guest;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:guest@example.test\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID:20260716T100000Z\r\nDTSTART:20260716T120000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR";
         let events = parse_events(raw.to_owned(), Some("etag".to_owned()), None);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].exdates.as_deref(), Some("20260715T100000Z"));
+        assert_eq!(events[0].attendees[0].email, "guest@example.test");
+        assert_eq!(events[0].attendees[0].partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(events[0].alarms[0].trigger_minutes, 15);
         assert_eq!(events[1].recurrence_id.as_deref(), Some("20260716T100000Z"));
     }
 

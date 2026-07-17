@@ -816,6 +816,41 @@ impl Db {
                     .bind(&event.remote_url)
                     .fetch_one(&mut *tx)
                     .await?;
+                    sqlx::query("DELETE FROM event_attendees WHERE event_id=?")
+                        .bind(event_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for attendee in &event.attendees {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO event_attendees(
+                                event_id, email, name, role, partstat, rsvp
+                             ) VALUES(?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(event_id)
+                        .bind(&attendee.email)
+                        .bind(&attendee.name)
+                        .bind(&attendee.role)
+                        .bind(&attendee.partstat)
+                        .bind(attendee.rsvp)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    sqlx::query("DELETE FROM event_alarms WHERE event_id=?")
+                        .bind(event_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for alarm in &event.alarms {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO event_alarms(
+                                event_id, trigger_minutes, action
+                             ) VALUES(?, ?, ?)",
+                        )
+                        .bind(event_id)
+                        .bind(alarm.trigger_minutes)
+                        .bind(&alarm.action)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
                     active_events.insert(event_id);
                     event_count += 1;
                 }
@@ -1718,7 +1753,43 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok((calendars, rows.into_iter().map(Into::into).collect()))
+        let mut events: Vec<Event> = rows.into_iter().map(Into::into).collect();
+        let indexes: std::collections::HashMap<i64, usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| event.id.map(|id| (id, index)))
+            .collect();
+        let attendee_rows: Vec<EventAttendeeRow> = sqlx::query_as(
+            "SELECT event_id, email, name, role, partstat, rsvp
+             FROM event_attendees ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for attendee in attendee_rows {
+            if let Some(index) = indexes.get(&attendee.event_id) {
+                events[*index].attendees.push(crate::model::Attendee {
+                    email: attendee.email,
+                    name: attendee.name,
+                    role: attendee.role,
+                    partstat: attendee.partstat,
+                    rsvp: attendee.rsvp != 0,
+                });
+            }
+        }
+        let alarm_rows: Vec<EventAlarmRow> = sqlx::query_as(
+            "SELECT event_id, trigger_minutes, action FROM event_alarms ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for alarm in alarm_rows {
+            if let Some(index) = indexes.get(&alarm.event_id) {
+                events[*index].alarms.push(crate::model::Alarm {
+                    trigger_minutes: alarm.trigger_minutes,
+                    action: alarm.action,
+                });
+            }
+        }
+        Ok((calendars, events))
     }
 
     /// Отметить письмо прочитанным (локально; в outbox уйдёт синхронизация флага).
@@ -2336,6 +2407,23 @@ struct EventRow {
     url: Option<String>,
     organizer: Option<String>,
     sequence: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventAttendeeRow {
+    event_id: i64,
+    email: String,
+    name: Option<String>,
+    role: Option<String>,
+    partstat: Option<String>,
+    rsvp: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventAlarmRow {
+    event_id: i64,
+    trigger_minutes: i32,
+    action: String,
 }
 impl From<EventRow> for Event {
     fn from(row: EventRow) -> Self {
