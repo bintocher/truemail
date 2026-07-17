@@ -107,7 +107,28 @@
     revokeApiClient: (clientId) => invoke("revoke_api_client", { clientId }),
     listApiAudit: (limit = 50) => invoke("list_api_audit", { limit }),
     clearApiAudit: () => invoke("clear_api_audit"),
+    checkForUpdate: () => invoke("check_for_update"),
+    installUpdate: () => invoke("install_update"),
   };
+  const offerUpdate = info => {
+    if (!info?.available_version) return;
+    const message = wizardLocale === "en" ? `truemail ${info.available_version} is available` : `Доступен truemail ${info.available_version}`;
+    showToast(message, L("Обновить", "Update"), async () => {
+      const status = document.getElementById("updateStatus");
+      if (status) status.textContent = L("Скачиваю и устанавливаю обновление…", "Downloading and installing the update…");
+      await window.tm.installUpdate();
+    });
+  };
+  tauri.event?.listen("truemail-update-available", event => offerUpdate(event.payload)).catch(console.error);
+  tauri.event?.listen("truemail-update-progress", event => {
+    const status = document.getElementById("updateStatus"), progress = event.payload;
+    if (!status || !progress) return;
+    if (progress.event === "finished") status.textContent = L("Обновление скачано, запускаю установку…", "Update downloaded, starting installation…");
+    else if (progress.total) {
+      const percent = Math.min(100, Math.round(progress.downloaded / progress.total * 100));
+      status.textContent = L(`Скачано ${percent}%`, `Downloaded ${percent}%`);
+    }
+  }).catch(console.error);
   tauri.event?.listen("truemail-global-shortcut", event => {
     const action = event.payload;
     if (action === "compose") document.getElementById("composeBtn")?.click();

@@ -11,6 +11,7 @@ use std::{
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::account::{
@@ -178,7 +179,7 @@ pub struct ConnectedAccount {
 
 #[derive(Serialize)]
 pub struct ApiError {
-    message: String,
+    pub(crate) message: String,
 }
 
 impl From<truemail_core::Error> for ApiError {
@@ -190,6 +191,106 @@ impl From<truemail_core::Error> for ApiError {
 }
 
 type CmdResult<T> = Result<T, ApiError>;
+
+fn api_error(message: impl Into<String>) -> ApiError {
+    ApiError {
+        message: message.into(),
+    }
+}
+
+const DEFAULT_UPDATE_ENDPOINT: &str = "https://chernov.gitverse.site/truemail/latest.json";
+
+fn update_manifest_endpoint() -> CmdResult<url::Url> {
+    let value = std::env::var("TRUEMAIL_UPDATE_ENDPOINT")
+        .unwrap_or_else(|_| DEFAULT_UPDATE_ENDPOINT.to_owned());
+    url::Url::parse(value.trim())
+        .map_err(|error| api_error(format!("адрес манифеста обновлений: {error}")))
+}
+
+async fn available_update(app: &AppHandle) -> CmdResult<Option<Update>> {
+    let endpoint = update_manifest_endpoint()?;
+    app.updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|error| api_error(error.to_string()))?
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| api_error(error.to_string()))?
+        .check()
+        .await
+        .map_err(|error| api_error(format!("проверка обновления: {error}")))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateInfo {
+    current_version: String,
+    available_version: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateProgress {
+    event: &'static str,
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> CmdResult<UpdateInfo> {
+    let update = available_update(&app).await?;
+    Ok(UpdateInfo {
+        current_version: app.package_info().version.to_string(),
+        available_version: update.as_ref().map(|value| value.version.clone()),
+        notes: update.and_then(|value| value.body),
+    })
+}
+
+pub async fn announce_available_update(app: AppHandle) -> CmdResult<()> {
+    let info = check_for_update(app.clone()).await?;
+    if info.available_version.is_some() {
+        let _ = app.emit("truemail-update-available", info);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> CmdResult<()> {
+    let Some(update) = available_update(&app).await? else {
+        return Err(api_error("новая версия уже не найдена"));
+    };
+    let progress_app = app.clone();
+    let finished_app = app.clone();
+    let mut downloaded = 0_u64;
+    update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded = downloaded.saturating_add(chunk as u64);
+                let _ = progress_app.emit(
+                    "truemail-update-progress",
+                    UpdateProgress {
+                        event: "progress",
+                        downloaded,
+                        total,
+                    },
+                );
+            },
+            move || {
+                let _ = finished_app.emit(
+                    "truemail-update-progress",
+                    UpdateProgress {
+                        event: "finished",
+                        downloaded: 0,
+                        total: None,
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|error| api_error(format!("установка обновления: {error}")))?;
+    app.state::<AppState>()
+        .quitting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.restart();
+}
 
 #[derive(Serialize)]
 pub struct BootstrapStatus {
@@ -3061,4 +3162,17 @@ pub async fn clear_api_audit(state: State<'_, AppState>) -> CmdResult<u64> {
 #[tauri::command]
 pub fn localization_catalog(locale: String) -> HashMap<String, String> {
     truemail_core::i18n::I18n::new(&locale).catalog()
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn update_manifest_is_public_and_uses_https() {
+        let endpoint = url::Url::parse(DEFAULT_UPDATE_ENDPOINT).unwrap();
+        assert_eq!(endpoint.scheme(), "https");
+        assert_eq!(endpoint.host_str(), Some("chernov.gitverse.site"));
+        assert!(endpoint.path().ends_with("/latest.json"));
+    }
 }

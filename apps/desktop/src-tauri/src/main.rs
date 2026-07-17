@@ -139,6 +139,11 @@ fn run() -> anyhow::Result<()> {
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
     tauri::Builder::default()
+        // Должен быть первым плагином: второй процесс передаёт аргументы уже
+        // работающему экземпляру и сразу завершается.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
@@ -165,6 +170,7 @@ fn run() -> anyhow::Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Окно уведомлений живёт по своим правилам: позицию ему задаёт
         // notify_position, размер - высота карточек. Плагин иначе восстанавливал
         // его позицию, размер и видимость, показывая пустое окно поверх главного.
@@ -251,6 +257,16 @@ fn run() -> anyhow::Result<()> {
                 let _ = window.set_ignore_cursor_events(true);
                 commands::position_notify_window(app.handle());
             }
+
+            // Не задерживаем старт и не пугаем сетевой ошибкой: при появлении
+            // подписанного релиза UI сам предложит установить новую версию.
+            let update_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                if let Err(error) = commands::announce_available_update(update_app).await {
+                    tracing::debug!(error = %error.message, "автопроверка обновлений пропущена");
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -353,6 +369,8 @@ fn run() -> anyhow::Result<()> {
             commands::revoke_api_client,
             commands::list_api_audit,
             commands::clear_api_audit,
+            commands::check_for_update,
+            commands::install_update,
             commands::localization_catalog,
             commands::set_autostart,
             commands::get_autostart,
@@ -386,6 +404,8 @@ mod command_contract_tests {
             "message_action",
             "move_messages_to_folder",
             "undo_message_action",
+            "check_for_update",
+            "install_update",
         ] {
             assert!(
                 MAIN.contains(&format!("commands::{command}")),
@@ -400,5 +420,20 @@ mod command_contract_tests {
                 "{command} is missing from bridge.js"
             );
         }
+    }
+
+    #[test]
+    fn single_instance_is_registered_before_every_other_plugin() {
+        let builder = MAIN
+            .find("tauri::Builder::default()")
+            .expect("Tauri builder missing");
+        let single = MAIN
+            .find(".plugin(tauri_plugin_single_instance::init")
+            .expect("single-instance plugin missing");
+        let first_plugin = MAIN[builder..]
+            .find(".plugin(")
+            .map(|offset| builder + offset)
+            .expect("plugin registration missing");
+        assert_eq!(single, first_plugin);
     }
 }
