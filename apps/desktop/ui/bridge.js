@@ -106,7 +106,6 @@
     revokeApiClient: (clientId) => invoke("revoke_api_client", { clientId }),
     listApiAudit: (limit = 50) => invoke("list_api_audit", { limit }),
     clearApiAudit: () => invoke("clear_api_audit"),
-    localizationCatalog: (locale) => invoke("localization_catalog", { locale }),
   };
   tauri.event?.listen("truemail-global-shortcut", event => {
     const action = event.payload;
@@ -153,6 +152,7 @@
   // Первичная загрузка только реальных данных из ядра.
   (async () => {
     try {
+      await window.localizationReady;
       const bootstrap = await window.tm.bootstrapStatus();
       window.tmStorageReady = bootstrap.ready;
       window.tmDefaultDataDir = bootstrap.data_dir;
@@ -170,7 +170,6 @@
       const onboardingCompleted = settings.onboarding_completed;
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
-      if (savedLocale && window.applyUiCatalog) window.applyUiCatalog(await window.tm.localizationCatalog(savedLocale));
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
       await window.reloadMailRules?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);

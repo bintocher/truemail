@@ -106,8 +106,7 @@ crates/core/            core: models, transport, storage, search, encryption
   src/i18n/                  translations
 apps/desktop/            desktop program
   src-tauri/                link between the interface and the core
-  ui/                       interface
-locales/                 translations: ru.ftl / en.ftl
+  ui/                       interface, modules and RU/EN JSON catalogs
 ```
 
 ## License

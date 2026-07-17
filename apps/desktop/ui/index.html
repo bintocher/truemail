@@ -26,14 +26,14 @@
       <button type="button" class="navitem topnav" data-nav="contacts"><i data-i="people"></i><span data-i18n="navContacts">Контакты</span></button>
 
       <div class="navlabel"><span data-i18n="navSmartFolders">Умные папки</span> <button type="button" class="add" id="addSmart" data-i18n-title="createSmartFolder" title="Создать умную папку"><i data-i="plus"></i></button></div>
-      <button type="button" class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label">Все входящие</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i><span class="smart-label">Все важные</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i><span class="smart-label">Все отправленные</span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i><span class="smart-label">Все черновики</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i><span class="smart-label">Сегодня</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i><span class="smart-label">Непрочитанные (все)</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i><span class="smart-label">С вложениями</span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i><span class="smart-label">Ждут ответа</span><span class="count"></span></button>
+      <button type="button" class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label" data-i18n="navAllInbox">Все входящие</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i><span class="smart-label" data-i18n="navAllImportant">Все важные</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i><span class="smart-label" data-i18n="navAllSent">Все отправленные</span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i><span class="smart-label" data-i18n="navAllDrafts">Все черновики</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i><span class="smart-label" data-i18n="navToday">Сегодня</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i><span class="smart-label" data-i18n="navUnread">Непрочитанные (все)</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i><span class="smart-label" data-i18n="navWithAttachments">С вложениями</span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i><span class="smart-label" data-i18n="navWaitingReply">Ждут ответа</span><span class="count"></span></button>
 
       <div class="navlabel" data-navlabel="accounts"><span data-i18n="navAccounts">Аккаунты</span> <button type="button" class="add" id="addAcct" data-i18n-title="addAccount" title="Добавить аккаунт"><i data-i="plus"></i></button></div>
 
@@ -46,7 +46,7 @@
           <div class="fields-inline"><button class="iconbtn" id="filterBtn" data-i18n-title="tipFilter" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" data-i18n-title="tipSort" title="Сортировка"><i data-i="sort"></i></button></div></div>
         <div class="list-options hidden" id="filterMenu"><div class="filter-text"><input id="filterText" data-i18n-placeholder="filterPlaceholder" placeholder="Фильтр по тексту…" autocomplete="off"></div><label><input type="checkbox" data-filter="unread"> <span data-i18n="filterUnread">Только непрочитанные</span></label><label><input type="checkbox" data-filter="attachments"> <span data-i18n="filterAttachments">С вложениями</span></label><label><input type="checkbox" data-filter="flagged"> <span data-i18n="filterFlagged">Важные</span></label></div>
         <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc" data-i18n="sortNewest">Сначала новые</button><button data-sort="date-asc" data-i18n="sortOldest">Сначала старые</button><button data-sort="sender" data-i18n="sortSender">По отправителю</button><button data-sort="subject" data-i18n="sortSubject">По теме</button></div>
-        <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i><span data-i18n="selectAll">Выбрать все</span></button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i><span data-i18n="markRead">Прочитать</span></button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i><span data-i18n="actionArchive">В архив</span></button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i><span data-i18n="actionDelete">Удалить</span></button><button class="iconbtn ml-auto" id="bulkClear" data-i18n-title="tipClearSelection" title="Снять выделение"><i data-i="close"></i></button></div>
+        <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount" data-i18n="selectedCountZero">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i><span data-i18n="selectAll">Выбрать все</span></button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i><span data-i18n="markRead">Прочитать</span></button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i><span data-i18n="actionArchive">В архив</span></button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i><span data-i18n="actionDelete">Удалить</span></button><button class="iconbtn ml-auto" id="bulkClear" data-i18n-title="tipClearSelection" title="Снять выделение"><i data-i="close"></i></button></div>
         <button type="button" class="search" id="searchBox"><i data-i="search"></i><span class="search-placeholder" data-i18n="searchAllPlaceholder">Поиск по всем ящикам</span><span class="kbd">Ctrl K</span></button>
       </div>
       <div class="msgs" id="msgs"></div>
@@ -66,7 +66,7 @@
             <div id="threadMenuDynamic"></div>
             <div class="thread-menu-separator" id="threadMenuDynSep"></div>
             <button type="button" data-thread-action="raw"><i data-i="edit"></i><span data-i18n="viewSource">Исходный текст</span></button>
-            <button type="button" data-thread-action="export-eml"><i data-i="download"></i><span>Сохранить как .eml</span></button>
+            <button type="button" data-thread-action="export-eml"><i data-i="download"></i><span data-i18n="saveAsEml">Сохранить как .eml</span></button>
             <button type="button" data-thread-action="create-rule"><i data-i="filter"></i><span data-i18n="createRuleFromMessage">Создать правило из письма</span></button>
             <button type="button" data-thread-action="rules"><i data-i="settings"></i><span data-i18n="processingRules">Правила обработки</span></button>
             <div class="thread-menu-separator"></div>
@@ -79,7 +79,7 @@
     </section>
 
     <section class="cal" id="calSection" data-cv="month">
-      <div class="calhead"><button class="iconbtn"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle">Июль 2026</h2><button class="iconbtn"><i data-i="chevR"></i></button>
+      <div class="calhead"><button class="iconbtn"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle" data-i18n="calendarSampleMonth">Июль 2026</h2><button class="iconbtn"><i data-i="chevR"></i></button>
         <div class="seg ml-14" id="calViews"><button data-cv="month" class="on" data-i18n="calMonth">Месяц</button><button data-cv="week" data-i18n="calWeek">Неделя</button><button data-cv="day" data-i18n="calDay">День</button></div>
         <span class="cal-sync-info" id="calSyncInfo"></span>
         <button class="btn ml-auto" id="newEventBtn"><i data-i="plus"></i><span data-i18n="newEvent">Событие / задача</span></button>
@@ -126,7 +126,7 @@
         <h1 data-i18n="setGeneral">Общие</h1><p class="lead" data-i18n="generalLead">Основные параметры программы.</p>
         <div class="card"><div class="cb">
           <div class="frow"><div class="fl"><div class="t" data-i18n="expertMode">Режим эксперта</div><div class="d" data-i18n="expertModeDesc">Показывать продвинутые настройки и поля (большинству не нужны). По умолчанию - только необходимое для работы.</div></div><div class="fc"><div class="toggle" id="expertToggle"></div></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="uiLanguage">Язык интерфейса</div></div><div class="fc"><select class="sel" id="languageSetting"><option value="ru">Русский</option><option value="en">English</option></select></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="uiLanguage">Язык интерфейса</div></div><div class="fc"><select class="sel" id="languageSetting"><option value="ru" data-i18n="languageRussian">Русский</option><option value="en">English</option></select></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="showConversations">Показывать беседы</div><div class="d" data-i18n="showConversationsDesc">Группировать переписку в одну строку со счётчиком (по теме и цепочке ответов, в пределах аккаунта). Клик разворачивает все письма беседы.</div></div><div class="fc"><div class="toggle" id="conversationsToggle"></div></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="previewLinesLabel">Строк превью в списке</div><div class="d" data-i18n="previewLinesDesc">Сколько строк текста письма показывать под темой в списке.</div></div><div class="fc"><select class="sel" id="previewLines"><option value="1" data-i18n="previewLines1">1 строка</option><option value="2" data-i18n="previewLines2">2 строки</option><option value="3" data-i18n="previewLines3">3 строки</option></select></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="autostart">Запускать при старте системы</div><div class="d" data-i18n="autostartDesc">truemail будет запускаться автоматически и сворачиваться в трей. Окно можно открыть из значка в трее.</div></div><div class="fc"><div class="toggle" id="autostartToggle"></div></div></div>
@@ -152,7 +152,7 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="emailAddress">Адрес почты</div></div><div class="fc"><input class="inp inp-w280" id="accountEmail" type="email" placeholder="you@example.com"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="connection">Подключение</div><div class="d" data-i18n="connectionDesc">Провайдер и доступные сервисы определятся автоматически.</div></div><div class="fc"><button class="btn primary" id="accountOauthStart"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button></div></div>
           <div class="frow hidden" id="accountCodeRow"><div class="fl"><div class="t" data-i18n="confirmationCode">Код подтверждения</div><div class="d" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</div></div><div class="fc"><input class="inp inp-w280 mb-10" id="accountOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codeShort" placeholder="Код"><button class="btn primary" id="accountOauthConfirm"><i data-i="check"></i><span data-i18n="confirmShort">Подтвердить</span></button></div></div>
-          <div class="frow hidden" id="accountPasswordRow"><div class="fl"><div class="t">Пароль приложения / почты</div><div class="d">Пароль хранится только в системном хранилище. Для Mail.ru и iCloud используйте отдельный пароль приложения.</div></div><div class="fc account-server-fields"><select class="sel inp-w280" id="accountConnectionType"><option value="imap">IMAP / SMTP</option><option value="exchange">Self-hosted Exchange (EWS)</option></select><input class="inp inp-w280" id="accountUsername" autocomplete="username" placeholder="Имя пользователя"><input class="inp inp-w280" id="accountPassword" type="password" autocomplete="current-password" placeholder="Пароль"><input class="inp inp-w280 hidden" id="accountEwsServer" placeholder="Exchange-сервер или https://…/EWS/Exchange.asmx"><div class="server-pair"><input class="inp" id="accountImapHost" placeholder="IMAP-сервер"><input class="inp server-port" id="accountImapPort" type="number" min="1" max="65535" value="993"><select class="sel" id="accountImapSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><div class="server-pair"><input class="inp" id="accountSmtpHost" placeholder="SMTP-сервер"><input class="inp server-port" id="accountSmtpPort" type="number" min="1" max="65535" value="465"><select class="sel" id="accountSmtpSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><button class="btn primary" id="accountPasswordConfirm"><i data-i="check"></i>Подключить</button></div></div>
+          <div class="frow hidden" id="accountPasswordRow"><div class="fl"><div class="t" data-i18n="mailPasswordTitle">Пароль приложения / почты</div><div class="d" data-i18n="mailPasswordDesc">Пароль хранится только в системном хранилище. Для Mail.ru и iCloud используйте отдельный пароль приложения.</div></div><div class="fc account-server-fields"><select class="sel inp-w280" id="accountConnectionType"><option value="imap">IMAP / SMTP</option><option value="exchange">Self-hosted Exchange (EWS)</option></select><input class="inp inp-w280" id="accountUsername" autocomplete="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Имя пользователя"><input class="inp inp-w280" id="accountPassword" type="password" autocomplete="current-password" data-i18n-placeholder="passwordPlaceholder" placeholder="Пароль"><input class="inp inp-w280 hidden" id="accountEwsServer" data-i18n-placeholder="exchangeServerPlaceholder" placeholder="Exchange-сервер или https://…/EWS/Exchange.asmx"><div class="server-pair"><input class="inp" id="accountImapHost" data-i18n-placeholder="imapServerPlaceholder" placeholder="IMAP-сервер"><input class="inp server-port" id="accountImapPort" type="number" min="1" max="65535" value="993"><select class="sel" id="accountImapSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><div class="server-pair"><input class="inp" id="accountSmtpHost" data-i18n-placeholder="smtpServerPlaceholder" placeholder="SMTP-сервер"><input class="inp server-port" id="accountSmtpPort" type="number" min="1" max="65535" value="465"><select class="sel" id="accountSmtpSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><button class="btn primary" id="accountPasswordConfirm"><i data-i="check"></i><span data-i18n="connect">Подключить</span></button></div></div>
           <div class="wz-connect-status" id="accountOauthStatus" aria-live="polite"></div>
         </div></div>
         <div class="btn-row"><button class="btn" id="accountWizardCancel" data-i18n="cancel">Отмена</button></div>
@@ -227,7 +227,7 @@
       <div class="setpage" id="set-storage">
         <h1 data-i18n="setStorage">Хранилище</h1><p class="lead" data-i18n="storageLead">truemail держит зашифрованную локальную копию почты для скорости и работы без сети. Здесь видно, что занимает место, где оно лежит и как настроено хранение.</p>
         <div class="card"><div class="ch"><i data-i="storage"></i><span data-i18n="diskUsage">Занято на диске</span></div><div class="cb">
-          <div class="baseline"><span class="storage-big">0 Б</span><span class="storage-sub" data-i18n="localData">локальных данных</span></div>
+          <div class="baseline"><span class="storage-big" data-i18n="zeroBytes">0 Б</span><span class="storage-sub" data-i18n="localData">локальных данных</span></div>
           <div class="usebar" data-i18n-aria="localDataDistribution" aria-label="Распределение локальных данных"><span class="seg-db" data-i18n-title="encryptedDb" title="Зашифрованная база"></span><span class="seg-blob" data-i18n-title="encryptedFiles" title="Зашифрованные файлы"></span></div>
         </div></div>
         <div class="card"><div class="ch"><i data-i="folder"></i><span data-i18n="locationEncryption">Расположение и шифрование</span></div><div class="cb">
@@ -241,26 +241,26 @@
           <div class="frow"><div class="fl"><div class="d" id="keyBackupStatus" aria-live="polite"></div></div><div class="fc"><button class="btn sm" id="exportKeyBackup"><i data-i="save"></i><span data-i18n="exportKeyBackup">Сохранить backup ключей</span></button></div></div>
         </div></div>
         <div class="card"><div class="ch"><i data-i="trash"></i><span data-i18n="freeUpSpace">Освободить место</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t" data-i18n="oldAttachments">Вложения старше года</div><div class="d" data-i18n="oldAttachmentsDesc">Останутся на сервере, скачаются при открытии</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="old_attachments" data-i18n="clear">Очистить</button></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="trashSpamData">Локальные данные корзины и спама</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="trash_spam" data-i18n="clear">Очистить</button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="oldAttachments">Вложения старше года</div><div class="d" data-i18n="oldAttachmentsDesc">Останутся на сервере, скачаются при открытии</div></div><div class="fc fc-inline"><span class="size-num" data-i18n="zeroBytes">0 Б</span><button class="btn sm" data-clear="old_attachments" data-i18n="clear">Очистить</button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="trashSpamData">Локальные данные корзины и спама</div></div><div class="fc fc-inline"><span class="size-num" data-i18n="zeroBytes">0 Б</span><button class="btn sm" data-clear="trash_spam" data-i18n="clear">Очистить</button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="clearAllLocal">Полностью очистить локальные данные</div><div class="d" data-i18n="clearAllLocalDesc">Письма перекачаются с серверов заново</div></div><div class="fc"><button class="btn sm danger-btn" data-clear="all"><i data-i="trash"></i><span data-i18n="clearAll">Очистить всё</span></button></div></div>
         </div></div>
       </div>
 
       <div class="setpage" id="set-api">
-        <h1>API / MCP</h1><p class="lead">Локальный доступ для агентов и скриптов. Сервер слушает только 127.0.0.1; каждый токен ограничен выбранными правами.</p>
-        <div class="card"><div class="ch"><i data-i="server"></i><span>Локальный сервер</span><span class="api-state ml-auto" id="apiState">Остановлен</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t">Порт</div><div class="d">REST: /v1/tools/{name}, MCP: /mcp</div></div><div class="fc fc-inline"><input class="inp api-port" id="apiPort" type="number" min="1024" max="65535" value="34981"><button class="btn primary" id="apiToggle">Запустить</button></div></div>
+        <h1>API / MCP</h1><p class="lead" data-i18n="apiLead">Локальный доступ для агентов и скриптов. Сервер слушает только 127.0.0.1; каждый токен ограничен выбранными правами.</p>
+        <div class="card"><div class="ch"><i data-i="server"></i><span data-i18n="apiLocalServer">Локальный сервер</span><span class="api-state ml-auto" id="apiState" data-i18n="apiStopped">Остановлен</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t" data-i18n="port">Порт</div><div class="d">REST: /v1/tools/{name}, MCP: /mcp</div></div><div class="fc fc-inline"><input class="inp api-port" id="apiPort" type="number" min="1024" max="65535" value="34981"><button class="btn primary" id="apiToggle" data-i18n="run">Запустить</button></div></div>
           <div class="api-url mono" id="apiUrl"></div>
         </div></div>
-        <div class="card"><div class="ch"><i data-i="key"></i><span>Новый API-клиент</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t">Название</div></div><div class="fc"><input class="inp" id="apiClientName" placeholder="Например: локальный агент"></div></div>
-          <div class="api-caps" id="apiCaps"><label><input type="checkbox" value="read" checked> Чтение</label><label><input type="checkbox" value="search" checked> Поиск</label><label><input type="checkbox" value="send"> Отправка</label><label><input type="checkbox" value="labels"> Метки</label><label><input type="checkbox" value="calendar"> Календарь</label><label><input type="checkbox" value="network"> Сеть</label></div>
-          <button class="btn primary mt-14" id="apiClientCreate"><i data-i="plus"></i>Создать токен</button>
-          <div class="api-token-box hidden" id="apiTokenBox"><strong>Скопируйте токен сейчас — повторно он не показывается.</strong><div class="fc-inline mt-8"><input class="inp mono grow" id="apiToken" readonly><button class="btn" id="apiTokenCopy">Копировать</button></div></div>
+        <div class="card"><div class="ch"><i data-i="key"></i><span data-i18n="apiNewClient">Новый API-клиент</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t" data-i18n="titleLabel">Название</div></div><div class="fc"><input class="inp" id="apiClientName" data-i18n-placeholder="apiClientPlaceholder" placeholder="Например: локальный агент"></div></div>
+          <div class="api-caps" id="apiCaps"><label><input type="checkbox" value="read" checked> <span data-i18n="apiCapRead">Чтение</span></label><label><input type="checkbox" value="search" checked> <span data-i18n="apiCapSearch">Поиск</span></label><label><input type="checkbox" value="send"> <span data-i18n="apiCapSend">Отправка</span></label><label><input type="checkbox" value="labels"> <span data-i18n="apiCapLabels">Метки</span></label><label><input type="checkbox" value="calendar"> <span data-i18n="navCalendar">Календарь</span></label><label><input type="checkbox" value="network"> <span data-i18n="apiCapNetwork">Сеть</span></label></div>
+          <button class="btn primary mt-14" id="apiClientCreate"><i data-i="plus"></i><span data-i18n="apiCreateToken">Создать токен</span></button>
+          <div class="api-token-box hidden" id="apiTokenBox"><strong data-i18n="apiTokenWarning">Скопируйте токен сейчас — повторно он не показывается.</strong><div class="fc-inline mt-8"><input class="inp mono grow" id="apiToken" readonly><button class="btn" id="apiTokenCopy" data-i18n="copy">Копировать</button></div></div>
         </div></div>
-        <div class="card"><div class="ch"><span>Клиенты</span></div><div class="cb api-client-list" id="apiClientList"></div></div>
-        <div class="card"><div class="ch"><span>Последние вызовы</span><button class="btn sm ml-auto" id="apiAuditRefresh">Обновить</button><button class="btn sm" id="apiAuditClear">Очистить</button></div><div class="cb api-audit-list" id="apiAuditList"></div></div>
+        <div class="card"><div class="ch"><span data-i18n="apiClients">Клиенты</span></div><div class="cb api-client-list" id="apiClientList"></div></div>
+        <div class="card"><div class="ch"><span data-i18n="apiRecentCalls">Последние вызовы</span><button class="btn sm ml-auto" id="apiAuditRefresh" data-i18n="refresh">Обновить</button><button class="btn sm" id="apiAuditClear" data-i18n="clear">Очистить</button></div><div class="cb api-audit-list" id="apiAuditList"></div></div>
       </div>
 
       <div class="setpage" id="set-privacy">
@@ -282,7 +282,7 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionReplyAll">Ответить всем</div></div><div class="fc"><input class="inp keybind-input" data-key-action="reply_all" value="A"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionForward">Переслать</div></div><div class="fc"><input class="inp keybind-input" data-key-action="forward" value="F"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionArchive">В архив</div></div><div class="fc"><input class="inp keybind-input" data-key-action="archive" value="E"></div></div>
-          <div class="frow"><div class="fl"><div class="t">Отложить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="snooze" value="H"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="snooze">Отложить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="snooze" value="H"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="keyNextPrev">Следующее / предыдущее письмо</div></div><div class="fc fc-inline"><input class="inp keybind-input keybind-short" data-key-action="next_message" value="J"><input class="inp keybind-input keybind-short" data-key-action="prev_message" value="K"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionDelete">Удалить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="delete" value="Del"></div></div>
         </div></div>
@@ -318,7 +318,7 @@
       <button class="iconbtn" data-i18n-title="fmtMention" title="Упомянуть"><i data-i="at"></i></button>
       <span class="div"></span>
       <button class="iconbtn" data-i18n-title="fmtAttach" title="Вложение" id="compAttach"><i data-i="paperclip"></i></button>
-      <button class="iconbtn" title="Шаблоны" id="compTemplates"><i data-i="edit"></i></button>
+      <button class="iconbtn" data-i18n-title="templates" title="Шаблоны" id="compTemplates"><i data-i="edit"></i></button>
       <input type="file" id="compFile" multiple hidden>
     </div>
     <div class="compfoot">
@@ -451,7 +451,7 @@
         <h1 data-i18n="languageTitle">Choose your language</h1>
         <p class="sub" data-i18n="languageSub">You can change it later in Settings.</p>
         <div class="left">
-          <button class="wz-opt" type="button" data-wlang="ru"><span class="pv" style="background:#5B63D3">RU</span><div><div class="nm">Русский</div><div class="ds">Русский язык</div></div></button>
+          <button class="wz-opt" type="button" data-wlang="ru"><span class="pv" style="background:#5B63D3">RU</span><div><div class="nm" data-i18n="languageRussian">Русский</div><div class="ds" data-i18n="languageRussianDesc">Русский язык</div></div></button>
           <button class="wz-opt" type="button" data-wlang="en"><span class="pv" style="background:#17181C">EN</span><div><div class="nm">English</div><div class="ds">English language</div></div></button>
         </div>
         <div class="wznav"><button class="btn primary" id="wzLanguageNext" data-wz="4" disabled data-i18n="next">Continue</button></div>
@@ -538,7 +538,14 @@
   </div>
 </div>
 
-<script src="app.js?v=20260717-1"></script>
+<script src="modules/shell.js?v=20260717-1"></script>
+<script src="modules/calendar-contacts.js?v=20260717-1"></script>
+<script src="modules/commands-accessibility.js?v=20260717-1"></script>
+<script src="modules/smart-rules.js?v=20260717-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260717-1"></script>
+<script src="modules/mail.js?v=20260717-1"></script>
+<script src="modules/composer.js?v=20260717-1"></script>
+<script src="modules/settings.js?v=20260717-1"></script>
 <script src="bridge.js?v=20260713-4"></script>
 </body>
 </html>

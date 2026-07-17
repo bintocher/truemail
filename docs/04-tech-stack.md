@@ -7,7 +7,7 @@
 - IMAP/SMTP, Gmail API, CalDAV/CardDAV и EWS: транспорты провайдеров.
 - SQLite FTS5 за трейтом `SearchIndex`: локальный полнотекстовый поиск.
 - Axum: loopback-only REST/MCP API.
-- Fluent и UI-словарь: текущий переходный слой локализации.
+- Общие JSON-каталоги RU/EN: единая локализация WebView и core.
 
 Секреты аккаунтов и API-клиентов хранятся в системном keychain. Ключи базы и
 blob-store не записываются в открытую на диск.

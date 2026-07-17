@@ -56,10 +56,6 @@ chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
 argon2 = "0.5.3"
 
-# локализация (Fluent, см. docs/10-design.md)
-fluent = "0.17.0"
-unic-langid = { version = "0.9.6", features = ["macros"] }
-
 [profile.release]
 opt-level = 3
 lto = true
