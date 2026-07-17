@@ -697,6 +697,98 @@ mod tests {
         .expect("read remaining projections");
         assert_eq!(remaining, vec![("remote-1".into(), "INBOX".into())]);
 
+        let (message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=1")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("message id for snooze");
+        assert_eq!(
+            db.set_messages_snoozed(&[message_id], Some("2099-01-01 09:00:00"))
+                .await
+                .expect("snooze message"),
+            1
+        );
+        assert!(
+            !db.list_messages(folder_id, 100)
+                .await
+                .expect("list without snoozed message")
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+        db.set_messages_snoozed(&[message_id], None)
+            .await
+            .expect("unsnooze message");
+        assert!(
+            db.list_messages(folder_id, 100)
+                .await
+                .expect("list restored message")
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+
+        db.upsert_signature(account.id, "new", "<b>Regards</b>", true)
+            .await
+            .expect("save signature");
+        let signatures = db
+            .list_signatures(account.id)
+            .await
+            .expect("list signatures");
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].body_html, "<b>Regards</b>");
+
+        let template_id = db
+            .save_message_template(None, account.id, "Status", "Weekly", "<p>Done</p>")
+            .await
+            .expect("save template");
+        let templates = db
+            .list_message_templates(account.id)
+            .await
+            .expect("list templates");
+        assert_eq!(templates[0].id, template_id);
+        assert_eq!(templates[0].subject, "Weekly");
+        assert!(
+            db.delete_message_template(template_id, account.id)
+                .await
+                .expect("delete template")
+        );
+
+        let calendar_raw = b"From: calendar@example.test\r\nTo: repo@example.test\r\nSubject: Meeting\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=calendar\r\n\r\n--calendar\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nInvitation\r\n--calendar\r\nContent-Type: text/calendar; charset=utf-8; name=invite.ics\r\nContent-Disposition: attachment; filename=invite.ics\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n--calendar--\r\n";
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 5,
+                remote_id: Some("calendar-message".into()),
+                size: Some(calendar_raw.len() as u32),
+                seen: false,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: calendar_raw.to_vec(),
+            }],
+        )
+        .await
+        .expect("save calendar attachment");
+        let (calendar_message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=5")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("calendar message id");
+        let calendar_message = db
+            .get_message(calendar_message_id)
+            .await
+            .expect("parse calendar attachment");
+        assert!(calendar_message.attachments[0].size.unwrap_or_default() > 0);
+        assert_eq!(
+            db.attachment_bytes(calendar_message_id, 0)
+                .await
+                .expect("calendar attachment bytes")
+                .0,
+            "invite.ics"
+        );
+
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)
             .execute(&db.write_pool)

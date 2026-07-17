@@ -66,6 +66,7 @@
             <div id="threadMenuDynamic"></div>
             <div class="thread-menu-separator" id="threadMenuDynSep"></div>
             <button type="button" data-thread-action="raw"><i data-i="edit"></i><span data-i18n="viewSource">Исходный текст</span></button>
+            <button type="button" data-thread-action="export-eml"><i data-i="download"></i><span>Сохранить как .eml</span></button>
             <button type="button" data-thread-action="create-rule"><i data-i="filter"></i><span data-i18n="createRuleFromMessage">Создать правило из письма</span></button>
             <button type="button" data-thread-action="rules"><i data-i="settings"></i><span data-i18n="processingRules">Правила обработки</span></button>
             <div class="thread-menu-separator"></div>
@@ -298,6 +299,7 @@
       <button class="iconbtn" data-i18n-title="fmtMention" title="Упомянуть"><i data-i="at"></i></button>
       <span class="div"></span>
       <button class="iconbtn" data-i18n-title="fmtAttach" title="Вложение" id="compAttach"><i data-i="paperclip"></i></button>
+      <button class="iconbtn" title="Шаблоны" id="compTemplates"><i data-i="edit"></i></button>
       <input type="file" id="compFile" multiple hidden>
     </div>
     <div class="compfoot">

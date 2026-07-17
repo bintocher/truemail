@@ -61,6 +61,16 @@ pub struct MessageFull {
     pub unsubscribe: Option<Unsubscribe>,
 }
 
+/// Сохраняемый пользователем шаблон нового письма.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageTemplate {
+    pub id: i64,
+    pub account_id: i64,
+    pub name: String,
+    pub subject: String,
+    pub body_html: String,
+}
+
 /// Данные для отписки от рассылки (RFC 2369 / 8058).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Unsubscribe {

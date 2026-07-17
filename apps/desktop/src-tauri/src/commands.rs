@@ -18,7 +18,7 @@ use truemail_core::account::{
 use truemail_core::api::{McpTool, mcp_tools};
 use truemail_core::model::{
     Account, AuthKind, BackendKind, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull,
-    MessageMeta, Provider, Security, ServerConfig, SmartFolder,
+    MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature, SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
 use zeroize::Zeroize;
@@ -878,6 +878,22 @@ pub async fn message_raw(state: State<'_, AppState>, message_id: i64) -> CmdResu
         tracing::warn!(message_id, %error, "докачка исходника письма не удалась");
     }
     Ok(core.db.message_raw(message_id).await?)
+}
+
+/// Экспортировать исходный RFC 5322/MIME без перекодирования.
+#[tauri::command]
+pub async fn export_message_eml(
+    state: State<'_, AppState>,
+    message_id: i64,
+    dest_path: String,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.accounts.ensure_message_raw(message_id).await?;
+    let raw = core.db.message_raw_bytes(message_id).await?;
+    std::fs::write(&dest_path, raw).map_err(|error| ApiError {
+        message: format!("не удалось сохранить .eml: {error}"),
+    })?;
+    Ok(())
 }
 
 /// Одношаговая отписка (RFC 8058) - POST на List-Unsubscribe URL.
@@ -2049,6 +2065,117 @@ pub async fn schedule_message(
 #[tauri::command]
 pub async fn mark_seen(state: State<'_, AppState>, message_id: i64, seen: bool) -> CmdResult<()> {
     Ok(core(&state).await?.db.mark_seen(message_id, seen).await?)
+}
+
+#[tauri::command]
+pub async fn snooze_messages(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    until: String,
+) -> CmdResult<usize> {
+    if message_ids.is_empty() {
+        return Err(ApiError {
+            message: "Не выбрано ни одного письма".into(),
+        });
+    }
+    let until = chrono::DateTime::parse_from_rfc3339(&until).map_err(|error| ApiError {
+        message: format!("неверная дата пробуждения: {error}"),
+    })?;
+    if until <= chrono::Utc::now() {
+        return Err(ApiError {
+            message: "время пробуждения должно быть в будущем".into(),
+        });
+    }
+    let until = until
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_snoozed(&message_ids, Some(&until))
+        .await?)
+}
+
+#[tauri::command]
+pub async fn unsnooze_messages(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_snoozed(&message_ids, None)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn release_due_snoozes(state: State<'_, AppState>) -> CmdResult<usize> {
+    Ok(core(&state).await?.db.release_due_snoozes().await?)
+}
+
+#[tauri::command]
+pub async fn list_signatures(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<Signature>> {
+    Ok(core(&state).await?.db.list_signatures(account_id).await?)
+}
+
+#[tauri::command]
+pub async fn save_signature(
+    state: State<'_, AppState>,
+    account_id: i64,
+    kind: String,
+    body_html: String,
+    enabled: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .upsert_signature(account_id, &kind, &body_html, enabled)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_message_templates(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<MessageTemplate>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_message_templates(account_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn save_message_template(
+    state: State<'_, AppState>,
+    id: Option<i64>,
+    account_id: i64,
+    name: String,
+    subject: String,
+    body_html: String,
+) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .save_message_template(id, account_id, &name, &subject, &body_html)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn delete_message_template(
+    state: State<'_, AppState>,
+    id: i64,
+    account_id: i64,
+) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .delete_message_template(id, account_id)
+        .await?)
 }
 
 #[tauri::command]

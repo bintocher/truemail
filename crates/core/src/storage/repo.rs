@@ -1081,6 +1081,9 @@ impl Db {
                     let size = match &part.body {
                         mail_parser::PartType::Binary(bytes)
                         | mail_parser::PartType::InlineBinary(bytes) => Some(bytes.len() as i64),
+                        mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
+                            Some(text.len() as i64)
+                        }
                         _ => None,
                     };
                     (
@@ -1377,6 +1380,7 @@ impl Db {
                     seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
              FROM messages
              WHERE folder_id = ?
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
                AND NOT EXISTS (
                  SELECT 1 FROM outbox_ops o
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
@@ -1413,6 +1417,7 @@ impl Db {
              FROM messages
              WHERE folder_id = ?
                AND (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
                AND NOT EXISTS (
                  SELECT 1 FROM outbox_ops o
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
@@ -1433,7 +1438,8 @@ impl Db {
     pub async fn list_recent_messages(&self, limit: i64) -> Result<Vec<MessageMeta>> {
         let ids: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM messages
-             WHERE NOT EXISTS (
+             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (
                SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                  AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
              )
@@ -1444,6 +1450,159 @@ impl Db {
         .await?;
         self.list_messages_by_ids(&ids.into_iter().map(|row| row.0).collect::<Vec<_>>())
             .await
+    }
+
+    pub async fn set_messages_snoozed(&self, ids: &[i64], until: Option<&str>) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE messages SET snoozed_until = ");
+        query.push_bind(until);
+        query.push(" WHERE id IN (");
+        let mut separated = query.separated(",");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        Ok(query
+            .build()
+            .execute(&self.write_pool)
+            .await?
+            .rows_affected() as usize)
+    }
+
+    pub async fn release_due_snoozes(&self) -> Result<usize> {
+        Ok(sqlx::query(
+            "UPDATE messages SET snoozed_until = NULL
+             WHERE snoozed_until IS NOT NULL AND snoozed_until <= datetime('now')",
+        )
+        .execute(&self.write_pool)
+        .await?
+        .rows_affected() as usize)
+    }
+
+    pub async fn list_signatures(&self, account_id: i64) -> Result<Vec<Signature>> {
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT kind, body_html, enabled FROM signatures
+             WHERE account_id = ? ORDER BY CASE kind WHEN 'new' THEN 0 ELSE 1 END",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, body_html, enabled)| Signature {
+                kind,
+                body_html,
+                enabled,
+            })
+            .collect())
+    }
+
+    pub async fn upsert_signature(
+        &self,
+        account_id: i64,
+        kind: &str,
+        body_html: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        if !matches!(kind, "new" | "reply") {
+            return Err(crate::Error::AccountConfig(
+                "вид подписи должен быть new или reply".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO signatures(account_id, kind, body_html, enabled)
+             VALUES(?, ?, ?, ?)
+             ON CONFLICT(account_id, kind) DO UPDATE SET
+               body_html=excluded.body_html, enabled=excluded.enabled",
+        )
+        .bind(account_id)
+        .bind(kind)
+        .bind(body_html)
+        .bind(enabled)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_message_templates(&self, account_id: i64) -> Result<Vec<MessageTemplate>> {
+        let rows: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, account_id, name, subject, body_html FROM message_templates
+             WHERE account_id = ? ORDER BY name COLLATE NOCASE, id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, account_id, name, subject, body_html)| MessageTemplate {
+                    id,
+                    account_id,
+                    name,
+                    subject,
+                    body_html,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn save_message_template(
+        &self,
+        id: Option<i64>,
+        account_id: i64,
+        name: &str,
+        subject: &str,
+        body_html: &str,
+    ) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(crate::Error::AccountConfig(
+                "название шаблона не указано".into(),
+            ));
+        }
+        if let Some(id) = id {
+            let result = sqlx::query(
+                "UPDATE message_templates SET name=?, subject=?, body_html=?, updated_at=datetime('now')
+                 WHERE id=? AND account_id=?",
+            )
+            .bind(name)
+            .bind(subject)
+            .bind(body_html)
+            .bind(id)
+            .bind(account_id)
+            .execute(&self.write_pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(crate::Error::Other("шаблон не найден".into()));
+            }
+            return Ok(id);
+        }
+        Ok(sqlx::query(
+            "INSERT INTO message_templates(account_id, name, subject, body_html)
+             VALUES(?, ?, ?, ?)",
+        )
+        .bind(account_id)
+        .bind(name)
+        .bind(subject)
+        .bind(body_html)
+        .execute(&self.write_pool)
+        .await?
+        .last_insert_rowid())
+    }
+
+    pub async fn delete_message_template(&self, id: i64, account_id: i64) -> Result<bool> {
+        Ok(
+            sqlx::query("DELETE FROM message_templates WHERE id=? AND account_id=?")
+                .bind(id)
+                .bind(account_id)
+                .execute(&self.write_pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
     }
 
     pub async fn list_messages_by_ids(&self, ids: &[i64]) -> Result<Vec<MessageMeta>> {
@@ -1548,6 +1707,7 @@ impl Db {
                 });
                 let bytes = match &part.body {
                     PartType::Binary(bytes) | PartType::InlineBinary(bytes) => Some(bytes.as_ref()),
+                    PartType::Text(text) | PartType::Html(text) => Some(text.as_bytes()),
                     _ => None,
                 };
                 if let (Some(html), Some(id), Some(bytes)) =
@@ -1671,6 +1831,11 @@ impl Db {
 
     /// Сырой MIME-исходник письма (для просмотра "как есть" и диагностики).
     pub async fn message_raw(&self, message_id: i64) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.message_raw_bytes(message_id).await?).into_owned())
+    }
+
+    /// Исходные байты RFC 5322/MIME без перекодирования — для экспорта `.eml`.
+    pub async fn message_raw_bytes(&self, message_id: i64) -> Result<Vec<u8>> {
         let (raw_ref,): (Option<String>,) =
             sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
                 .bind(message_id)
@@ -1681,7 +1846,7 @@ impl Db {
             .map(|reference| self.blobs.get(reference))
             .transpose()?
             .ok_or_else(|| crate::Error::Other("исходник письма недоступен".into()))?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        Ok(raw)
     }
 
     /// Извлечь содержимое вложения по индексу (Attachment.id) из raw-MIME письма.

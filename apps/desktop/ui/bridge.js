@@ -37,6 +37,7 @@
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
+    exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),
     unsubscribeOneClick: (url) => invoke("unsubscribe_one_click", { url }),
     setAutostart: (enabled) => invoke("set_autostart", { enabled }),
     getAutostart: () => invoke("get_autostart"),
@@ -67,6 +68,14 @@
     sendMessage: (request) => invoke("send_message", { request }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
+    snoozeMessages: (messageIds, until) => invoke("snooze_messages", { messageIds, until }),
+    unsnoozeMessages: (messageIds) => invoke("unsnooze_messages", { messageIds }),
+    releaseDueSnoozes: () => invoke("release_due_snoozes"),
+    listSignatures: (accountId) => invoke("list_signatures", { accountId }),
+    saveSignature: (accountId, kind, bodyHtml, enabled) => invoke("save_signature", { accountId, kind, bodyHtml, enabled }),
+    listMessageTemplates: (accountId) => invoke("list_message_templates", { accountId }),
+    saveMessageTemplate: (template) => invoke("save_message_template", template),
+    deleteMessageTemplate: (id, accountId) => invoke("delete_message_template", { id, accountId }),
     messageAction: (messageIds, action) => invoke("message_action", { messageIds, action }),
     moveMessagesToFolder: (messageIds, folderId) => invoke("move_messages_to_folder", { messageIds, folderId }),
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
@@ -153,6 +162,12 @@
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
       if (accounts.length) {
+        const releaseSnoozed = async () => {
+          const released = await window.tm.releaseDueSnoozes();
+          if (released) scheduleReload(0);
+        };
+        releaseSnoozed().catch(console.error);
+        setInterval(() => releaseSnoozed().catch(console.error), 30000);
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
         // Календарь/контакты/задачи тянем сразу при старте, а не только в 5-минутном

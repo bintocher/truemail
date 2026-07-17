@@ -329,10 +329,18 @@
   .rcpt-x:hover{background:var(--danger,#e5484d);color:#fff}.recipient-toggles{display:flex;gap:3px}.recipient-toggles button,.recipient-close{border:0;background:transparent;color:var(--text-3);font:inherit;font-size:12.5px;padding:3px 5px;border-radius:5px;cursor:pointer}.recipient-toggles button:hover,.recipient-close:hover{color:var(--accent-text);background:var(--hover)}.recipient-close{font-size:18px;line-height:1}.recipient-suggestions{display:none;position:absolute;left:0;right:0;top:calc(100% + 8px);z-index:55;max-height:260px;overflow-y:auto;padding:5px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow)}.recipient-suggestions.open{display:block}.recipient-option{display:grid;grid-template-columns:minmax(0,1fr);gap:1px;width:100%;padding:7px 9px;border:0;border-radius:7px;background:transparent;color:var(--text);font:inherit;text-align:left;cursor:pointer}.recipient-option:hover,.recipient-option.active{background:var(--hover)}.recipient-option span{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.recipient-option small{color:var(--text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .cfield .from-sel{border:1px solid var(--border);border-radius:7px;padding:5px 10px;background:var(--panel);font-size:13px;}
   .compedit{padding:16px 0;min-height:220px;color:var(--text);line-height:1.6;}
+  .composer-signature{margin:14px 0;color:var(--text-2);border-top:1px solid var(--border);padding-top:10px;}
   .comptool{display:flex;align-items:center;gap:3px;padding:10px 20px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);flex-wrap:wrap;}
   .comptool .div{width:1px;height:20px;background:var(--border);margin:0 6px;}
   .compfoot{display:flex;align-items:center;gap:8px;padding:14px 20px;}
   .sig{color:var(--text-3);border-top:1px solid var(--border);padding-top:14px;margin-top:14px;font-size:13px;white-space:pre-line;}
+  .signature-settings{margin-top:18px;padding-top:16px;border-top:1px solid var(--border)}
+  .signature-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:10px}
+  .signature-item{padding:11px;border:1px solid var(--border);border-radius:9px;background:var(--panel)}
+  .signature-item-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;font-size:12px}
+  .signature-editor{min-height:76px;padding:9px;border:1px solid var(--border-strong);border-radius:7px;background:var(--bg);outline:none;line-height:1.45}
+  .signature-editor:empty:before{content:attr(data-ph);color:var(--text-3)}
+  .signature-save{margin-top:8px}
 
   /* settings popover on mail */
   .pop{position:fixed;top:50px;left:14px;width:250px;background:var(--bg);border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow);padding:12px;z-index:40;display:none;}
@@ -357,6 +365,10 @@
   .modal .mh{display:flex;align-items:center;gap:11px;padding:16px 20px;border-bottom:1px solid var(--border);}
   .modal .mh i svg{width:19px;height:19px;color:var(--accent-text);} .modal .mh h3{margin:0;font-size:16px;} .modal .mh .x{margin-left:auto;}
   .modal .mb{padding:18px 20px;max-height:64vh;overflow-y:auto;} .modal .mf{display:flex;align-items:center;gap:8px;padding:14px 20px;border-top:1px solid var(--border);}
+  .compact-modal{width:min(460px,94vw)}
+  .snooze-presets{display:grid;gap:8px;margin-bottom:14px}.snooze-presets .btn{justify-content:flex-start}
+  .template-field{display:grid;gap:6px;color:var(--text-2);font-size:12px}
+  .template-list{display:grid;gap:8px}.template-row{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid var(--border);border-radius:9px}.template-row .t{font-weight:600}.template-row .d{font-size:12px;color:var(--text-3)}.template-empty{color:var(--text-3);text-align:center;padding:20px}
   .aux-form .fld{margin-bottom:13px}.aux-form .fld>label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px}.aux-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.aux-check{display:flex;align-items:center;gap:8px;font-size:13px;margin:-2px 0 13px}.aux-check input{accent-color:var(--accent)}.ccard{cursor:pointer}.ccard:hover{background:var(--hover)}
   .fld{margin-bottom:18px;} .fld>label{display:block;font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:7px;}
   .name-row{display:flex;gap:10px;align-items:center;} .name-row .inp{flex:1;}
