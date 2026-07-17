@@ -35,6 +35,60 @@ pub struct OutboxOperation {
 }
 
 impl Db {
+    pub async fn list_keybindings(&self) -> Result<Vec<Keybinding>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, scope, combo FROM keybindings ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(action, scope, combo)| Keybinding {
+            action,
+            scope,
+            combo,
+        })
+        .collect())
+    }
+
+    pub async fn set_keybinding(&self, action: &str, combo: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE keybindings SET combo=? WHERE action=?")
+            .bind(combo)
+            .bind(action)
+            .execute(&self.write_pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(crate::Error::Other(
+                "неизвестное действие клавиатуры".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn image_sender_trusted(&self, sender: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT allow FROM image_trust WHERE sender=lower(?)")
+                .bind(sender.trim())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some_and(|(allow,)| allow != 0))
+    }
+
+    pub async fn set_image_sender_trusted(&self, sender: &str, allow: bool) -> Result<()> {
+        let sender = sender.trim().to_lowercase();
+        if sender.is_empty() {
+            return Err(crate::Error::Other("отправитель не указан".into()));
+        }
+        sqlx::query(
+            "INSERT INTO image_trust(sender, allow) VALUES(?, ?)
+             ON CONFLICT(sender) DO UPDATE SET allow=excluded.allow",
+        )
+        .bind(sender)
+        .bind(allow as i64)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
     /// Remove files no longer reachable from SQLite and report broken links.
     /// Run before background synchronization starts, so the reference snapshot
     /// cannot race a writer.

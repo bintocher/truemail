@@ -19,7 +19,7 @@ const WINDOW_STATE_FLAGS: StateFlags = StateFlags::SIZE
     .union(StateFlags::POSITION)
     .union(StateFlags::MAXIMIZED)
     .union(StateFlags::FULLSCREEN);
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 use truemail_core::Core;
 
 /// Показать и сфокусировать главное окно (из трея/клика).
@@ -121,6 +121,10 @@ fn run() -> anyhow::Result<()> {
         })
         .map(|value| commands::NotifyAnchor::parse(&value))
         .unwrap_or_else(commands::NotifyAnchor::platform_default);
+    let initial_keybindings = core
+        .as_ref()
+        .and_then(|core| rt.block_on(core.db.list_keybindings()).ok())
+        .unwrap_or_else(commands::default_keybindings);
     let state = AppState {
         core: tokio::sync::RwLock::new(core),
         notify_anchor: Arc::new(std::sync::Mutex::new(notify_anchor)),
@@ -132,14 +136,8 @@ fn run() -> anyhow::Result<()> {
         reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_server: Arc::new(tokio::sync::Mutex::new(None)),
+        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
-
-    let show_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM);
-    let compose_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
-    let search_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyF);
-    let show_handler = show_shortcut;
-    let compose_handler = compose_shortcut;
-    let search_handler = search_shortcut;
     tauri::Builder::default()
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -147,15 +145,13 @@ fn run() -> anyhow::Result<()> {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    let action = if shortcut == &show_handler {
-                        "toggle"
-                    } else if shortcut == &compose_handler {
-                        "compose"
-                    } else if shortcut == &search_handler {
-                        "search"
-                    } else {
-                        return;
-                    };
+                    let action = app
+                        .state::<AppState>()
+                        .shortcut_actions
+                        .read()
+                        .ok()
+                        .and_then(|actions| actions.get(&shortcut.to_string()).cloned());
+                    let Some(action) = action else { return };
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
@@ -184,9 +180,7 @@ fn run() -> anyhow::Result<()> {
         ))
         .manage(state)
         .setup(move |app| {
-            app.global_shortcut().register(show_shortcut)?;
-            app.global_shortcut().register(compose_shortcut)?;
-            app.global_shortcut().register(search_shortcut)?;
+            commands::register_global_shortcuts(app.handle(), &initial_keybindings)?;
 
             // Меню и иконка в системном трее. Приложение продолжает работать в
             // фоне (IMAP IDLE, синхронизация), даже когда окно скрыто.
@@ -340,6 +334,10 @@ fn run() -> anyhow::Result<()> {
             commands::undo_message_action,
             commands::get_setting,
             commands::set_setting,
+            commands::list_keybindings,
+            commands::set_keybinding,
+            commands::image_sender_trusted,
+            commands::set_image_sender_trusted,
             commands::all_settings,
             commands::begin_account_connection,
             commands::complete_password_imap,

@@ -6,6 +6,11 @@
 self-hosted Exchange — EWS. Автоконфигурация сначала проверяет известного
 провайдера, затем стандартные autoconfig/ISPDB/SRV-механизмы.
 
+Desktop OAuth использует PKCE и loopback callback. Для Яндекса в настройках
+OAuth-приложения должен быть зарегистрирован точный адрес
+`http://127.0.0.1:34982/oauth/yandex/callback`; его можно заменить при сборке
+через `TRUEMAIL_YANDEX_REDIRECT_URI`. Google принимает случайный loopback-порт.
+
 Синхронизация хранит серверные курсоры: UIDVALIDITY/HIGHESTMODSEQ для IMAP,
 `historyId` для Gmail, `syncToken`/`ctag` для DAV. Новый курсор фиксируется только
 после успешного сохранения соответствующей порции данных. Ядро не допускает две

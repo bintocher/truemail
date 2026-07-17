@@ -23,6 +23,14 @@ pub fn configured_yandex_client_id() -> Option<String> {
     )
 }
 
+pub fn configured_yandex_redirect_uri() -> String {
+    configured_oauth_value(
+        "TRUEMAIL_YANDEX_REDIRECT_URI",
+        option_env!("TRUEMAIL_YANDEX_REDIRECT_URI"),
+    )
+    .unwrap_or_else(|| "http://127.0.0.1:34982/oauth/yandex/callback".into())
+}
+
 pub fn configured_google_client_id() -> Option<String> {
     configured_oauth_value(
         "TRUEMAIL_GOOGLE_CLIENT_ID",
@@ -105,6 +113,7 @@ pub fn yandex_authorize_url(
     email_hint: &str,
     state: &str,
     challenge: &str,
+    redirect_uri: &str,
 ) -> Result<String> {
     if client_id.trim().is_empty() {
         return Err(Error::AccountConfig(
@@ -117,7 +126,7 @@ pub fn yandex_authorize_url(
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
-        .append_pair("redirect_uri", "https://oauth.yandex.ru/verification_code")
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", YANDEX_SCOPES)
         .append_pair("login_hint", email_hint)
         .append_pair("force_confirm", "yes")
@@ -164,6 +173,7 @@ pub async fn exchange_yandex_code(
     client_id: &str,
     code: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> Result<OAuthToken> {
     let response = oauth_client("yandex-oauth")?
         .post("https://oauth.yandex.ru/token")
@@ -172,6 +182,7 @@ pub async fn exchange_yandex_code(
             ("code", code.trim()),
             ("client_id", client_id),
             ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
         ])
         .send()
         .await
@@ -333,8 +344,14 @@ mod tests {
 
     #[test]
     fn authorize_url_contains_combined_scopes_and_pkce() {
-        let url =
-            yandex_authorize_url("client", "me@yandex.ru", "state", "challenge").expect("url");
+        let url = yandex_authorize_url(
+            "client",
+            "me@yandex.ru",
+            "state",
+            "challenge",
+            "http://127.0.0.1:34982/oauth/yandex/callback",
+        )
+        .expect("url");
         let parsed = Url::parse(&url).expect("parse");
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
         assert_eq!(
@@ -342,6 +359,10 @@ mod tests {
                 .get("code_challenge_method")
                 .map(|value| value.as_ref()),
             Some("S256")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|value| value.as_ref()),
+            Some("http://127.0.0.1:34982/oauth/yandex/callback")
         );
         let scopes = params.get("scope").expect("scope");
         assert!(scopes.contains("mail:imap_full"));

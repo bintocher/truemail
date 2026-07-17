@@ -5,22 +5,25 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::account::{
     ContactInput, EventInput, RemoteObject, configured_google_client_id,
-    configured_google_client_secret, configured_yandex_client_id,
+    configured_google_client_secret, configured_yandex_client_id, configured_yandex_redirect_uri,
 };
 use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
 };
 use truemail_core::model::{
-    Account, AuthKind, BackendKind, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull,
-    MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature, SmartFolder,
+    Account, AuthKind, BackendKind, Contact, Event, Folder, Keybinding, MailRule, MailRuleInput,
+    MessageFull, MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature,
+    SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -36,6 +39,7 @@ pub struct AppState {
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
     pub api_server: Arc<tokio::sync::Mutex<Option<truemail_core::api::RunningApiServer>>>,
+    pub shortcut_actions: Arc<std::sync::RwLock<HashMap<String, String>>>,
     // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
     // действительно завершает приложение, а не сворачивает в трей.
     pub quitting: Arc<std::sync::atomic::AtomicBool>,
@@ -44,6 +48,54 @@ pub struct AppState {
     // Куда прижимать окно уведомлений; кэш настройки notify_position,
     // чтобы позиционирование не лезло в БД (оно синхронное).
     pub notify_anchor: Arc<std::sync::Mutex<NotifyAnchor>>,
+}
+
+pub fn default_keybindings() -> Vec<Keybinding> {
+    [
+        ("toggle_window", "global", "Ctrl+Shift+M"),
+        ("compose_global", "global", "Ctrl+Shift+C"),
+        ("quick_search", "global", "Ctrl+Shift+F"),
+        ("palette", "local", "Ctrl+K"),
+        ("compose", "local", "C"),
+        ("reply", "local", "R"),
+        ("reply_all", "local", "A"),
+        ("forward", "local", "F"),
+        ("archive", "local", "E"),
+        ("snooze", "local", "H"),
+        ("next_message", "local", "J"),
+        ("prev_message", "local", "K"),
+        ("delete", "local", "Del"),
+    ]
+    .into_iter()
+    .map(|(action, scope, combo)| Keybinding {
+        action: action.into(),
+        scope: scope.into(),
+        combo: combo.into(),
+    })
+    .collect()
+}
+
+pub fn register_global_shortcuts(app: &AppHandle, bindings: &[Keybinding]) -> anyhow::Result<()> {
+    let manager = app.global_shortcut();
+    manager.unregister_all()?;
+    let mut actions = HashMap::new();
+    for binding in bindings.iter().filter(|binding| binding.scope == "global") {
+        let emitted = match binding.action.as_str() {
+            "toggle_window" => "toggle",
+            "compose_global" => "compose",
+            "quick_search" => "search",
+            _ => continue,
+        };
+        let shortcut = Shortcut::from_str(&binding.combo)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", binding.combo))?;
+        manager.register(shortcut)?;
+        actions.insert(shortcut.to_string(), emitted.to_owned());
+    }
+    *app.state::<AppState>()
+        .shortcut_actions
+        .write()
+        .map_err(|_| anyhow::anyhow!("блокировка горячих клавиш повреждена"))? = actions;
+    Ok(())
 }
 
 /// Угол экрана для окна уведомлений.
@@ -2292,6 +2344,79 @@ pub async fn set_setting(state: State<'_, AppState>, key: String, value: String)
     Ok(core(&state).await?.db.set_setting(&key, &value).await?)
 }
 
+#[tauri::command]
+pub async fn list_keybindings(state: State<'_, AppState>) -> CmdResult<Vec<Keybinding>> {
+    Ok(core(&state).await?.db.list_keybindings().await?)
+}
+
+#[tauri::command]
+pub async fn set_keybinding(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    action: String,
+    combo: String,
+) -> CmdResult<()> {
+    let combo = combo.trim();
+    if combo.is_empty() {
+        return Err(ApiError {
+            message: "сочетание клавиш не может быть пустым".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let previous = core.db.list_keybindings().await?;
+    let mut updated = previous.clone();
+    let binding = updated
+        .iter_mut()
+        .find(|binding| binding.action == action)
+        .ok_or_else(|| ApiError {
+            message: "неизвестное действие клавиатуры".into(),
+        })?;
+    if binding.scope == "global" {
+        Shortcut::from_str(combo).map_err(|error| ApiError {
+            message: format!("неверное сочетание клавиш: {error}"),
+        })?;
+    }
+    binding.combo = combo.to_owned();
+    let mut seen = HashSet::new();
+    if updated
+        .iter()
+        .any(|binding| !seen.insert(binding.combo.to_ascii_lowercase()))
+    {
+        return Err(ApiError {
+            message: "это сочетание уже назначено другому действию".into(),
+        });
+    }
+    if let Err(error) = register_global_shortcuts(&app, &updated) {
+        let _ = register_global_shortcuts(&app, &previous);
+        return Err(ApiError {
+            message: format!("не удалось зарегистрировать сочетание: {error}"),
+        });
+    }
+    if let Err(error) = core.db.set_keybinding(&action, combo).await {
+        let _ = register_global_shortcuts(&app, &previous);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn image_sender_trusted(state: State<'_, AppState>, sender: String) -> CmdResult<bool> {
+    Ok(core(&state).await?.db.image_sender_trusted(&sender).await?)
+}
+
+#[tauri::command]
+pub async fn set_image_sender_trusted(
+    state: State<'_, AppState>,
+    sender: String,
+    allow: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_image_sender_trusted(&sender, allow)
+        .await?)
+}
+
 fn yandex_client_id() -> CmdResult<String> {
     configured_yandex_client_id().ok_or_else(|| ApiError {
         message: "Подключение к Яндексу пока не настроено в этой сборке truemail.".into(),
@@ -2310,9 +2435,10 @@ fn google_client_credentials() -> CmdResult<(String, String)> {
     Ok((client_id, client_secret))
 }
 
-async fn receive_google_callback(
+async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
+    provider: &str,
 ) -> CmdResult<String> {
     tokio::time::timeout(std::time::Duration::from_secs(300), async {
         loop {
@@ -2341,13 +2467,13 @@ async fn receive_google_callback(
             let (status, title, body) = if success {
                 (
                     "200 OK",
-                    "Gmail подключён",
+                    format!("{provider} подключён"),
                     "Авторизация завершена. Можно закрыть эту вкладку и вернуться в truemail.",
                 )
             } else {
                 (
                     "400 Bad Request",
-                    "Не удалось подключить Gmail",
+                    format!("Не удалось подключить {provider}"),
                     "Вернитесь в truemail и повторите подключение.",
                 )
             };
@@ -2362,12 +2488,12 @@ async fn receive_google_callback(
             let _ = stream.shutdown().await;
             if !valid_state {
                 return Err(ApiError {
-                    message: "Google OAuth вернул неверный state; подключение отменено".into(),
+                    message: format!("{provider} OAuth вернул неверный state; подключение отменено"),
                 });
             }
             if let Some(error) = error {
                 return Err(ApiError {
-                    message: format!("Google OAuth: {error}"),
+                    message: format!("{provider} OAuth: {error}"),
                 });
             }
             if let Some(code) = code {
@@ -2377,7 +2503,7 @@ async fn receive_google_callback(
     })
     .await
     .map_err(|_| ApiError {
-        message: "Время ожидания входа в Google истекло. Нажмите «Подключить» ещё раз.".into(),
+        message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
     })?
 }
 
@@ -2492,27 +2618,59 @@ pub async fn begin_account_connection(
     match config.provider {
         truemail_core::model::Provider::Yandex => {
             let client_id = yandex_client_id()?;
+            // Redirect URI должен быть зарегистрирован в OAuth-приложении
+            // Яндекса с точным scheme/host/port/path.
+            let redirect_uri = configured_yandex_redirect_uri();
+            let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
+                message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
+            })?;
+            if redirect.scheme() != "http"
+                || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
+            {
+                return Err(ApiError {
+                    message: "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
+                        .into(),
+                });
+            }
+            let port = redirect.port().ok_or_else(|| ApiError {
+                message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
+            })?;
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .map_err(|error| ApiError {
+                    message: format!(
+                        "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
+                    ),
+                })?;
             let url = truemail_core::account::yandex_authorize_url(
                 &client_id,
                 &email,
                 &oauth_state,
                 &pkce.challenge,
+                &redirect_uri,
             )?;
             open_in_yandex_browser(&app, &url)?;
-            let mut oauth = state.oauth.lock().await;
-            oauth.clear();
-            oauth.insert(
-                oauth_state.clone(),
-                PendingOAuth {
-                    email,
-                    verifier: pkce.verifier.clone(),
-                    client_id,
-                },
-            );
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+            let token = truemail_core::account::exchange_yandex_code(
+                &client_id,
+                &code,
+                &pkce.verifier,
+                &redirect_uri,
+            )
+            .await?;
+            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+            let connected = core
+                .accounts
+                .add_yandex_oauth(&email, &display_name, token)
+                .await?;
+            let account = connected.account.clone();
+            let response = connected_response(connected);
+            spawn_initial_mail_sync(&app, &state, core, account).await;
             Ok(PendingOAuthResponse {
-                mode: "verification_code".into(),
-                state: Some(oauth_state),
-                connected: None,
+                mode: "connected".into(),
+                state: None,
+                connected: Some(response),
                 password_config: None,
             })
         }
@@ -2539,7 +2697,8 @@ pub async fn begin_account_connection(
                 &redirect_uri,
             )?;
             open_in_yandex_browser(&app, &url)?;
-            let code = Zeroizing::new(receive_google_callback(listener, &oauth_state).await?);
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
             let token = truemail_core::account::exchange_google_code(
                 &client_id,
                 &client_secret,
@@ -2722,9 +2881,13 @@ pub async fn complete_yandex_oauth(
         .ok_or_else(|| ApiError {
             message: "OAuth-сессия не найдена или устарела".into(),
         })?;
-    let token =
-        truemail_core::account::exchange_yandex_code(&pending.client_id, &code, &pending.verifier)
-            .await?;
+    let token = truemail_core::account::exchange_yandex_code(
+        &pending.client_id,
+        &code,
+        &pending.verifier,
+        "https://oauth.yandex.ru/verification_code",
+    )
+    .await?;
     state.oauth.lock().await.remove(&oauth_state);
     let email = pending.email.trim().to_lowercase();
     let display_name = email.split('@').next().unwrap_or(&email).to_owned();

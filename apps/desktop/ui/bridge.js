@@ -85,6 +85,10 @@
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
     getSetting: (key) => invoke("get_setting", { key }),
     setSetting: (key, value) => invoke("set_setting", { key, value }),
+    listKeybindings: () => invoke("list_keybindings"),
+    setKeybinding: (action, combo) => invoke("set_keybinding", { action, combo }),
+    imageSenderTrusted: (sender) => invoke("image_sender_trusted", { sender }),
+    setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     openExternal: (url) => invoke("open_external_url", { url }),
@@ -162,6 +166,7 @@
       // молча не восстановленная настройка (так терялись show_conversations,
       // preview_lines, contacts_view, notify_position).
       const settings = await window.tm.allSettings();
+      await window.refreshKeybindings?.();
       const onboardingCompleted = settings.onboarding_completed;
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);

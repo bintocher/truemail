@@ -63,6 +63,7 @@ and `make dev` reads it while building.
 
 ```dotenv
 TRUEMAIL_YANDEX_CLIENT_ID=your_yandex_application_id
+TRUEMAIL_YANDEX_REDIRECT_URI=http://127.0.0.1:34982/oauth/yandex/callback
 TRUEMAIL_GOOGLE_CLIENT_ID=your_google_application_id
 TRUEMAIL_GOOGLE_CLIENT_SECRET=the_string_google_issues
 ```
@@ -70,8 +71,8 @@ TRUEMAIL_GOOGLE_CLIENT_SECRET=the_string_google_issues
 Yandex needs no application password. Google issues one even for programs on a
 computer and requires it when connecting, so it is listed here.
 
-Yandex: an application of type `Web services`, callback URL
-`https://oauth.yandex.ru/verification_code`, permissions `mail:imap_full`,
+Yandex: an application of type `Web services`, exact callback URL
+`http://127.0.0.1:34982/oauth/yandex/callback`, permissions `mail:imap_full`,
 `mail:smtp`, `calendar:all`, `directory:read_external_contacts`,
 `directory:write_external_contacts`.
 
@@ -82,7 +83,7 @@ receives the answer on a temporary `http://127.0.0.1` address on a random port.
 
 ## How data is stored
 
-On first run you choose a language, a folder for the data, and create the
+On first run you choose a language, review the setup process, choose a folder for the data, and create the
 encryption keys by moving the mouse. Those random movements are mixed with
 random numbers from the operating system, so the key cannot be predicted. Keys
 are kept in the system password store.

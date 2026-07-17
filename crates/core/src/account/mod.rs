@@ -18,8 +18,9 @@ pub use google_services::sync_google_services;
 pub use oauth::{
     GOOGLE_SCOPES, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
     configured_google_client_id, configured_google_client_secret, configured_yandex_client_id,
-    exchange_google_code, exchange_yandex_code, generate_pkce, generate_state,
-    google_authorize_url, refresh_google_token, refresh_yandex_token, yandex_authorize_url,
+    configured_yandex_redirect_uri, exchange_google_code, exchange_yandex_code, generate_pkce,
+    generate_state, google_authorize_url, refresh_google_token, refresh_yandex_token,
+    yandex_authorize_url,
 };
 
 use crate::Result;

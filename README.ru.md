@@ -63,6 +63,7 @@ make dev       # запустить программу
 
 ```dotenv
 TRUEMAIL_YANDEX_CLIENT_ID=идентификатор_приложения_яндекса
+TRUEMAIL_YANDEX_REDIRECT_URI=http://127.0.0.1:34982/oauth/yandex/callback
 TRUEMAIL_GOOGLE_CLIENT_ID=идентификатор_приложения_google
 TRUEMAIL_GOOGLE_CLIENT_SECRET=строка_выданная_google
 ```
@@ -70,8 +71,8 @@ TRUEMAIL_GOOGLE_CLIENT_SECRET=строка_выданная_google
 Яндексу пароль приложения не нужен. Google выдаёт его даже для программ на
 компьютере и требует при подключении, поэтому он указывается здесь.
 
-Яндекс: приложение с типом `Веб-сервисы`, адрес для ответа
-`https://oauth.yandex.ru/verification_code`, права `mail:imap_full`,
+Яндекс: приложение с типом `Веб-сервисы`, точный адрес для ответа
+`http://127.0.0.1:34982/oauth/yandex/callback`, права `mail:imap_full`,
 `mail:smtp`, `calendar:all`, `directory:read_external_contacts`,
 `directory:write_external_contacts`.
 
@@ -82,7 +83,7 @@ Google: проект в [Google Cloud Console](https://console.cloud.google.com/
 
 ## Хранение данных
 
-При первом запуске вы выбираете язык, папку для данных и создаёте ключи
+При первом запуске вы выбираете язык, знакомитесь с процессом, выбираете папку для данных и создаёте ключи
 шифрования, двигая мышью. Случайные движения смешиваются со случайными числами
 операционной системы — так ключ нельзя предсказать. Ключи хранятся в системном
 хранилище паролей.

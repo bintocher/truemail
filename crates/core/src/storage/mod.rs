@@ -632,6 +632,34 @@ mod tests {
             .expect("save generic account");
         assert_eq!(account.provider, Provider::Generic);
 
+        let bindings = db.list_keybindings().await.expect("list keybindings");
+        assert!(bindings.iter().any(|binding| binding.action == "compose"));
+        db.set_keybinding("compose", "N")
+            .await
+            .expect("change keybinding");
+        assert_eq!(
+            db.list_keybindings()
+                .await
+                .expect("reload keybindings")
+                .into_iter()
+                .find(|binding| binding.action == "compose")
+                .map(|binding| binding.combo),
+            Some("N".into())
+        );
+        assert!(
+            !db.image_sender_trusted("news@example.test")
+                .await
+                .expect("read missing image trust")
+        );
+        db.set_image_sender_trusted("News@Example.Test", true)
+            .await
+            .expect("trust image sender");
+        assert!(
+            db.image_sender_trusted("news@example.test")
+                .await
+                .expect("read image trust")
+        );
+
         let indexes: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_messages_folder_date','uq_events_calendar_uid','idx_attachments_message') ORDER BY name",
         )
