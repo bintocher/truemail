@@ -324,6 +324,21 @@ impl EwsBackend {
             .map_err(|error| backend_error("mime", error))
     }
 
+    async fn item_change_key(&self, password: &str, item_id: &str) -> Result<String> {
+        let body = format!(
+            r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:GetItem>"#,
+            escape(item_id)
+        );
+        let response = self.soap(password, "GetItem", &body).await?;
+        let document = Document::parse(&response).map_err(|error| backend_error("xml", error))?;
+        document
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+            .and_then(|node| node.attribute("ChangeKey"))
+            .map(str::to_owned)
+            .ok_or_else(|| backend_error("item", "Exchange не вернул ChangeKey письма"))
+    }
+
     /// Календарь и адресная книга Exchange для aux-синхронизации.
     ///
     /// Календарь и контакты необязательны: у ящика может не быть прав на них, а
@@ -905,12 +920,18 @@ impl MailBackend for EwsBackend {
         let item_id = payload["remote_id"]
             .as_str()
             .ok_or_else(|| Error::AccountConfig("EWS outbox: нет remote_id".into()))?;
+        let change_key = if operation == "flag" {
+            Some(self.item_change_key(credential, item_id).await?)
+        } else {
+            None
+        };
         let (action, body) = match operation {
             "flag" => (
                 "UpdateItem",
                 format!(
-                    r#"<m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}"/><t:Updates><t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>{}</t:IsRead></t:Message></t:SetItemField></t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
+                    r#"<m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates><t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>{}</t:IsRead></t:Message></t:SetItemField></t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
                     escape(item_id),
+                    escape(change_key.as_deref().unwrap_or_default()),
                     payload["seen"].as_bool().unwrap_or(false)
                 ),
             ),

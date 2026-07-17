@@ -66,6 +66,10 @@ impl Db {
             // очередь записи, поэтому ожидаем завершения активной транзакции,
             // а не показываем пользователю ложную ошибку хранилища.
             .acquire_timeout(std::time::Duration::from_secs(10 * 60))
+            // Несколько аккаунтов завершают сетевую синхронизацию одновременно
+            // и штатно ждут единственного SQLCipher-писателя. До 30 секунд это
+            // нормальная очередь, а не медленное получение соединения.
+            .acquire_slow_threshold(std::time::Duration::from_secs(30))
             .connect_with(encrypted_options(&db_path, database_key, true))
             .await?;
 

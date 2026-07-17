@@ -2346,6 +2346,21 @@ impl Db {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Вернуть в очередь операции Exchange, отложенные старой реализацией,
+    /// которая отправляла UpdateItem без обязательного ChangeKey.
+    pub async fn requeue_exchange_change_key_operations(&self, account_id: i64) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE outbox_ops SET status='retry', attempts=0, next_attempt_at=datetime('now')
+             WHERE account_id=? AND status IN ('retry','failed')
+               AND attempts >= 7
+               AND last_error LIKE '%ChangeKey is required%'",
+        )
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
     pub async fn queue_scheduled_send(
         &self,
         account_id: i64,

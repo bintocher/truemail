@@ -103,7 +103,8 @@ let activeMessage=null;
 let activeFullMessage=null;
 let mailRules=[];
 let editingRuleId=null;
-const MESSAGE_PAGE_SIZE=100;
+const MESSAGE_INITIAL_PAGE_SIZE=100;
+const MESSAGE_PAGE_SIZE=500;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
@@ -127,7 +128,7 @@ function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s
 
 const msgsEl=document.getElementById('msgs');
 async function loadNextMessagePage(){
-  if(loadingMoreMessages)return;const folderIds=currentFolderId!==null?[currentFolderId]:coreFolders.filter(folder=>window.coreUnifiedSettings?.[folder.id]!=='0'&&folderHasMore.get(folder.id)!==false).map(folder=>folder.id);if(!folderIds.length)return;
+  if(loadingMoreMessages||currentFolderId===null)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;
   try{
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}const page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length===MESSAGE_PAGE_SIZE);}

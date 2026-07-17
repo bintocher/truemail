@@ -173,11 +173,11 @@ function createMessageRow(message,index){
   row.onclick=e=>{if(suppressClick)return;if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();lastSelectedMessageIndex=index;showMessage(message);};renderIcons(row);return row;
 }
 function renderMessageWindow(force=false){
+  messageRowHeight=Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--message-row-height'))||76;
   const list=msgsEl,total=currentMessageRows.length,viewport=Math.max(list.clientHeight,400),start=Math.max(0,Math.floor(list.scrollTop/messageRowHeight)-MESSAGE_WINDOW_OVERSCAN),end=Math.min(total,Math.ceil((list.scrollTop+viewport)/messageRowHeight)+MESSAGE_WINDOW_OVERSCAN);
   if(!force&&start===messageWindowStart&&end===messageWindowEnd)return;messageWindowStart=start;messageWindowEnd=end;
   let canvas=list.querySelector(':scope > .message-list-canvas');if(!canvas){canvas=document.createElement('div');canvas.className='message-list-canvas';list.replaceChildren(canvas);}canvas.style.height=`${total*messageRowHeight}px`;
   const fragment=document.createDocumentFragment(),windowEl=document.createElement('div');windowEl.className='message-list-window';windowEl.style.transform=`translateY(${start*messageRowHeight}px)`;for(let index=start;index<end;index++)windowEl.appendChild(createMessageRow(currentMessageRows[index],index));fragment.appendChild(windowEl);canvas.replaceChildren(fragment);
-  const sample=list.querySelector('.msg');if(sample)requestAnimationFrame(()=>{if(!sample.isConnected)return;const measured=sample.getBoundingClientRect().height;if(measured>20&&Math.abs(measured-messageRowHeight)>1){const anchor=start,offset=list.scrollTop-start*messageRowHeight;messageRowHeight=measured;list.scrollTop=Math.max(0,anchor*messageRowHeight+offset);messageWindowStart=-1;renderMessageWindow(true);}});
 }
 function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)msgsEl.scrollTop=top;else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)msgsEl.scrollTop=Math.max(0,bottom-msgsEl.clientHeight);renderMessageWindow(true);showMessage(currentMessageRows[index]);}
 function renderMessageList(rows,title,resetScroll=false){
@@ -227,7 +227,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   coreSmartRows.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   renderRulesList();
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
-  coreFolders.forEach(folder=>folderHasMore.set(folder.id,messages.filter(message=>message.folder_id===folder.id).length===MESSAGE_PAGE_SIZE));
+  coreFolders.forEach(folder=>folderHasMore.set(folder.id,messages.filter(message=>message.folder_id===folder.id).length===MESSAGE_INITIAL_PAGE_SIZE));
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;

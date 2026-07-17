@@ -122,6 +122,7 @@ pub struct AccountManager {
     // одновременно видят "истёк" и рефрешат по нескольку раз за минуту.
     refresh_lock: tokio::sync::Mutex<()>,
     sync_registry: SyncRegistry,
+    exchange_outbox_repaired: tokio::sync::Mutex<std::collections::HashSet<i64>>,
 }
 
 #[derive(Debug)]
@@ -140,6 +141,7 @@ impl AccountManager {
             db,
             refresh_lock: tokio::sync::Mutex::new(()),
             sync_registry: SyncRegistry::default(),
+            exchange_outbox_repaired: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -588,6 +590,21 @@ impl AccountManager {
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
         let token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
+        if account.provider == Provider::Exchange
+            && !self
+                .exchange_outbox_repaired
+                .lock()
+                .await
+                .contains(&account.id)
+        {
+            self.db
+                .requeue_exchange_change_key_operations(account.id)
+                .await?;
+            self.exchange_outbox_repaired
+                .lock()
+                .await
+                .insert(account.id);
+        }
         let operations = self.db.claim_outbox_operations(account.id, 50).await?;
         let mut completed = 0;
         for operation in operations {
