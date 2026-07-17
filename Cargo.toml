@@ -53,6 +53,7 @@ quoted_printable = "0.5.2"
 keyring = "4.1.4"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
+argon2 = "0.5.3"
 
 # локализация (Fluent, см. docs/10-design.md)
 fluent = "0.17.0"

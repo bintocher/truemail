@@ -20,6 +20,7 @@ use truemail_core::model::{
     Account, Contact, Event, Folder, MessageFull, MessageMeta, SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
+use zeroize::Zeroize;
 
 /// Общее состояние приложения — ядро.
 pub struct AppState {
@@ -568,6 +569,98 @@ pub async fn initialize_storage(
         }
     };
     *state.core.write().await = Some(initialized);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn export_key_backup(
+    state: State<'_, AppState>,
+    path: String,
+    mut password: String,
+) -> CmdResult<()> {
+    let _ = core(&state).await?;
+    let path = PathBuf::from(path.trim());
+    if !path.is_absolute() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Выберите полный путь для резервной копии".into(),
+        });
+    }
+    let backup = tokio::task::spawn_blocking(move || {
+        let result = truemail_core::crypto::export_key_backup(&password);
+        password.zeroize();
+        result
+    })
+    .await
+    .map_err(|error| ApiError {
+        message: format!("Создание резервной копии прервано: {error}"),
+    })??;
+    std::fs::write(&path, backup).map_err(|error| ApiError {
+        message: format!("Не удалось записать резервную копию: {error}"),
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restore_key_backup(
+    state: State<'_, AppState>,
+    data_dir: String,
+    backup_path: String,
+    mut password: String,
+) -> CmdResult<()> {
+    if state.core.read().await.is_some() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Хранилище уже открыто; существующие ключи не перезаписываются".into(),
+        });
+    }
+    let data_dir = PathBuf::from(data_dir.trim());
+    let backup_path = PathBuf::from(backup_path.trim());
+    if !data_dir.is_absolute() || !backup_path.is_absolute() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Выберите полные пути к архиву и резервной копии".into(),
+        });
+    }
+    if !data_dir.join("truemail.db").is_file() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "В выбранной папке нет truemail.db".into(),
+        });
+    }
+    let serialized = std::fs::read_to_string(&backup_path).map_err(|error| {
+        password.zeroize();
+        ApiError {
+            message: format!("Не удалось прочитать резервную копию: {error}"),
+        }
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let result = truemail_core::crypto::restore_key_backup(&serialized, &password);
+        password.zeroize();
+        result
+    })
+    .await
+    .map_err(|error| ApiError {
+        message: format!("Восстановление ключей прервано: {error}"),
+    })??;
+
+    let opened = async {
+        truemail_core::crypto::store_data_dir(&data_dir)?;
+        Core::bootstrap(data_dir.clone()).await
+    }
+    .await;
+    let opened = match opened {
+        Ok(core) => Arc::new(core),
+        Err(error) => {
+            let _ = truemail_core::crypto::remove_installation_keys();
+            return Err(ApiError {
+                message: format!(
+                    "Ключи расшифрованы, но архив не открылся; восстановление отменено: {error}"
+                ),
+            });
+        }
+    };
+    *state.core.write().await = Some(opened);
     Ok(())
 }
 

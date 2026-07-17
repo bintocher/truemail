@@ -31,6 +31,7 @@ anyhow.workspace = true
 rfd.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
+zeroize.workspace = true
 tokio-rustls.workspace = true
 url.workspace = true
 tauri-plugin-notification = "2.3.3"

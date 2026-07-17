@@ -669,8 +669,10 @@ Object.assign(wizardText.ru,{codeExpired:'Код истёк или уже был
 Object.assign(wizardText.en,{codeExpired:'The code expired or was already used. Select Connect to get a new code.'});
 Object.assign(wizardText.ru,{storageTitle:'Папка данных',storageSub:'Здесь будут храниться зашифрованная почта, календарь, контакты и индекс.',storagePath:'Путь хранения',chooseFolder:'Выбрать…',storageRequired:'Выберите папку данных.',keyTitle:'Создайте ключи шифрования',keySub:'Водите мышью внутри поля, пока шкала не заполнится. Движения используются один раз и не сохраняются.',keyMove:'Двигайте мышью здесь',createKeys:'Создать защищённое хранилище',creatingStorage:'Создаю ключи и зашифрованную базу…'});
 Object.assign(wizardText.en,{storageTitle:'Data folder',storageSub:'Encrypted mail, calendars, contacts and the search index will be stored here.',storagePath:'Storage path',chooseFolder:'Choose…',storageRequired:'Choose a data folder.',keyTitle:'Create encryption keys',keySub:'Move the mouse inside the area until the bar is full. The movements are used once and are never stored.',keyMove:'Move the mouse here',createKeys:'Create encrypted storage',creatingStorage:'Creating keys and the encrypted database…'});
-Object.assign(wizardText.ru,{securityRecovery:'Не удаляйте системное хранилище ключей: без него локальный архив восстановить нельзя.'});
-Object.assign(wizardText.en,{securityRecovery:'Do not remove the system credential-store keys: the local archive cannot be recovered without them.'});
+Object.assign(wizardText.ru,{securityRecovery:'Сохраните парольный backup ключей в разделе «Хранилище»: он восстановит доступ к локальному архиву после переустановки.'});
+Object.assign(wizardText.en,{securityRecovery:'Save a password-protected key backup in Storage: it restores access to the local archive after reinstalling.'});
+Object.assign(wizardText.ru,{restoreArchive:'Или восстановите ключи существующего архива',chooseBackup:'Выбрать backup…',backupPassword:'Пароль backup',restoreKeys:'Восстановить архив',keyBackupTitle:'Резервная копия ключей',keyBackupDesc:'Зашифрованный backup позволяет открыть локальный архив после переустановки или потери системного хранилища ключей.',backupPasswordDesc:'Не менее 12 символов. Без этого пароля восстановление невозможно.',backupPasswordConfirm:'Повторите пароль',exportKeyBackup:'Сохранить backup ключей'});
+Object.assign(wizardText.en,{restoreArchive:'Or restore the keys for an existing archive',chooseBackup:'Choose backup…',backupPassword:'Backup password',restoreKeys:'Restore archive',keyBackupTitle:'Key backup',keyBackupDesc:'An encrypted backup lets you open the local archive after reinstalling or losing the system credential-store keys.',backupPasswordDesc:'At least 12 characters. Recovery is impossible without this password.',backupPasswordConfirm:'Repeat password',exportKeyBackup:'Save key backup'});
 // Static UI strings shared by index.html (data-i18n / data-i18n-title / -placeholder / -aria / -tip / -ph).
 Object.assign(wizardText.ru,{
   tipResize:'Изменить ширину панели',composeTip:'Написать письмо',tipSettings:'Настройки',navCalendar:'Календарь',navContacts:'Контакты',
@@ -812,6 +814,7 @@ let entropyBytes=0;
 let entropyEvents=0;
 let lastEntropySample=null;
 let selectedDataDir='';
+let selectedBackupPath='';
 const entropyPad=document.getElementById('entropyPad');
 const entropyProgress=document.getElementById('entropyProgress');
 const entropyCaption=document.getElementById('entropyCaption');
@@ -831,6 +834,24 @@ document.getElementById('wzChooseDataDir').onclick=async()=>{
     const chosen=await window.tm?.chooseDataDir(document.getElementById('wzDataDir').value||window.tmDefaultDataDir);
     if(typeof chosen==='string'&&chosen){document.getElementById('wzDataDir').value=chosen;selectedDataDir=chosen;status.textContent='';}
   }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+};
+document.getElementById('wzChooseBackup').onclick=async()=>{
+  const status=document.getElementById('wzRestoreStatus');
+  try{
+    const chosen=await window.tm?.chooseKeyBackup(selectedBackupPath||selectedDataDir);
+    if(typeof chosen==='string'&&chosen){selectedBackupPath=chosen;document.getElementById('wzBackupPath').value=chosen;status.textContent='';}
+  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+};
+document.getElementById('wzRestoreKeys').onclick=async()=>{
+  const button=document.getElementById('wzRestoreKeys'),status=document.getElementById('wzRestoreStatus'),passwordInput=document.getElementById('wzRestorePassword');
+  selectedDataDir=document.getElementById('wzDataDir').value.trim();const password=passwordInput.value;
+  if(!selectedDataDir||!selectedBackupPath||!password){status.textContent=wizardLocale==='en'?'Choose the data folder and key backup, then enter its password.':'Выберите папку архива и backup ключей, затем введите пароль.';status.dataset.kind='error';return;}
+  try{
+    button.disabled=true;status.textContent=wizardLocale==='en'?'Opening encrypted archive…':'Открываю зашифрованный архив…';status.dataset.kind='';
+    await window.tm.restoreKeyBackup(selectedDataDir,selectedBackupPath,password);
+    passwordInput.value='';window.tmStorageReady=true;status.textContent='';configureStorageWizard(await window.tm.bootstrapStatus());wzGo(4);
+  }catch(error){passwordInput.value='';status.textContent=error.message||String(error);status.dataset.kind='error';}
+  finally{button.disabled=false;}
 };
 document.getElementById('wzStorageNext').onclick=()=>{
   const input=document.getElementById('wzDataDir');
@@ -1370,6 +1391,18 @@ function setUiScale(value,persist=true){value=Math.max(50,Math.min(250,+value||1
 
 function confirmAction(message){return new Promise(resolve=>{const overlay=document.createElement('div');overlay.className='overlay open';const modal=document.createElement('div');modal.className='modal compact-modal';const body=document.createElement('div');body.className='mb';body.textContent=message;const foot=document.createElement('div');foot.className='mf';const ok=document.createElement('button');ok.className='btn primary';ok.textContent=L('Продолжить','Continue');const cancel=document.createElement('button');cancel.className='btn';cancel.textContent=L('Отмена','Cancel');const done=value=>{overlay.remove();resolve(value);};ok.onclick=()=>done(true);cancel.onclick=()=>done(false);overlay.onclick=e=>{if(e.target===overlay)done(false);};foot.append(ok,cancel);modal.append(body,foot);overlay.appendChild(modal);document.body.appendChild(overlay);cancel.focus();});}
 document.getElementById('openDataDir').onclick=()=>window.tm?.openDataDir().catch(error=>showToast(error.message||String(error)));document.getElementById('changeDataDir').onclick=async()=>{try{const current=document.querySelector('#set-storage .d.mono').textContent,chosen=await window.tm.chooseDataDir(current);if(chosen){await window.tm.moveStorage(chosen);showToast(L('Данные перенесены, новый путь уже используется.','Data moved, the new path is now in use.'));document.querySelector('#set-storage .d.mono').textContent=chosen;}}catch(error){showToast(error.message||String(error));}};document.querySelectorAll('[data-clear]').forEach(button=>button.onclick=async()=>{if(!await confirmAction(L('Очистить выбранные локальные данные? Данные на сервере не удаляются.','Clear the selected local data? Data on the server is not deleted.')))return;try{await window.tm.clearLocalData(button.dataset.clear);await window.reloadCoreData();showToast(L('Локальные данные очищены','Local data cleared'));}catch(error){showToast(error.message||String(error));}});
+document.getElementById('exportKeyBackup').onclick=async()=>{
+  const passwordInput=document.getElementById('keyBackupPassword'),confirmInput=document.getElementById('keyBackupPasswordConfirm'),status=document.getElementById('keyBackupStatus'),button=document.getElementById('exportKeyBackup');
+  const password=passwordInput.value;
+  if(password.length<12){status.textContent=L('Пароль должен содержать не менее 12 символов.','The password must contain at least 12 characters.');status.dataset.kind='error';return;}
+  if(password!==confirmInput.value){status.textContent=L('Пароли не совпадают.','Passwords do not match.');status.dataset.kind='error';return;}
+  try{
+    const path=await window.tm.saveFileDialog('truemail-keys.tmkeys');if(!path)return;
+    button.disabled=true;status.textContent=L('Шифрую backup ключей…','Encrypting key backup…');status.dataset.kind='';
+    await window.tm.exportKeyBackup(path,password);status.textContent=L('Backup ключей сохранён. Храните файл и пароль отдельно.','Key backup saved. Keep the file and password separately.');status.dataset.kind='success';
+  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+  finally{passwordInput.value='';confirmInput.value='';button.disabled=false;}
+};
 
 let tooltipPortal=null;document.addEventListener('mouseover',e=>{const help=e.target.closest('.help[data-tip]');if(!help)return;tooltipPortal=document.createElement('div');tooltipPortal.className='help-portal';tooltipPortal.textContent=help.dataset.tip;document.body.appendChild(tooltipPortal);const rect=help.getBoundingClientRect(),box=tooltipPortal.getBoundingClientRect();let left=Math.max(12,Math.min(window.innerWidth-box.width-12,rect.left+rect.width/2-box.width/2)),top=rect.top-box.height-10;if(top<12)top=rect.bottom+10;tooltipPortal.style.left=`${left}px`;tooltipPortal.style.top=`${top}px`;});document.addEventListener('mouseout',e=>{if(e.target.closest('.help[data-tip]')){tooltipPortal?.remove();tooltipPortal=null;}});
 

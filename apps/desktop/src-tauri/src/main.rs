@@ -273,6 +273,8 @@ fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap_status,
             commands::initialize_storage,
+            commands::export_key_backup,
+            commands::restore_key_backup,
             commands::list_accounts,
             commands::rename_account,
             commands::set_account_color,

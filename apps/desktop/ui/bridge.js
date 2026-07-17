@@ -13,9 +13,12 @@
   window.tm = {
     bootstrapStatus: () => invoke("bootstrap_status"),
     initializeStorage: (dataDir, locale, entropy) => invoke("initialize_storage", { dataDir, locale, entropy }),
+    exportKeyBackup: (path, password) => invoke("export_key_backup", { path, password }),
+    restoreKeyBackup: (dataDir, backupPath, password) => invoke("restore_key_backup", { dataDir, backupPath, password }),
     chooseDataDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
     chooseDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
     saveFileDialog: (defaultPath) => tauri.dialog.save({ defaultPath }),
+    chooseKeyBackup: (defaultPath) => tauri.dialog.open({ directory: false, multiple: false, defaultPath, filters: [{ name: "truemail key backup", extensions: ["tmkeys"] }] }),
     listAccounts: () => invoke("list_accounts"),
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),

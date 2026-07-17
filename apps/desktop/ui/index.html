@@ -230,6 +230,12 @@
           <div class="frow"><div class="fl"><div class="t"><span data-i18n="dataFolder">Папка для хранения данных</span> <span class="help" data-i18n-tip="dataFolderTip" data-tip="Где truemail держит зашифрованную локальную копию почты, вложений и индекса. Можно вынести на отдельный или зашифрованный диск.">?</span></div><div class="d mono"></div></div><div class="fc"><button class="btn sm" id="changeDataDir" data-i18n="change">Изменить</button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="openFolder">Открыть папку</div></div><div class="fc"><button class="btn sm" id="openDataDir"><i data-i="openext"></i><span data-i18n="inExplorer">В проводнике</span></button></div></div>
         </div></div>
+        <div class="card"><div class="ch"><i data-i="key"></i><span data-i18n="keyBackupTitle">Резервная копия ключей</span></div><div class="cb">
+          <p class="note-muted" data-i18n="keyBackupDesc">Зашифрованный backup позволяет открыть локальный архив после переустановки или потери системного хранилища ключей.</p>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="backupPassword">Пароль backup</div><div class="d" data-i18n="backupPasswordDesc">Не менее 12 символов. Без этого пароля восстановление невозможно.</div></div><div class="fc"><input class="inp" id="keyBackupPassword" type="password" autocomplete="new-password"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="backupPasswordConfirm">Повторите пароль</div></div><div class="fc"><input class="inp" id="keyBackupPasswordConfirm" type="password" autocomplete="new-password"></div></div>
+          <div class="frow"><div class="fl"><div class="d" id="keyBackupStatus" aria-live="polite"></div></div><div class="fc"><button class="btn sm" id="exportKeyBackup"><i data-i="save"></i><span data-i18n="exportKeyBackup">Сохранить backup ключей</span></button></div></div>
+        </div></div>
         <div class="card"><div class="ch"><i data-i="trash"></i><span data-i18n="freeUpSpace">Освободить место</span></div><div class="cb">
           <div class="frow"><div class="fl"><div class="t" data-i18n="oldAttachments">Вложения старше года</div><div class="d" data-i18n="oldAttachmentsDesc">Останутся на сервере, скачаются при открытии</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="old_attachments" data-i18n="clear">Очистить</button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="trashSpamData">Локальные данные корзины и спама</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="trash_spam" data-i18n="clear">Очистить</button></div></div>
@@ -450,6 +456,13 @@
         <div class="entropy-progress"><span id="entropyProgress"></span></div>
         <div class="entropy-caption" id="entropyCaption">0%</div>
         <div class="wz-connect-status" id="wzEntropyStatus" aria-live="polite"></div>
+        <div class="left">
+          <div class="wz-field-label" data-i18n="restoreArchive">Или восстановите ключи существующего архива</div>
+          <div class="wz-path-row"><input class="inp" id="wzBackupPath" readonly><button class="btn" id="wzChooseBackup" type="button" data-i18n="chooseBackup">Выбрать backup…</button></div>
+          <input class="inp mt-10" id="wzRestorePassword" type="password" autocomplete="current-password" data-i18n-placeholder="backupPassword" placeholder="Пароль backup">
+          <button class="btn btn-full mt-10" id="wzRestoreKeys" type="button" data-i18n="restoreKeys">Восстановить архив</button>
+          <div class="wz-connect-status" id="wzRestoreStatus" aria-live="polite"></div>
+        </div>
         <div class="wznav"><button class="btn" data-wz="2"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzCreateKeys" disabled data-i18n="createKeys">Создать защищённое хранилище</button></div>
       </div>
       <div class="wzstep" id="wz4">
@@ -489,7 +502,7 @@
           <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityLocal">Вся почта хранится локально на устройстве</span></div>
           <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityTokens">OAuth-токены — в системном хранилище паролей</span></div>
           <div class="wz-fact"><i data-i="check"></i><span data-i18n="securityTracking">Трекинг-пиксели и UTM-метки блокируются</span></div>
-          <div class="wz-fact warning"><i data-i="key"></i><span data-i18n="securityRecovery">Не удаляйте системное хранилище ключей: без него локальный архив восстановить нельзя</span></div>
+          <div class="wz-fact warning"><i data-i="key"></i><span data-i18n="securityRecovery">Сохраните парольный backup ключей в разделе «Хранилище»</span></div>
         </div>
         <div class="wznav"><button class="btn" data-wz="6"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" data-wz="8" data-i18n="next">Далее</button></div>
       </div>
