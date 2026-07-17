@@ -13,13 +13,14 @@ function expandCalendarEvents(events,rangeStart,rangeEnd){
   overrides.forEach(event=>{const date=parseDavDate(event.dtstart);if(date&&!output.some(item=>item.id===event.id))add(event,date);});return output;
 }
 function localeName(date,options){return new Intl.DateTimeFormat(wizardLocale||'ru',options).format(date);}
+function calendarDateKey(date){const pad=value=>String(value).padStart(2,'0');return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;}
 function renderCalendarData(data=coreCalendarData){
   coreCalendarData=data||{calendars:[],events:[]};const events=coreCalendarData.events||[];
   const year=calendarCursor.getFullYear(),month=calendarCursor.getMonth(),displayEvents=expandCalendarEvents(events,new Date(year,month-1,20),new Date(year,month+2,10));document.getElementById('calTitle').textContent=localeName(calendarCursor,{month:'long',year:'numeric'});
   cg.innerHTML='';const start=(new Date(year,month,1).getDay()+6)%7,days=new Date(year,month+1,0).getDate(),prevDays=new Date(year,month,0).getDate();
   let visibleEvents=0;for(let i=0;i<42;i++){const day=i-start+1,current=i>=start&&day<=days,date=new Date(year,month,current?day:day<1?day:day);const number=current?day:day<1?prevDays+day:day-days;
     const cell=document.createElement('div');cell.className='calcell'+(!current?' other':'')+(new Date().toDateString()===date.toDateString()?' today':'');cell.innerHTML=`<div class="d${current?'':' d-dim'}">${number}</div>`;
-    if(current){cell.onclick=()=>{calendarCursor=new Date(date);};displayEvents.filter(event=>parseDavDate(event.dtstart)?.toDateString()===date.toDateString()).forEach((event,index)=>{visibleEvents++;const item=document.createElement('div');item.className=`ev ev-c${index%4}`;item.dataset.eventId=event.id;item.textContent=event.summary;item.style.cssText=eventColorStyle(event);cell.appendChild(item);});}cg.appendChild(cell);}
+    if(current){cell.dataset.date=calendarDateKey(date);cell.onclick=()=>{calendarCursor=new Date(date);};displayEvents.filter(event=>parseDavDate(event.dtstart)?.toDateString()===date.toDateString()).forEach((event,index)=>{visibleEvents++;const item=document.createElement('div');item.className=`ev ev-c${index%4}`;item.dataset.eventId=event.id;item.dataset.eventStart=event.dtstart;item.draggable=true;item.title=L('Перетащите на другую дату','Drag to another date');item.textContent=event.summary;item.style.cssText=eventColorStyle(event);cell.appendChild(item);});}cg.appendChild(cell);}
   const info=document.getElementById('calSyncInfo');if(info){const dated=events.map(event=>({date:parseDavDate(event.dtstart)})).filter(item=>item.date).sort((a,b)=>b.date-a.date),latest=dated[0];info.textContent=L(`${coreCalendarData.calendars?.length||0} календаря · ${events.length} событий${visibleEvents?'':latest?' · показать последние':' · событий нет'}`,`${coreCalendarData.calendars?.length||0} calendars · ${events.length} events${visibleEvents?'':latest?' · show latest':' · no events'}`);info.classList.toggle('clickable',!visibleEvents&&Boolean(latest));info.onclick=!visibleEvents&&latest?()=>{calendarCursor=new Date(latest.date.getFullYear(),latest.date.getMonth(),1);renderCalendarData();}:null;info.title=!visibleEvents&&latest?L(`Перейти к ${localeName(latest.date,{month:'long',year:'numeric'})}`,`Go to ${localeName(latest.date,{month:'long',year:'numeric'})}`):'';}
   renderWeekDay(events);
   const count=document.querySelector('[data-nav="calendar"] .count');if(count)count.textContent=events.length||'';
@@ -49,7 +50,7 @@ function renderDayColumn(dayStart,items){
     const color=eventAccountColor(it.event);
     const paint=color?`border-left:3px solid ${color};background:${color}22;`:'';
     const style=`top:${top}px;height:${Math.max(height-2,16)}px;left:calc(${left}% + 2px);width:calc(${width}% - 4px);${paint}`;
-    return `<div class="wk-ev" data-event-id="${it.event.id}" style="${style}" title="${escapeHtml(it.event.summary)}">${escapeHtml(it.event.summary)}</div>`;
+    return `<div class="wk-ev" draggable="true" data-event-id="${it.event.id}" data-event-start="${escapeHtml(it.event.dtstart)}" style="${style}" title="${escapeHtml(L('Перетащите на другое время','Drag to another time'))}">${escapeHtml(it.event.summary)}</div>`;
   }).join('');
 }
 function timesColumn(){let out='<div class="wk-times">';for(let hr=0;hr<24;hr++)out+=`<div class="wk-tlabel">${String(hr).padStart(2,'0')}:00</div>`;return out+'</div>';}
@@ -60,16 +61,22 @@ function renderWeekDay(events){
   const dayItems=(d)=>{const next=new Date(d.getFullYear(),d.getMonth(),d.getDate()+1);return intervals.filter(it=>it.start<next&&it.end>d);};
   // Неделя
   let head='<div class="wk-corner"></div>',cols='';
-  for(let i=0;i<7;i++){const d=new Date(monday);d.setDate(monday.getDate()+i);const wd=localeName(d,{weekday:'short'}).replace('.','');const today=new Date().toDateString()===d.toDateString();head+=`<div class="wk-dayhd${today?' today':''}">${wizardLocale==='ru'?wd.slice(0,2):wd.slice(0,3)}<b>${d.getDate()}</b></div>`;const day=new Date(d.getFullYear(),d.getMonth(),d.getDate());cols+=`<div class="wk-daycol">${renderDayColumn(day,dayItems(day))}</div>`;}
+  for(let i=0;i<7;i++){const d=new Date(monday);d.setDate(monday.getDate()+i);const wd=localeName(d,{weekday:'short'}).replace('.','');const today=new Date().toDateString()===d.toDateString();head+=`<div class="wk-dayhd${today?' today':''}">${wizardLocale==='ru'?wd.slice(0,2):wd.slice(0,3)}<b>${d.getDate()}</b></div>`;const day=new Date(d.getFullYear(),d.getMonth(),d.getDate());cols+=`<div class="wk-daycol" data-date="${calendarDateKey(day)}">${renderDayColumn(day,dayItems(day))}</div>`;}
   document.getElementById('calweek').innerHTML=`<div class="wk-head">${head}</div><div class="wk-scroll">${timesColumn()}<div class="wk-cols">${cols}</div></div>`;
   // День
   const dayD=new Date(base.getFullYear(),base.getMonth(),base.getDate()),dToday=new Date().toDateString()===base.toDateString(),dwd=localeName(base,{weekday:'short'}).replace('.','');
-  document.getElementById('calday').innerHTML=`<div class="wk-head wk-head-day"><div class="wk-corner"></div><div class="wk-dayhd${dToday?' today':''}">${wizardLocale==='ru'?dwd.slice(0,2):dwd.slice(0,3)}<b>${base.getDate()}</b></div></div><div class="wk-scroll">${timesColumn()}<div class="wk-cols wk-cols-day"><div class="wk-daycol">${renderDayColumn(dayD,dayItems(dayD))}</div></div></div>`;
+  document.getElementById('calday').innerHTML=`<div class="wk-head wk-head-day"><div class="wk-corner"></div><div class="wk-dayhd${dToday?' today':''}">${wizardLocale==='ru'?dwd.slice(0,2):dwd.slice(0,3)}<b>${base.getDate()}</b></div></div><div class="wk-scroll">${timesColumn()}<div class="wk-cols wk-cols-day"><div class="wk-daycol" data-date="${calendarDateKey(dayD)}">${renderDayColumn(dayD,dayItems(dayD))}</div></div></div>`;
 }
 function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 // Цвет события = цвет его аккаунта (через календарь), как у писем в списке.
 function eventAccountColor(event){const cal=(coreCalendarData.calendars||[]).find(item=>item.id===event.calendar_id);return cal?accountColorById(cal.account_id):null;}
 function eventColorStyle(event){const color=eventAccountColor(event);return color?`border-left:3px solid ${color};background:${color}22`:'';}
+const calendarSection=document.getElementById('calSection');
+calendarSection.addEventListener('dragstart',event=>{const item=event.target.closest('.ev,.wk-ev');if(!item)return;item.classList.add('dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-truemail-event',JSON.stringify({id:Number(item.dataset.eventId),start:item.dataset.eventStart}));});
+calendarSection.addEventListener('dragend',event=>{event.target.closest('.ev,.wk-ev')?.classList.remove('dragging');calendarSection.querySelectorAll('.drop-hi').forEach(item=>item.classList.remove('drop-hi'));});
+calendarSection.addEventListener('dragover',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(!target)return;event.preventDefault();event.dataTransfer.dropEffect='move';calendarSection.querySelectorAll('.drop-hi').forEach(item=>item.classList.toggle('drop-hi',item===target));});
+calendarSection.addEventListener('dragleave',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(target&&!target.contains(event.relatedTarget))target.classList.remove('drop-hi');});
+calendarSection.addEventListener('drop',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(!target)return;event.preventDefault();target.classList.remove('drop-hi');let payload;try{payload=JSON.parse(event.dataTransfer.getData('application/x-truemail-event'));}catch(_){return;}let destination=target.dataset.date;if(target.classList.contains('wk-daycol')){const match=destination.match(/^(\d{4})-(\d{2})-(\d{2})$/),date=new Date(+match[1],+match[2]-1,+match[3]),minutes=Math.max(0,Math.min(1425,Math.round(((event.clientY-target.getBoundingClientRect().top)/WK_HOUR*60)/15)*15));date.setMinutes(minutes);destination=date.toISOString();}window.calendarDropJustHappened=true;setTimeout(()=>{window.calendarDropJustHappened=false;},100);window.moveCalendarEvent?.(payload.id,payload.start,destination);});
 
 /* contacts */
 const cts=[];

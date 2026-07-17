@@ -407,6 +407,33 @@
         <label class="aux-check"><input type="checkbox" id="eventAllDay"> <span data-i18n="allDay">Весь день</span></label>
         <div class="fld"><label data-i18n="locationLabel">Место</label><input class="inp" id="eventLocation"></div>
         <div class="fld"><label data-i18n="descriptionLabel">Описание</label><textarea class="inp" id="eventDescription"></textarea></div>
+        <details class="event-advanced">
+          <summary data-i18n="eventAdvanced">Повторение, участники и другие поля</summary>
+          <div class="event-advanced-body">
+            <div class="aux-two">
+              <div class="fld"><label data-i18n="eventRecurrence">Повторение</label><select class="sel" id="eventRecurrence"><option value="" data-i18n="eventRepeatNone">Не повторять</option><option value="FREQ=DAILY" data-i18n="eventRepeatDaily">Каждый день</option><option value="FREQ=WEEKLY" data-i18n="eventRepeatWeekly">Каждую неделю</option><option value="FREQ=MONTHLY" data-i18n="eventRepeatMonthly">Каждый месяц</option><option value="FREQ=YEARLY" data-i18n="eventRepeatYearly">Каждый год</option><option value="custom" data-i18n="eventRepeatCustom">Своё правило RRULE</option></select></div>
+              <div class="fld event-rrule-custom hidden"><label data-i18n="eventRrule">Правило RRULE</label><input class="inp" id="eventRrule" placeholder="FREQ=WEEKLY;BYDAY=MO,WE"></div>
+            </div>
+            <div class="aux-two">
+              <div class="fld"><label data-i18n="eventExceptions">Исключить даты (по одной в строке)</label><textarea class="inp event-lines" id="eventExdates" placeholder="20260720T070000Z"></textarea></div>
+              <div class="fld"><label data-i18n="eventExtraDates">Дополнительные даты (по одной в строке)</label><textarea class="inp event-lines" id="eventRdates" placeholder="20260721T070000Z"></textarea></div>
+            </div>
+            <div class="fld"><label data-i18n="eventAttendees">Участники (по одному в строке)</label><textarea class="inp event-lines" id="eventAttendees" data-i18n-placeholder="eventAttendeesPlaceholder" placeholder="Имя &lt;user@example.com&gt;"></textarea></div>
+            <div class="aux-two">
+              <div class="fld"><label data-i18n="eventOrganizer">Организатор</label><input class="inp" id="eventOrganizer" type="email"></div>
+              <div class="fld"><label data-i18n="eventReminders">Напоминания в минутах (по одному в строке)</label><textarea class="inp event-lines" id="eventAlarms" placeholder="10&#10;60"></textarea></div>
+            </div>
+            <div class="aux-two">
+              <div class="fld"><label data-i18n="eventTimezone">Часовой пояс</label><input class="inp" id="eventTimezone" placeholder="Europe/Moscow"></div>
+              <div class="fld"><label data-i18n="eventAvailability">Занятость</label><select class="sel" id="eventTransp"><option value="opaque" data-i18n="eventBusy">Занят</option><option value="transparent" data-i18n="eventFree">Свободен</option></select></div>
+            </div>
+            <div class="aux-two">
+              <div class="fld"><label data-i18n="eventPrivacy">Доступ</label><select class="sel" id="eventClass"><option value="public" data-i18n="eventPublic">Публичное</option><option value="private" data-i18n="eventPrivate">Личное</option><option value="confidential" data-i18n="eventConfidential">Конфиденциальное</option></select></div>
+              <div class="fld"><label data-i18n="eventCategories">Категории через запятую</label><input class="inp" id="eventCategories"></div>
+            </div>
+            <div class="fld"><label data-i18n="eventUrl">Ссылка</label><input class="inp" id="eventUrl" type="url" placeholder="https://"></div>
+          </div>
+        </details>
         <div class="wz-connect-status" id="eventStatus" aria-live="polite"></div>
       </div>
       <div class="mf"><button class="btn primary" type="submit"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" type="button" id="eventCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" type="button" id="eventDelete"><i data-i="trash"></i><span data-i18n="delete">Удалить</span></button></div>

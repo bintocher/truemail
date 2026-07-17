@@ -64,6 +64,24 @@ struct GoogleEvent {
     #[serde(default)]
     attendees: Vec<GoogleAttendee>,
     reminders: Option<GoogleReminders>,
+    transparency: Option<String>,
+    visibility: Option<String>,
+    organizer: Option<GoogleAttendee>,
+    sequence: Option<i64>,
+    source: Option<GoogleEventSource>,
+    extended_properties: Option<GoogleExtendedProperties>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleEventSource {
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct GoogleExtendedProperties {
+    #[serde(default)]
+    private: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -320,6 +338,10 @@ fn event_from_google(event: GoogleEvent, default_reminders: &[GoogleReminder]) -
             action: reminder.method.to_ascii_uppercase(),
         })
         .collect();
+    let private = event
+        .extended_properties
+        .as_ref()
+        .map(|value| &value.private);
     Some(DavEvent {
         remote_url: Some(format!("google-event:{}", event.id)),
         uid,
@@ -335,6 +357,29 @@ fn event_from_google(event: GoogleEvent, default_reminders: &[GoogleReminder]) -
         status: event.status,
         attendees,
         alarms,
+        timezone: event
+            .start
+            .as_ref()
+            .and_then(|value| value.time_zone.clone()),
+        transp: event.transparency.map(|value| value.to_ascii_uppercase()),
+        class: event.visibility.map(|value| value.to_ascii_uppercase()),
+        categories: private
+            .and_then(|values| values.get("truemailCategories"))
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        url: event.source.and_then(|value| value.url),
+        organizer: private
+            .and_then(|values| values.get("truemailOrganizer"))
+            .cloned()
+            .or_else(|| event.organizer.map(|value| value.email)),
+        sequence: event.sequence.unwrap_or_default(),
         raw,
         etag: event.etag,
     })
@@ -562,6 +607,13 @@ fn task_event(list_id: &str, task: GoogleTask) -> Option<DavEvent> {
         status: task.status,
         attendees: Vec::new(),
         alarms: Vec::new(),
+        timezone: None,
+        transp: None,
+        class: None,
+        categories: Vec::new(),
+        url: None,
+        organizer: None,
+        sequence: 0,
         raw,
         etag: task.etag,
     })
@@ -692,7 +744,7 @@ mod tests {
         let event: GoogleEvent = serde_json::from_value(serde_json::json!({
             "id": "instance",
             "summary": "Daily",
-            "start": {"dateTime": "2026-07-14T10:00:00+03:00"},
+            "start": {"dateTime": "2026-07-14T10:00:00+03:00", "timeZone": "Europe/Moscow"},
             "end": {"dateTime": "2026-07-14T11:00:00+03:00"},
             "recurrence": ["RRULE:FREQ=DAILY;COUNT=3"],
             "recurringEventId": null,
@@ -705,7 +757,13 @@ mod tests {
             "reminders": {
                 "useDefault": false,
                 "overrides": [{"method": "popup", "minutes": 10}]
-            }
+            },
+            "transparency": "transparent",
+            "visibility": "private",
+            "organizer": {"email": "owner@example.test", "organizer": true},
+            "sequence": 3,
+            "source": {"url": "https://example.test/meeting"},
+            "extendedProperties": {"private": {"truemailCategories": "Team,Demo"}}
         }))
         .expect("event");
         let mapped = event_from_google(event, &[]).expect("mapped event");
@@ -715,6 +773,13 @@ mod tests {
         assert_eq!(mapped.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
         assert_eq!(mapped.alarms[0].trigger_minutes, 10);
         assert_eq!(mapped.alarms[0].action, "POPUP");
+        assert_eq!(mapped.timezone.as_deref(), Some("Europe/Moscow"));
+        assert_eq!(mapped.transp.as_deref(), Some("TRANSPARENT"));
+        assert_eq!(mapped.class.as_deref(), Some("PRIVATE"));
+        assert_eq!(mapped.categories, ["Team", "Demo"]);
+        assert_eq!(mapped.url.as_deref(), Some("https://example.test/meeting"));
+        assert_eq!(mapped.organizer.as_deref(), Some("owner@example.test"));
+        assert_eq!(mapped.sequence, 3);
     }
 
     #[test]

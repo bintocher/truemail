@@ -365,3 +365,40 @@ fn run() -> anyhow::Result<()> {
         .run(tauri::generate_context!())?;
     Ok(())
 }
+
+#[cfg(test)]
+mod command_contract_tests {
+    const MAIN: &str = include_str!("main.rs");
+    const COMMANDS: &str = include_str!("commands.rs");
+    const BRIDGE: &str = include_str!("../../ui/bridge.js");
+
+    #[test]
+    fn critical_user_flows_are_exposed_by_tauri_and_the_ui_bridge() {
+        for command in [
+            "get_message",
+            "send_message",
+            "create_event",
+            "update_event",
+            "delete_event",
+            "create_contact",
+            "update_contact",
+            "delete_contact",
+            "message_action",
+            "move_messages_to_folder",
+            "undo_message_action",
+        ] {
+            assert!(
+                MAIN.contains(&format!("commands::{command}")),
+                "{command} is missing from generate_handler"
+            );
+            assert!(
+                COMMANDS.contains(&format!("fn {command}(")),
+                "{command} implementation is missing"
+            );
+            assert!(
+                BRIDGE.contains(&format!("invoke(\"{command}\"")),
+                "{command} is missing from bridge.js"
+            );
+        }
+    }
+}

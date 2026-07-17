@@ -849,8 +849,9 @@ impl Db {
                     let (event_id,): (i64,) = sqlx::query_as(
                         "INSERT INTO events(calendar_id, uid, summary, description, location,
                                             dtstart, dtend, all_day, rrule, recurrence_id, exdates, rdates,
-                                            status, ical_ref, etag, remote_url)
-                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            status, ical_ref, etag, remote_url, timezone, transp, class,
+                                            categories, url, organizer, sequence)
+                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT DO UPDATE SET summary=excluded.summary,
                             description=excluded.description, location=excluded.location,
                             dtstart=excluded.dtstart, dtend=excluded.dtend,
@@ -859,7 +860,10 @@ impl Db {
                             exdates=excluded.exdates, rdates=excluded.rdates,
                             status=excluded.status,
                             ical_ref=excluded.ical_ref, etag=excluded.etag,
-                            remote_url=excluded.remote_url
+                            remote_url=excluded.remote_url, timezone=excluded.timezone,
+                            transp=excluded.transp, class=excluded.class,
+                            categories=excluded.categories, url=excluded.url,
+                            organizer=excluded.organizer, sequence=excluded.sequence
                          RETURNING id",
                     )
                     .bind(calendar_id)
@@ -881,6 +885,13 @@ impl Db {
                     .bind(blob_ref)
                     .bind(&event.etag)
                     .bind(&event.remote_url)
+                    .bind(&event.timezone)
+                    .bind(&event.transp)
+                    .bind(&event.class)
+                    .bind(event.categories.join(","))
+                    .bind(&event.url)
+                    .bind(&event.organizer)
+                    .bind(event.sequence)
                     .fetch_one(&mut *tx)
                     .await?;
                     sqlx::query("DELETE FROM event_attendees WHERE event_id=?")

@@ -76,6 +76,13 @@ pub struct DavEvent {
     pub status: Option<String>,
     pub attendees: Vec<Attendee>,
     pub alarms: Vec<Alarm>,
+    pub timezone: Option<String>,
+    pub transp: Option<String>,
+    pub class: Option<String>,
+    pub categories: Vec<String>,
+    pub url: Option<String>,
+    pub organizer: Option<String>,
+    pub sequence: i64,
     pub raw: String,
     pub etag: Option<String>,
 }
@@ -430,6 +437,36 @@ fn parse_events(raw: String, etag: Option<String>, remote_url: Option<String>) -
                 status: prop(&event, "STATUS"),
                 attendees: parse_attendees(&event),
                 alarms: parse_alarms(&event),
+                timezone: prop(&event, "X-WR-TIMEZONE").or_else(|| {
+                    unfolded(&event).lines().find_map(|line| {
+                        let (key, _) = line.split_once(':')?;
+                        key.split(';')
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case("DTSTART"))
+                            .then(|| property_param(key, "TZID"))
+                            .flatten()
+                    })
+                }),
+                transp: prop(&event, "TRANSP"),
+                class: prop(&event, "CLASS"),
+                categories: prop(&event, "CATEGORIES")
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                url: prop(&event, "URL"),
+                organizer: prop(&event, "ORGANIZER").map(|value| {
+                    value
+                        .strip_prefix("mailto:")
+                        .or_else(|| value.strip_prefix("MAILTO:"))
+                        .unwrap_or(&value)
+                        .to_owned()
+                }),
+                sequence: prop(&event, "SEQUENCE")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default(),
                 raw: event,
                 etag: etag.clone(),
             });
@@ -695,13 +732,23 @@ mod tests {
 
     #[test]
     fn parses_every_vevent_and_recurrence_override() {
-        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART:20260714T100000Z\r\nSUMMARY:Base\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260715T100000Z\r\nATTENDEE;CN=Guest;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:guest@example.test\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID:20260716T100000Z\r\nDTSTART:20260716T120000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR";
+        let raw = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nDTSTART;TZID=Europe/Moscow:20260714T100000\r\nSUMMARY:Base\r\nRRULE:FREQ=DAILY\r\nEXDATE:20260715T100000Z\r\nTRANSP:TRANSPARENT\r\nCLASS:PRIVATE\r\nCATEGORIES:Team,Demo\r\nURL:https://example.test/meeting\r\nORGANIZER:mailto:owner@example.test\r\nSEQUENCE:4\r\nATTENDEE;CN=Guest;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=FALSE:mailto:guest@example.test\r\nBEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:a\r\nRECURRENCE-ID:20260716T100000Z\r\nDTSTART:20260716T120000Z\r\nSUMMARY:Moved\r\nEND:VEVENT\r\nEND:VCALENDAR";
         let events = parse_events(raw.to_owned(), Some("etag".to_owned()), None);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].exdates.as_deref(), Some("20260715T100000Z"));
         assert_eq!(events[0].attendees[0].email, "guest@example.test");
         assert_eq!(events[0].attendees[0].partstat.as_deref(), Some("ACCEPTED"));
         assert_eq!(events[0].alarms[0].trigger_minutes, 15);
+        assert_eq!(events[0].timezone.as_deref(), Some("Europe/Moscow"));
+        assert_eq!(events[0].transp.as_deref(), Some("TRANSPARENT"));
+        assert_eq!(events[0].class.as_deref(), Some("PRIVATE"));
+        assert_eq!(events[0].categories, ["Team", "Demo"]);
+        assert_eq!(
+            events[0].url.as_deref(),
+            Some("https://example.test/meeting")
+        );
+        assert_eq!(events[0].organizer.as_deref(), Some("owner@example.test"));
+        assert_eq!(events[0].sequence, 4);
         assert_eq!(events[1].recurrence_id.as_deref(), Some("20260716T100000Z"));
     }
 

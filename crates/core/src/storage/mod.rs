@@ -37,7 +37,7 @@ impl Db {
         Self::open_with_database_key(data_dir, crypto, &database_key).await
     }
 
-    async fn open_with_database_key(
+    pub(crate) async fn open_with_database_key(
         data_dir: &Path,
         crypto: Arc<StorageCrypto>,
         database_key: &DatabaseKey,
@@ -1075,6 +1075,13 @@ mod tests {
                     trigger_minutes: 15,
                     action: "DISPLAY".into(),
                 }],
+                timezone: Some("Europe/Moscow".into()),
+                transp: Some("OPAQUE".into()),
+                class: Some("PRIVATE".into()),
+                categories: vec!["Demo".into()],
+                url: Some("https://example.test/event".into()),
+                organizer: Some("owner@example.test".into()),
+                sequence: 3,
                 raw: format!("event:{id}:{summary}"),
                 etag: None,
             }
@@ -1190,6 +1197,13 @@ mod tests {
         assert_eq!(updated.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
         assert_eq!(updated.alarms.len(), 1);
         assert_eq!(updated.alarms[0].trigger_minutes, 15);
+        assert_eq!(updated.timezone.as_deref(), Some("Europe/Moscow"));
+        assert_eq!(updated.transp, Some(crate::model::Transp::Opaque));
+        assert_eq!(updated.class, Some(crate::model::EventClass::Private));
+        assert_eq!(updated.categories, ["Demo"]);
+        assert_eq!(updated.url.as_deref(), Some("https://example.test/event"));
+        assert_eq!(updated.organizer.as_deref(), Some("owner@example.test"));
+        assert_eq!(updated.sequence, 3);
         let contacts: Vec<(String,)> = sqlx::query_as(
             "SELECT display_name FROM contacts WHERE uid NOT LIKE 'mail:%' ORDER BY display_name",
         )
@@ -1323,6 +1337,150 @@ mod tests {
                 .await
                 .expect("read rule progress");
         assert!(progress > 0);
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn outbox_move_retries_completes_and_can_be_undone() {
+        use crate::model::{AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
+
+        let root = std::env::temp_dir().join(format!("truemail-outbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "outbox@example.test".into(),
+                display_name: "Outbox test".into(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "imap.example.test".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: None,
+                ews_url: None,
+                jmap_url: None,
+                username: Some("outbox@example.test".into()),
+                secret_ref: "test-keychain-ref".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+        for (path, name, role) in [
+            ("INBOX", "Inbox", "inbox"),
+            ("Archive", "Archive", "archive"),
+            ("Trash", "Trash", "trash"),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders(account_id, remote_path, display_name, role)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(path)
+            .bind(name)
+            .bind(role)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert folder");
+        }
+        let (inbox_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role='inbox'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("inbox id");
+        let mut message_ids = Vec::new();
+        for uid in [41_i64, 42] {
+            let id = sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, subject)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(inbox_id)
+            .bind(uid)
+            .bind(format!("Message {uid}"))
+            .execute(&db.write_pool)
+            .await
+            .expect("insert message")
+            .last_insert_rowid();
+            message_ids.push(id);
+        }
+
+        let queued = db
+            .queue_message_action(&message_ids[..1], "archive")
+            .await
+            .expect("queue archive");
+        sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+            .bind(queued.operation_ids[0])
+            .execute(&db.write_pool)
+            .await
+            .expect("make operation due");
+        let first_claim = db
+            .claim_outbox_operations(account.id, 10)
+            .await
+            .expect("claim operation");
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].op_kind, "move");
+        db.fail_outbox_operation(first_claim[0].id, "temporary network failure")
+            .await
+            .expect("schedule retry");
+        let retry: (String, i64, String) =
+            sqlx::query_as("SELECT status, attempts, last_error FROM outbox_ops WHERE id=?")
+                .bind(first_claim[0].id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read retry state");
+        assert_eq!(
+            retry,
+            ("retry".into(), 1, "temporary network failure".into())
+        );
+        sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+            .bind(first_claim[0].id)
+            .execute(&db.write_pool)
+            .await
+            .expect("make retry due");
+        let second_claim = db
+            .claim_outbox_operations(account.id, 10)
+            .await
+            .expect("claim retry");
+        assert_eq!(second_claim.len(), 1);
+        db.complete_outbox_operation(&second_claim[0])
+            .await
+            .expect("complete operation");
+        let first_exists: (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id=?")
+            .bind(message_ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .expect("check completed message");
+        assert_eq!(first_exists.0, 0);
+
+        let undo = db
+            .queue_message_action(&message_ids[1..], "trash")
+            .await
+            .expect("queue trash");
+        assert_eq!(
+            db.cancel_outbox_operations(&undo.operation_ids)
+                .await
+                .expect("undo pending action"),
+            1
+        );
+        let second_exists: (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id=?")
+            .bind(message_ids[1])
+            .fetch_one(&db.pool)
+            .await
+            .expect("check undone message");
+        assert_eq!(second_exists.0, 1);
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

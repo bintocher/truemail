@@ -990,7 +990,10 @@ mod tests {
             "Mailbox/get" => json!({
                 "accountId": "a1",
                 "state": "m1",
-                "list": [{"id":"inbox-id","name":"Inbox","role":"inbox","totalEmails":1,"unreadEmails":1}],
+                "list": [
+                    {"id":"inbox-id","name":"Inbox","role":"inbox","totalEmails":1,"unreadEmails":1},
+                    {"id":"archive-id","name":"Archive","role":"archive","totalEmails":0,"unreadEmails":0}
+                ],
                 "notFound": []
             }),
             "Email/query" => json!({
@@ -1016,6 +1019,10 @@ mod tests {
                 "accountId":"a1", "oldState":"s1", "newState":"s2",
                 "created":{"send":{"id":"submission-1"}}
             }),
+            "Email/set" => json!({
+                "accountId":"a1", "oldState":"e1", "newState":"e2",
+                "updated":{"email-1":null}, "notUpdated":{}, "notDestroyed":{}
+            }),
             _ => json!({"type":"unknownMethod","description":name}),
         };
         let response_name = if matches!(
@@ -1026,6 +1033,7 @@ mod tests {
                 | "Email/import"
                 | "Identity/get"
                 | "EmailSubmission/set"
+                | "Email/set"
         ) {
             name
         } else {
@@ -1041,10 +1049,7 @@ mod tests {
         Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "message/rfc822")
-            .body(Body::from(
-                b"From: sender@example.test\r\nTo: user@example.test\r\nSubject: JMAP\r\n\r\nHello"
-                    .to_vec(),
-            ))
+            .body(Body::from(b"From: sender@example.test\r\nTo: user@example.test\r\nSubject: JMAP\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p><b>Hello</b> from JMAP</p>\r\n--outer\r\nContent-Type: text/plain; name=notes.txt\r\nContent-Disposition: attachment; filename=notes.txt\r\nContent-Transfer-Encoding: base64\r\n\r\nbm90ZXM=\r\n--outer--\r\n".to_vec()))
             .unwrap()
     }
 
@@ -1078,13 +1083,29 @@ mod tests {
             .unwrap();
 
         server.abort();
-        assert_eq!(discovered.folders.len(), 1);
-        assert_eq!(discovered.folders[0].role, Some(FolderRole::Inbox));
+        assert_eq!(discovered.folders.len(), 2);
+        assert!(
+            discovered
+                .folders
+                .iter()
+                .any(|folder| folder.role == Some(FolderRole::Inbox))
+        );
+        assert!(
+            discovered
+                .folders
+                .iter()
+                .any(|folder| folder.role == Some(FolderRole::Archive))
+        );
         assert!(discovered.folders[0].sync_token.is_some());
         assert_eq!(discovered.messages.len(), 1);
         assert_eq!(discovered.messages[0].remote_id.as_deref(), Some("email-1"));
         assert!(discovered.messages[0].flagged);
-        assert!(discovered.messages[0].raw.ends_with(b"Hello"));
+        assert!(
+            discovered.messages[0]
+                .raw
+                .windows(b"<b>Hello</b>".len())
+                .any(|window| window == b"<b>Hello</b>")
+        );
         assert_eq!(discovered.remote_snapshot, Some(vec!["email-1".into()]));
     }
 
@@ -1118,5 +1139,157 @@ mod tests {
         backend.send(message, "app-password").await.unwrap();
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_sync_read_send_move_and_undo() {
+        use crate::crypto::{DatabaseKey, StorageCrypto};
+        use crate::model::{AuthKind, BackendKind, NewAccount, Provider};
+        use crate::storage::Db;
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/.well-known/jmap", get(mock_session))
+            .route("/api", post(mock_api))
+            .route("/download/a1/blob-1/message.eml", get(mock_download))
+            .route("/upload/a1", post(mock_upload))
+            .with_state(base.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = JmapBackend {
+            session_url: format!("{base}/.well-known/jmap"),
+            username: "user@example.test".into(),
+        };
+        let root = std::env::temp_dir().join(format!("truemail-jmap-e2e-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key([7; 32])),
+            &DatabaseKey::from_key([9; 32]),
+        )
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let account = db
+            .save_account(&NewAccount {
+                email: "user@example.test".into(),
+                display_name: "JMAP E2E".into(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Jmap,
+                auth_kind: AuthKind::AppPassword,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                jmap_url: Some(format!("{base}/.well-known/jmap")),
+                username: Some("user@example.test".into()),
+                secret_ref: "test-keychain-ref".into(),
+                color: None,
+            })
+            .await
+            .unwrap();
+
+        let discovery = backend
+            .discover("user@example.test", "app-password", &HashMap::new())
+            .await
+            .unwrap();
+        db.save_discovered_folders(account.id, &discovery.folders)
+            .await
+            .unwrap();
+        db.save_discovered_messages(account.id, &discovery.messages)
+            .await
+            .unwrap();
+        db.save_folder_sync_tokens(account.id, &discovery.folders)
+            .await
+            .unwrap();
+        let (message_id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE account_id=?")
+            .bind(account.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let message = db.get_message(message_id).await.unwrap();
+        assert!(
+            message
+                .body_html
+                .as_deref()
+                .unwrap()
+                .contains("<b>Hello</b>")
+        );
+        assert_eq!(message.attachments.len(), 1);
+        assert_eq!(message.attachments[0].filename, "notes.txt");
+
+        backend
+            .send(
+                OutgoingMessage {
+                    from: "user@example.test".into(),
+                    to: vec!["recipient@example.test".into()],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: "JMAP E2E send".into(),
+                    body_text: "Hello".into(),
+                    body_html: Some("<b>Hello</b>".into()),
+                    attachments: vec![crate::backend::OutgoingAttachment {
+                        filename: "answer.txt".into(),
+                        mime_type: "text/plain".into(),
+                        data: b"answer".to_vec(),
+                    }],
+                },
+                "app-password",
+            )
+            .await
+            .unwrap();
+
+        let (archive_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role='archive'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let pending = db
+            .queue_message_move(&[message_id], archive_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.cancel_outbox_operations(&pending.operation_ids)
+                .await
+                .unwrap(),
+            1
+        );
+        let queued = db
+            .queue_message_move(&[message_id], archive_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+            .bind(queued.operation_ids[0])
+            .execute(&db.write_pool)
+            .await
+            .unwrap();
+        let operation = db
+            .claim_outbox_operations(account.id, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        backend
+            .apply_operation(
+                "user@example.test",
+                "app-password",
+                &operation.op_kind,
+                &operation.payload,
+            )
+            .await
+            .unwrap();
+        db.complete_outbox_operation(&operation).await.unwrap();
+        let (remaining,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id=?")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        db.close().await;
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

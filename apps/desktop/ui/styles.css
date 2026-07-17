@@ -134,7 +134,7 @@
   .search input{border:0;background:transparent;outline:none;color:var(--text);font:inherit;flex:1;min-width:0;}
   .msgs{overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;min-height:0;flex:1;}
   .message-list-spacer{width:1px;min-height:0;pointer-events:none;}
-  .msg{display:grid;grid-template-columns:32px 1fr auto;gap:10px;padding:var(--row-py) 14px;border-bottom:1px solid var(--border);cursor:pointer;align-items:start;position:relative;content-visibility:auto;contain-intrinsic-size:76px;user-select:none;-webkit-user-select:none;}.msg.selected{background:var(--accent-weak)}
+  .msg{display:grid;grid-template-columns:32px 1fr auto;gap:10px;padding:var(--row-py) 14px;border-bottom:1px solid var(--border);cursor:pointer;align-items:start;position:relative;content-visibility:auto;contain-intrinsic-size:76px;user-select:none;-webkit-user-select:none;touch-action:pan-y;}.msg.selected{background:var(--accent-weak)}
   .msg:hover{background:var(--hover);} .msg.active{background:var(--active);}
   .msg.active::before{content:"";position:absolute;left:0;top:10px;width:3px;height:36px;background:var(--accent);border-radius:0 3px 3px 0;}
   .avawrap{position:relative;width:32px;height:32px;flex:none;}
@@ -378,6 +378,7 @@
   .template-field{display:grid;gap:6px;color:var(--text-2);font-size:12px}
   .template-list{display:grid;gap:8px}.template-row{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid var(--border);border-radius:9px}.template-row .t{font-weight:600}.template-row .d{font-size:12px;color:var(--text-3)}.template-empty{color:var(--text-3);text-align:center;padding:20px}
   .aux-form .fld{margin-bottom:13px}.aux-form .fld>label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px}.aux-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.aux-check{display:flex;align-items:center;gap:8px;font-size:13px;margin:-2px 0 13px}.aux-check input{accent-color:var(--accent)}.ccard{cursor:pointer}.ccard:hover{background:var(--hover)}
+  .event-advanced{border-top:1px solid var(--border);padding-top:11px;margin-top:3px}.event-advanced>summary{cursor:pointer;color:var(--accent-text);font-size:13px;font-weight:600}.event-advanced-body{padding-top:13px}.event-lines{min-height:62px}.event-advanced .sel{width:100%}
   .fld{margin-bottom:18px;} .fld>label{display:block;font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:7px;}
   .name-row{display:flex;gap:10px;align-items:center;} .name-row .inp{flex:1;}
   .icons{display:flex;gap:6px;} .ic-pick{width:30px;height:30px;border-radius:8px;display:grid;place-items:center;cursor:pointer;border:1px solid var(--border);color:var(--text-2);} .ic-pick.on{border-color:var(--accent);color:var(--accent-text);background:var(--accent-weak);} .ic-pick i svg{width:16px;height:16px;}
@@ -555,7 +556,9 @@
   }
   .acct-line{display:flex;align-items:center;gap:10px;} .grow{flex:1;min-width:0;} .ava-26{width:26px;height:26px;border-radius:7px;font-size:11px;}
   .acctbar{height:6px;border-radius:3px;background:var(--panel);margin-top:5px;width:220px;max-width:100%;} .acctbar>span{display:block;height:100%;background:var(--accent);border-radius:3px;} .bar-70{width:70%;} .bar-28{width:28%;} .bar-30{width:30%;}
-  .ev.dragging,.wk-ev.dragging{opacity:.45;} .calcell.drop-hi,.wk-cell.drop-hi{background:var(--accent-weak);}
+  .ev.dragging,.wk-ev.dragging{opacity:.45;} .calcell.drop-hi,.wk-daycol.drop-hi{background:var(--accent-weak);}
+  .folder-row.drop-hi{outline:2px solid var(--accent);outline-offset:-2px;background:var(--accent-weak)}
+  .msg.mail-dragging{opacity:.45}.msg.swiping{transition:none!important;z-index:2}.msg.swipe-archive{box-shadow:inset 5px 0 var(--good)}.msg.swipe-trash{box-shadow:inset -5px 0 var(--danger)}
   .compose.dragover{outline:2px dashed var(--accent);outline-offset:-10px;}
   .comp-att{display:flex;flex-wrap:wrap;gap:8px;padding:0 20px 10px;}
   .att-mini{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12.5px;background:var(--panel);} .att-mini .x{cursor:pointer;color:var(--text-3);} .att-mini .x:hover{color:var(--danger);} .att-mini i svg{width:15px;height:15px;color:var(--text-3);}
