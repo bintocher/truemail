@@ -153,8 +153,8 @@ impl Db {
             "INSERT INTO accounts(
                 uuid, email, display_name, provider, backend_kind, auth_kind,
                 imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                username, secret_ref, color
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ews_url, jmap_url, username, secret_ref, color
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(email) DO UPDATE SET
                 display_name = excluded.display_name,
                 provider = excluded.provider,
@@ -166,6 +166,8 @@ impl Db {
                 smtp_host = excluded.smtp_host,
                 smtp_port = excluded.smtp_port,
                 smtp_security = excluded.smtp_security,
+                ews_url = excluded.ews_url,
+                jmap_url = excluded.jmap_url,
                 username = excluded.username,
                 secret_ref = excluded.secret_ref,
                 enabled = 1,
@@ -183,6 +185,8 @@ impl Db {
         .bind(input.smtp.as_ref().map(|server| &server.host))
         .bind(input.smtp.as_ref().map(|server| server.port as i64))
         .bind(security(input.smtp.as_ref()))
+        .bind(input.ews_url.as_deref())
+        .bind(input.jmap_url.as_deref())
         .bind(input.username.as_deref())
         .bind(&input.secret_ref)
         .bind(input.color.as_deref())
@@ -200,7 +204,7 @@ impl Db {
         let rows = sqlx::query_as::<_, AccountRow>(
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, username, secret_ref, include_in_unified, color, retention_days, enabled
+                ews_url, jmap_url, username, secret_ref, include_in_unified, color, retention_days, enabled
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
@@ -3191,6 +3195,7 @@ struct AccountRow {
     smtp_port: Option<i64>,
     smtp_security: Option<String>,
     ews_url: Option<String>,
+    jmap_url: Option<String>,
     username: Option<String>,
     secret_ref: Option<String>,
     include_in_unified: i64,
@@ -3242,6 +3247,7 @@ impl From<AccountRow> for Account {
             imap,
             smtp,
             ews_url: r.ews_url,
+            jmap_url: r.jmap_url,
             username: r.username,
             secret_ref: r.secret_ref,
             include_in_unified: r.include_in_unified != 0,

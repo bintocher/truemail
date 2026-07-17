@@ -26,7 +26,8 @@ pub use oauth::{
 
 use crate::Result;
 use crate::backend::{
-    EwsBackend, GenericImapBackend, GmailBackend, MailBackend, OutlookBackend, YandexBackend,
+    EwsBackend, GenericImapBackend, GmailBackend, JmapBackend, MailBackend, OutlookBackend,
+    YandexBackend,
 };
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
@@ -193,6 +194,17 @@ impl AccountManager {
     }
 
     fn mail_backend(account: &Account) -> Result<Box<dyn MailBackend>> {
+        if account.backend_kind == BackendKind::Jmap {
+            return Ok(Box::new(JmapBackend {
+                session_url: account.jmap_url.clone().ok_or_else(|| {
+                    crate::Error::AccountConfig("для аккаунта не настроен JMAP Session URL".into())
+                })?,
+                username: account
+                    .username
+                    .clone()
+                    .unwrap_or_else(|| account.email.clone()),
+            }));
+        }
         match account.provider {
             Provider::Yandex => Ok(Box::new(YandexBackend)),
             Provider::Gmail => Ok(Box::new(GmailBackend)),
@@ -611,6 +623,7 @@ impl AccountManager {
                 imap: Some(imap),
                 smtp: config.smtp.clone(),
                 ews_url: None,
+                jmap_url: None,
                 username: Some(username.to_owned()),
                 secret_ref: secret_ref.clone(),
                 color: Some("#3F7C85".into()),
@@ -674,9 +687,67 @@ impl AccountManager {
                 imap: None,
                 smtp: None,
                 ews_url: Some(endpoint),
+                jmap_url: None,
                 username: Some(username.to_owned()),
                 secret_ref: secret_ref.clone(),
                 color: Some("#0078D4".into()),
+            })
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = entry.delete_credential();
+                return Err(error);
+            }
+        };
+        Ok(ConnectedAccountSync {
+            account,
+            mail_folders: 0,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Подключить JMAP-сервер по отдельному паролю приложения.
+    pub async fn add_jmap_password(
+        &self,
+        email: &str,
+        display_name: &str,
+        username: &str,
+        password: &str,
+        session_url: &str,
+    ) -> Result<ConnectedAccountSync> {
+        if password.is_empty() {
+            return Err(crate::Error::AccountConfig("пароль не указан".into()));
+        }
+        let backend = JmapBackend {
+            session_url: session_url.trim().to_owned(),
+            username: username.to_owned(),
+        };
+        backend.validate(email, password).await?;
+        let secret_ref = format!("jmap-password:{}", email.to_lowercase());
+        let entry = keyring::Entry::new("truemail", &secret_ref)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        let account = match self
+            .db
+            .save_account(&NewAccount {
+                email: email.to_owned(),
+                display_name: display_name.to_owned(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Jmap,
+                auth_kind: AuthKind::AppPassword,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                jmap_url: Some(session_url.trim().to_owned()),
+                username: Some(username.to_owned()),
+                secret_ref: secret_ref.clone(),
+                color: Some("#6B5DD3".into()),
             })
             .await
         {
@@ -732,6 +803,7 @@ impl AccountManager {
                     security: Security::Ssl,
                 }),
                 ews_url: None,
+                jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
                 color: Some("#5B63D3".into()),
@@ -826,6 +898,7 @@ impl AccountManager {
                     security: Security::Ssl,
                 }),
                 ews_url: None,
+                jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
                 color: Some("#4285F4".into()),
@@ -902,6 +975,7 @@ impl AccountManager {
                     security: Security::Starttls,
                 }),
                 ews_url: None,
+                jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
                 color: Some("#0078D4".into()),

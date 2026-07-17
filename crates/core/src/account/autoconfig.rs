@@ -12,6 +12,7 @@ pub struct ProviderConfig {
     pub imap: Option<ServerConfig>,
     pub smtp: Option<ServerConfig>,
     pub ews_url: Option<String>,
+    pub jmap_url: Option<String>,
 }
 
 /// Подобрать известного провайдера и его стандартные серверы по домену адреса.
@@ -40,6 +41,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             imap: imap("imap.yandex.com", 993),
             smtp: smtp("smtp.yandex.com", 465),
             ews_url: None,
+            jmap_url: None,
         },
         "mail.ru" | "inbox.ru" | "list.ru" | "bk.ru" => ProviderConfig {
             provider: Provider::Mailru,
@@ -48,6 +50,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             imap: imap("imap.mail.ru", 993),
             smtp: smtp("smtp.mail.ru", 465),
             ews_url: None,
+            jmap_url: None,
         },
         "icloud.com" | "me.com" | "mac.com" => ProviderConfig {
             provider: Provider::Icloud,
@@ -60,6 +63,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
                 security: Security::Starttls,
             }),
             ews_url: None,
+            jmap_url: None,
         },
         "gmail.com" | "googlemail.com" => ProviderConfig {
             provider: Provider::Gmail,
@@ -68,6 +72,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             imap: imap("imap.gmail.com", 993),
             smtp: smtp("smtp.gmail.com", 465),
             ews_url: None,
+            jmap_url: None,
         },
         "outlook.com" | "hotmail.com" | "live.com" => ProviderConfig {
             provider: Provider::Outlook,
@@ -80,6 +85,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
                 security: Security::Starttls,
             }),
             ews_url: None,
+            jmap_url: None,
         },
         _ => ProviderConfig {
             provider: Provider::Generic,
@@ -88,6 +94,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             imap: None,
             smtp: None,
             ews_url: None,
+            jmap_url: None,
         },
     }
 }
@@ -129,6 +136,18 @@ fn config_for_provider(provider: Provider) -> ProviderConfig {
         _ => "user@invalid.local",
     };
     autoconfig(sample)
+}
+
+fn jmap_config(session_url: String) -> ProviderConfig {
+    ProviderConfig {
+        provider: Provider::Generic,
+        backend_kind: BackendKind::Jmap,
+        auth_kind: AuthKind::AppPassword,
+        imap: None,
+        smtp: None,
+        ews_url: None,
+        jmap_url: Some(session_url),
+    }
 }
 
 async fn xml_autoconfig(email: &str, domain: &str) -> Option<ProviderConfig> {
@@ -213,6 +232,7 @@ async fn xml_autoconfig(email: &str, domain: &str) -> Option<ProviderConfig> {
             imap,
             smtp,
             ews_url: None,
+            jmap_url: None,
         });
     }
     None
@@ -252,6 +272,27 @@ pub async fn discover_provider(email: &str) -> ProviderConfig {
             if provider != Provider::Generic {
                 return config_for_provider(provider);
             }
+        }
+
+        if let Ok(records) = resolver.srv_lookup(format!("_jmap._tcp.{domain}.")).await
+            && let Some(record) = records
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::SRV(value) => Some(value),
+                    _ => None,
+                })
+                .min_by_key(|record| record.priority)
+        {
+            let host = record.target.to_utf8();
+            let host = host.trim_end_matches('.');
+            let port = record.port;
+            let authority = if port == 443 {
+                host.to_owned()
+            } else {
+                format!("{host}:{port}")
+            };
+            return jmap_config(format!("https://{authority}/.well-known/jmap"));
         }
 
         let mut imap = None;
@@ -294,11 +335,22 @@ pub async fn discover_provider(email: &str) -> ProviderConfig {
                 imap,
                 smtp,
                 ews_url: None,
+                jmap_url: None,
             };
         }
     }
 
-    xml_autoconfig(email, &domain).await.unwrap_or(known)
+    let (jmap, xml) = tokio::join!(
+        crate::backend::probe_jmap_session_url(email),
+        xml_autoconfig(email, &domain)
+    );
+    if let Some(url) = jmap {
+        return jmap_config(url);
+    }
+    if let Some(config) = xml {
+        return config;
+    }
+    known
 }
 
 #[cfg(test)]

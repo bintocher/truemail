@@ -3,6 +3,7 @@
 mod ews;
 mod gmail_api;
 mod imap;
+mod jmap;
 mod smtp;
 
 pub use ews::{EwsBackend, discover_ews_url};
@@ -14,6 +15,7 @@ pub use imap::{
     validate_password, validate_yandex, wait_for_gmail_change, wait_for_password_change,
     wait_for_yandex_change,
 };
+pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex};
 
 /// ID последних писем Gmail Входящих - для быстрых уведомлений о новой почте.

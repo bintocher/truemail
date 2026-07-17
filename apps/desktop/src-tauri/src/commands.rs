@@ -159,9 +159,11 @@ pub struct PendingOAuthResponse {
 #[derive(Serialize)]
 pub struct PasswordConnectionInfo {
     provider: Provider,
+    backend_kind: BackendKind,
     username: String,
-    imap: ServerConfig,
+    imap: Option<ServerConfig>,
     smtp: Option<ServerConfig>,
+    jmap_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2736,19 +2738,29 @@ pub async fn begin_account_connection(
                 connected: None,
                 password_config: Some(PasswordConnectionInfo {
                     provider: config.provider,
+                    backend_kind: config.backend_kind,
                     username: email.clone(),
-                    imap: config.imap.unwrap_or(ServerConfig {
-                        host: format!("imap.{domain}"),
-                        port: 993,
-                        security: Security::Ssl,
-                    }),
-                    smtp: config.smtp.or_else(|| {
-                        (!domain.is_empty()).then(|| ServerConfig {
-                            host: format!("smtp.{domain}"),
-                            port: 465,
+                    imap: if config.backend_kind == BackendKind::Jmap {
+                        None
+                    } else {
+                        Some(config.imap.unwrap_or(ServerConfig {
+                            host: format!("imap.{domain}"),
+                            port: 993,
                             security: Security::Ssl,
+                        }))
+                    },
+                    smtp: if config.backend_kind == BackendKind::Jmap {
+                        None
+                    } else {
+                        config.smtp.or_else(|| {
+                            (!domain.is_empty()).then(|| ServerConfig {
+                                host: format!("smtp.{domain}"),
+                                port: 465,
+                                security: Security::Ssl,
+                            })
                         })
-                    }),
+                    },
+                    jmap_url: config.jmap_url,
                 }),
             })
         }
@@ -2822,6 +2834,7 @@ pub async fn complete_password_imap(
             })
             .transpose()?,
         ews_url: None,
+        jmap_url: None,
     };
     let core = core(&state).await?;
     let display_name = email.split('@').next().unwrap_or(&email).to_owned();
@@ -2861,6 +2874,40 @@ pub async fn complete_exchange_ews(
             username,
             &password,
             (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
+        )
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn complete_jmap(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    session_url: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() || session_url.trim().is_empty() {
+        return Err(ApiError {
+            message: "укажите имя пользователя и JMAP Session URL".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_jmap_password(
+            &email,
+            &display_name,
+            username,
+            &password,
+            session_url.trim(),
         )
         .await?;
     let account = connected.account.clone();
