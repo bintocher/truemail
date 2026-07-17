@@ -15,6 +15,9 @@ pub const GOOGLE_SCOPES: &str = "https://mail.google.com/ \
 https://www.googleapis.com/auth/calendar \
 https://www.googleapis.com/auth/contacts \
 https://www.googleapis.com/auth/tasks";
+pub const MICROSOFT_SCOPES: &str = "offline_access \
+https://outlook.office.com/IMAP.AccessAsUser.All \
+https://outlook.office.com/SMTP.Send";
 
 pub fn configured_yandex_client_id() -> Option<String> {
     configured_oauth_value(
@@ -43,6 +46,21 @@ pub fn configured_google_client_secret() -> Option<String> {
         "TRUEMAIL_GOOGLE_CLIENT_SECRET",
         option_env!("TRUEMAIL_GOOGLE_CLIENT_SECRET"),
     )
+}
+
+pub fn configured_microsoft_client_id() -> Option<String> {
+    configured_oauth_value(
+        "TRUEMAIL_MICROSOFT_CLIENT_ID",
+        option_env!("TRUEMAIL_MICROSOFT_CLIENT_ID"),
+    )
+}
+
+pub fn configured_microsoft_tenant() -> String {
+    configured_oauth_value(
+        "TRUEMAIL_MICROSOFT_TENANT",
+        option_env!("TRUEMAIL_MICROSOFT_TENANT"),
+    )
+    .unwrap_or_else(|| "common".into())
 }
 
 fn configured_oauth_value(environment_name: &str, compiled: Option<&str>) -> Option<String> {
@@ -169,6 +187,49 @@ pub fn google_authorize_url(
     Ok(url.into())
 }
 
+fn microsoft_endpoint(tenant: &str, endpoint: &str) -> Result<Url> {
+    if tenant.is_empty()
+        || !tenant
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+    {
+        return Err(Error::AccountConfig(
+            "TRUEMAIL_MICROSOFT_TENANT содержит недопустимые символы".into(),
+        ));
+    }
+    Url::parse(&format!(
+        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/{endpoint}"
+    ))
+    .map_err(|error| Error::Other(format!("Microsoft OAuth URL: {error}")))
+}
+
+pub fn microsoft_authorize_url(
+    client_id: &str,
+    tenant: &str,
+    email_hint: &str,
+    state: &str,
+    challenge: &str,
+    redirect_uri: &str,
+) -> Result<String> {
+    if client_id.trim().is_empty() {
+        return Err(Error::AccountConfig(
+            "не задан TRUEMAIL_MICROSOFT_CLIENT_ID".into(),
+        ));
+    }
+    let mut url = microsoft_endpoint(tenant, "authorize")?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_mode", "query")
+        .append_pair("scope", MICROSOFT_SCOPES)
+        .append_pair("login_hint", email_hint)
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.into())
+}
+
 pub async fn exchange_yandex_code(
     client_id: &str,
     code: &str,
@@ -220,6 +281,32 @@ pub async fn exchange_google_code(
     parse_token_response(response, "google-oauth").await
 }
 
+pub async fn exchange_microsoft_code(
+    client_id: &str,
+    tenant: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthToken> {
+    let response = oauth_client("microsoft-oauth")?
+        .post(microsoft_endpoint(tenant, "token")?)
+        .form(&[
+            ("client_id", client_id),
+            ("scope", MICROSOFT_SCOPES),
+            ("code", code.trim()),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "microsoft-oauth".into(),
+            message: error.to_string(),
+        })?;
+    parse_token_response(response, "microsoft-oauth").await
+}
+
 /// Продлить OAuth-токен без участия пользователя.
 pub async fn refresh_yandex_token(client_id: &str, refresh_token: &str) -> Result<OAuthToken> {
     let response = oauth_client("yandex-oauth")?
@@ -258,6 +345,28 @@ pub async fn refresh_google_token(
             message: e.to_string(),
         })?;
     parse_token_response(response, "google-oauth").await
+}
+
+pub async fn refresh_microsoft_token(
+    client_id: &str,
+    tenant: &str,
+    refresh_token: &str,
+) -> Result<OAuthToken> {
+    let response = oauth_client("microsoft-oauth")?
+        .post(microsoft_endpoint(tenant, "token")?)
+        .form(&[
+            ("client_id", client_id),
+            ("scope", MICROSOFT_SCOPES),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "microsoft-oauth".into(),
+            message: error.to_string(),
+        })?;
+    parse_token_response(response, "microsoft-oauth").await
 }
 
 fn oauth_client(backend: &str) -> Result<reqwest::Client> {
@@ -405,6 +514,31 @@ mod tests {
         // include_granted_scopes намеренно не задаётся: нужен полный набор scope
         // на каждом входе, инкрементальная авторизация давала урезанный токен.
         assert_eq!(params.get("include_granted_scopes"), None);
+    }
+
+    #[test]
+    fn microsoft_authorize_url_uses_mail_scopes_and_pkce() {
+        let url = microsoft_authorize_url(
+            "client",
+            "common",
+            "me@outlook.com",
+            "state",
+            "challenge",
+            "http://127.0.0.1:49153/oauth/microsoft/callback",
+        )
+        .expect("url");
+        let parsed = Url::parse(&url).expect("parse");
+        assert_eq!(parsed.host_str(), Some("login.microsoftonline.com"));
+        assert_eq!(parsed.path(), "/common/oauth2/v2.0/authorize");
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        let scopes = params.get("scope").expect("scope");
+        assert!(scopes.contains("offline_access"));
+        assert!(scopes.contains("IMAP.AccessAsUser.All"));
+        assert!(scopes.contains("SMTP.Send"));
+        assert_eq!(
+            params.get("code_challenge_method").map(|v| v.as_ref()),
+            Some("S256")
+        );
     }
 
     #[test]

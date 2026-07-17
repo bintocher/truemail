@@ -45,7 +45,7 @@ pub async fn unsubscribe_one_click(url: &str) -> Result<u16> {
 }
 
 use crate::Result;
-use crate::model::ServerConfig;
+use crate::model::{Security, ServerConfig};
 use async_trait::async_trait;
 use std::collections::HashMap;
 
@@ -105,6 +105,9 @@ pub struct YandexBackend;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GmailBackend;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct OutlookBackend;
 
 #[derive(Debug, Clone)]
 pub struct GenericImapBackend {
@@ -286,6 +289,108 @@ impl MailBackend for GmailBackend {
             message: "нет remote_id для докачки письма".into(),
         })?;
         gmail_api::fetch_message_raw(credential, id).await
+    }
+}
+
+#[async_trait]
+impl MailBackend for OutlookBackend {
+    fn provider_id(&self) -> &'static str {
+        "outlook"
+    }
+
+    async fn validate(&self, email: &str, credential: &str) -> Result<()> {
+        imap::validate_oauth("outlook.office365.com", email, credential).await
+    }
+
+    async fn discover(
+        &self,
+        email: &str,
+        credential: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+    ) -> Result<ImapDiscovery> {
+        imap::discover_oauth("outlook.office365.com", email, credential, cursors).await
+    }
+
+    async fn discover_folders(
+        &self,
+        email: &str,
+        credential: &str,
+    ) -> Result<Vec<DiscoveredFolder>> {
+        imap::discover_oauth_folders("outlook.office365.com", email, credential).await
+    }
+
+    async fn discover_inbox(
+        &self,
+        email: &str,
+        credential: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+    ) -> Result<ImapDiscovery> {
+        imap::discover_oauth_inbox("outlook.office365.com", email, credential, cursors).await
+    }
+
+    async fn apply_operation(
+        &self,
+        email: &str,
+        credential: &str,
+        operation: &str,
+        payload: &str,
+    ) -> Result<()> {
+        imap::apply_oauth_operation(
+            "outlook.office365.com",
+            email,
+            credential,
+            operation,
+            payload,
+        )
+        .await
+    }
+
+    async fn rename_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        remote_path: &str,
+        new_name: &str,
+    ) -> Result<String> {
+        imap::rename_oauth_folder(
+            "outlook.office365.com",
+            email,
+            credential,
+            remote_path,
+            new_name,
+        )
+        .await
+    }
+
+    async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()> {
+        imap::delete_oauth_folder("outlook.office365.com", email, credential, remote_path).await
+    }
+
+    async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()> {
+        imap::wait_for_oauth_change("outlook.office365.com", email, credential).await
+    }
+
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
+        smtp::send_oauth(
+            message,
+            credential,
+            "smtp.office365.com",
+            587,
+            Security::Starttls,
+        )
+        .await
+    }
+
+    async fn fetch_message_raw(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        uid: u32,
+        _remote_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        imap::fetch_oauth_message_raw("outlook.office365.com", email, credential, folder_path, uid)
+            .await
     }
 }
 

@@ -82,11 +82,17 @@ pub async fn send_oauth(
     access_token: &str,
     host: &str,
     port: u16,
+    security: Security,
 ) -> Result<()> {
     let from = message.from.clone();
     let email = build_message(message)?;
     let credentials = Credentials::new(from, access_token.to_owned());
-    let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    let builder = if security == Security::Starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    };
+    let transport = builder
         .map_err(|error| Error::Backend {
             backend: "smtp".into(),
             message: error.to_string(),
@@ -107,7 +113,7 @@ pub async fn send_oauth(
 }
 
 pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
-    send_oauth(message, access_token, "smtp.yandex.com", 465).await
+    send_oauth(message, access_token, "smtp.yandex.com", 465, Security::Ssl).await
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {

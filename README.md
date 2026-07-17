@@ -17,7 +17,8 @@ locally in an encrypted database. Yandex and Gmail are supported.
 
 Mail:
 
-- Connects Yandex and Gmail over OAuth, without entering your mailbox password.
+- Connects Yandex, Gmail and Outlook/Microsoft 365 over OAuth, without entering
+  your mailbox password.
 - Receives mail over IMAP; new messages arrive immediately, without waiting for a poll.
 - Sends over SMTP, with drafts, attachments and scheduled sending.
 - Sending queue: with no network, a message goes out on the next connection.
@@ -55,8 +56,8 @@ the list beforehand: `make sweep-preview`.
 ## Connecting mail
 
 A released build connects mailboxes on its own. If you build from source, you
-need to register your own application with Yandex and Google and provide the
-identifiers they issue: the repository does not contain them.
+need to register your own application with Yandex, Google and Microsoft and
+provide the identifiers they issue: the repository does not contain them.
 
 Copy `.env.example` to `.env` and fill in the values. `.env` stays out of Git,
 and `make dev` reads it while building.
@@ -66,6 +67,8 @@ TRUEMAIL_YANDEX_CLIENT_ID=your_yandex_application_id
 TRUEMAIL_YANDEX_REDIRECT_URI=http://127.0.0.1:34982/oauth/yandex/callback
 TRUEMAIL_GOOGLE_CLIENT_ID=your_google_application_id
 TRUEMAIL_GOOGLE_CLIENT_SECRET=the_string_google_issues
+TRUEMAIL_MICROSOFT_CLIENT_ID=your_entra_application_id
+TRUEMAIL_MICROSOFT_TENANT=common
 ```
 
 Yandex needs no application password. Google issues one even for programs on a
@@ -81,6 +84,12 @@ with `Gmail API` enabled, access permission `https://mail.google.com/` and an
 application of type `Desktop app`. No callback URL is needed: the program
 receives the answer on a temporary `http://127.0.0.1` address on a random port.
 
+Microsoft: a Microsoft Entra application for personal and organizational
+accounts, platform `Mobile and desktop applications`, public client flow
+enabled, and delegated permissions `IMAP.AccessAsUser.All` and `SMTP.Send`.
+Register the loopback path `/oauth/microsoft/callback`; truemail chooses its
+port at run time and requests `offline_access` for token refresh.
+
 ## How data is stored
 
 On first run you choose a language, review the setup process, choose a folder for the data, and create the
@@ -89,8 +98,9 @@ random numbers from the operating system, so the key cannot be predicted. Keys
 are kept in the system password store.
 
 The whole database is encrypted, including internal data and the search index.
-Message texts and attachments are encrypted separately. The program neither
-stores nor sees mailbox passwords: access is granted over OAuth.
+Message texts and attachments are encrypted separately. OAuth providers do not
+share mailbox passwords. Passwords for app-password IMAP and self-hosted
+Exchange are kept only in the operating system credential store.
 
 ## Structure
 

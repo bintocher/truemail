@@ -3,13 +3,16 @@
 ## Почта
 
 Обычные и Яндекс-аккаунты используют IMAP/SMTP, Gmail — Gmail API для почты,
-self-hosted Exchange — EWS. Автоконфигурация сначала проверяет известного
+Outlook/Microsoft 365 — IMAP/SMTP с Microsoft OAuth, self-hosted Exchange — EWS.
+Автоконфигурация сначала проверяет известного
 провайдера, затем стандартные autoconfig/ISPDB/SRV-механизмы.
 
 Desktop OAuth использует PKCE и loopback callback. Для Яндекса в настройках
 OAuth-приложения должен быть зарегистрирован точный адрес
 `http://127.0.0.1:34982/oauth/yandex/callback`; его можно заменить при сборке
-через `TRUEMAIL_YANDEX_REDIRECT_URI`. Google принимает случайный loopback-порт.
+через `TRUEMAIL_YANDEX_REDIRECT_URI`. Google и Microsoft принимают случайный
+loopback-порт. Microsoft Entra приложение должно разрешать public client flow и
+делегированные scope `IMAP.AccessAsUser.All`, `SMTP.Send`, `offline_access`.
 
 Синхронизация хранит серверные курсоры: UIDVALIDITY/HIGHESTMODSEQ для IMAP,
 `historyId` для Gmail, `syncToken`/`ctag` для DAV. Новый курсор фиксируется только
@@ -23,3 +26,6 @@ sync-token и удалённые идентификаторы сохраняют
 
 Raw MIME, vCard и iCalendar остаются каноническими данными; нормализованные
 таблицы предназначены для быстрого UI и поиска.
+
+Спецификация Microsoft OAuth для IMAP/SMTP:
+<https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth>.

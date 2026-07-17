@@ -16,15 +16,18 @@ pub use dav::{
 };
 pub use google_services::sync_google_services;
 pub use oauth::{
-    GOOGLE_SCOPES, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
-    configured_google_client_id, configured_google_client_secret, configured_yandex_client_id,
-    configured_yandex_redirect_uri, exchange_google_code, exchange_yandex_code, generate_pkce,
-    generate_state, google_authorize_url, refresh_google_token, refresh_yandex_token,
-    yandex_authorize_url,
+    GOOGLE_SCOPES, MICROSOFT_SCOPES, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
+    configured_google_client_id, configured_google_client_secret, configured_microsoft_client_id,
+    configured_microsoft_tenant, configured_yandex_client_id, configured_yandex_redirect_uri,
+    exchange_google_code, exchange_microsoft_code, exchange_yandex_code, generate_pkce,
+    generate_state, google_authorize_url, microsoft_authorize_url, refresh_google_token,
+    refresh_microsoft_token, refresh_yandex_token, yandex_authorize_url,
 };
 
 use crate::Result;
-use crate::backend::{EwsBackend, GenericImapBackend, GmailBackend, MailBackend, YandexBackend};
+use crate::backend::{
+    EwsBackend, GenericImapBackend, GmailBackend, MailBackend, OutlookBackend, YandexBackend,
+};
 use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
 use crate::storage::Db;
 use zeroize::Zeroizing;
@@ -193,6 +196,7 @@ impl AccountManager {
         match account.provider {
             Provider::Yandex => Ok(Box::new(YandexBackend)),
             Provider::Gmail => Ok(Box::new(GmailBackend)),
+            Provider::Outlook => Ok(Box::new(OutlookBackend)),
             Provider::Mailru | Provider::Icloud | Provider::Generic => {
                 let imap = account.imap.clone().ok_or_else(|| {
                     crate::Error::AccountConfig("для аккаунта не настроен IMAP-сервер".into())
@@ -215,9 +219,6 @@ impl AccountManager {
                     .clone()
                     .unwrap_or_else(|| account.email.clone()),
             })),
-            _ => Err(crate::Error::AccountConfig(
-                "почтовый транспорт для провайдера не настроен".into(),
-            )),
         }
     }
 
@@ -303,6 +304,20 @@ impl AccountManager {
                             )
                         })?);
                     refresh_google_token(&client_id, &client_secret, &refresh_token).await?
+                }
+                Provider::Outlook => {
+                    let client_id = configured_microsoft_client_id().ok_or_else(|| {
+                        crate::Error::AccountConfig(
+                            "для обновления OAuth-токена не задан TRUEMAIL_MICROSOFT_CLIENT_ID"
+                                .into(),
+                        )
+                    })?;
+                    refresh_microsoft_token(
+                        &client_id,
+                        &configured_microsoft_tenant(),
+                        &refresh_token,
+                    )
+                    .await?
                 }
                 _ => {
                     return Err(crate::Error::AccountConfig(
@@ -501,6 +516,14 @@ impl AccountManager {
         let credential = self.mail_credential(&account).await?;
         Self::mail_backend(&account)?
             .send(message, &credential)
+            .await
+    }
+
+    /// Ждать серверное изменение через механизм выбранного транспорта.
+    pub async fn wait_for_mail_change(&self, account: &Account) -> Result<()> {
+        let credential = self.mail_credential(account).await?;
+        Self::mail_backend(account)?
+            .wait_for_change(&account.email, &credential)
             .await
     }
 
@@ -819,6 +842,82 @@ impl AccountManager {
         let mut warnings = Vec::new();
         if let Err(error) = GmailBackend.validate(email, &access_token).await {
             warnings.push(format!("Проверка доступа к Gmail: {error}"));
+        }
+        Ok(ConnectedAccountSync {
+            account,
+            mail_folders: 0,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
+            warnings,
+        })
+    }
+
+    /// Сохранить Outlook/Exchange Online после Microsoft desktop OAuth PKCE.
+    pub async fn add_outlook_oauth(
+        &self,
+        email: &str,
+        display_name: &str,
+        token: OAuthToken,
+    ) -> Result<ConnectedAccountSync> {
+        if let Some(granted) = token.scope.as_deref() {
+            let granted: std::collections::HashSet<_> = granted.split_whitespace().collect();
+            let missing: Vec<_> = MICROSOFT_SCOPES
+                .split_whitespace()
+                .filter(|scope| !granted.contains(scope))
+                .collect();
+            if !missing.is_empty() {
+                return Err(crate::Error::AccountConfig(format!(
+                    "Microsoft не выдал все разрешения для почты. Не выданы: {}",
+                    missing.join(", ")
+                )));
+            }
+        }
+        let access_token = Zeroizing::new(token.access_token.clone());
+        let secret_ref = format!("microsoft-oauth:{}", email.to_lowercase());
+        let entry = keyring::Entry::new("truemail", &secret_ref)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+        let credential = StoredOAuthCredential::from(token);
+        let serialized = Zeroizing::new(serde_json::to_string(&credential)?);
+        entry
+            .set_password(&serialized)
+            .map_err(|error| crate::Error::Keyring(error.to_string()))?;
+
+        let account = match self
+            .db
+            .save_account(&NewAccount {
+                email: email.to_owned(),
+                display_name: display_name.to_owned(),
+                provider: Provider::Outlook,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "outlook.office365.com".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: Some(ServerConfig {
+                    host: "smtp.office365.com".into(),
+                    port: 587,
+                    security: Security::Starttls,
+                }),
+                ews_url: None,
+                username: Some(email.to_owned()),
+                secret_ref: secret_ref.clone(),
+                color: Some("#0078D4".into()),
+            })
+            .await
+        {
+            Ok(account) => account,
+            Err(error) => {
+                let _ = entry.delete_credential();
+                return Err(error);
+            }
+        };
+
+        let mut warnings = Vec::new();
+        if let Err(error) = OutlookBackend.validate(email, &access_token).await {
+            warnings.push(format!("Проверка доступа к Outlook: {error}"));
         }
         Ok(ConnectedAccountSync {
             account,

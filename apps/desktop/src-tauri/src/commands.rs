@@ -15,7 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::account::{
     ContactInput, EventInput, RemoteObject, configured_google_client_id,
-    configured_google_client_secret, configured_yandex_client_id, configured_yandex_redirect_uri,
+    configured_google_client_secret, configured_microsoft_client_id, configured_microsoft_tenant,
+    configured_yandex_client_id, configured_yandex_redirect_uri,
 };
 use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
@@ -1767,10 +1768,7 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
 pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
     for account in core.db.list_accounts().await? {
-        if !matches!(
-            account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+        if !account.enabled {
             continue;
         }
         let mut syncing = state.syncing.lock().await;
@@ -1813,7 +1811,8 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         if !matches!(
             account.provider,
             truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+        ) || !account.enabled
+        {
             continue;
         }
         let mut syncing = state.syncing_aux.lock().await;
@@ -1887,10 +1886,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         );
     }
     for account in core.db.list_accounts().await? {
-        if !matches!(
-            account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+        if !account.enabled {
             continue;
         }
         let mut watching = state.watching.lock().await;
@@ -1899,12 +1895,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         }
         drop(watching);
 
-        // IMAP IDLE держим только для Yandex. У Gmail IMAP-порт 993 часто
-        // недоступен по сети (провайдерская блокировка), поэтому IDLE зацикливался
-        // на тайм-аутах подключения. Синхронизация Gmail всё равно идёт через
-        // Gmail API (периодический sync_accounts каждые 5 минут), а IMAP-discover
-        // для Gmail тяжёлый (maxResults=500 без курсора) и не годится для polling.
-        if matches!(account.provider, truemail_core::model::Provider::Yandex) {
+        // Gmail работает через отдельный лёгкий REST polling. Для остальных
+        // транспорт сам выбирает IDLE, EWS/JMAP polling или иной механизм ожидания.
+        if !matches!(
+            account.provider,
+            truemail_core::model::Provider::Gmail | truemail_core::model::Provider::Exchange
+        ) {
             let watch_core = core.clone();
             let watch_syncing = state.syncing.clone();
             let watch_app = app.clone();
@@ -1917,31 +1913,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     if watch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                         break;
                     }
-                    let token = match watch_core.accounts.oauth_access_token(&watch_account).await {
-                        Ok(token) => token,
-                        Err(error) => {
-                            tracing::error!(account = %watch_account.email, %error, "не удалось прочитать OAuth-токен для IMAP IDLE");
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                            continue;
-                        }
-                    };
-                    let wait = match watch_account.provider {
-                        truemail_core::model::Provider::Yandex => {
-                            truemail_core::backend::wait_for_yandex_change(
-                                &watch_account.email,
-                                &token,
-                            )
-                            .await
-                        }
-                        truemail_core::model::Provider::Gmail => {
-                            truemail_core::backend::wait_for_gmail_change(
-                                &watch_account.email,
-                                &token,
-                            )
-                            .await
-                        }
-                        _ => unreachable!(),
-                    };
+                    let wait = watch_core
+                        .accounts
+                        .wait_for_mail_change(&watch_account)
+                        .await;
                     match wait {
                         Ok(()) => {
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "syncing"}));
@@ -1962,7 +1937,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     tracing::info!(
                                         account = %watch_account.email,
                                         messages,
-                                        "IMAP IDLE: входящие обновлены"
+                                        "почтовый транспорт: входящие обновлены"
                                     );
                                     notify_new_mail(
                                         &watch_app,
@@ -1975,12 +1950,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 Ok(messages) => tracing::debug!(
                                     account = %watch_account.email,
                                     messages,
-                                    "IMAP IDLE: переустановлен, новых писем нет"
+                                    "наблюдение переустановлено, новых писем нет"
                                 ),
                                 Err(error) => tracing::error!(
                                     account = %watch_account.email,
                                     %error,
-                                    "IMAP IDLE: не удалось дозагрузить входящие"
+                                    "не удалось дозагрузить входящие"
                                 ),
                             }
                             watch_syncing.lock().await.remove(&watch_account.id);
@@ -1999,9 +1974,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
                             if routine {
-                                tracing::debug!(account = %watch_account.email, %error, "IMAP IDLE переустанавливается");
+                                tracing::debug!(account = %watch_account.email, %error, "наблюдение за почтой переустанавливается");
                             } else {
-                                tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                                tracing::warn!(account = %watch_account.email, %error, "наблюдение за почтой будет восстановлено");
                             }
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
                             tokio::time::sleep(retry_delay).await;
@@ -2060,25 +2035,8 @@ pub async fn send_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if !matches!(
-        account.provider,
-        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-    ) {
-        return Err(ApiError {
-            message: "Отправка для этого провайдера ещё не настроена".into(),
-        });
-    }
-    let token = core.accounts.oauth_access_token(&account).await?;
     let outgoing = outgoing_message(&account, request);
-    match account.provider {
-        truemail_core::model::Provider::Yandex => {
-            truemail_core::backend::send_yandex(outgoing, &token).await?
-        }
-        truemail_core::model::Provider::Gmail => {
-            truemail_core::backend::send_gmail(outgoing, &token).await?
-        }
-        _ => unreachable!(),
-    }
+    core.accounts.send_outgoing(account.id, outgoing).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
 }
@@ -2123,14 +2081,6 @@ pub async fn schedule_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if !matches!(
-        account.provider,
-        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-    ) {
-        return Err(ApiError {
-            message: "Отложенная отправка для этого провайдера не настроена".into(),
-        });
-    }
     let send_at = chrono::DateTime::parse_from_rfc3339(&send_at).map_err(|_| ApiError {
         message: "Некорректная дата отложенной отправки".into(),
     })?;
@@ -2435,6 +2385,13 @@ fn google_client_credentials() -> CmdResult<(String, String)> {
     Ok((client_id, client_secret))
 }
 
+fn microsoft_client_id() -> CmdResult<String> {
+    configured_microsoft_client_id().ok_or_else(|| ApiError {
+        message: "Outlook OAuth не настроен в этой сборке: не задан TRUEMAIL_MICROSOFT_CLIENT_ID."
+            .into(),
+    })
+}
+
 async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
@@ -2711,6 +2668,55 @@ pub async fn begin_account_connection(
             let connected = core
                 .accounts
                 .add_gmail_oauth(&email, &display_name, token)
+                .await?;
+            let account = connected.account.clone();
+            let response = connected_response(connected);
+            spawn_initial_mail_sync(&app, &state, core, account).await;
+            Ok(PendingOAuthResponse {
+                mode: "connected".into(),
+                state: None,
+                connected: Some(response),
+                password_config: None,
+            })
+        }
+        truemail_core::model::Provider::Outlook => {
+            let client_id = microsoft_client_id()?;
+            let tenant = configured_microsoft_tenant();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| ApiError {
+                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                })?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| ApiError {
+                    message: format!("не удалось определить OAuth callback: {error}"),
+                })?
+                .port();
+            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
+            let url = truemail_core::account::microsoft_authorize_url(
+                &client_id,
+                &tenant,
+                &email,
+                &oauth_state,
+                &pkce.challenge,
+                &redirect_uri,
+            )?;
+            open_in_yandex_browser(&app, &url)?;
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Microsoft").await?);
+            let token = truemail_core::account::exchange_microsoft_code(
+                &client_id,
+                &tenant,
+                &code,
+                &pkce.verifier,
+                &redirect_uri,
+            )
+            .await?;
+            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+            let connected = core
+                .accounts
+                .add_outlook_oauth(&email, &display_name, token)
                 .await?;
             let account = connected.account.clone();
             let response = connected_response(connected);
