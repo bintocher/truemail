@@ -3,7 +3,34 @@
 use crate::{Error, Result};
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
+use std::collections::HashMap;
 use url::Url;
+
+#[derive(Debug, Clone, Default)]
+pub struct AuxiliarySyncCursors {
+    pub calendars: HashMap<String, CollectionCursor>,
+    pub contact_collections: HashMap<String, CollectionCursor>,
+    pub contacts_sync_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CollectionCursor {
+    pub ctag: Option<String>,
+    pub sync_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncScope {
+    Full,
+    Delta,
+    Unchanged,
+}
+
+impl Default for SyncScope {
+    fn default() -> Self {
+        Self::Full
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct DavSyncResult {
@@ -11,10 +38,19 @@ pub struct DavSyncResult {
     pub contacts: Vec<DavContact>,
     /// Доступные CardDAV-коллекции. Нужны для создания первого контакта,
     /// когда адресная книга ещё пуста и URL нельзя вывести из vCard.
-    pub contact_collections: Vec<String>,
+    pub contact_collections: Vec<DavCollection>,
     /// CardDAV-коллекция действительно была доступна и прочитана. Если Яндекс
     /// ещё не создал адресную книгу и вернул 404, локальные контакты удалять нельзя.
     pub contacts_available: bool,
+    pub contacts_scope: SyncScope,
+    pub contacts_sync_token: Option<String>,
+    pub deleted_contact_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DavCollection {
+    pub url: String,
+    pub ctag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -22,6 +58,9 @@ pub struct DavCalendar {
     pub url: String,
     pub name: String,
     pub ctag: Option<String>,
+    pub sync_token: Option<String>,
+    pub sync_scope: SyncScope,
+    pub deleted_event_urls: Vec<String>,
     pub events: Vec<DavEvent>,
 }
 
@@ -335,7 +374,29 @@ fn parse_contact(
     })
 }
 
-pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncResult> {
+fn collection_unchanged(
+    cursors: &HashMap<String, CollectionCursor>,
+    url: &str,
+    ctag: Option<&str>,
+) -> bool {
+    ctag.is_some() && cursors.get(url).and_then(|cursor| cursor.ctag.as_deref()) == ctag
+}
+
+fn collections_unchanged(
+    cursors: &HashMap<String, CollectionCursor>,
+    collections: &[DavCollection],
+) -> bool {
+    collections.len() == cursors.len()
+        && collections.iter().all(|collection| {
+            collection_unchanged(cursors, &collection.url, collection.ctag.as_deref())
+        })
+}
+
+pub async fn sync_yandex_dav(
+    email: &str,
+    access_token: &str,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<DavSyncResult> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(45))
         .build()
@@ -398,20 +459,32 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
             .find(|n| n.is_element() && n.tag_name().name() == "getctag")
             .and_then(|n| n.text())
             .map(str::to_owned);
-        let report = r#"<?xml version="1.0"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>"#;
-        let event_xml =
-            dav_request(&client, "REPORT", &url, "1", report, email, access_token).await?;
-        let events = response_parts(&event_xml, "calendar-data")?
-            .into_iter()
-            .flat_map(|(href, etag, raw)| {
-                let remote_url = resolve(cal_base, &href).ok();
-                parse_events(raw, etag, remote_url)
-            })
-            .collect();
+        let unchanged = collection_unchanged(&cursors.calendars, &url, ctag.as_deref());
+        let events = if unchanged {
+            Vec::new()
+        } else {
+            let report = r#"<?xml version="1.0"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"/></c:comp-filter></c:filter></c:calendar-query>"#;
+            let event_xml =
+                dav_request(&client, "REPORT", &url, "1", report, email, access_token).await?;
+            response_parts(&event_xml, "calendar-data")?
+                .into_iter()
+                .flat_map(|(href, etag, raw)| {
+                    let remote_url = resolve(cal_base, &href).ok();
+                    parse_events(raw, etag, remote_url)
+                })
+                .collect()
+        };
         calendars.push(DavCalendar {
             url,
             name,
             ctag,
+            sync_token: None,
+            sync_scope: if unchanged {
+                SyncScope::Unchanged
+            } else {
+                SyncScope::Full
+            },
+            deleted_event_urls: Vec::new(),
             events,
         });
     }
@@ -431,6 +504,9 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
             contacts: Vec::new(),
             contact_collections: Vec::new(),
             contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
         });
     };
     let card_doc = Document::parse(&card_xml).map_err(|e| Error::Backend {
@@ -453,11 +529,32 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
             .find(|n| n.is_element() && n.tag_name().name() == "href")
             .and_then(|n| n.text())
         {
-            addressbooks.push(resolve(card_base, href)?);
+            let url = resolve(card_base, href)?;
+            let ctag = response
+                .descendants()
+                .find(|n| n.is_element() && n.tag_name().name() == "getctag")
+                .and_then(|n| n.text())
+                .map(str::to_owned);
+            addressbooks.push(DavCollection { url, ctag });
         }
     }
     if addressbooks.is_empty() {
-        addressbooks.push(card_home);
+        addressbooks.push(DavCollection {
+            url: card_home,
+            ctag: None,
+        });
+    }
+    let contacts_unchanged = collections_unchanged(&cursors.contact_collections, &addressbooks);
+    if contacts_unchanged {
+        return Ok(DavSyncResult {
+            calendars,
+            contacts: Vec::new(),
+            contact_collections: addressbooks,
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        });
     }
     let contacts_report = r#"<?xml version="1.0"?><a:addressbook-query xmlns:d="DAV:" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><d:getetag/><a:address-data/></d:prop></a:addressbook-query>"#;
     let mut contacts = Vec::new();
@@ -465,7 +562,7 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
         let Some(contact_xml) = dav_request_optional(
             &client,
             "REPORT",
-            addressbook,
+            &addressbook.url,
             "1",
             contacts_report,
             email,
@@ -489,6 +586,9 @@ pub async fn sync_yandex_dav(email: &str, access_token: &str) -> Result<DavSyncR
         contacts,
         contact_collections: addressbooks,
         contacts_available: true,
+        contacts_scope: SyncScope::Full,
+        contacts_sync_token: None,
+        deleted_contact_urls: Vec::new(),
     })
 }
 
@@ -511,5 +611,44 @@ mod tests {
         let contact = parse_contact(raw.to_owned(), None, None).expect("valid contact");
         assert_eq!(contact.display_name, "Иван");
         assert_eq!(contact.emails, ["test@example.com"]);
+    }
+
+    #[test]
+    fn skips_only_collections_with_a_matching_ctag() {
+        let cursors = HashMap::from([(
+            "https://dav.test/calendar/".into(),
+            CollectionCursor {
+                ctag: Some("42".into()),
+                sync_token: None,
+            },
+        )]);
+        assert!(collection_unchanged(
+            &cursors,
+            "https://dav.test/calendar/",
+            Some("42")
+        ));
+        assert!(!collection_unchanged(
+            &cursors,
+            "https://dav.test/calendar/",
+            Some("43")
+        ));
+        assert!(!collection_unchanged(
+            &cursors,
+            "https://dav.test/calendar/",
+            None
+        ));
+        assert!(!collections_unchanged(
+            &cursors,
+            &[
+                DavCollection {
+                    url: "https://dav.test/calendar/".into(),
+                    ctag: Some("42".into()),
+                },
+                DavCollection {
+                    url: "https://dav.test/new/".into(),
+                    ctag: Some("1".into()),
+                },
+            ]
+        ));
     }
 }

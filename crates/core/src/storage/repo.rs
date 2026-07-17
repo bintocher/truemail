@@ -625,6 +625,53 @@ impl Db {
         Ok(delete_ids.len())
     }
 
+    pub async fn auxiliary_sync_cursors(
+        &self,
+        account_id: i64,
+    ) -> Result<crate::account::AuxiliarySyncCursors> {
+        use crate::account::{AuxiliarySyncCursors, CollectionCursor};
+
+        let calendar_rows: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT url, ctag, sync_token FROM calendars WHERE account_id=? AND url IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let collection_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT url, ctag FROM auxiliary_collections WHERE account_id=? AND kind='carddav'",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let contacts_sync_token: Option<(String,)> = sqlx::query_as(
+            "SELECT sync_token FROM auxiliary_sync_state WHERE account_id=? AND kind='google-contacts'",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(AuxiliarySyncCursors {
+            calendars: calendar_rows
+                .into_iter()
+                .filter_map(|(url, ctag, sync_token)| {
+                    url.map(|url| (url, CollectionCursor { ctag, sync_token }))
+                })
+                .collect(),
+            contact_collections: collection_rows
+                .into_iter()
+                .map(|(url, ctag)| {
+                    (
+                        url,
+                        CollectionCursor {
+                            ctag,
+                            sync_token: None,
+                        },
+                    )
+                })
+                .collect(),
+            contacts_sync_token: contacts_sync_token.map(|row| row.0),
+        })
+    }
+
     pub async fn save_yandex_dav(
         &self,
         account_id: i64,
@@ -699,10 +746,11 @@ impl Db {
             let mut event_count = 0;
             for (calendar, events) in calendar_rows {
                 let (calendar_id,): (i64,) = sqlx::query_as(
-                    "INSERT INTO calendars(account_id, uid, name, kind, url, ctag)
-                     VALUES(?, ?, ?, ?, ?, ?)
+                    "INSERT INTO calendars(account_id, uid, name, kind, url, ctag, sync_token)
+                     VALUES(?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT DO UPDATE SET name=excluded.name, url=excluded.url,
-                         kind=excluded.kind, ctag=excluded.ctag
+                         kind=excluded.kind, ctag=excluded.ctag,
+                         sync_token=excluded.sync_token
                      RETURNING id",
                 )
                 .bind(account_id)
@@ -711,15 +759,24 @@ impl Db {
                 .bind(source_kind)
                 .bind(&calendar.url)
                 .bind(&calendar.ctag)
+                .bind(&calendar.sync_token)
                 .fetch_one(&mut *tx)
                 .await?;
                 active_calendars.insert(calendar_id);
 
-                let existing_events: Vec<(i64,)> =
-                    sqlx::query_as("SELECT id FROM events WHERE calendar_id=?")
+                let existing_events: Vec<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM events WHERE calendar_id=?",
+                )
                         .bind(calendar_id)
                         .fetch_all(&mut *tx)
                         .await?;
+                for remote_url in &calendar.deleted_event_urls {
+                    sqlx::query("DELETE FROM events WHERE calendar_id=? AND remote_url=?")
+                        .bind(calendar_id)
+                        .bind(remote_url)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 let mut active_events = HashSet::new();
                 for (event, blob_ref) in events {
                     let (event_id,): (i64,) = sqlx::query_as(
@@ -762,12 +819,14 @@ impl Db {
                     active_events.insert(event_id);
                     event_count += 1;
                 }
-                for (event_id,) in existing_events {
-                    if !active_events.contains(&event_id) {
-                        sqlx::query("DELETE FROM events WHERE id=?")
-                            .bind(event_id)
-                            .execute(&mut *tx)
-                            .await?;
+                if calendar.sync_scope == crate::account::SyncScope::Full {
+                    for (event_id,) in existing_events {
+                        if !active_events.contains(&event_id) {
+                            sqlx::query("DELETE FROM events WHERE id=?")
+                                .bind(event_id)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -787,10 +846,13 @@ impl Db {
                     .await?;
                 for collection in &data.contact_collections {
                     sqlx::query(
-                        "INSERT OR IGNORE INTO auxiliary_collections(account_id, kind, url) VALUES(?, 'carddav', ?)",
+                        "INSERT INTO auxiliary_collections(account_id, kind, url, ctag)
+                         VALUES(?, 'carddav', ?, ?)
+                         ON CONFLICT(account_id, kind, url) DO UPDATE SET ctag=excluded.ctag",
                     )
                     .bind(account_id)
-                    .bind(collection)
+                    .bind(&collection.url)
+                    .bind(&collection.ctag)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -801,6 +863,13 @@ impl Db {
                 .fetch_all(&mut *tx)
                 .await?;
                 let mut active_contacts = HashSet::new();
+                for remote_url in &data.deleted_contact_urls {
+                    sqlx::query("DELETE FROM contacts WHERE account_id=? AND remote_url=?")
+                        .bind(account_id)
+                        .bind(remote_url)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 for (contact, blob_ref) in contact_rows {
                     let (contact_id,): (i64,) = sqlx::query_as(
                         "INSERT INTO contacts(account_id, uid, display_name, first_name,
@@ -838,13 +907,27 @@ impl Db {
                         .await?;
                     }
                 }
-                for (contact_id,) in existing_contacts {
-                    if !active_contacts.contains(&contact_id) {
-                        sqlx::query("DELETE FROM contacts WHERE id=?")
-                            .bind(contact_id)
-                            .execute(&mut *tx)
-                            .await?;
+                if data.contacts_scope == crate::account::SyncScope::Full {
+                    for (contact_id,) in existing_contacts {
+                        if !active_contacts.contains(&contact_id) {
+                            sqlx::query("DELETE FROM contacts WHERE id=?")
+                                .bind(contact_id)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
+                }
+                if let Some(sync_token) = &data.contacts_sync_token {
+                    sqlx::query(
+                        "INSERT INTO auxiliary_sync_state(account_id, kind, sync_token)
+                         VALUES(?, 'google-contacts', ?)
+                         ON CONFLICT(account_id, kind) DO UPDATE SET
+                            sync_token=excluded.sync_token, updated_at=datetime('now')",
+                    )
+                    .bind(account_id)
+                    .bind(sync_token)
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
 
@@ -863,10 +946,35 @@ impl Db {
             }
         };
 
-        let current_refs: HashSet<&str> = created_refs.iter().map(String::as_str).collect();
-        for (reference,) in old_event_refs.into_iter().chain(old_contact_refs) {
+        let current_event_refs: HashSet<String> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT e.ical_ref FROM events e JOIN calendars c ON c.id=e.calendar_id
+             WHERE c.account_id=? AND e.ical_ref IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.0)
+        .collect();
+        let current_contact_refs: HashSet<String> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT vcard_ref FROM contacts WHERE account_id=? AND vcard_ref IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.0)
+        .collect();
+        for (reference,) in old_event_refs {
             if let Some(reference) = reference
-                && !current_refs.contains(reference.as_str())
+                && !current_event_refs.contains(&reference)
+            {
+                let _ = self.blobs.remove(&reference);
+            }
+        }
+        for (reference,) in old_contact_refs {
+            if let Some(reference) = reference
+                && !current_contact_refs.contains(&reference)
             {
                 let _ = self.blobs.remove(&reference);
             }

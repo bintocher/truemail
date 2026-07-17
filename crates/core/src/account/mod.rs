@@ -10,7 +10,10 @@ pub use auxiliary::{
     ContactInput, EventInput, RemoteObject, delete_contact, delete_event, write_contact,
     write_event,
 };
-pub use dav::{DavSyncResult, sync_yandex_dav, validate_yandex_dav};
+pub use dav::{
+    AuxiliarySyncCursors, CollectionCursor, DavCalendar, DavCollection, DavContact, DavEvent,
+    DavSyncResult, SyncScope, sync_yandex_dav, validate_yandex_dav,
+};
 pub use google_services::sync_google_services;
 pub use oauth::{
     GOOGLE_SCOPES, OAuthToken, PkcePair, StoredOAuthCredential, YANDEX_SCOPES,
@@ -304,7 +307,8 @@ impl AccountManager {
         account: &Account,
     ) -> Result<(usize, usize, usize)> {
         let access_token = self.oauth_access_token(account).await?;
-        let dav = sync_yandex_dav(&account.email, &access_token).await?;
+        let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
+        let dav = sync_yandex_dav(&account.email, &access_token, &cursors).await?;
         self.db.save_yandex_dav(account.id, &dav).await
     }
 
@@ -314,7 +318,8 @@ impl AccountManager {
         account: &Account,
     ) -> Result<(usize, usize, usize)> {
         let access_token = self.oauth_access_token(account).await?;
-        let data = sync_google_services(&access_token).await?;
+        let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
+        let data = sync_google_services(&access_token, &cursors).await?;
         self.db.save_google_services(account.id, &data).await
     }
 
@@ -604,12 +609,16 @@ impl AccountManager {
                 0
             }
         };
+        let auxiliary_cursors = self.db.auxiliary_sync_cursors(account.id).await?;
         let dav_result = match account.provider {
             Provider::Yandex => Some((
                 "caldav",
-                sync_yandex_dav(&account.email, &access_token).await,
+                sync_yandex_dav(&account.email, &access_token, &auxiliary_cursors).await,
             )),
-            Provider::Gmail => Some(("google", sync_google_services(&access_token).await)),
+            Provider::Gmail => Some((
+                "google",
+                sync_google_services(&access_token, &auxiliary_cursors).await,
+            )),
             _ => None,
         };
         let (calendars, events, contacts) = match dav_result {

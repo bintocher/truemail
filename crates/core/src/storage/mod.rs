@@ -694,4 +694,152 @@ mod tests {
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
+
+    #[tokio::test]
+    async fn auxiliary_deltas_preserve_unchanged_rows_and_commit_cursors() {
+        use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
+        use crate::model::{AuthKind, BackendKind, NewAccount, Provider};
+
+        fn event(id: &str, summary: &str) -> DavEvent {
+            DavEvent {
+                remote_url: Some(format!("google-event:{id}")),
+                uid: id.into(),
+                summary: summary.into(),
+                description: None,
+                location: None,
+                dtstart: "2026-07-17T10:00:00Z".into(),
+                dtend: None,
+                rrule: None,
+                recurrence_id: None,
+                exdates: None,
+                rdates: None,
+                status: Some("confirmed".into()),
+                raw: format!("event:{id}:{summary}"),
+                etag: None,
+            }
+        }
+
+        fn contact(id: &str, name: &str) -> DavContact {
+            DavContact {
+                remote_url: Some(format!("google-contact:people/{id}")),
+                uid: format!("people/{id}"),
+                display_name: name.into(),
+                first_name: None,
+                last_name: None,
+                organization: None,
+                emails: vec![format!("{id}@example.test")],
+                raw: format!("contact:{id}:{name}"),
+                etag: None,
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("truemail-aux-delta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "delta@example.test".into(),
+                display_name: "Delta test".into(),
+                provider: Provider::Gmail,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                username: None,
+                secret_ref: "delta-test".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+
+        let full = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("calendar-token-1".into()),
+                sync_scope: SyncScope::Full,
+                deleted_event_urls: Vec::new(),
+                events: vec![
+                    event("event-1", "One"),
+                    event("event-2", "Two"),
+                    event("event-3", "Three"),
+                ],
+            }],
+            contacts: vec![
+                contact("1", "One"),
+                contact("2", "Two"),
+                contact("3", "Three"),
+            ],
+            contact_collections: Vec::new(),
+            contacts_available: true,
+            contacts_scope: SyncScope::Full,
+            contacts_sync_token: Some("contacts-token-1".into()),
+            deleted_contact_urls: Vec::new(),
+        };
+        db.save_google_services(account.id, &full)
+            .await
+            .expect("save full auxiliary snapshot");
+
+        let delta = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("calendar-token-2".into()),
+                sync_scope: SyncScope::Delta,
+                deleted_event_urls: vec!["google-event:event-2".into()],
+                events: vec![event("event-1", "One updated")],
+            }],
+            contacts: vec![contact("1", "One updated")],
+            contact_collections: Vec::new(),
+            contacts_available: true,
+            contacts_scope: SyncScope::Delta,
+            contacts_sync_token: Some("contacts-token-2".into()),
+            deleted_contact_urls: vec!["google-contact:people/2".into()],
+        };
+        db.save_google_services(account.id, &delta)
+            .await
+            .expect("save auxiliary delta");
+
+        let events: Vec<(String,)> = sqlx::query_as("SELECT summary FROM events ORDER BY summary")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read events after delta");
+        assert_eq!(events, vec![("One updated".into(),), ("Three".into(),)]);
+        let contacts: Vec<(String,)> = sqlx::query_as(
+            "SELECT display_name FROM contacts WHERE uid NOT LIKE 'mail:%' ORDER BY display_name",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read contacts after delta");
+        assert_eq!(contacts, vec![("One updated".into(),), ("Three".into(),)]);
+        let cursors = db
+            .auxiliary_sync_cursors(account.id)
+            .await
+            .expect("read auxiliary cursors");
+        assert_eq!(
+            cursors
+                .calendars
+                .get("google-calendar:primary")
+                .and_then(|cursor| cursor.sync_token.as_deref()),
+            Some("calendar-token-2")
+        );
+        assert_eq!(
+            cursors.contacts_sync_token.as_deref(),
+            Some("contacts-token-2")
+        );
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
 }

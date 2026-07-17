@@ -1,6 +1,8 @@
 //! Синхронизация Google Calendar, Contacts и Tasks через REST API.
 
-use super::dav::{DavCalendar, DavContact, DavEvent, DavSyncResult};
+use super::dav::{
+    AuxiliarySyncCursors, DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope,
+};
 use crate::{Error, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -34,6 +36,7 @@ struct EventPage {
     #[serde(default)]
     items: Option<Vec<Value>>,
     next_page_token: Option<String>,
+    next_sync_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -77,6 +80,7 @@ struct ConnectionsPage {
     #[serde(default)]
     connections: Vec<GooglePerson>,
     next_page_token: Option<String>,
+    next_sync_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -90,6 +94,13 @@ struct GooglePerson {
     email_addresses: Vec<PersonEmail>,
     #[serde(default)]
     organizations: Vec<PersonOrganization>,
+    metadata: Option<PersonMetadata>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersonMetadata {
+    #[serde(default)]
+    deleted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -137,11 +148,19 @@ struct TasksPage {
 struct GoogleTask {
     id: String,
     etag: Option<String>,
+    #[serde(default)]
     title: String,
     notes: Option<String>,
     due: Option<String>,
     status: Option<String>,
     completed: Option<String>,
+    #[serde(default)]
+    deleted: bool,
+}
+
+enum SyncResponse<T> {
+    Data(T),
+    Expired,
 }
 
 fn api_error(backend: &str, message: impl Into<String>) -> Error {
@@ -174,6 +193,34 @@ async fn get_json<T: DeserializeOwned>(
     response
         .json()
         .await
+        .map_err(|error| api_error(backend, format!("ответ Google не разобран: {error}")))
+}
+
+async fn get_sync_json<T: DeserializeOwned>(
+    client: &Client,
+    url: Url,
+    access_token: &str,
+    backend: &str,
+) -> Result<SyncResponse<T>> {
+    let response = client
+        .get(url.clone())
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|error| api_error(backend, error.to_string()))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::GONE || body.contains("EXPIRED_SYNC_TOKEN") {
+        return Ok(SyncResponse::Expired);
+    }
+    if !status.is_success() {
+        return Err(api_error(
+            backend,
+            format!("GET {url}: HTTP {status}: {body}"),
+        ));
+    }
+    serde_json::from_str(&body)
+        .map(SyncResponse::Data)
         .map_err(|error| api_error(backend, format!("ответ Google не разобран: {error}")))
 }
 
@@ -217,7 +264,11 @@ fn event_from_google(event: GoogleEvent) -> Option<DavEvent> {
     })
 }
 
-async fn fetch_calendars(client: &Client, access_token: &str) -> Result<Vec<DavCalendar>> {
+async fn fetch_calendars(
+    client: &Client,
+    access_token: &str,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<Vec<DavCalendar>> {
     let mut calendars = Vec::new();
     let mut page_token: Option<String> = None;
     loop {
@@ -228,44 +279,87 @@ async fn fetch_calendars(client: &Client, access_token: &str) -> Result<Vec<DavC
         }
         let page: CalendarListPage = get_json(client, url, access_token, "google-calendar").await?;
         for calendar in page.items {
-            let mut events = Vec::new();
-            let mut event_page_token: Option<String> = None;
-            loop {
-                let mut events_url =
-                    api_url(CALENDAR_BASE, &["calendars", &calendar.id, "events"])?;
-                events_url
-                    .query_pairs_mut()
-                    .append_pair("maxResults", "2500")
-                    .append_pair("showDeleted", "false")
-                    .append_pair("singleEvents", "false");
-                if let Some(token) = &event_page_token {
-                    events_url.query_pairs_mut().append_pair("pageToken", token);
-                }
-                let event_page: EventPage =
-                    get_json(client, events_url, access_token, "google-calendar").await?;
-                for raw_event in event_page.items.unwrap_or_default() {
-                    match serde_json::from_value::<GoogleEvent>(raw_event) {
-                        Ok(event) => {
-                            if let Some(event) = event_from_google(event) {
-                                events.push(event);
+            let source_url = format!("google-calendar:{}", calendar.id);
+            let stored_token = cursors
+                .calendars
+                .get(&source_url)
+                .and_then(|cursor| cursor.sync_token.clone());
+            let mut requested_token = stored_token.clone();
+            let (events, deleted_event_urls, sync_token, sync_scope) = 'retry: loop {
+                let mut events = Vec::new();
+                let mut deleted_event_urls = Vec::new();
+                let mut event_page_token: Option<String> = None;
+                loop {
+                    let mut events_url =
+                        api_url(CALENDAR_BASE, &["calendars", &calendar.id, "events"])?;
+                    events_url
+                        .query_pairs_mut()
+                        .append_pair("maxResults", "2500")
+                        .append_pair("showDeleted", "true")
+                        .append_pair("singleEvents", "false");
+                    if let Some(token) = requested_token.as_deref() {
+                        events_url.query_pairs_mut().append_pair("syncToken", token);
+                    }
+                    if let Some(token) = &event_page_token {
+                        events_url.query_pairs_mut().append_pair("pageToken", token);
+                    }
+                    let event_page: EventPage =
+                        match get_sync_json(client, events_url, access_token, "google-calendar")
+                            .await?
+                        {
+                            SyncResponse::Data(page) => page,
+                            SyncResponse::Expired if requested_token.is_some() => {
+                                requested_token = None;
+                                continue 'retry;
                             }
+                            SyncResponse::Expired => {
+                                return Err(api_error(
+                                    "google-calendar",
+                                    "Google отклонил полную синхронизацию как устаревшую",
+                                ));
+                            }
+                        };
+                    for raw_event in event_page.items.unwrap_or_default() {
+                        match serde_json::from_value::<GoogleEvent>(raw_event) {
+                            Ok(event) => {
+                                if event.status.as_deref() == Some("cancelled") {
+                                    deleted_event_urls.push(format!("google-event:{}", event.id));
+                                } else if let Some(event) = event_from_google(event) {
+                                    events.push(event);
+                                }
+                            }
+                            Err(error) => tracing::warn!(
+                                calendar = %calendar.id,
+                                %error,
+                                "служебное событие Google Calendar пропущено"
+                            ),
                         }
-                        Err(error) => tracing::warn!(
-                            calendar = %calendar.id,
-                            %error,
-                            "служебное событие Google Calendar пропущено"
-                        ),
+                    }
+                    event_page_token = event_page.next_page_token;
+                    if event_page_token.is_none() {
+                        let sync_token = event_page.next_sync_token.ok_or_else(|| {
+                            api_error("google-calendar", "Google не вернул nextSyncToken")
+                        })?;
+                        break 'retry (
+                            events,
+                            deleted_event_urls,
+                            sync_token,
+                            if requested_token.is_some() {
+                                SyncScope::Delta
+                            } else {
+                                SyncScope::Full
+                            },
+                        );
                     }
                 }
-                event_page_token = event_page.next_page_token;
-                if event_page_token.is_none() {
-                    break;
-                }
-            }
+            };
             calendars.push(DavCalendar {
-                url: format!("google-calendar:{}", calendar.id),
+                url: source_url,
                 name: calendar.summary,
                 ctag: calendar.etag.or(calendar.description),
+                sync_token: Some(sync_token),
+                sync_scope,
+                deleted_event_urls,
                 events,
             });
         }
@@ -277,52 +371,99 @@ async fn fetch_calendars(client: &Client, access_token: &str) -> Result<Vec<DavC
     Ok(calendars)
 }
 
-async fn fetch_contacts(client: &Client, access_token: &str) -> Result<Vec<DavContact>> {
-    let mut contacts = Vec::new();
-    let mut page_token: Option<String> = None;
-    loop {
-        let mut url = Url::parse(PEOPLE_CONNECTIONS)
-            .map_err(|error| api_error("google-contacts", error.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("pageSize", "1000")
-            .append_pair("personFields", "names,emailAddresses,organizations");
-        if let Some(token) = &page_token {
-            url.query_pairs_mut().append_pair("pageToken", token);
-        }
-        let page: ConnectionsPage = get_json(client, url, access_token, "google-contacts").await?;
-        for person in page.connections {
-            let name = person.names.first();
-            let emails: Vec<String> = person
-                .email_addresses
-                .iter()
-                .filter_map(|item| item.value.clone())
-                .collect();
-            let display_name = name
-                .and_then(|value| value.display_name.clone())
-                .or_else(|| emails.first().cloned())
-                .unwrap_or_else(|| "Без имени".into());
-            let raw = serde_json::to_string(&person)?;
-            contacts.push(DavContact {
-                remote_url: Some(format!("google-contact:{}", person.resource_name)),
-                uid: person.resource_name,
-                display_name,
-                first_name: name.and_then(|value| value.given_name.clone()),
-                last_name: name.and_then(|value| value.family_name.clone()),
-                organization: person
-                    .organizations
-                    .first()
-                    .and_then(|value| value.name.clone()),
-                emails,
-                raw,
-                etag: person.etag,
-            });
-        }
-        page_token = page.next_page_token;
-        if page_token.is_none() {
-            break;
+async fn fetch_contacts(
+    client: &Client,
+    access_token: &str,
+    stored_token: Option<&str>,
+) -> Result<(Vec<DavContact>, Vec<String>, String, SyncScope)> {
+    let mut requested_token = stored_token.map(str::to_owned);
+    'retry: loop {
+        let mut contacts = Vec::new();
+        let mut deleted_contact_urls = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut url = Url::parse(PEOPLE_CONNECTIONS)
+                .map_err(|error| api_error("google-contacts", error.to_string()))?;
+            url.query_pairs_mut()
+                .append_pair("pageSize", "1000")
+                .append_pair(
+                    "personFields",
+                    "metadata,names,emailAddresses,organizations",
+                )
+                .append_pair("requestSyncToken", "true");
+            if let Some(token) = requested_token.as_deref() {
+                url.query_pairs_mut().append_pair("syncToken", token);
+            }
+            if let Some(token) = &page_token {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let page: ConnectionsPage =
+                match get_sync_json(client, url, access_token, "google-contacts").await? {
+                    SyncResponse::Data(page) => page,
+                    SyncResponse::Expired if requested_token.is_some() => {
+                        requested_token = None;
+                        continue 'retry;
+                    }
+                    SyncResponse::Expired => {
+                        return Err(api_error(
+                            "google-contacts",
+                            "Google отклонил полную синхронизацию как устаревшую",
+                        ));
+                    }
+                };
+            for person in page.connections {
+                if person
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.deleted)
+                {
+                    deleted_contact_urls.push(format!("google-contact:{}", person.resource_name));
+                    continue;
+                }
+                let name = person.names.first();
+                let emails: Vec<String> = person
+                    .email_addresses
+                    .iter()
+                    .filter_map(|item| item.value.clone())
+                    .collect();
+                let display_name = name
+                    .and_then(|value| value.display_name.clone())
+                    .or_else(|| emails.first().cloned())
+                    .unwrap_or_else(|| "Без имени".into());
+                let raw = serde_json::to_string(&person)?;
+                contacts.push(DavContact {
+                    remote_url: Some(format!("google-contact:{}", person.resource_name)),
+                    uid: person.resource_name,
+                    display_name,
+                    first_name: name.and_then(|value| value.given_name.clone()),
+                    last_name: name.and_then(|value| value.family_name.clone()),
+                    organization: person
+                        .organizations
+                        .first()
+                        .and_then(|value| value.name.clone()),
+                    emails,
+                    raw,
+                    etag: person.etag,
+                });
+            }
+            page_token = page.next_page_token;
+            if page_token.is_none() {
+                let sync_token = page.next_sync_token.ok_or_else(|| {
+                    api_error("google-contacts", "Google не вернул nextSyncToken")
+                })?;
+                return Ok((
+                    contacts,
+                    deleted_contact_urls,
+                    sync_token,
+                    if requested_token.is_some() {
+                        SyncScope::Delta
+                    } else {
+                        SyncScope::Full
+                    },
+                ));
+            }
         }
     }
-    Ok(contacts)
 }
 
 fn task_event(list_id: &str, task: GoogleTask) -> Option<DavEvent> {
@@ -346,9 +487,16 @@ fn task_event(list_id: &str, task: GoogleTask) -> Option<DavEvent> {
     })
 }
 
-async fn fetch_task_calendars(client: &Client, access_token: &str) -> Result<Vec<DavCalendar>> {
+async fn fetch_task_calendars(
+    client: &Client,
+    access_token: &str,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<Vec<DavCalendar>> {
     let mut calendars = Vec::new();
     let mut page_token: Option<String> = None;
+    // Baseline is captured before requests so a concurrent edit is never
+    // skipped; at worst it is returned once again in the next delta.
+    let next_updated_min = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     loop {
         let mut url = api_url(TASKS_BASE, &["users", "@me", "lists"])?;
         url.query_pairs_mut().append_pair("maxResults", "100");
@@ -357,7 +505,13 @@ async fn fetch_task_calendars(client: &Client, access_token: &str) -> Result<Vec
         }
         let page: TaskListsPage = get_json(client, url, access_token, "google-tasks").await?;
         for list in page.items {
+            let source_url = format!("google-tasks:{}", list.id);
+            let updated_min = cursors
+                .calendars
+                .get(&source_url)
+                .and_then(|cursor| cursor.sync_token.as_deref());
             let mut events = Vec::new();
+            let mut deleted_event_urls = Vec::new();
             let mut task_page_token: Option<String> = None;
             loop {
                 let mut tasks_url = api_url(TASKS_BASE, &["lists", &list.id, "tasks"])?;
@@ -365,27 +519,46 @@ async fn fetch_task_calendars(client: &Client, access_token: &str) -> Result<Vec
                     .query_pairs_mut()
                     .append_pair("maxResults", "100")
                     .append_pair("showCompleted", "true")
-                    .append_pair("showHidden", "true");
+                    .append_pair("showHidden", "true")
+                    .append_pair("showDeleted", "true");
+                if let Some(updated_min) = updated_min {
+                    tasks_url
+                        .query_pairs_mut()
+                        .append_pair("updatedMin", updated_min);
+                }
                 if let Some(token) = &task_page_token {
                     tasks_url.query_pairs_mut().append_pair("pageToken", token);
                 }
                 let task_page: TasksPage =
                     get_json(client, tasks_url, access_token, "google-tasks").await?;
-                events.extend(
-                    task_page
-                        .items
-                        .into_iter()
-                        .filter_map(|task| task_event(&list.id, task)),
-                );
+                for task in task_page.items {
+                    let remote_url = format!("google-task:{}", task.id);
+                    if task.deleted {
+                        deleted_event_urls.push(remote_url);
+                    } else if let Some(event) = task_event(&list.id, task) {
+                        events.push(event);
+                    } else if updated_min.is_some() {
+                        // A task that lost its due/completed date no longer
+                        // belongs in the calendar projection.
+                        deleted_event_urls.push(remote_url);
+                    }
+                }
                 task_page_token = task_page.next_page_token;
                 if task_page_token.is_none() {
                     break;
                 }
             }
             calendars.push(DavCalendar {
-                url: format!("google-tasks:{}", list.id),
+                url: source_url,
                 name: format!("Google Tasks · {}", list.title),
                 ctag: list.etag,
+                sync_token: Some(next_updated_min.clone()),
+                sync_scope: if updated_min.is_some() {
+                    SyncScope::Delta
+                } else {
+                    SyncScope::Full
+                },
+                deleted_event_urls,
                 events,
             });
         }
@@ -398,24 +571,35 @@ async fn fetch_task_calendars(client: &Client, access_token: &str) -> Result<Vec
 }
 
 /// Загрузить календари, контакты и задачи одним Google OAuth-токеном.
-pub async fn sync_google_services(access_token: &str) -> Result<DavSyncResult> {
+pub async fn sync_google_services(
+    access_token: &str,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<DavSyncResult> {
     let client = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(45))
         .build()
         .map_err(|error| api_error("google-services", error.to_string()))?;
     let (calendar_result, contacts_result, tasks_result) = tokio::join!(
-        fetch_calendars(&client, access_token),
-        fetch_contacts(&client, access_token),
-        fetch_task_calendars(&client, access_token)
+        fetch_calendars(&client, access_token, cursors),
+        fetch_contacts(
+            &client,
+            access_token,
+            cursors.contacts_sync_token.as_deref()
+        ),
+        fetch_task_calendars(&client, access_token, cursors)
     );
     let mut calendars = calendar_result?;
     calendars.extend(tasks_result?);
+    let (contacts, deleted_contact_urls, contacts_sync_token, contacts_scope) = contacts_result?;
     Ok(DavSyncResult {
         calendars,
-        contacts: contacts_result?,
+        contacts,
         contact_collections: Vec::new(),
         contacts_available: true,
+        contacts_scope,
+        contacts_sync_token: Some(contacts_sync_token),
+        deleted_contact_urls,
     })
 }
 
@@ -450,6 +634,7 @@ mod tests {
             due: None,
             status: Some("needsAction".into()),
             completed: None,
+            deleted: false,
         };
         assert!(task_event("list", task).is_none());
     }
