@@ -79,14 +79,14 @@
     </section>
 
     <section class="cal" id="calSection" data-cv="month">
-      <div class="calhead"><button type="button" class="iconbtn" id="calSidebarToggle" aria-controls="calendarSidebar" aria-expanded="false" title="Показать календари"><i data-i="list"></i></button><button class="iconbtn" data-cal-nav="prev"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle" data-i18n="calendarSampleMonth">Июль 2026</h2><button class="iconbtn" data-cal-nav="next"><i data-i="chevR"></i></button>
+      <div class="calhead"><button type="button" class="iconbtn" id="calSidebarToggle" aria-controls="calendarSidebar" aria-expanded="false" data-i18n-title="calendarSidebarShow" title="Показать календари"><i data-i="list"></i></button><button class="iconbtn" data-cal-nav="prev"><i data-i="chevL"></i></button><h2 class="ch-title" id="calTitle" data-i18n="calendarSampleMonth">Июль 2026</h2><button class="iconbtn" data-cal-nav="next"><i data-i="chevR"></i></button>
         <div class="seg ml-14" id="calViews"><button data-cv="month" class="on" data-i18n="calMonth">Месяц</button><button data-cv="week" data-i18n="calWeek">Неделя</button><button data-cv="day" data-i18n="calDay">День</button></div>
         <span class="cal-sync-info" id="calSyncInfo"></span>
         <button class="btn ml-auto" id="newEventBtn"><i data-i="plus"></i><span data-i18n="newEvent">Событие / задача</span></button>
         </div>
       <div class="calbody">
-        <aside class="cal-sidebar" id="calendarSidebar" aria-label="Календари">
-          <div class="cal-sidebar-head"><strong>Календари</strong><button type="button" class="iconbtn" id="calSidebarClose" title="Закрыть"><i data-i="close"></i></button></div>
+        <aside class="cal-sidebar" id="calendarSidebar" data-i18n-aria="setCalendars" aria-label="Календари">
+          <div class="cal-sidebar-head"><strong data-i18n="setCalendars">Календари</strong><button type="button" class="iconbtn" id="calSidebarClose" data-i18n-title="close" title="Закрыть"><i data-i="close"></i></button></div>
           <div class="cal-sidebar-list" id="calendarSidebarList"></div>
         </aside>
         <div class="calmain">
@@ -206,7 +206,7 @@
 
       <div class="setpage" id="set-calendars">
         <h1 data-i18n="setCalendars">Календари</h1><p class="lead" data-i18n="calendarsLead">Календари теперь настраиваются внутри соответствующего аккаунта: truemail сам определяет CalDAV, Exchange или iCal.</p>
-        <div class="card"><div class="ch">Отображаемые часы</div><div class="cb"><div class="d">Диапазон времени для недельного и дневного видов календаря.</div><div class="calendar-hours"><label>Показывать с<input class="inp" id="calendarHourStart" type="time" value="08:00"></label><label>по<input class="inp" id="calendarHourEnd" type="time" value="20:00"></label></div><div class="wz-connect-status" id="calendarHoursStatus" aria-live="polite"></div></div></div>
+        <div class="card"><div class="ch" data-i18n="calendarHoursTitle">Отображаемые часы</div><div class="cb"><div class="d" data-i18n="calendarHoursDesc">Диапазон времени для недельного и дневного видов календаря.</div><div class="calendar-hours"><label><span data-i18n="calendarHoursFrom">Показывать с</span><input class="inp" id="calendarHourStart" type="time" value="08:00"></label><label><span data-i18n="calendarHoursTo">по</span><input class="inp" id="calendarHourEnd" type="time" value="20:00"></label></div><div class="wz-connect-status" id="calendarHoursStatus" aria-live="polite"></div></div></div>
         <button class="btn" data-set="accounts"><i data-i="user"></i><span data-i18n="goToAccounts">Перейти к аккаунтам</span></button>
       </div>
 
@@ -455,7 +455,7 @@
         <div class="aux-two"><div class="fld"><label data-i18n="firstName">Имя</label><input class="inp" id="contactFirstName"></div><div class="fld"><label data-i18n="lastName">Фамилия</label><input class="inp" id="contactLastName"></div></div>
         <div class="fld"><label data-i18n="organization">Организация</label><input class="inp" id="contactOrganization"></div>
         <div class="fld"><label data-i18n="emailsOnePerLine">Email (по одному в строке)</label><textarea class="inp" id="contactEmails"></textarea></div>
-        <div class="fld"><label>Телефоны</label><div class="contact-phones" id="contactPhones"></div><button class="btn sm contact-phone-add" type="button" id="contactAddPhone"><i data-i="plus"></i>Добавить телефон</button></div>
+        <div class="fld"><label><span data-i18n="contactPhones">Телефоны</span></label><div class="contact-phones" id="contactPhones"></div><button class="btn sm contact-phone-add" type="button" id="contactAddPhone"><i data-i="plus"></i><span data-i18n="contactAddPhone">Добавить телефон</span></button></div>
         <div class="wz-connect-status" id="contactStatus" aria-live="polite"></div>
       </div>
       <div class="mf"><button class="btn primary" type="submit"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" type="button" id="contactCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" type="button" id="contactDelete"><i data-i="trash"></i><span data-i18n="delete">Удалить</span></button></div>
@@ -478,11 +478,11 @@
 </div>
 
 <div class="ctxmenu" id="ctxcontact">
-  <div class="tmi" data-contact-action="compose"><i data-i="compose"></i>Написать письмо</div>
-  <div class="tmi" data-contact-action="edit"><i data-i="edit"></i>Изменить</div>
-  <div class="tmi" data-contact-action="copy"><i data-i="copy"></i>Копировать email</div>
+  <div class="tmi" data-contact-action="compose"><i data-i="compose"></i><span data-i18n="composeTip">Написать письмо</span></div>
+  <div class="tmi" data-contact-action="edit"><i data-i="edit"></i><span data-i18n="change">Изменить</span></div>
+  <div class="tmi" data-contact-action="copy"><i data-i="copy"></i><span data-i18n="contactCopyEmail">Копировать email</span></div>
   <div class="tmsep"></div>
-  <div class="tmi danger-menu-item" data-contact-action="delete"><i data-i="trash"></i>Удалить контакт</div>
+  <div class="tmi danger-menu-item" data-contact-action="delete"><i data-i="trash"></i><span data-i18n="contactDelete">Удалить контакт</span></div>
 </div>
 
 <!-- custom right-click menu -->
@@ -585,11 +585,11 @@
 </div>
 
 <script src="modules/shell.js?v=20260717-2"></script>
-<script src="modules/calendar-contacts.js?v=20260717-2"></script>
+<script src="modules/calendar-contacts.js?v=20260717-3"></script>
 <script src="modules/commands-accessibility.js?v=20260717-1"></script>
-<script src="modules/smart-rules.js?v=20260717-2"></script>
-<script src="modules/i18n-onboarding.js?v=20260717-1"></script>
-<script src="modules/mail.js?v=20260717-2"></script>
+<script src="modules/smart-rules.js?v=20260717-3"></script>
+<script src="modules/i18n-onboarding.js?v=20260717-2"></script>
+<script src="modules/mail.js?v=20260717-3"></script>
 <script src="modules/composer.js?v=20260717-1"></script>
 <script src="modules/settings.js?v=20260717-2"></script>
 <script src="bridge.js?v=20260717-1"></script>
