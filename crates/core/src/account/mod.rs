@@ -544,6 +544,18 @@ impl AccountManager {
             .await
     }
 
+    /// Обновить дополнительные сервисы поддерживаемого провайдера.
+    /// Почтовый цикл вызывает только почтовую синхронизацию, а этот метод —
+    /// единственная точка входа для календарей, контактов и задач.
+    pub async fn sync_auxiliary_account(&self, account: &Account) -> Result<(usize, usize, usize)> {
+        match account.provider {
+            Provider::Yandex => self.sync_yandex_dav_account(account).await,
+            Provider::Gmail => self.sync_google_auxiliary_account(account).await,
+            Provider::Exchange => self.sync_exchange_auxiliary_account(account).await,
+            _ => Ok((0, 0, 0)),
+        }
+    }
+
     /// Отправить письмо через транспорт выбранного аккаунта; поле From задаёт core.
     pub async fn send_outgoing(
         &self,
@@ -1144,43 +1156,12 @@ impl AccountManager {
                 0
             }
         };
-        let auxiliary_cursors = self.db.auxiliary_sync_cursors(account.id).await?;
-        let dav_result = match account.provider {
-            Provider::Yandex => Some((
-                "caldav",
-                sync_yandex_dav(&account.email, &access_token, &auxiliary_cursors).await,
-            )),
-            Provider::Gmail => Some((
-                "google",
-                sync_google_services(&access_token, &auxiliary_cursors).await,
-            )),
-            _ => None,
-        };
-        let (calendars, events, contacts) = match dav_result {
-            None => (0, 0, 0),
-            Some((source_kind, Ok(dav))) => self
-                .db
-                .save_auxiliary_data(account.id, source_kind, &dav)
-                .await
-                .unwrap_or_else(|error| {
-                    warnings.push(format!(
-                        "Календарь и контакты подключены, но не сохранились: {error}"
-                    ));
-                    (0, 0, 0)
-                }),
-            Some((_, Err(error))) => {
-                warnings.push(format!(
-                    "Календарь и контакты: первая синхронизация отложена: {error}"
-                ));
-                (0, 0, 0)
-            }
-        };
         Ok(ConnectedAccountSync {
             account: account.clone(),
             mail_folders,
-            calendars,
-            events,
-            contacts,
+            calendars: 0,
+            events: 0,
+            contacts: 0,
             warnings,
         })
     }

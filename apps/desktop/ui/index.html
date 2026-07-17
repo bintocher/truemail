@@ -157,11 +157,36 @@
 
       <div class="setpage" id="set-addacct">
         <h1 data-i18n="accountWizardTitle">Мастер подключения аккаунта</h1><p class="lead" data-i18n="connectSub">Введите любой адрес — truemail определит провайдера и выберет способ входа.</p>
-        <div class="card"><div class="ch"><i data-i="lock"></i><span data-i18n="secureOauth">Безопасный вход OAuth</span></div><div class="cb">
+        <div class="card"><div class="ch"><i data-i="lock"></i><span data-i18n="secureAccountConnection">Безопасное подключение аккаунта</span></div><div class="cb">
           <div class="frow"><div class="fl"><div class="t" data-i18n="emailAddress">Адрес почты</div></div><div class="fc"><input class="inp inp-w280" id="accountEmail" type="email" placeholder="you@example.com"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="connection">Подключение</div><div class="d" data-i18n="connectionDesc">Провайдер и доступные сервисы определятся автоматически.</div></div><div class="fc"><button class="btn primary" id="accountOauthStart"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button></div></div>
+          <div class="frow" id="accountConnectionDetectRow"><div class="fl"><div class="t" data-i18n="connection">Подключение</div><div class="d" data-i18n="connectionDesc">Провайдер и доступные сервисы определятся автоматически.</div></div><div class="fc"><button class="btn primary" id="accountOauthStart"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button></div></div>
           <div class="frow hidden" id="accountCodeRow"><div class="fl"><div class="t" data-i18n="confirmationCode">Код подтверждения</div><div class="d" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</div></div><div class="fc"><input class="inp inp-w280 mb-10" id="accountOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codeShort" placeholder="Код"><button class="btn primary" id="accountOauthConfirm"><i data-i="check"></i><span data-i18n="confirmShort">Подтвердить</span></button></div></div>
-          <div class="frow hidden" id="accountPasswordRow"><div class="fl"><div class="t" data-i18n="mailPasswordTitle">Пароль приложения / почты</div><div class="d" data-i18n="mailPasswordDesc">Пароль хранится только в системном хранилище. Для Mail.ru, iCloud и JMAP используйте отдельный пароль приложения.</div></div><div class="fc account-server-fields"><select class="sel inp-w280" id="accountConnectionType"><option value="imap">IMAP / SMTP</option><option value="exchange">Self-hosted Exchange (EWS)</option><option value="jmap">JMAP</option></select><input class="inp inp-w280" id="accountUsername" autocomplete="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Имя пользователя"><input class="inp inp-w280" id="accountPassword" type="password" autocomplete="current-password" data-i18n-placeholder="passwordPlaceholder" placeholder="Пароль"><input class="inp inp-w280 hidden" id="accountEwsServer" data-i18n-placeholder="exchangeServerPlaceholder" placeholder="Exchange-сервер или https://…/EWS/Exchange.asmx"><input class="inp inp-w280 hidden" id="accountJmapServer" data-i18n-placeholder="jmapServerPlaceholder" placeholder="https://mail.example/.well-known/jmap"><div class="server-pair"><input class="inp" id="accountImapHost" data-i18n-placeholder="imapServerPlaceholder" placeholder="IMAP-сервер"><input class="inp server-port" id="accountImapPort" type="number" min="1" max="65535" value="993"><select class="sel" id="accountImapSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><div class="server-pair"><input class="inp" id="accountSmtpHost" data-i18n-placeholder="smtpServerPlaceholder" placeholder="SMTP-сервер"><input class="inp server-port" id="accountSmtpPort" type="number" min="1" max="65535" value="465"><select class="sel" id="accountSmtpSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></div><button class="btn primary" id="accountPasswordConfirm"><i data-i="check"></i><span data-i18n="connect">Подключить</span></button></div></div>
+          <div class="account-connection-panel hidden" id="accountPasswordRow">
+            <div class="account-connection-head">
+              <div class="t" id="accountPasswordTitle" data-i18n="mailPasswordTitle">Пароль приложения / почты</div>
+              <div class="d" id="accountPasswordDesc" data-i18n="mailPasswordDesc">Пароль хранится только в системном хранилище. Для Mail.ru, iCloud и JMAP используйте отдельный пароль приложения.</div>
+            </div>
+            <div class="account-server-fields">
+              <label class="account-field account-field-wide"><span data-i18n="connectionTypeLabel">Тип подключения</span><select class="sel" id="accountConnectionType"><option value="imap">IMAP / SMTP</option><option value="exchange">Self-hosted Exchange (EWS)</option><option value="jmap">JMAP</option></select></label>
+              <div class="account-auth-grid">
+                <label class="account-field"><span data-i18n="usernameLabel">Имя пользователя</span><input class="inp" id="accountUsername" autocomplete="username" data-i18n-placeholder="usernamePlaceholder" placeholder="Имя пользователя"></label>
+                <label class="account-field"><span data-i18n="passwordLabel">Пароль</span><input class="inp" id="accountPassword" type="password" autocomplete="current-password" data-i18n-placeholder="passwordPlaceholder" placeholder="Пароль"></label>
+              </div>
+              <label class="account-field account-field-wide hidden" id="accountEwsField"><span data-i18n="exchangeServerLabel">Адрес EWS</span><input class="inp" id="accountEwsServer" data-i18n-placeholder="exchangeServerPlaceholder" placeholder="Exchange-сервер или https://…/EWS/Exchange.asmx"></label>
+              <label class="account-field account-field-wide hidden" id="accountJmapField"><span data-i18n="jmapServerLabel">Адрес JMAP Session</span><input class="inp" id="accountJmapServer" data-i18n-placeholder="jmapServerPlaceholder" placeholder="https://mail.example/.well-known/jmap"></label>
+              <div class="server-pair">
+                <label class="account-field"><span data-i18n="imapServerLabel">IMAP-сервер</span><input class="inp" id="accountImapHost" data-i18n-placeholder="imapServerPlaceholder" placeholder="IMAP-сервер"></label>
+                <label class="account-field"><span data-i18n="port">Порт</span><input class="inp server-port" id="accountImapPort" type="number" min="1" max="65535" value="993"></label>
+                <label class="account-field"><span data-i18n="securityLabel">Защита</span><select class="sel" id="accountImapSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              </div>
+              <div class="server-pair">
+                <label class="account-field"><span data-i18n="smtpServerLabel">SMTP-сервер</span><input class="inp" id="accountSmtpHost" data-i18n-placeholder="smtpServerPlaceholder" placeholder="SMTP-сервер"></label>
+                <label class="account-field"><span data-i18n="port">Порт</span><input class="inp server-port" id="accountSmtpPort" type="number" min="1" max="65535" value="465"></label>
+                <label class="account-field"><span data-i18n="securityLabel">Защита</span><select class="sel" id="accountSmtpSecurity"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              </div>
+              <div class="account-connect-actions"><button class="btn primary" id="accountPasswordConfirm"><i data-i="check"></i><span data-i18n="connect">Подключить</span></button></div>
+            </div>
+          </div>
           <div class="wz-connect-status" id="accountOauthStatus" aria-live="polite"></div>
         </div></div>
         <div class="btn-row"><button class="btn" id="accountWizardCancel" data-i18n="cancel">Отмена</button></div>
@@ -588,8 +613,8 @@
 <script src="modules/calendar-contacts.js?v=20260717-3"></script>
 <script src="modules/commands-accessibility.js?v=20260717-1"></script>
 <script src="modules/smart-rules.js?v=20260717-3"></script>
-<script src="modules/i18n-onboarding.js?v=20260717-2"></script>
-<script src="modules/mail.js?v=20260717-3"></script>
+<script src="modules/i18n-onboarding.js?v=20260717-3"></script>
+<script src="modules/mail.js?v=20260717-4"></script>
 <script src="modules/composer.js?v=20260717-1"></script>
 <script src="modules/settings.js?v=20260717-2"></script>
 <script src="bridge.js?v=20260717-1"></script>

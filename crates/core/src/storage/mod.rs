@@ -61,6 +61,11 @@ impl Db {
         // угодно: это ожидание своей очереди, а не блокировки, и оно не падает.
         let write_pool = SqlitePoolOptions::new()
             .max_connections(1)
+            // Первая полная синхронизация календаря может занимать единственный
+            // SQLCipher-писатель дольше стандартных 30 секунд sqlx. Этот пул —
+            // очередь записи, поэтому ожидаем завершения активной транзакции,
+            // а не показываем пользователю ложную ошибку хранилища.
+            .acquire_timeout(std::time::Duration::from_secs(10 * 60))
             .connect_with(encrypted_options(&db_path, database_key, true))
             .await?;
 

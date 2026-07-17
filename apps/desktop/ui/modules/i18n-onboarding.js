@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260717-2`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260717-3`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -155,7 +155,7 @@ createKeysButton.onclick=createStorageFromEntropy;
 function showAccountWizard(prefillEmail=''){
   accountOauthState='';accountPasswordProvider='generic';
   const status=document.getElementById('accountOauthStatus'),start=document.getElementById('accountOauthStart'),confirm=document.getElementById('accountOauthConfirm'),code=document.getElementById('accountOauthCode');
-  status.textContent='';status.dataset.kind='';start.disabled=false;confirm.disabled=false;code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
+  status.textContent='';status.dataset.kind='';start.disabled=false;confirm.disabled=false;code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
   document.querySelector('.settings').classList.add('account-wizard-mode');showView('settingsView');setSection('addacct');
 }
 function closeAccountWizard(){document.querySelector('.settings').classList.remove('account-wizard-mode');setSection('accounts');}

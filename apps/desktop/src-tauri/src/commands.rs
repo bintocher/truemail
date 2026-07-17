@@ -2004,24 +2004,7 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         );
         tokio::spawn(async move {
             tracing::info!(account = %account.email, provider = ?account.provider, "aux-sync начат");
-            let sync_result = match account.provider {
-                truemail_core::model::Provider::Yandex => {
-                    sync_core.accounts.sync_yandex_dav_account(&account).await
-                }
-                truemail_core::model::Provider::Gmail => {
-                    sync_core
-                        .accounts
-                        .sync_google_auxiliary_account(&account)
-                        .await
-                }
-                truemail_core::model::Provider::Exchange => {
-                    sync_core
-                        .accounts
-                        .sync_exchange_auxiliary_account(&account)
-                        .await
-                }
-                _ => unreachable!(),
-            };
+            let sync_result = sync_core.accounts.sync_auxiliary_account(&account).await;
             let state = match sync_result {
                 Ok((calendars, events, contacts)) => {
                     tracing::info!(account = %account.email, calendars, events, contacts, "календари, задачи и контакты обновлены");
@@ -2668,18 +2651,45 @@ async fn spawn_initial_mail_sync(
     }
     drop(syncing);
     let sync_set = state.syncing.clone();
+    let aux_sync_set = state.syncing_aux.clone();
     let sync_app = app.clone();
     tokio::spawn(async move {
         match core.accounts.sync_mail_account(&account).await {
             Ok(result) => {
-                tracing::info!(account = %account.email, folders = result.mail_folders, calendars = result.calendars, events = result.events, contacts = result.contacts, "фоновая синхронизация завершена")
+                tracing::info!(account = %account.email, folders = result.mail_folders, "первая синхронизация почты завершена")
             }
             Err(error) => {
-                tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась")
+                tracing::error!(account = %account.email, %error, "первая синхронизация почты не удалась")
             }
         }
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
+        if matches!(
+            account.provider,
+            Provider::Yandex | Provider::Gmail | Provider::Exchange
+        ) {
+            let mut syncing_aux = aux_sync_set.lock().await;
+            if !syncing_aux.insert(account.id) {
+                return;
+            }
+            drop(syncing_aux);
+            match core.accounts.sync_auxiliary_account(&account).await {
+                Ok((calendars, events, contacts)) => tracing::info!(
+                    account = %account.email,
+                    calendars,
+                    events,
+                    contacts,
+                    "первая синхронизация календарей и контактов завершена"
+                ),
+                Err(error) => tracing::error!(
+                    account = %account.email,
+                    %error,
+                    "первая синхронизация календарей и контактов не удалась"
+                ),
+            }
+            aux_sync_set.lock().await.remove(&account.id);
+            let _ = sync_app.emit("truemail-data-changed", account.id);
+        }
     });
 }
 
