@@ -1,6 +1,6 @@
 //! Первичная синхронизация календарей и контактов Яндекса по CalDAV/CardDAV.
 
-use crate::model::{Alarm, Attendee};
+use crate::model::{Alarm, Attendee, ContactPhone, clean_contact_name};
 use crate::{Error, Result};
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
@@ -96,6 +96,7 @@ pub struct DavContact {
     pub last_name: Option<String>,
     pub organization: Option<String>,
     pub emails: Vec<String>,
+    pub phones: Vec<ContactPhone>,
     pub raw: String,
     pub etag: Option<String>,
 }
@@ -495,14 +496,50 @@ fn parse_contact(
             Some(decode_property(key, value))
         })
         .collect();
+    let phones = unfolded(&raw)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.split(';')
+                .next()
+                .filter(|key| key.eq_ignore_ascii_case("TEL"))?;
+            let kind = key
+                .split(';')
+                .skip(1)
+                .flat_map(|part| {
+                    part.split_once('=')
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("TYPE"))
+                        .map(|(_, value)| value)
+                        .unwrap_or(part)
+                        .split(',')
+                })
+                .map(str::to_lowercase)
+                .find(|value| matches!(value.as_str(), "cell" | "mobile" | "work" | "home" | "fax"))
+                .map(|value| {
+                    if value == "cell" {
+                        "mobile".to_owned()
+                    } else {
+                        value
+                    }
+                });
+            Some(ContactPhone::from_remote(
+                &decode_property(key, value),
+                kind,
+            ))
+        })
+        .filter(|phone| !phone.number.is_empty())
+        .collect();
     Some(DavContact {
         remote_url,
         uid: prop(&raw, "UID")?,
-        display_name: prop(&raw, "FN").unwrap_or_else(|| name.replace(';', " ").trim().to_owned()),
+        display_name: clean_contact_name(
+            &prop(&raw, "FN").unwrap_or_else(|| name.replace(';', " ").trim().to_owned()),
+        ),
         first_name,
         last_name,
         organization: prop(&raw, "ORG"),
         emails,
+        phones,
         raw,
         etag,
     })
@@ -754,10 +791,13 @@ mod tests {
 
     #[test]
     fn decodes_vcard_quoted_printable_properties() {
-        let raw = "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:1\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=D0=98=D0=B2=D0=B0=D0=BD\r\nEMAIL:test@example.com\r\nEND:VCARD";
+        let raw = "BEGIN:VCARD\r\nVERSION:2.1\r\nUID:1\r\nFN;CHARSET=UTF-8;ENCODING=QUOTED-PRINTABLE:=D0=98=D0=B2=D0=B0=D0=BD\r\nEMAIL:test@example.com\r\nTEL;TYPE=CELL:+79990000000;ext=123\r\nEND:VCARD";
         let contact = parse_contact(raw.to_owned(), None, None).expect("valid contact");
         assert_eq!(contact.display_name, "Иван");
         assert_eq!(contact.emails, ["test@example.com"]);
+        assert_eq!(contact.phones[0].number, "+79990000000");
+        assert_eq!(contact.phones[0].kind.as_deref(), Some("mobile"));
+        assert_eq!(contact.phones[0].extension.as_deref(), Some("123"));
     }
 
     #[test]

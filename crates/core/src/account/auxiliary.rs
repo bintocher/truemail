@@ -1,6 +1,6 @@
 //! Двусторонние операции календаря, контактов и задач для Google и Яндекса.
 
-use crate::model::{Alarm, Attendee, EventClass, Provider, Transp};
+use crate::model::{Alarm, Attendee, ContactPhone, EventClass, Provider, Transp};
 use crate::{Error, Result};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,8 @@ pub struct ContactInput {
     pub organization: Option<String>,
     #[serde(default)]
     pub emails: Vec<String>,
+    #[serde(default)]
+    pub phones: Vec<ContactPhone>,
 }
 
 #[derive(Debug, Clone)]
@@ -549,6 +551,7 @@ fn google_contact_body(input: &ContactInput, etag: Option<&str>) -> Value {
             "familyName": input.last_name,
         }],
         "emailAddresses": input.emails.iter().map(|email| json!({"value": email})).collect::<Vec<_>>(),
+        "phoneNumbers": input.phones.iter().map(|phone| json!({"value": phone.remote_value(), "type": phone.kind.as_deref().unwrap_or("other")})).collect::<Vec<_>>(),
         "organizations": input.organization.as_ref().map(|name| vec![json!({"name": name})]).unwrap_or_default(),
     });
     if let Some(etag) = etag {
@@ -569,14 +572,22 @@ async fn write_google_contact(
         let path = format!("{}:updateContact", url.path());
         url.set_path(&path);
         url.query_pairs_mut()
-            .append_pair("updatePersonFields", "names,emailAddresses,organizations")
-            .append_pair("personFields", "names,emailAddresses,organizations");
+            .append_pair(
+                "updatePersonFields",
+                "names,emailAddresses,phoneNumbers,organizations",
+            )
+            .append_pair(
+                "personFields",
+                "names,emailAddresses,phoneNumbers,organizations",
+            );
         (Method::PATCH, url)
     } else {
         let mut url = Url::parse(&format!("{GOOGLE_PEOPLE_BASE}/people:createContact"))
             .map_err(|error| backend_error("google-contacts", error.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("personFields", "names,emailAddresses,organizations");
+        url.query_pairs_mut().append_pair(
+            "personFields",
+            "names,emailAddresses,phoneNumbers,organizations",
+        );
         (Method::POST, url)
     };
     google_json(
@@ -609,6 +620,22 @@ fn yandex_contact_body(uid: &str, input: &ContactInput) -> String {
             .iter()
             .map(|email| format!("EMAIL;TYPE=INTERNET:{}", ical_escape(email))),
     );
+    lines.extend(input.phones.iter().map(|phone| {
+        let number = ical_escape(phone.number.trim());
+        let value = match phone
+            .extension
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(extension) => format!("{number};ext={}", ical_escape(extension.trim())),
+            None => number,
+        };
+        format!(
+            "TEL;TYPE={}:{}",
+            phone.kind.as_deref().unwrap_or("OTHER").to_uppercase(),
+            value
+        )
+    }));
     lines.extend(["END:VCARD".to_owned(), String::new()]);
     lines.join("\r\n")
 }

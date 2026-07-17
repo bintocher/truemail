@@ -321,6 +321,7 @@ fn run() -> anyhow::Result<()> {
             commands::list_contacts,
             commands::search,
             commands::list_calendar_data,
+            commands::set_calendar_visible,
             commands::create_event,
             commands::update_event,
             commands::delete_event,

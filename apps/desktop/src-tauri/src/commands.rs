@@ -1411,6 +1411,19 @@ pub async fn list_calendar_data(state: State<'_, AppState>) -> CmdResult<Calenda
     Ok(CalendarData { calendars, events })
 }
 
+#[tauri::command]
+pub async fn set_calendar_visible(
+    state: State<'_, AppState>,
+    calendar_id: i64,
+    visible: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_calendar_visible(calendar_id, visible)
+        .await?)
+}
+
 async fn account_by_id(core: &Core, account_id: i64) -> CmdResult<Account> {
     core.db
         .list_accounts()
@@ -1558,6 +1571,11 @@ pub async fn create_contact(
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
+    if !matches!(account.provider, Provider::Gmail | Provider::Yandex) {
+        core.db.save_local_contact(account_id, None, &input).await?;
+        let _ = app.emit("truemail-data-changed", account_id);
+        return Ok(());
+    }
     let stored_collection: Option<(String,)> = sqlx::query_as(
         "SELECT url FROM auxiliary_collections WHERE account_id=? AND kind='carddav' LIMIT 1",
     )
@@ -1616,6 +1634,13 @@ pub async fn update_contact(
             .await
             .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
+    if row.2.is_none() {
+        core.db
+            .save_local_contact(account.id, Some(contact_id), &input)
+            .await?;
+        let _ = app.emit("truemail-data-changed", account.id);
+        return Ok(());
+    }
     let token = core.accounts.oauth_access_token(&account).await?;
     truemail_core::account::write_contact(
         account.provider,
@@ -1649,9 +1674,11 @@ pub async fn delete_contact(
             .await
             .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
-    let remote_url = row.1.as_deref().ok_or_else(|| ApiError {
-        message: "У контакта нет серверного идентификатора".into(),
-    })?;
+    let Some(remote_url) = row.1.as_deref() else {
+        core.db.hide_local_contact(contact_id).await?;
+        let _ = app.emit("truemail-data-changed", account.id);
+        return Ok(());
+    };
     let token = core.accounts.oauth_access_token(&account).await?;
     truemail_core::account::delete_contact(
         account.provider,

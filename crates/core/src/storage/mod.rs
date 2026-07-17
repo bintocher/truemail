@@ -1048,7 +1048,9 @@ mod tests {
     #[tokio::test]
     async fn auxiliary_deltas_preserve_unchanged_rows_and_commit_cursors() {
         use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
-        use crate::model::{Alarm, Attendee, AuthKind, BackendKind, NewAccount, Provider};
+        use crate::model::{
+            Alarm, Attendee, AuthKind, BackendKind, ContactPhone, NewAccount, Provider,
+        };
 
         fn event(id: &str, summary: &str) -> DavEvent {
             DavEvent {
@@ -1096,6 +1098,11 @@ mod tests {
                 last_name: None,
                 organization: None,
                 emails: vec![format!("{id}@example.test")],
+                phones: vec![ContactPhone {
+                    number: format!("+7999000000{id}"),
+                    kind: Some("mobile".into()),
+                    extension: Some(format!("10{id}")),
+                }],
                 raw: format!("contact:{id}:{name}"),
                 etag: None,
             }
@@ -1158,6 +1165,14 @@ mod tests {
         db.save_google_services(account.id, &full)
             .await
             .expect("save full auxiliary snapshot");
+        let (calendars, _) = db
+            .list_calendars_and_events()
+            .await
+            .expect("load calendars");
+        let calendar_id = calendars[0].id;
+        db.set_calendar_visible(calendar_id, false)
+            .await
+            .expect("hide calendar");
 
         let delta = DavSyncResult {
             calendars: vec![DavCalendar {
@@ -1185,10 +1200,11 @@ mod tests {
             .await
             .expect("read events after delta");
         assert_eq!(events, vec![("One updated".into(),), ("Three".into(),)]);
-        let (_, loaded_events) = db
+        let (loaded_calendars, loaded_events) = db
             .list_calendars_and_events()
             .await
             .expect("load event children");
+        assert!(!loaded_calendars[0].visible);
         let updated = loaded_events
             .iter()
             .find(|event| event.summary == "One updated")
@@ -1211,6 +1227,25 @@ mod tests {
         .await
         .expect("read contacts after delta");
         assert_eq!(contacts, vec![("One updated".into(),), ("Three".into(),)]);
+        let loaded_contacts = db.list_contacts(None).await.expect("load contacts");
+        let updated_contact = loaded_contacts
+            .iter()
+            .find(|contact| contact.display_name == "One updated")
+            .expect("updated contact");
+        assert_eq!(updated_contact.phones.len(), 1);
+        assert_eq!(updated_contact.phones[0].number, "+79990000001");
+        assert_eq!(updated_contact.phones[0].kind.as_deref(), Some("mobile"));
+        assert_eq!(updated_contact.phones[0].extension.as_deref(), Some("101"));
+        db.hide_local_contact(updated_contact.id.expect("contact id"))
+            .await
+            .expect("hide contact");
+        assert!(
+            db.list_contacts(None)
+                .await
+                .expect("load visible contacts")
+                .iter()
+                .all(|contact| contact.display_name != "One updated")
+        );
         let cursors = db
             .auxiliary_sync_cursors(account.id)
             .await

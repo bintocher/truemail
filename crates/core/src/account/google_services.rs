@@ -3,7 +3,7 @@
 use super::dav::{
     AuxiliarySyncCursors, DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope,
 };
-use crate::model::{Alarm, Attendee};
+use crate::model::{Alarm, Attendee, ContactPhone, clean_contact_name};
 use crate::{Error, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -144,6 +144,8 @@ struct GooglePerson {
     #[serde(default)]
     email_addresses: Vec<PersonEmail>,
     #[serde(default)]
+    phone_numbers: Vec<PersonPhone>,
+    #[serde(default)]
     organizations: Vec<PersonOrganization>,
     metadata: Option<PersonMetadata>,
 }
@@ -165,6 +167,13 @@ struct PersonName {
 #[derive(Debug, Deserialize, Serialize)]
 struct PersonEmail {
     value: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersonPhone {
+    value: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -511,7 +520,7 @@ async fn fetch_contacts(
                 .append_pair("pageSize", "1000")
                 .append_pair(
                     "personFields",
-                    "metadata,names,emailAddresses,organizations",
+                    "metadata,names,emailAddresses,phoneNumbers,organizations",
                 )
                 .append_pair("requestSyncToken", "true");
             if let Some(token) = requested_token.as_deref() {
@@ -549,6 +558,16 @@ async fn fetch_contacts(
                     .iter()
                     .filter_map(|item| item.value.clone())
                     .collect();
+                let phones = person
+                    .phone_numbers
+                    .iter()
+                    .filter_map(|item| {
+                        item.value
+                            .as_deref()
+                            .map(|value| ContactPhone::from_remote(value, item.kind.clone()))
+                    })
+                    .filter(|phone| !phone.number.is_empty())
+                    .collect();
                 let display_name = name
                     .and_then(|value| value.display_name.clone())
                     .or_else(|| emails.first().cloned())
@@ -557,7 +576,7 @@ async fn fetch_contacts(
                 contacts.push(DavContact {
                     remote_url: Some(format!("google-contact:{}", person.resource_name)),
                     uid: person.resource_name,
-                    display_name,
+                    display_name: clean_contact_name(&display_name),
                     first_name: name.and_then(|value| value.given_name.clone()),
                     last_name: name.and_then(|value| value.family_name.clone()),
                     organization: person
@@ -565,6 +584,7 @@ async fn fetch_contacts(
                         .first()
                         .and_then(|value| value.name.clone()),
                     emails,
+                    phones,
                     raw,
                     etag: person.etag,
                 });

@@ -56,6 +56,7 @@
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
+    setCalendarVisible: (calendarId, visible) => invoke("set_calendar_visible", { calendarId, visible }),
     createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
     updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
     deleteEvent: (eventId) => invoke("delete_event", { eventId }),

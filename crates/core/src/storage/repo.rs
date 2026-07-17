@@ -970,7 +970,8 @@ impl Db {
                     .await?;
                 }
                 let existing_contacts: Vec<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM contacts WHERE account_id=? AND uid NOT LIKE 'mail:%'",
+                    "SELECT id FROM contacts
+                     WHERE account_id=? AND uid NOT LIKE 'mail:%' AND uid NOT LIKE 'local:%'",
                 )
                 .bind(account_id)
                 .fetch_all(&mut *tx)
@@ -996,7 +997,7 @@ impl Db {
                     )
                     .bind(account_id)
                     .bind(&contact.uid)
-                    .bind(&contact.display_name)
+                    .bind(clean_contact_name(&contact.display_name))
                     .bind(&contact.first_name)
                     .bind(&contact.last_name)
                     .bind(&contact.organization)
@@ -1016,6 +1017,22 @@ impl Db {
                         )
                         .bind(contact_id)
                         .bind(email)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    sqlx::query("DELETE FROM contact_phones WHERE contact_id=?")
+                        .bind(contact_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for phone in &contact.phones {
+                        sqlx::query(
+                            "INSERT INTO contact_phones(contact_id, number, kind, extension)
+                             VALUES(?, ?, ?, ?)",
+                        )
+                        .bind(contact_id)
+                        .bind(&phone.number)
+                        .bind(&phone.kind)
+                        .bind(&phone.extension)
                         .execute(&mut *tx)
                         .await?;
                     }
@@ -1393,11 +1410,11 @@ impl Db {
             {
                 return;
             }
-            let display = name
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(&normalized)
-                .to_owned();
+            let display = clean_contact_name(
+                name.map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&normalized),
+            );
             candidates
                 .entry(normalized)
                 .and_modify(|current| {
@@ -2096,6 +2113,15 @@ impl Db {
             }
         }
         Ok((calendars, events))
+    }
+
+    pub async fn set_calendar_visible(&self, calendar_id: i64, visible: bool) -> Result<()> {
+        sqlx::query("UPDATE calendars SET visible=? WHERE id=?")
+            .bind(visible)
+            .bind(calendar_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
     }
 
     /// Отметить письмо прочитанным (локально; в outbox уйдёт синхронизация флага).
@@ -2972,11 +2998,87 @@ impl Db {
 
     // ---------- Контакты ----------
 
+    pub async fn save_local_contact(
+        &self,
+        account_id: i64,
+        contact_id: Option<i64>,
+        input: &crate::account::ContactInput,
+    ) -> Result<i64> {
+        let mut tx = self.begin_write().await?;
+        let id = if let Some(contact_id) = contact_id {
+            sqlx::query(
+                "UPDATE contacts SET display_name=?, first_name=?, last_name=?, organization=?, hidden=0
+                 WHERE id=? AND account_id=?",
+            )
+            .bind(clean_contact_name(&input.display_name))
+            .bind(&input.first_name)
+            .bind(&input.last_name)
+            .bind(&input.organization)
+            .bind(contact_id)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+            contact_id
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO contacts(account_id, uid, display_name, first_name, last_name, organization)
+                 VALUES(?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(format!("local:{}", uuid::Uuid::new_v4()))
+            .bind(clean_contact_name(&input.display_name))
+            .bind(&input.first_name)
+            .bind(&input.last_name)
+            .bind(&input.organization)
+            .execute(&mut *tx)
+            .await?;
+            result.last_insert_rowid()
+        };
+        sqlx::query("DELETE FROM contact_emails WHERE contact_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for email in &input.emails {
+            sqlx::query(
+                "INSERT OR IGNORE INTO contact_emails(contact_id, email, kind) VALUES(?, ?, 'other')",
+            )
+            .bind(id)
+            .bind(email.trim())
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM contact_phones WHERE contact_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for phone in &input.phones {
+            sqlx::query(
+                "INSERT INTO contact_phones(contact_id, number, kind, extension) VALUES(?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(phone.number.trim())
+            .bind(&phone.kind)
+            .bind(phone.extension.as_deref().map(str::trim))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn hide_local_contact(&self, contact_id: i64) -> Result<()> {
+        sqlx::query("UPDATE contacts SET hidden=1 WHERE id=?")
+            .bind(contact_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_contacts(&self, query: Option<&str>) -> Result<Vec<Contact>> {
         let like = format!("%{}%", query.unwrap_or(""));
         let rows = sqlx::query_as::<_, ContactRow>(
             "SELECT id, account_id, uid, display_name, first_name, last_name, organization, is_favorite
-             FROM contacts WHERE display_name LIKE ? ORDER BY display_name LIMIT 500",
+             FROM contacts WHERE hidden=0 AND display_name LIKE ? ORDER BY display_name LIMIT 500",
         )
         .bind(like)
         .fetch_all(&self.pool)
@@ -2994,6 +3096,19 @@ impl Db {
                 .map(|row| ContactEmail {
                     email: row.email,
                     kind: row.kind,
+                })
+                .collect();
+                contact.phones = sqlx::query_as::<_, ContactPhoneRow>(
+                    "SELECT number, kind, extension FROM contact_phones WHERE contact_id = ? ORDER BY id",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| ContactPhone {
+                    number: row.number,
+                    kind: row.kind,
+                    extension: row.extension,
                 })
                 .collect();
             }
@@ -3464,6 +3579,13 @@ struct ContactEmailRow {
     kind: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ContactPhoneRow {
+    number: String,
+    kind: Option<String>,
+    extension: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CalendarSummary {
     pub id: i64,
@@ -3563,11 +3685,12 @@ impl From<ContactRow> for Contact {
             id: Some(r.id),
             account_id: r.account_id,
             uid: r.uid,
-            display_name: r.display_name,
+            display_name: clean_contact_name(&r.display_name),
             first_name: r.first_name,
             last_name: r.last_name,
             organization: r.organization,
             emails: Vec::new(),
+            phones: Vec::new(),
             is_favorite: r.is_favorite != 0,
         }
     }
