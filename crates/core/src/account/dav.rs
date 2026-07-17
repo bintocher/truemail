@@ -31,6 +31,9 @@ pub enum SyncScope {
 #[derive(Debug, Default)]
 pub struct DavSyncResult {
     pub calendars: Vec<DavCalendar>,
+    /// Календарные коллекции действительно были доступны и прочитаны. При
+    /// временной ошибке старые календари и события удалять нельзя.
+    pub calendars_available: bool,
     pub contacts: Vec<DavContact>,
     /// Доступные CardDAV-коллекции. Нужны для создания первого контакта,
     /// когда адресная книга ещё пуста и URL нельзя вывести из vCard.
@@ -672,6 +675,7 @@ pub async fn sync_yandex_dav(
     else {
         return Ok(DavSyncResult {
             calendars,
+            calendars_available: true,
             contacts: Vec::new(),
             contact_collections: Vec::new(),
             contacts_available: false,
@@ -719,6 +723,7 @@ pub async fn sync_yandex_dav(
     if contacts_unchanged {
         return Ok(DavSyncResult {
             calendars,
+            calendars_available: true,
             contacts: Vec::new(),
             contact_collections: addressbooks,
             contacts_available: false,
@@ -754,6 +759,7 @@ pub async fn sync_yandex_dav(
     }
     Ok(DavSyncResult {
         calendars,
+        calendars_available: true,
         contacts,
         contact_collections: addressbooks,
         contacts_available: true,

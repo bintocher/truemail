@@ -4,7 +4,8 @@ use super::{
     DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery, MailBackend,
     OutgoingMessage,
 };
-use crate::model::{FolderRole, infer_folder_role};
+use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
+use crate::model::{ContactPhone, FolderRole, infer_folder_role};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -322,6 +323,108 @@ impl EwsBackend {
             .decode(encoded.trim())
             .map_err(|error| backend_error("mime", error))
     }
+
+    /// Календарь и адресная книга Exchange для aux-синхронизации.
+    ///
+    /// Календарь и контакты необязательны: у ящика может не быть прав на них, а
+    /// почта при этом должна продолжать работать. Поэтому сбой любой из коллекций
+    /// не роняет всю синхронизацию - только помечает её недоступной, чтобы
+    /// save_auxiliary_data не удалил локальные данные из-за временной ошибки.
+    pub async fn auxiliary(&self, password: &str) -> Result<DavSyncResult> {
+        let (calendars, calendar_available) = match self.calendar_events(password).await {
+            Ok(events) => (
+                vec![DavCalendar {
+                    url: "ews-calendar:calendar".into(),
+                    name: "Exchange".into(),
+                    ctag: None,
+                    sync_token: None,
+                    sync_scope: SyncScope::Full,
+                    deleted_event_urls: Vec::new(),
+                    events,
+                }],
+                true,
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "EWS: календарь пропущен");
+                (Vec::new(), false)
+            }
+        };
+        let (contacts, contacts_available) = match self.contact_entries(password).await {
+            Ok(contacts) => (contacts, true),
+            Err(error) => {
+                tracing::warn!(%error, "EWS: контакты пропущены");
+                (Vec::new(), false)
+            }
+        };
+        Ok(DavSyncResult {
+            calendars,
+            calendars_available: calendar_available,
+            contacts,
+            contact_collections: Vec::new(),
+            contacts_available,
+            contacts_scope: SyncScope::Full,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        })
+    }
+
+    async fn calendar_events(&self, password: &str) -> Result<Vec<DavEvent>> {
+        // CalendarView разворачивает повторения в отдельные вхождения с
+        // собственными ItemId, поэтому uid каждого вхождения уникален и
+        // рекуррентные события не конфликтуют в базе.
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::days(30);
+        let end = now + chrono::Duration::days(365);
+        let body = format!(
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:CalendarView StartDate="{}" EndDate="{}" MaxEntriesReturned="1000"/><m:ParentFolderIds><t:DistinguishedFolderId Id="calendar"/></m:ParentFolderIds></m:FindItem>"#,
+            start.format("%Y-%m-%dT%H:%M:%SZ"),
+            end.format("%Y-%m-%dT%H:%M:%SZ"),
+        );
+        let response = self.soap(password, "FindItem", &body).await?;
+        let ids = parse_item_ids(&response)?;
+        let mut events = Vec::new();
+        for chunk in ids.chunks(50) {
+            let item_ids = chunk
+                .iter()
+                .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
+                .collect::<String>();
+            let body = format!(
+                r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
+            );
+            let response = self.soap(password, "GetItem", &body).await?;
+            events.extend(parse_calendar_items(&response)?);
+        }
+        Ok(events)
+    }
+
+    async fn contact_entries(&self, password: &str) -> Result<Vec<DavContact>> {
+        let mut contacts = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let body = format!(
+                r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="500" Offset="{offset}" BasePoint="Beginning"/><m:ParentFolderIds><t:DistinguishedFolderId Id="contacts"/></m:ParentFolderIds></m:FindItem>"#
+            );
+            let response = self.soap(password, "FindItem", &body).await?;
+            let ids = parse_item_ids(&response)?;
+            let page_size = ids.len();
+            for chunk in ids.chunks(50) {
+                let item_ids = chunk
+                    .iter()
+                    .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
+                    .collect::<String>();
+                let body = format!(
+                    r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
+                );
+                let response = self.soap(password, "GetItem", &body).await?;
+                contacts.extend(parse_contacts(&response)?);
+            }
+            if page_size == 0 || includes_last_item(&response) {
+                break;
+            }
+            offset += page_size;
+        }
+        Ok(contacts)
+    }
 }
 
 fn parse_folders(xml: &str) -> Result<Vec<DiscoveredFolder>> {
@@ -381,6 +484,19 @@ fn parse_item_ids(xml: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+fn includes_last_item(xml: &str) -> bool {
+    Document::parse(xml)
+        .ok()
+        .and_then(|document| {
+            document
+                .descendants()
+                .find(|node| node.is_element() && node.tag_name().name() == "RootFolder")
+                .and_then(|node| node.attribute("IncludesLastItemInRange"))
+                .map(|value| value.eq_ignore_ascii_case("true"))
+        })
+        .unwrap_or(true)
+}
+
 fn stable_uid(id: &str) -> u32 {
     let digest = Sha256::digest(id.as_bytes());
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).max(1)
@@ -419,6 +535,279 @@ fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>
         });
     }
     Ok(messages)
+}
+
+/// EWS отдаёт даты в RFC3339 (2026-07-16T17:00:00Z). Календарь хранит их в
+/// компактном iCalendar-виде: "20260716T170000Z" для событий со временем,
+/// "20260716" для события на весь день - по длине save_auxiliary_data отличает
+/// всесуточные события.
+fn to_ical_datetime(iso: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(iso).ok().map(|dt| {
+        dt.with_timezone(&chrono::Utc)
+            .format("%Y%m%dT%H%M%SZ")
+            .to_string()
+    })
+}
+
+fn to_ical_date(iso: &str) -> Option<String> {
+    chrono::DateTime::parse_from_rfc3339(iso)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y%m%d").to_string())
+}
+
+fn ical_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace(',', "\\,")
+        .replace(';', "\\;")
+}
+
+fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
+    let document = Document::parse(xml).map_err(|error| backend_error("calendar-xml", error))?;
+    let mut events = Vec::new();
+    for item in document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "CalendarItem")
+    {
+        let Some(id) = item
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+            .and_then(|node| node.attribute("Id"))
+        else {
+            continue;
+        };
+        let all_day = node_text(item, "IsAllDayEvent") == Some("true");
+        let Some(start_iso) = node_text(item, "Start") else {
+            continue;
+        };
+        let dtstart = if all_day {
+            to_ical_date(start_iso)
+        } else {
+            to_ical_datetime(start_iso)
+        };
+        let Some(dtstart) = dtstart else {
+            continue;
+        };
+        let dtend = node_text(item, "End").and_then(|value| {
+            if all_day {
+                to_ical_date(value)
+            } else {
+                to_ical_datetime(value)
+            }
+        });
+        let summary = node_text(item, "Subject")
+            .unwrap_or("Без названия")
+            .to_owned();
+        let description = node_text(item, "Body").map(str::to_owned);
+        let location = node_text(item, "Location").map(str::to_owned);
+        let organizer = item
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "Organizer")
+            .and_then(|node| node_text(node, "EmailAddress"))
+            .map(str::to_owned);
+        let raw = build_vevent(
+            id,
+            &summary,
+            &dtstart,
+            dtend.as_deref(),
+            location.as_deref(),
+        );
+        events.push(DavEvent {
+            remote_url: Some(format!("ews-event:{id}")),
+            uid: id.to_owned(),
+            summary,
+            description,
+            location,
+            dtstart,
+            dtend,
+            rrule: None,
+            recurrence_id: None,
+            exdates: None,
+            rdates: None,
+            status: None,
+            attendees: Vec::new(),
+            alarms: Vec::new(),
+            timezone: None,
+            transp: None,
+            class: None,
+            categories: Vec::new(),
+            url: None,
+            organizer,
+            sequence: 0,
+            raw,
+            etag: None,
+        });
+    }
+    Ok(events)
+}
+
+fn build_vevent(
+    uid: &str,
+    summary: &str,
+    dtstart: &str,
+    dtend: Option<&str>,
+    location: Option<&str>,
+) -> String {
+    let mut lines = vec![
+        "BEGIN:VCALENDAR".to_owned(),
+        "VERSION:2.0".to_owned(),
+        "PRODID:-//truemail//EWS//EN".to_owned(),
+        "BEGIN:VEVENT".to_owned(),
+        format!("UID:{}", ical_escape(uid)),
+        format!("SUMMARY:{}", ical_escape(summary)),
+        format!("DTSTART:{dtstart}"),
+    ];
+    if let Some(dtend) = dtend {
+        lines.push(format!("DTEND:{dtend}"));
+    }
+    if let Some(location) = location {
+        lines.push(format!("LOCATION:{}", ical_escape(location)));
+    }
+    lines.push("END:VEVENT".to_owned());
+    lines.push("END:VCALENDAR".to_owned());
+    lines.join("\r\n")
+}
+
+fn parse_contacts(xml: &str) -> Result<Vec<DavContact>> {
+    let document = Document::parse(xml).map_err(|error| backend_error("contacts-xml", error))?;
+    let mut contacts = Vec::new();
+    for item in document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Contact")
+    {
+        let Some(id) = item
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+            .and_then(|node| node.attribute("Id"))
+        else {
+            continue;
+        };
+        let first_name = node_text(item, "GivenName").map(str::to_owned);
+        let last_name = node_text(item, "Surname").map(str::to_owned);
+        let organization = node_text(item, "CompanyName").map(str::to_owned);
+        let display_name = node_text(item, "DisplayName")
+            .map(str::to_owned)
+            .or_else(|| match (&first_name, &last_name) {
+                (Some(first), Some(last)) => Some(format!("{first} {last}")),
+                (Some(name), None) | (None, Some(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Без имени".to_owned());
+        let emails = item
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Entry")
+            .filter(|node| {
+                node.parent()
+                    .is_some_and(|parent| parent.tag_name().name() == "EmailAddresses")
+            })
+            .filter_map(|node| node.text())
+            .map(|value| {
+                value
+                    .strip_prefix("SMTP:")
+                    .or_else(|| value.strip_prefix("smtp:"))
+                    .unwrap_or(value)
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let phones = item
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Entry")
+            .filter(|node| {
+                node.parent()
+                    .is_some_and(|parent| parent.tag_name().name() == "PhoneNumbers")
+            })
+            .filter_map(|node| {
+                let value = node.text()?.trim();
+                if value.is_empty() {
+                    return None;
+                }
+                Some(ContactPhone::from_remote(
+                    value,
+                    node.attribute("Key").map(phone_kind),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let raw = build_vcard(
+            id,
+            &display_name,
+            first_name.as_deref(),
+            last_name.as_deref(),
+            organization.as_deref(),
+            &emails,
+            &phones,
+        );
+        contacts.push(DavContact {
+            remote_url: Some(format!("ews-contact:{id}")),
+            uid: id.to_owned(),
+            display_name,
+            first_name,
+            last_name,
+            organization,
+            emails,
+            phones,
+            raw,
+            etag: None,
+        });
+    }
+    Ok(contacts)
+}
+
+fn phone_kind(key: &str) -> String {
+    match key {
+        "MobilePhone" => "mobile",
+        "BusinessPhone" | "BusinessPhone2" => "work",
+        "HomePhone" | "HomePhone2" => "home",
+        "BusinessFax" | "HomeFax" => "fax",
+        _ => "other",
+    }
+    .to_owned()
+}
+
+fn build_vcard(
+    uid: &str,
+    display_name: &str,
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+    organization: Option<&str>,
+    emails: &[String],
+    phones: &[ContactPhone],
+) -> String {
+    let mut lines = vec![
+        "BEGIN:VCARD".to_owned(),
+        "VERSION:3.0".to_owned(),
+        format!("UID:{}", ical_escape(uid)),
+        format!("FN:{}", ical_escape(display_name)),
+        format!(
+            "N:{};{};;;",
+            ical_escape(last_name.unwrap_or("")),
+            ical_escape(first_name.unwrap_or(""))
+        ),
+    ];
+    if let Some(organization) = organization {
+        lines.push(format!("ORG:{}", ical_escape(organization)));
+    }
+    for email in emails {
+        lines.push(format!("EMAIL:{}", ical_escape(email)));
+    }
+    for phone in phones {
+        let number = ical_escape(phone.number.trim());
+        let value = match phone
+            .extension
+            .as_deref()
+            .filter(|extension| !extension.trim().is_empty())
+        {
+            Some(extension) => format!("{number};ext={}", ical_escape(extension.trim())),
+            None => number,
+        };
+        lines.push(format!(
+            "TEL;TYPE={}:{}",
+            phone.kind.as_deref().unwrap_or("other").to_uppercase(),
+            value
+        ));
+    }
+    lines.push("END:VCARD".to_owned());
+    lines.join("\r\n")
 }
 
 #[async_trait]
@@ -620,5 +1009,44 @@ mod tests {
             stable_uid("AAMk-long-item-id"),
             stable_uid("AAMk-long-item-id")
         );
+    }
+
+    #[test]
+    fn parses_ews_calendar_item() {
+        let xml = r#"<Envelope><CalendarItem><ItemId Id="event-1"/><Subject>Встреча</Subject><Body>Описание</Body><Start>2026-07-17T09:00:00Z</Start><End>2026-07-17T10:30:00Z</End><IsAllDayEvent>false</IsAllDayEvent><Location>Переговорная</Location><Organizer><Mailbox><EmailAddress>owner@example.test</EmailAddress></Mailbox></Organizer></CalendarItem></Envelope>"#;
+        let events = parse_calendar_items(xml).expect("calendar response");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, "event-1");
+        assert_eq!(events[0].summary, "Встреча");
+        assert_eq!(events[0].dtstart, "20260717T090000Z");
+        assert_eq!(events[0].dtend.as_deref(), Some("20260717T103000Z"));
+        assert_eq!(events[0].location.as_deref(), Some("Переговорная"));
+        assert_eq!(events[0].organizer.as_deref(), Some("owner@example.test"));
+    }
+
+    #[test]
+    fn parses_ews_contact_with_all_addresses_and_phones() {
+        let xml = r#"<Envelope><Contact><ItemId Id="contact-1"/><DisplayName>Иван Петров</DisplayName><GivenName>Иван</GivenName><Surname>Петров</Surname><CompanyName>Пример</CompanyName><EmailAddresses><Entry Key="EmailAddress1">SMTP:ivan@example.test</Entry><Entry Key="EmailAddress2">other@example.test</Entry></EmailAddresses><PhoneNumbers><Entry Key="MobilePhone">+79990000000</Entry><Entry Key="BusinessPhone">+74950000000;ext=123</Entry></PhoneNumbers></Contact></Envelope>"#;
+        let contacts = parse_contacts(xml).expect("contacts response");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0].emails,
+            ["ivan@example.test", "other@example.test"]
+        );
+        assert_eq!(contacts[0].phones.len(), 2);
+        assert_eq!(contacts[0].phones[0].kind.as_deref(), Some("mobile"));
+        assert_eq!(contacts[0].phones[1].extension.as_deref(), Some("123"));
+        assert!(contacts[0].raw.contains("ORG:Пример"));
+        assert!(
+            contacts[0]
+                .raw
+                .contains("TEL;TYPE=WORK:+74950000000;ext=123")
+        );
+    }
+
+    #[test]
+    fn malformed_auxiliary_xml_is_an_error() {
+        assert!(parse_calendar_items("<broken").is_err());
+        assert!(parse_contacts("<broken").is_err());
     }
 }

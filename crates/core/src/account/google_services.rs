@@ -746,6 +746,7 @@ pub async fn sync_google_services(
     let (contacts, deleted_contact_urls, contacts_sync_token, contacts_scope) = contacts_result?;
     Ok(DavSyncResult {
         calendars,
+        calendars_available: true,
         contacts,
         contact_collections: Vec::new(),
         contacts_available: true,

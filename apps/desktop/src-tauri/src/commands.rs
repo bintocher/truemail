@@ -165,6 +165,7 @@ pub struct PasswordConnectionInfo {
     imap: Option<ServerConfig>,
     smtp: Option<ServerConfig>,
     jmap_url: Option<String>,
+    ews_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1443,6 +1444,11 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
         truemail_core::model::Provider::Gmail => {
             core.accounts.sync_google_auxiliary_account(account).await?;
         }
+        truemail_core::model::Provider::Exchange => {
+            core.accounts
+                .sync_exchange_auxiliary_account(account)
+                .await?;
+        }
         _ => {
             return Err(ApiError {
                 message: "Календарь и контакты этого провайдера пока не поддерживаются".into(),
@@ -1977,7 +1983,9 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
     for account in core.db.list_accounts().await? {
         if !matches!(
             account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
+            truemail_core::model::Provider::Yandex
+                | truemail_core::model::Provider::Gmail
+                | truemail_core::model::Provider::Exchange
         ) || !account.enabled
         {
             continue;
@@ -2004,6 +2012,12 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
                     sync_core
                         .accounts
                         .sync_google_auxiliary_account(&account)
+                        .await
+                }
+                truemail_core::model::Provider::Exchange => {
+                    sync_core
+                        .accounts
+                        .sync_exchange_auxiliary_account(&account)
                         .await
                 }
                 _ => unreachable!(),
@@ -2669,23 +2683,6 @@ async fn spawn_initial_mail_sync(
     });
 }
 
-fn unsupported_provider_message(config: &truemail_core::account::ProviderConfig) -> String {
-    let provider = format!("{:?}", config.provider);
-    let imap = config
-        .imap
-        .as_ref()
-        .map(|server| format!("{}:{}", server.host, server.port))
-        .unwrap_or_else(|| "не найден".into());
-    let smtp = config
-        .smtp
-        .as_ref()
-        .map(|server| format!("{}:{}", server.host, server.port))
-        .unwrap_or_else(|| "не найден".into());
-    format!(
-        "Определён провайдер {provider}, но OAuth для него в truemail пока не реализован. IMAP: {imap}; SMTP: {smtp}. Для Mail.ru и iCloud нужен отдельный пароль приложения; обычный пароль аккаунта использовать не следует."
-    )
-}
-
 fn open_in_yandex_browser(app: &AppHandle, url: &str) -> CmdResult<()> {
     #[cfg(target_os = "windows")]
     {
@@ -2926,11 +2923,25 @@ pub async fn begin_account_connection(
                         })
                     },
                     jmap_url: config.jmap_url,
+                    ews_url: None,
                 }),
             })
         }
-        _ => Err(ApiError {
-            message: unsupported_provider_message(&config),
+        Provider::Exchange => Ok(PendingOAuthResponse {
+            mode: "password".into(),
+            state: None,
+            connected: None,
+            // Autodiscover уточнит адрес EWS с учётными данными; из discover
+            // приходит только предполагаемый URL как подсказка для поля.
+            password_config: Some(PasswordConnectionInfo {
+                provider: Provider::Exchange,
+                backend_kind: BackendKind::Ews,
+                username: email.clone(),
+                imap: None,
+                smtp: None,
+                jmap_url: None,
+                ews_url: config.ews_url,
+            }),
         }),
     }
 }

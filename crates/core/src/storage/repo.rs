@@ -783,14 +783,16 @@ impl Db {
 
         let mut created_refs: Vec<String> = Vec::new();
         let mut calendar_rows = Vec::new();
-        for calendar in &data.calendars {
-            let mut events = Vec::new();
-            for event in &calendar.events {
-                let reference = self.blobs.put(event.raw.as_bytes())?;
-                created_refs.push(reference.clone());
-                events.push((event, reference));
+        if data.calendars_available {
+            for calendar in &data.calendars {
+                let mut events = Vec::new();
+                for event in &calendar.events {
+                    let reference = self.blobs.put(event.raw.as_bytes())?;
+                    created_refs.push(reference.clone());
+                    events.push((event, reference));
+                }
+                calendar_rows.push((calendar, events));
             }
-            calendar_rows.push((calendar, events));
         }
         let mut contact_rows = Vec::new();
         if data.contacts_available {
@@ -803,12 +805,15 @@ impl Db {
 
         let save_result: Result<(usize, usize, usize)> = async {
             let mut tx = self.begin_write().await?;
-            let existing_calendars: Vec<(i64,)> =
+            let existing_calendars: Vec<(i64,)> = if data.calendars_available {
                 sqlx::query_as("SELECT id FROM calendars WHERE account_id=? AND kind=?")
                     .bind(account_id)
                     .bind(source_kind)
                     .fetch_all(&mut *tx)
-                    .await?;
+                    .await?
+            } else {
+                Vec::new()
+            };
             let mut active_calendars = HashSet::new();
             let mut event_count = 0;
             for (calendar, events) in calendar_rows {

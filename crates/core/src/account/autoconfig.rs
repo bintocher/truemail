@@ -274,6 +274,50 @@ pub async fn discover_provider(email: &str) -> ProviderConfig {
             }
         }
 
+        // Exchange публикует SRV _autodiscover._tcp; наличие записи означает
+        // локальный Exchange, а её target - хост с EWS. Точный адрес EWS
+        // уточняется при подключении через autodiscover с учётными данными.
+        if let Ok(records) = resolver
+            .srv_lookup(format!("_autodiscover._tcp.{domain}."))
+            .await
+            && let Some(record) = records
+                .answers()
+                .iter()
+                .filter_map(|record| match &record.data {
+                    RData::SRV(value) => Some(value),
+                    _ => None,
+                })
+                .min_by_key(|record| record.priority)
+        {
+            let host = record.target.to_utf8();
+            let host = host.trim_end_matches('.');
+            if !host.is_empty() {
+                let provider = if host.eq_ignore_ascii_case("autodiscover.outlook.com") {
+                    Provider::Outlook
+                } else {
+                    Provider::Exchange
+                };
+                let authority = if record.port == 443 {
+                    host.to_owned()
+                } else {
+                    format!("{host}:{}", record.port)
+                };
+                return ProviderConfig {
+                    provider,
+                    backend_kind: BackendKind::Ews,
+                    auth_kind: if provider == Provider::Outlook {
+                        AuthKind::Oauth2
+                    } else {
+                        AuthKind::Password
+                    },
+                    imap: None,
+                    smtp: None,
+                    ews_url: Some(format!("https://{authority}/EWS/Exchange.asmx")),
+                    jmap_url: None,
+                };
+            }
+        }
+
         if let Ok(records) = resolver.srv_lookup(format!("_jmap._tcp.{domain}.")).await
             && let Some(record) = records
                 .answers()

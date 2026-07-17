@@ -1151,6 +1151,7 @@ mod tests {
                     event("event-3", "Three"),
                 ],
             }],
+            calendars_available: true,
             contacts: vec![
                 contact("1", "One"),
                 contact("2", "Two"),
@@ -1184,6 +1185,7 @@ mod tests {
                 deleted_event_urls: vec!["google-event:event-2".into()],
                 events: vec![event("event-1", "One updated")],
             }],
+            calendars_available: true,
             contacts: vec![contact("1", "One updated")],
             contact_collections: Vec::new(),
             contacts_available: true,
@@ -1194,6 +1196,20 @@ mod tests {
         db.save_google_services(account.id, &delta)
             .await
             .expect("save auxiliary delta");
+
+        let temporarily_unavailable = DavSyncResult {
+            calendars: Vec::new(),
+            calendars_available: false,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        db.save_auxiliary_data(account.id, "google", &temporarily_unavailable)
+            .await
+            .expect("preserve unavailable auxiliary data");
 
         let events: Vec<(String,)> = sqlx::query_as("SELECT summary FROM events ORDER BY summary")
             .fetch_all(&db.pool)

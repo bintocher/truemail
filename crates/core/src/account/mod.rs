@@ -511,6 +511,39 @@ impl AccountManager {
         self.db.save_google_services(account.id, &data).await
     }
 
+    /// Обновить календарь и контакты Exchange через EWS отдельно от почты.
+    pub async fn sync_exchange_auxiliary_account(
+        &self,
+        account: &Account,
+    ) -> Result<(usize, usize, usize)> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Auxiliary,
+                self.sync_exchange_auxiliary_account_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_exchange_auxiliary_account_inner(
+        &self,
+        account: &Account,
+    ) -> Result<(usize, usize, usize)> {
+        let credential = self.mail_credential(account).await?;
+        let endpoint = account.ews_url.clone().ok_or_else(|| {
+            crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
+        })?;
+        let username = account
+            .username
+            .clone()
+            .unwrap_or_else(|| account.email.clone());
+        let backend = EwsBackend { endpoint, username };
+        let data = backend.auxiliary(&credential).await?;
+        self.db
+            .save_auxiliary_data(account.id, "exchange", &data)
+            .await
+    }
+
     /// Отправить письмо через транспорт выбранного аккаунта; поле From задаёт core.
     pub async fn send_outgoing(
         &self,
