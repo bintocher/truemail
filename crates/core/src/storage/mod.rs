@@ -553,13 +553,11 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("truemail-repo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create temp data dir");
-        let db = Db::open_with_database_key(
-            &root,
-            Arc::new(StorageCrypto::from_key(random_key())),
-            &DatabaseKey::from_key(random_key()),
-        )
-        .await
-        .expect("open database");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let db =
+            Db::open_with_database_key(&root, crypto.clone(), &DatabaseKey::from_key(random_key()))
+                .await
+                .expect("open database");
         db.migrate().await.expect("migrate database");
         let account = db
             .save_account(&NewAccount {
@@ -841,6 +839,88 @@ mod tests {
         db.save_smart_folders(&[])
             .await
             .expect("delete omitted custom smart folder");
+
+        let api_token = "tm_integration_test_token";
+        let api_hash = sha2::Sha256::digest(api_token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        sqlx::query(
+            "INSERT INTO api_clients(name, token_ref, token_hash, caps)
+             VALUES('integration', 'not-used-in-test', ?, '[\"read\"]')",
+        )
+        .bind(api_hash)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert API test client");
+        let api_core = Arc::new(crate::Core {
+            db: db.clone(),
+            search: Arc::new(crate::search::Fts5Index::new(db.clone())),
+            crypto: crypto.clone(),
+            accounts: crate::account::AccountManager::new(db.clone()),
+        });
+        let audit_core = api_core.clone();
+        let api_server = crate::api::start_server(api_core, 0)
+            .await
+            .expect("start loopback API");
+        let api_url = format!("http://127.0.0.1:{}", api_server.port);
+        let http = reqwest::Client::new();
+        assert_eq!(
+            http.get(format!("{api_url}/health"))
+                .send()
+                .await
+                .expect("API health")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            http.get(format!("{api_url}/v1/tools"))
+                .send()
+                .await
+                .expect("unauthorized API")
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            http.get(format!("{api_url}/v1/tools"))
+                .bearer_auth("tm_invalid")
+                .send()
+                .await
+                .expect("invalid API token")
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let tools: serde_json::Value = http
+            .get(format!("{api_url}/v1/tools"))
+            .bearer_auth(api_token)
+            .send()
+            .await
+            .expect("authorized tools")
+            .json()
+            .await
+            .expect("tools json");
+        assert!(tools["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| tool["name"] == "list_messages")
+                && !tools.iter().any(|tool| tool["name"] == "send")
+        }));
+        assert_eq!(
+            http.post(format!("{api_url}/v1/tools/label"))
+                .bearer_auth(api_token)
+                .json(&serde_json::json!({"message_id": message_id, "label_id": 1}))
+                .send()
+                .await
+                .expect("denied API call")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        api_server.stop();
+        assert!(
+            crate::api::list_audit(audit_core.as_ref(), 10)
+                .await
+                .expect("API audit")
+                .iter()
+                .any(|entry| entry.action == "tool:label:denied")
+        );
 
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)

@@ -341,6 +341,9 @@
   .signature-editor{min-height:76px;padding:9px;border:1px solid var(--border-strong);border-radius:7px;background:var(--bg);outline:none;line-height:1.45}
   .signature-editor:empty:before{content:attr(data-ph);color:var(--text-3)}
   .signature-save{margin-top:8px}
+  .api-port{width:100px}.api-state{font-size:12px;color:var(--text-3)}.api-state.on{color:var(--success,#238636)}.api-url{min-height:20px;color:var(--accent-text)}
+  .api-caps{display:flex;flex-wrap:wrap;gap:8px 16px;padding:10px 0}.api-caps label{display:flex;align-items:center;gap:6px;font-size:13px}.api-token-box{margin-top:14px;padding:12px;border:1px solid var(--accent);border-radius:9px;background:var(--accent-weak)}
+  .api-client-row,.api-audit-row{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid var(--border)}.api-client-row:last-child,.api-audit-row:last-child{border-bottom:0}.api-caps-text,.api-audit-detail{font-size:12px;color:var(--text-3)}.api-audit-row{align-items:flex-start}.api-audit-time{flex:none;width:130px;font-size:12px;color:var(--text-3)}
 
   /* settings popover on mail */
   .pop{position:fixed;top:50px;left:14px;width:250px;background:var(--bg);border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow);padding:12px;z-index:40;display:none;}

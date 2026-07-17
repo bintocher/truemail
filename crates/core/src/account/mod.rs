@@ -473,6 +473,26 @@ impl AccountManager {
         self.db.save_google_services(account.id, &data).await
     }
 
+    /// Отправить письмо через транспорт выбранного аккаунта; поле From задаёт core.
+    pub async fn send_outgoing(
+        &self,
+        account_id: i64,
+        mut message: crate::backend::OutgoingMessage,
+    ) -> Result<()> {
+        let account = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| crate::Error::AccountConfig("аккаунт отправителя не найден".into()))?;
+        message.from = account.email.clone();
+        let credential = self.mail_credential(&account).await?;
+        Self::mail_backend(&account)?
+            .send(message, &credential)
+            .await
+    }
+
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
         let token = self.mail_credential(account).await?;

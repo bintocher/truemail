@@ -15,7 +15,9 @@ use truemail_core::account::{
     ContactInput, EventInput, RemoteObject, configured_google_client_id,
     configured_google_client_secret, configured_yandex_client_id,
 };
-use truemail_core::api::{McpTool, mcp_tools};
+use truemail_core::api::{
+    ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
+};
 use truemail_core::model::{
     Account, AuthKind, BackendKind, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull,
     MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature, SmartFolder,
@@ -33,6 +35,7 @@ pub struct AppState {
     pub syncing_aux: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    pub api_server: Arc<tokio::sync::Mutex<Option<truemail_core::api::RunningApiServer>>>,
     // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
     // действительно завершает приложение, а не сворачивает в трей.
     pub quitting: Arc<std::sync::atomic::AtomicBool>,
@@ -2741,6 +2744,104 @@ pub async fn complete_yandex_oauth(
 #[tauri::command]
 pub fn api_tools() -> Vec<McpTool> {
     mcp_tools()
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalApiStatus {
+    pub running: bool,
+    pub port: Option<u16>,
+    pub url: Option<String>,
+}
+
+#[tauri::command]
+pub async fn external_api_status(state: State<'_, AppState>) -> CmdResult<ExternalApiStatus> {
+    let server = state.api_server.lock().await;
+    let port = server.as_ref().map(|server| server.port);
+    Ok(ExternalApiStatus {
+        running: port.is_some(),
+        port,
+        url: port.map(|port| format!("http://127.0.0.1:{port}")),
+    })
+}
+
+#[tauri::command]
+pub async fn start_external_api(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+) -> CmdResult<ExternalApiStatus> {
+    let core = core(&state).await?;
+    let mut server = state.api_server.lock().await;
+    if let Some(running) = server.as_ref() {
+        return Ok(ExternalApiStatus {
+            running: true,
+            port: Some(running.port),
+            url: Some(format!("http://127.0.0.1:{}", running.port)),
+        });
+    }
+    let requested_port = port.unwrap_or(34981);
+    let running = truemail_core::api::start_server(core.clone(), requested_port).await?;
+    let actual_port = running.port;
+    *server = Some(running);
+    core.db.set_setting("external_api_enabled", "1").await?;
+    core.db
+        .set_setting("external_api_port", &requested_port.to_string())
+        .await?;
+    Ok(ExternalApiStatus {
+        running: true,
+        port: Some(actual_port),
+        url: Some(format!("http://127.0.0.1:{actual_port}")),
+    })
+}
+
+#[tauri::command]
+pub async fn stop_external_api(state: State<'_, AppState>) -> CmdResult<ExternalApiStatus> {
+    let core = core(&state).await?;
+    if let Some(server) = state.api_server.lock().await.take() {
+        server.stop();
+    }
+    core.db.set_setting("external_api_enabled", "0").await?;
+    Ok(ExternalApiStatus {
+        running: false,
+        port: None,
+        url: None,
+    })
+}
+
+#[tauri::command]
+pub async fn list_api_clients(state: State<'_, AppState>) -> CmdResult<Vec<ApiClient>> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::list_clients(core.as_ref()).await?)
+}
+
+#[tauri::command]
+pub async fn create_api_client(
+    state: State<'_, AppState>,
+    name: String,
+    caps: Vec<Capability>,
+) -> CmdResult<CreatedApiClient> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::create_client(core.as_ref(), &name, caps).await?)
+}
+
+#[tauri::command]
+pub async fn revoke_api_client(state: State<'_, AppState>, client_id: i64) -> CmdResult<bool> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::revoke_client(core.as_ref(), client_id).await?)
+}
+
+#[tauri::command]
+pub async fn list_api_audit(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<ApiAuditEntry>> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::list_audit(core.as_ref(), limit.unwrap_or(50)).await?)
+}
+
+#[tauri::command]
+pub async fn clear_api_audit(state: State<'_, AppState>) -> CmdResult<u64> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::clear_audit(core.as_ref()).await?)
 }
 
 #[tauri::command]

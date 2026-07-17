@@ -23,6 +23,7 @@ sqlx.workspace = true
 libsqlite3-sys.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+axum.workspace = true
 async-imap.workspace = true
 futures.workspace = true
 socket2.workspace = true

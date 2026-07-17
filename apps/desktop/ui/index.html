@@ -116,6 +116,7 @@
       <div class="sec" data-set="calendars"><i data-i="cal"></i><span data-i18n="setCalendars">Календари</span></div>
       <div class="sec" data-set="storage"><i data-i="storage"></i><span data-i18n="setStorageNav">Хранилище и кэш</span></div>
       <div class="sec" data-set="themes"><i data-i="palette"></i><span data-i18n="setThemes">Темы и оформление</span></div>
+      <div class="sec" data-set="api"><i data-i="server"></i><span>API / MCP</span></div>
       <div class="sec" data-set="privacy"><i data-i="shield"></i><span data-i18n="setPrivacy">Приватность</span></div>
       <div class="sec" data-set="keys"><i data-i="keyboard"></i><span data-i18n="setKeys">Горячие клавиши</span></div>
     </nav>
@@ -243,6 +244,22 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="trashSpamData">Локальные данные корзины и спама</div></div><div class="fc fc-inline"><span class="size-num">0 Б</span><button class="btn sm" data-clear="trash_spam" data-i18n="clear">Очистить</button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="clearAllLocal">Полностью очистить локальные данные</div><div class="d" data-i18n="clearAllLocalDesc">Письма перекачаются с серверов заново</div></div><div class="fc"><button class="btn sm danger-btn" data-clear="all"><i data-i="trash"></i><span data-i18n="clearAll">Очистить всё</span></button></div></div>
         </div></div>
+      </div>
+
+      <div class="setpage" id="set-api">
+        <h1>API / MCP</h1><p class="lead">Локальный доступ для агентов и скриптов. Сервер слушает только 127.0.0.1; каждый токен ограничен выбранными правами.</p>
+        <div class="card"><div class="ch"><i data-i="server"></i><span>Локальный сервер</span><span class="api-state ml-auto" id="apiState">Остановлен</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Порт</div><div class="d">REST: /v1/tools/{name}, MCP: /mcp</div></div><div class="fc fc-inline"><input class="inp api-port" id="apiPort" type="number" min="1024" max="65535" value="34981"><button class="btn primary" id="apiToggle">Запустить</button></div></div>
+          <div class="api-url mono" id="apiUrl"></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="key"></i><span>Новый API-клиент</span></div><div class="cb">
+          <div class="frow"><div class="fl"><div class="t">Название</div></div><div class="fc"><input class="inp" id="apiClientName" placeholder="Например: локальный агент"></div></div>
+          <div class="api-caps" id="apiCaps"><label><input type="checkbox" value="read" checked> Чтение</label><label><input type="checkbox" value="search" checked> Поиск</label><label><input type="checkbox" value="send"> Отправка</label><label><input type="checkbox" value="labels"> Метки</label><label><input type="checkbox" value="calendar"> Календарь</label><label><input type="checkbox" value="network"> Сеть</label></div>
+          <button class="btn primary mt-14" id="apiClientCreate"><i data-i="plus"></i>Создать токен</button>
+          <div class="api-token-box hidden" id="apiTokenBox"><strong>Скопируйте токен сейчас — повторно он не показывается.</strong><div class="fc-inline mt-8"><input class="inp mono grow" id="apiToken" readonly><button class="btn" id="apiTokenCopy">Копировать</button></div></div>
+        </div></div>
+        <div class="card"><div class="ch"><span>Клиенты</span></div><div class="cb api-client-list" id="apiClientList"></div></div>
+        <div class="card"><div class="ch"><span>Последние вызовы</span><button class="btn sm ml-auto" id="apiAuditRefresh">Обновить</button><button class="btn sm" id="apiAuditClear">Очистить</button></div><div class="cb api-audit-list" id="apiAuditList"></div></div>
       </div>
 
       <div class="setpage" id="set-privacy">

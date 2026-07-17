@@ -131,6 +131,7 @@ fn run() -> anyhow::Result<()> {
         quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        api_server: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     let show_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM);
@@ -345,6 +346,14 @@ fn run() -> anyhow::Result<()> {
             commands::complete_exchange_ews,
             commands::complete_yandex_oauth,
             commands::api_tools,
+            commands::external_api_status,
+            commands::start_external_api,
+            commands::stop_external_api,
+            commands::list_api_clients,
+            commands::create_api_client,
+            commands::revoke_api_client,
+            commands::list_api_audit,
+            commands::clear_api_audit,
             commands::localization_catalog,
             commands::set_autostart,
             commands::get_autostart,

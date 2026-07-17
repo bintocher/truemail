@@ -94,6 +94,14 @@
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
     apiTools: () => invoke("api_tools"),
+    externalApiStatus: () => invoke("external_api_status"),
+    startExternalApi: (port) => invoke("start_external_api", { port }),
+    stopExternalApi: () => invoke("stop_external_api"),
+    listApiClients: () => invoke("list_api_clients"),
+    createApiClient: (name, caps) => invoke("create_api_client", { name, caps }),
+    revokeApiClient: (clientId) => invoke("revoke_api_client", { clientId }),
+    listApiAudit: (limit = 50) => invoke("list_api_audit", { limit }),
+    clearApiAudit: () => invoke("clear_api_audit"),
     localizationCatalog: (locale) => invoke("localization_catalog", { locale }),
   };
   tauri.event?.listen("truemail-global-shortcut", event => {
