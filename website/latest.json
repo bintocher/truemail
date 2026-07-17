@@ -1,6 +1,15 @@
 {
   "version": "0.1.0",
-  "notes": "Первая версия канала обновлений truemail.",
+  "notes": "Текущая версия канала обновлений truemail.",
   "pub_date": "2026-07-17T00:00:00Z",
-  "platforms": {}
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRTzJDSDNXTjdXdmNDcGRzT0xXOThuY0plR3d6Rkd6SVo4UWNrUjY5aTdzSHdFc0Fpa2FPWlBKcE5CR0xmR2sxZlpOQ1ozNEJyZ0RtZCtBUmdFRnFhTU82MEJKeEhCT0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3NzYxCWZpbGU6dHJ1ZW1haWwtdXBkYXRlLmtleS5wdWIKZmxjeFYwSllIZXVrL0V1cDVaZ3lXS0s1UzZ5c1VYVDZoeUhtSERyTTZvVmRkZEN0MmF5NVpVM0tZS0tNTTRrZHlpTmRWMnBSSFZybytuMGhJZlB5QXc9PQo=",
+      "url": "https://chernov.gitverse.site/truemail/"
+    },
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRTzJDSDNXTjdXdmNDcGRzT0xXOThuY0plR3d6Rkd6SVo4UWNrUjY5aTdzSHdFc0Fpa2FPWlBKcE5CR0xmR2sxZlpOQ1ozNEJyZ0RtZCtBUmdFRnFhTU82MEJKeEhCT0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3NzYxCWZpbGU6dHJ1ZW1haWwtdXBkYXRlLmtleS5wdWIKZmxjeFYwSllIZXVrL0V1cDVaZ3lXS0s1UzZ5c1VYVDZoeUhtSERyTTZvVmRkZEN0MmF5NVpVM0tZS0tNTTRrZHlpTmRWMnBSSFZybytuMGhJZlB5QXc9PQo=",
+      "url": "https://chernov.gitverse.site/truemail/"
+    }
+  }
 }

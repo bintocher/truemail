@@ -13,6 +13,8 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     env:
       OPENSSL_NO_VENDOR: 1
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,7 +39,7 @@ jobs:
           out=dist
           rm -rf "$out" && mkdir -p "$out"
           find target/release/bundle -type f \
-            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \) \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.sig' \) \
             -exec cp {} "$out"/ \;
           ls -lh "$out"
 
@@ -55,3 +57,48 @@ jobs:
         if: always()
         run: |
           rm -rf dist target/release/bundle
+
+  windows:
+    # Windows-сборка идёт строго после Linux: Linux создаёт релиз, Windows
+    # добавляет NSIS и публикует общий latest.json для встроенного updater.
+    needs: linux
+    runs-on: [self-hosted, windows, x64]
+    defaults:
+      run:
+        shell: powershell
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $line) { throw 'Версия не найдена в Cargo.toml' }
+          $version = $line.Matches[0].Groups[1].Value
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Сборка NSIS
+        run: |
+          .\scripts\dev.ps1 -Check
+          Push-Location apps\desktop\src-tauri
+          try { cargo tauri build --bundles nsis } finally { Pop-Location }
+
+      - name: Собрать Windows-пакеты
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Get-ChildItem target\release\bundle\nsis -File |
+            Where-Object { $_.Name -like '*.exe' -or $_.Name -like '*.exe.sig' } |
+            Copy-Item -Destination dist
+          if (-not (Get-ChildItem dist -Filter '*.exe')) { throw 'NSIS installer не найден' }
+          if (-not (Get-ChildItem dist -Filter '*.exe.sig')) { throw 'Подпись NSIS не найдена' }
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Дополнить релиз и опубликовать latest.json
+        env:
+          TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .\scripts\publish-release.ps1 -Tag $env:TAG -Directory dist
