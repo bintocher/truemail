@@ -469,54 +469,90 @@ async fn notify_new_mail(
 /// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
 /// уведомление и дозагрузка при появлении новых. Gmail API push требует
 /// внешней Cloud Pub/Sub-инфраструктуры, которой у desktop-only клиента нет.
+fn observe_gmail_message_ids(
+    observed: &mut HashMap<i64, HashSet<String>>,
+    account_id: i64,
+    ids: Vec<String>,
+) -> Option<Vec<String>> {
+    use std::collections::hash_map::Entry;
+    match observed.entry(account_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(ids.into_iter().collect());
+            None
+        }
+        Entry::Occupied(mut entry) => {
+            let seen = entry.get_mut();
+            let fresh = ids
+                .iter()
+                .filter(|id| !seen.contains(*id))
+                .cloned()
+                .collect();
+            seen.extend(ids);
+            Some(fresh)
+        }
+    }
+}
+
 async fn gmail_realtime_loop(
     core: Arc<Core>,
     app: AppHandle,
     syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
 ) {
-    let mut notified: HashSet<String> = HashSet::new();
+    let mut observed: HashMap<i64, HashSet<String>> = HashMap::new();
+    let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
         let accounts = match core.db.list_accounts().await {
             Ok(accounts) => accounts,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                continue;
+            }
         };
         for account in accounts {
             if account.provider != truemail_core::model::Provider::Gmail {
                 continue;
             }
-            let new_ids = match core.accounts.gmail_new_message_ids(&account).await {
+            let latest_ids = match core.accounts.gmail_latest_message_ids(&account).await {
                 Ok(ids) => ids,
                 Err(_) => continue,
             };
-            // Уведомляем только о письмах, о которых ещё не сообщали (до тех пор,
-            // пока дозагрузка не запишет их в БД и они не перестанут быть "новыми").
-            let fresh: Vec<String> = new_ids
-                .into_iter()
-                .filter(|id| !notified.contains(id))
-                .collect();
-            if fresh.is_empty() {
+            // Первый снимок — только исходная точка. Наличие письма в Gmail, но
+            // отсутствие его в ещё заполняющейся локальной БД не делает письмо новым.
+            let Some(fresh) = observe_gmail_message_ids(&mut observed, account.id, latest_ids)
+            else {
+                tracing::debug!(account = %account.email, "Gmail realtime: исходный снимок сохранён");
+                continue;
+            };
+            if !fresh.is_empty() {
+                pending.entry(account.id).or_default().extend(fresh);
+            }
+            let pending_count = pending.get(&account.id).map(HashSet::len).unwrap_or(0);
+            if pending_count == 0 {
                 continue;
             }
-            for id in &fresh {
-                notified.insert(id.clone());
-            }
-            // Сначала дозагружаем (если свободно), чтобы уведомление показало
-            // отправителя и тему нового письма, а не общий счётчик.
+            // Если стартовая или ручная синхронизация ещё идёт, сохраняем новые
+            // ID в pending и ждём. Показывать последнее старое письмо из БД нельзя.
             let free = {
                 let mut guard = syncing.lock().await;
                 guard.insert(account.id)
             };
-            if free {
-                let _ = core.accounts.sync_mail_inbox(&account).await;
-                syncing.lock().await.remove(&account.id);
-                let _ = app.emit("truemail-data-changed", account.id);
+            if !free {
+                continue;
             }
-            notify_new_mail(&app, &core, &account, fresh.len()).await;
+            let synced = core.accounts.sync_mail_inbox(&account).await;
+            syncing.lock().await.remove(&account.id);
+            match synced {
+                Ok(_) => {
+                    pending.remove(&account.id);
+                    let _ = app.emit("truemail-data-changed", account.id);
+                    notify_new_mail(&app, &core, &account, pending_count).await;
+                }
+                Err(error) => {
+                    tracing::warn!(account = %account.email, %error, "Gmail realtime: не удалось загрузить новые письма");
+                }
+            }
         }
-        if notified.len() > 500 {
-            notified.clear();
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
     }
 }
 
@@ -3168,6 +3204,23 @@ pub fn localization_catalog(locale: String) -> HashMap<String, String> {
 #[cfg(test)]
 mod update_tests {
     use super::*;
+
+    #[test]
+    fn gmail_realtime_uses_first_snapshot_as_baseline() {
+        let mut observed = HashMap::new();
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["old".into()]),
+            None
+        );
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["new".into(), "old".into()]),
+            Some(vec!["new".into()])
+        );
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["new".into(), "old".into()]),
+            Some(Vec::new())
+        );
+    }
 
     #[test]
     fn update_manifest_is_public_and_uses_https() {

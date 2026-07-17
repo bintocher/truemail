@@ -353,18 +353,18 @@ impl AccountManager {
         Ok(Zeroizing::new(credential.access_token.clone()))
     }
 
-    /// Дозагрузить только последние входящие после события IMAP IDLE.
-    /// Лёгкая проверка новых писем Gmail (ID Входящих, которых ещё нет в БД).
-    /// Для почти реалтайм-уведомлений без тяжёлой полной синхронизации.
-    pub async fn gmail_new_message_ids(&self, account: &Account) -> Result<Vec<String>> {
+    /// Лёгкая проверка последних ID Gmail Входящих без загрузки писем.
+    /// Сравнение с предыдущим снимком выполняет цикл уведомлений: локальная БД
+    /// может быть ещё не заполнена во время стартовой синхронизации.
+    pub async fn gmail_latest_message_ids(&self, account: &Account) -> Result<Vec<String>> {
         if account.provider != Provider::Gmail {
             return Ok(Vec::new());
         }
         let token = self.oauth_access_token(account).await?;
-        let ids = crate::backend::gmail_latest_ids(&token, 25).await?;
-        self.db.unknown_remote_ids(account.id, &ids).await
+        crate::backend::gmail_latest_ids(&token, 25).await
     }
 
+    /// Дозагрузить только последние входящие после события IMAP IDLE.
     pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
