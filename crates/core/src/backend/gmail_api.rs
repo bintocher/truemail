@@ -4,8 +4,8 @@ use crate::{Error, Result};
 use base64::Engine as _;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-use futures::{StreamExt, stream};
-use reqwest::{Client, Method, Response, Url};
+use futures::{StreamExt, TryStreamExt, stream};
+use reqwest::{Client, Method, Response, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -40,14 +40,51 @@ struct Label {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct MessageList {
     #[serde(default)]
     messages: Vec<MessageRef>,
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MessageRef {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct MessageRef {
-    id: String,
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    history_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryList {
+    #[serde(default)]
+    history: Vec<HistoryRecord>,
+    next_page_token: Option<String>,
+    history_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryRecord {
+    #[serde(default)]
+    messages: Vec<MessageRef>,
+    #[serde(default)]
+    messages_added: Vec<HistoryMessage>,
+    #[serde(default)]
+    messages_deleted: Vec<HistoryMessage>,
+    #[serde(default)]
+    labels_added: Vec<HistoryMessage>,
+    #[serde(default)]
+    labels_removed: Vec<HistoryMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoryMessage {
+    message: MessageRef,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +140,22 @@ async fn request(
         message: error.to_string(),
     })?;
     checked(response, "gmail-api").await
+}
+
+async fn get_allow_not_found(client: &Client, url: Url, token: &str) -> Result<Option<Response>> {
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "gmail-api".into(),
+            message: error.to_string(),
+        })?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    checked(response, "gmail-api").await.map(Some)
 }
 
 fn url(parts: &[&str]) -> Result<Url> {
@@ -228,6 +281,7 @@ pub async fn discover_folders(access_token: &str) -> Result<Vec<DiscoveredFolder
             uidvalidity: None,
             uidnext: None,
             highestmodseq: None,
+            sync_token: None,
         })
         .collect();
     if !folders
@@ -243,70 +297,174 @@ pub async fn discover_folders(access_token: &str) -> Result<Vec<DiscoveredFolder
             uidvalidity: None,
             uidnext: None,
             highestmodseq: None,
+            sync_token: None,
         });
     }
     Ok(folders)
 }
 
-pub async fn discover(
-    access_token: &str,
-    _cursors: &HashMap<String, FolderSyncCursor>,
-) -> Result<ImapDiscovery> {
-    let client = client()?;
-    let folders = discover_folders(access_token).await?;
-    let included: HashSet<String> = folders
-        .iter()
-        .map(|folder| folder.remote_path.clone())
-        .collect();
-    let mut list_url = url(&["messages"])?;
-    list_url.query_pairs_mut().append_pair("maxResults", "500");
-    let listed: MessageList = request(&client, Method::GET, list_url, access_token, None)
+async fn profile_history_id(client: &Client, access_token: &str) -> Result<String> {
+    let profile: Profile = request(client, Method::GET, url(&["profile"])?, access_token, None)
         .await?
         .json()
         .await
         .map_err(|error| Error::Backend {
-            backend: "gmail-messages".into(),
+            backend: "gmail-profile".into(),
             message: error.to_string(),
         })?;
+    Ok(profile.history_id)
+}
+
+async fn list_all_message_ids(client: &Client, access_token: &str) -> Result<Vec<String>> {
+    let mut ids = Vec::new();
+    let mut page_token = None;
+    loop {
+        let mut list_url = url(&["messages"])?;
+        list_url
+            .query_pairs_mut()
+            .append_pair("maxResults", "500")
+            .append_pair("includeSpamTrash", "true");
+        if let Some(token) = page_token.as_deref() {
+            list_url.query_pairs_mut().append_pair("pageToken", token);
+        }
+        let listed: MessageList = request(client, Method::GET, list_url, access_token, None)
+            .await?
+            .json()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "gmail-messages".into(),
+                message: error.to_string(),
+            })?;
+        ids.extend(listed.messages.into_iter().map(|message| message.id));
+        page_token = listed.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+fn collect_history_ids(records: Vec<HistoryRecord>) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for record in records {
+        ids.extend(record.messages.into_iter().map(|message| message.id));
+        ids.extend(
+            record
+                .messages_added
+                .into_iter()
+                .map(|item| item.message.id),
+        );
+        ids.extend(
+            record
+                .messages_deleted
+                .into_iter()
+                .map(|item| item.message.id),
+        );
+        ids.extend(record.labels_added.into_iter().map(|item| item.message.id));
+        ids.extend(
+            record
+                .labels_removed
+                .into_iter()
+                .map(|item| item.message.id),
+        );
+    }
+    ids
+}
+
+/// `None` means that Gmail no longer accepts the stored history ID and the
+/// caller must rebuild a full snapshot.
+async fn history_delta(
+    client: &Client,
+    access_token: &str,
+    start_history_id: &str,
+) -> Result<Option<(Vec<String>, String)>> {
+    let mut ids = HashSet::new();
+    let mut page_token = None;
+    let mut latest_history_id: String;
+    loop {
+        let mut history_url = url(&["history"])?;
+        history_url
+            .query_pairs_mut()
+            .append_pair("startHistoryId", start_history_id)
+            .append_pair("maxResults", "500");
+        if let Some(token) = page_token.as_deref() {
+            history_url
+                .query_pairs_mut()
+                .append_pair("pageToken", token);
+        }
+        let Some(response) = get_allow_not_found(client, history_url, access_token).await? else {
+            return Ok(None);
+        };
+        let page: HistoryList = response.json().await.map_err(|error| Error::Backend {
+            backend: "gmail-history".into(),
+            message: error.to_string(),
+        })?;
+        ids.extend(collect_history_ids(page.history));
+        latest_history_id = page.history_id;
+        page_token = page.next_page_token;
+        if page_token.is_none() {
+            break;
+        }
+    }
+    let mut ids: Vec<_> = ids.into_iter().collect();
+    ids.sort();
+    Ok(Some((ids, latest_history_id)))
+}
+
+async fn fetch_messages(
+    client: &Client,
+    access_token: &str,
+    ids: Vec<String>,
+) -> Result<(Vec<RawMessage>, HashSet<String>)> {
     let token = access_token.to_owned();
-    let fetched: Vec<RawMessage> = stream::iter(listed.messages)
-        .map(|message| {
+    let results: Vec<(String, Option<RawMessage>)> = stream::iter(ids)
+        .map(|id| {
             let client = client.clone();
             let token = token.clone();
             async move {
-                let mut message_url = url(&["messages", &message.id])?;
+                let mut message_url = url(&["messages", &id])?;
                 message_url.query_pairs_mut().append_pair("format", "raw");
-                request(&client, Method::GET, message_url, &token, None)
-                    .await?
-                    .json()
-                    .await
-                    .map_err(|error| Error::Backend {
-                        backend: "gmail-message".into(),
-                        message: error.to_string(),
-                    })
+                let Some(response) = get_allow_not_found(&client, message_url, &token).await?
+                else {
+                    return Ok::<_, Error>((id, None));
+                };
+                let message = response.json().await.map_err(|error| Error::Backend {
+                    backend: "gmail-message".into(),
+                    message: error.to_string(),
+                })?;
+                Ok::<_, Error>((id, Some(message)))
             }
         })
         .buffer_unordered(8)
-        .filter_map(|result| async move {
-            match result {
-                Ok(message) => Some(message),
-                Err(error) => {
-                    tracing::warn!(%error, "письмо Gmail API пропущено");
-                    None
-                }
+        .try_collect()
+        .await?;
+    let mut fetched = Vec::new();
+    let mut not_found = HashSet::new();
+    for (id, message) in results {
+        match message {
+            Some(message) => fetched.push(message),
+            None => {
+                not_found.insert(id);
             }
-        })
-        .collect()
-        .await;
+        }
+    }
+    Ok((fetched, not_found))
+}
+
+fn project_messages(
+    fetched: Vec<RawMessage>,
+    included: &HashSet<String>,
+) -> Result<Vec<DiscoveredMessage>> {
     let mut messages = Vec::new();
     for message in fetched {
-        let raw = match GMAIL_RAW_B64.decode(message.raw.as_bytes()) {
-            Ok(raw) => raw,
-            Err(error) => {
-                tracing::warn!(message_id = %message.id, %error, "Gmail raw не декодирован");
-                continue;
-            }
-        };
+        let raw = GMAIL_RAW_B64
+            .decode(message.raw.as_bytes())
+            .map_err(|error| Error::Backend {
+                backend: "gmail-message".into(),
+                message: format!("{}: raw не декодирован: {error}", message.id),
+            })?;
         let labels: HashSet<_> = message.label_ids.iter().cloned().collect();
         let mut destinations: Vec<String> = labels
             .iter()
@@ -332,11 +490,55 @@ pub async fn discover(
             });
         }
     }
+    Ok(messages)
+}
+
+pub async fn discover(
+    access_token: &str,
+    cursors: &HashMap<String, FolderSyncCursor>,
+) -> Result<ImapDiscovery> {
+    let client = client()?;
+    let mut folders = discover_folders(access_token).await?;
+    let included: HashSet<String> = folders
+        .iter()
+        .map(|folder| folder.remote_path.clone())
+        .collect();
+    let cursor = cursors
+        .values()
+        .find_map(|cursor| cursor.sync_token.as_deref());
+    let (ids, sync_token, remote_snapshot, changed_remote_ids) = if let Some(cursor) = cursor {
+        match history_delta(&client, access_token, cursor).await? {
+            Some((ids, sync_token)) => (ids.clone(), sync_token, None, ids),
+            None => {
+                let sync_token = profile_history_id(&client, access_token).await?;
+                let ids = list_all_message_ids(&client, access_token).await?;
+                (ids.clone(), sync_token, Some(ids), Vec::new())
+            }
+        }
+    } else {
+        // Read the baseline before the snapshot. Changes racing with this full
+        // load then remain visible to the next history request.
+        let sync_token = profile_history_id(&client, access_token).await?;
+        let ids = list_all_message_ids(&client, access_token).await?;
+        (ids.clone(), sync_token, Some(ids), Vec::new())
+    };
+    let (fetched, not_found) = fetch_messages(&client, access_token, ids).await?;
+    let remote_snapshot = remote_snapshot.map(|ids| {
+        ids.into_iter()
+            .filter(|id| !not_found.contains(id))
+            .collect()
+    });
+    let messages = project_messages(fetched, &included)?;
+    for folder in &mut folders {
+        folder.sync_token = Some(sync_token.clone());
+    }
     Ok(ImapDiscovery {
         folders,
         messages,
         server_uids: Vec::new(),
         reset_folders: Vec::new(),
+        remote_snapshot,
+        changed_remote_ids,
     })
 }
 
@@ -437,4 +639,78 @@ pub async fn delete_label(access_token: &str, label_id: &str) -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history_message(id: &str) -> HistoryMessage {
+        HistoryMessage {
+            message: MessageRef { id: id.into() },
+        }
+    }
+
+    #[test]
+    fn history_collects_every_change_shape_without_duplicates() {
+        let ids = collect_history_ids(vec![HistoryRecord {
+            messages: vec![MessageRef {
+                id: "direct".into(),
+            }],
+            messages_added: vec![history_message("added")],
+            messages_deleted: vec![history_message("deleted")],
+            labels_added: vec![history_message("labels"), history_message("direct")],
+            labels_removed: vec![history_message("labels")],
+        }]);
+        assert_eq!(ids.len(), 4);
+        assert!(ids.contains("direct"));
+        assert!(ids.contains("added"));
+        assert!(ids.contains("deleted"));
+        assert!(ids.contains("labels"));
+    }
+
+    #[test]
+    fn gmail_message_is_projected_to_labels_and_all_mail() {
+        let included = HashSet::from(["INBOX".into(), "ALL".into(), "TRASH".into()]);
+        let raw = b"Subject: test\r\n\r\nbody";
+        let projected = project_messages(
+            vec![RawMessage {
+                id: "remote-1".into(),
+                label_ids: vec!["INBOX".into(), "UNREAD".into()],
+                raw: GMAIL_RAW_B64.encode(raw),
+                size_estimate: raw.len() as u32,
+            }],
+            &included,
+        )
+        .expect("project message");
+        assert_eq!(projected.len(), 2);
+        assert_eq!(
+            projected
+                .iter()
+                .map(|message| message.folder_path.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from(["INBOX", "ALL"])
+        );
+        assert!(projected.iter().all(|message| !message.seen));
+        assert!(
+            projected
+                .iter()
+                .all(|message| message.remote_id.as_deref() == Some("remote-1"))
+        );
+    }
+
+    #[test]
+    fn malformed_raw_aborts_delta_instead_of_deleting_local_message() {
+        let error = project_messages(
+            vec![RawMessage {
+                id: "remote-1".into(),
+                label_ids: vec!["INBOX".into()],
+                raw: "%%%".into(),
+                size_estimate: 3,
+            }],
+            &HashSet::from(["INBOX".into()]),
+        )
+        .expect_err("invalid raw must fail the whole sync");
+        assert!(error.to_string().contains("raw не декодирован"));
+    }
 }

@@ -435,30 +435,142 @@ impl Db {
         Ok(())
     }
 
+    /// Commit opaque provider cursors only after messages and projections were
+    /// stored successfully. If an earlier step fails, the same delta is safely
+    /// requested again on the next cycle.
+    pub async fn save_folder_sync_tokens(
+        &self,
+        account_id: i64,
+        folders: &[crate::backend::DiscoveredFolder],
+    ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        for folder in folders {
+            let Some(sync_token) = folder.sync_token.as_deref() else {
+                continue;
+            };
+            sqlx::query(
+                "UPDATE folders SET sync_token=?, last_synced=datetime('now')
+                 WHERE account_id=? AND remote_path=?",
+            )
+            .bind(sync_token)
+            .bind(account_id)
+            .bind(&folder.remote_path)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn folder_sync_cursors(
         &self,
         account_id: i64,
     ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
-        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT f.remote_path, f.uidvalidity, max(m.uid)
+        let rows: Vec<(String, Option<i64>, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT f.remote_path, f.uidvalidity, max(m.uid), f.sync_token
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
-             WHERE f.account_id=? GROUP BY f.id, f.remote_path, f.uidvalidity",
+             WHERE f.account_id=? GROUP BY f.id, f.remote_path, f.uidvalidity, f.sync_token",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(path, uidvalidity, last_uid)| {
+            .map(|(path, uidvalidity, last_uid, sync_token)| {
                 (
                     path,
                     crate::backend::FolderSyncCursor {
                         uidvalidity: uidvalidity.and_then(|value| u32::try_from(value).ok()),
                         last_uid: last_uid.and_then(|value| u32::try_from(value).ok()),
+                        sync_token,
                     },
                 )
             })
             .collect())
+    }
+
+    /// Reconcile provider projections keyed by a stable remote ID. Gmail can
+    /// expose one message in several label-backed folders; a history delta may
+    /// remove one projection, add another, or delete the message completely.
+    ///
+    /// For a complete snapshot, IDs absent from `remote_snapshot` are removed.
+    /// IDs that were listed but whose body failed to load are retained, so a
+    /// transient API failure never destroys an otherwise valid local copy.
+    pub async fn reconcile_remote_projections(
+        &self,
+        account_id: i64,
+        messages: &[crate::backend::DiscoveredMessage],
+        changed_remote_ids: &[String],
+        remote_snapshot: Option<&[String]>,
+    ) -> Result<usize> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut desired: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for message in messages {
+            if let Some(remote_id) = message.remote_id.as_deref() {
+                desired
+                    .entry(remote_id)
+                    .or_default()
+                    .insert(message.folder_path.as_str());
+            }
+        }
+        let changed: HashSet<&str> = changed_remote_ids.iter().map(String::as_str).collect();
+        let snapshot: Option<HashSet<&str>> =
+            remote_snapshot.map(|ids| ids.iter().map(String::as_str).collect());
+        if changed.is_empty() && snapshot.is_none() {
+            return Ok(0);
+        }
+
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.remote_id, f.remote_path, m.raw_blob_ref
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.account_id=? AND m.remote_id IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut delete_rows = Vec::new();
+        for (id, remote_id, folder_path, raw_ref) in rows {
+            let should_check = snapshot.is_some() || changed.contains(remote_id.as_str());
+            if !should_check {
+                continue;
+            }
+            let absent_from_server = snapshot
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(remote_id.as_str()));
+            let stale_projection = desired
+                .get(remote_id.as_str())
+                .is_some_and(|paths| !paths.contains(folder_path.as_str()));
+            let confirmed_deleted = snapshot.is_none()
+                && changed.contains(remote_id.as_str())
+                && !desired.contains_key(remote_id.as_str());
+            if absent_from_server || stale_projection || confirmed_deleted {
+                delete_rows.push((id, raw_ref));
+            }
+        }
+
+        let mut tx = self.begin_write().await?;
+        let mut blob_refs = Vec::new();
+        for (id, raw_ref) in &delete_rows {
+            let attachment_refs: Vec<(Option<String>,)> =
+                sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
+            if let Some(reference) = raw_ref {
+                blob_refs.push(reference.clone());
+            }
+            sqlx::query("DELETE FROM messages WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        for reference in blob_refs {
+            let _ = self.blobs.remove(&reference);
+        }
+        Ok(delete_rows.len())
     }
 
     /// Удалить локальные письма, которых больше нет на сервере, и полностью

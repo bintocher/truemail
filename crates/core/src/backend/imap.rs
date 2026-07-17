@@ -22,12 +22,14 @@ pub struct DiscoveredFolder {
     pub uidvalidity: Option<u32>,
     pub uidnext: Option<u32>,
     pub highestmodseq: Option<u64>,
+    pub sync_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FolderSyncCursor {
     pub uidvalidity: Option<u32>,
     pub last_uid: Option<u32>,
+    pub sync_token: Option<String>,
 }
 
 #[derive(Debug)]
@@ -52,6 +54,10 @@ pub struct ImapDiscovery {
     pub messages: Vec<DiscoveredMessage>,
     pub server_uids: Vec<(String, Vec<u32>)>,
     pub reset_folders: Vec<String>,
+    /// Complete set of remote IDs, when the provider returned a full snapshot.
+    pub remote_snapshot: Option<Vec<String>>,
+    /// Remote IDs whose folder projections may have changed in this delta.
+    pub changed_remote_ids: Vec<String>,
 }
 
 struct OAuth2<'a> {
@@ -488,6 +494,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             uidvalidity: None,
             uidnext: None,
             highestmodseq: None,
+            sync_token: None,
         });
     }
     Ok(folders)
@@ -639,6 +646,8 @@ pub async fn discover_oauth_inbox(
         messages,
         server_uids: vec![(path.clone(), uids)],
         reset_folders: reset.then_some(path).into_iter().collect(),
+        remote_snapshot: None,
+        changed_remote_ids: Vec::new(),
     })
 }
 
@@ -746,6 +755,8 @@ pub async fn discover_oauth(
         messages,
         server_uids,
         reset_folders,
+        remote_snapshot: None,
+        changed_remote_ids: Vec::new(),
     })
 }
 

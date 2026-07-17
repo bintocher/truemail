@@ -217,7 +217,18 @@ impl AccountManager {
             .reconcile_imap_snapshot(account.id, &discovery.server_uids, &discovery.reset_folders)
             .await?;
         self.db
+            .reconcile_remote_projections(
+                account.id,
+                &discovery.messages,
+                &discovery.changed_remote_ids,
+                discovery.remote_snapshot.as_deref(),
+            )
+            .await?;
+        self.db
             .save_discovered_messages(account.id, &discovery.messages)
+            .await?;
+        self.db
+            .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
         Ok(discovery.messages.len())
     }
@@ -543,9 +554,35 @@ impl AccountManager {
                             .await
                         {
                             Ok(_) => {
-                                self.db
-                                    .save_discovered_messages(account.id, &imap.messages)
+                                match self
+                                    .db
+                                    .reconcile_remote_projections(
+                                        account.id,
+                                        &imap.messages,
+                                        &imap.changed_remote_ids,
+                                        imap.remote_snapshot.as_deref(),
+                                    )
                                     .await
+                                {
+                                    Ok(_) => {
+                                        match self
+                                            .db
+                                            .save_discovered_messages(account.id, &imap.messages)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                self.db
+                                                    .save_folder_sync_tokens(
+                                                        account.id,
+                                                        &imap.folders,
+                                                    )
+                                                    .await
+                                            }
+                                            Err(error) => Err(error),
+                                        }
+                                    }
+                                    Err(error) => Err(error),
+                                }
                             }
                             Err(error) => Err(error),
                         }

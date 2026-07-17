@@ -588,6 +588,98 @@ mod tests {
             .await
             .expect("fts count");
         assert_eq!(before, 1);
+
+        use crate::backend::{DiscoveredFolder, DiscoveredMessage};
+        use crate::model::FolderRole;
+        let token_folder = DiscoveredFolder {
+            remote_path: "INBOX".into(),
+            display_name: "Inbox".into(),
+            role: Some(FolderRole::Inbox),
+            unread_count: 0,
+            total_count: 2,
+            uidvalidity: None,
+            uidnext: None,
+            highestmodseq: None,
+            sync_token: Some("history-123".into()),
+        };
+        db.save_discovered_folders(account.id, std::slice::from_ref(&token_folder))
+            .await
+            .expect("save folder metadata");
+        let (token_before_commit,): (Option<String>,) =
+            sqlx::query_as("SELECT sync_token FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read pending sync token");
+        assert_eq!(token_before_commit, None);
+        db.save_folder_sync_tokens(account.id, std::slice::from_ref(&token_folder))
+            .await
+            .expect("commit sync token");
+        let (token_after_commit,): (Option<String>,) =
+            sqlx::query_as("SELECT sync_token FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read committed sync token");
+        assert_eq!(token_after_commit.as_deref(), Some("history-123"));
+
+        sqlx::query("INSERT INTO folders(account_id, remote_path, display_name) VALUES(?, 'ALL', 'All Mail')")
+            .bind(account.id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert all-mail folder");
+        let (all_folder_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND remote_path='ALL'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("all-mail folder id");
+        for (target_folder, uid, remote_id) in [
+            (folder_id, 2_i64, "remote-1"),
+            (all_folder_id, 2_i64, "remote-1"),
+            (all_folder_id, 3_i64, "remote-deleted"),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, remote_id) VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(target_folder)
+            .bind(uid)
+            .bind(remote_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert Gmail projection");
+        }
+        let desired = DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 2,
+            remote_id: Some("remote-1".into()),
+            size: None,
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: Vec::new(),
+        };
+        let removed = db
+            .reconcile_remote_projections(
+                account.id,
+                &[desired],
+                &["remote-1".into(), "remote-deleted".into()],
+                None,
+            )
+            .await
+            .expect("reconcile Gmail projections");
+        assert_eq!(removed, 2);
+        let remaining: Vec<(String, String)> = sqlx::query_as(
+            "SELECT m.remote_id, f.remote_path FROM messages m
+             JOIN folders f ON f.id=m.folder_id WHERE m.remote_id IS NOT NULL",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read remaining projections");
+        assert_eq!(remaining, vec![("remote-1".into(), "INBOX".into())]);
+
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)
             .execute(&db.write_pool)
