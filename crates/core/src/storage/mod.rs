@@ -418,11 +418,27 @@ fn escape_sql_literal(value: &str) -> String {
 mod tests {
     use super::*;
     use rand::Rng;
+    use sha2::Digest as _;
 
     fn random_key() -> [u8; 32] {
         let mut key = [0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         key
+    }
+
+    #[test]
+    fn migration_17_checksum_is_stable() {
+        let checksum =
+            sha2::Sha384::digest(include_bytes!("../../migrations/0017_mail_sync_tokens.sql"));
+        let actual = checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            actual,
+            "5fbb38197fef7288e42c44df0ccd6869e215ef42ae498c3e81b3feb6565da7c33afc70c68e865dc2b9c3937ea73c8067",
+            "applied migrations are immutable"
+        );
     }
 
     #[tokio::test]
