@@ -1257,12 +1257,19 @@ pub async fn save_smart_folders(
 pub async fn list_smart_folder_messages(
     state: State<'_, AppState>,
     smart_folder_id: String,
-    limit: usize,
+    before_date: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<usize>,
 ) -> CmdResult<Vec<MessageMeta>> {
     Ok(core(&state)
         .await?
         .db
-        .list_smart_folder_messages(&smart_folder_id, limit)
+        .list_smart_folder_messages_page(
+            &smart_folder_id,
+            before_date.as_deref(),
+            before_id,
+            limit.unwrap_or(500),
+        )
         .await?)
 }
 

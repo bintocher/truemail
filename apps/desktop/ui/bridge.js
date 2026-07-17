@@ -46,7 +46,7 @@
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
     listSmartFolders: () => invoke("list_smart_folders"),
     saveSmartFolders: (folders) => invoke("save_smart_folders", { folders }),
-    listSmartFolderMessages: (smartFolderId, limit = 5000) => invoke("list_smart_folder_messages", { smartFolderId, limit }),
+    listSmartFolderMessages: (smartFolderId, beforeDate = null, beforeId = null, limit = 500) => invoke("list_smart_folder_messages", { smartFolderId, beforeDate, beforeId, limit }),
     listUnifiedSources: () => invoke("list_unified_sources"),
     setUnifiedSource: (folderId, included) => invoke("set_unified_source", { folderId, included }),
     listMailRules: () => invoke("list_mail_rules"),

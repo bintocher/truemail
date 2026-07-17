@@ -213,18 +213,18 @@ function smartConditionMatches(message,source){const condition=normalizeSmartCon
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
-async function loadCompleteSmartCoverage(index){
-  if(loadingSmartCoverage){queuedSmartCoverageIndex=index;return;}const folder=smartFolders[index];if(!folder)return;loadingSmartCoverage=true;
-  try{const rows=await window.tm.listSmartFolderMessages(folder.id,20000);coreSmartRows.set(folder.id,rows);const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=[...byId.values()];
-  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;if(currentSmartIndex===index&&currentFolderId===null)applyListOptions(false);if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverageIndex;queuedSmartCoverageIndex=null;if(queued!==null&&queued!==index)loadCompleteSmartCoverage(queued);}
+async function loadSmartCoveragePage(index,reset=false){
+  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;
+  try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),cursor=existing.at(-1),rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE),known=new Set(existing.map(message=>message.id)),combined=[...existing,...rows.filter(message=>!known.has(message.id))];coreSmartRows.set(folder.id,combined);smartHasMore.set(folder.id,rows.length===SMART_MESSAGE_PAGE_SIZE);const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=[...byId.values()];
+  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;if(currentSmartIndex===index&&currentFolderId===null)applyListOptions(false);if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset);}
 }
-function filterSmart(index,resetScroll=true){currentSmartIndex=index;currentFolderId=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadCompleteSmartCoverage(index);}
+function filterSmart(index,resetScroll=true){currentSmartIndex=index;currentFolderId=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true);}
 
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
   coreAccounts=accounts;coreFolders=foldersByAccount.flat();messages=loadedMessages;coreContacts=contacts;coreCalendarData=calendarData;
-  coreSmartRows.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
+  coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   renderRulesList();
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
   coreFolders.forEach(folder=>folderHasMore.set(folder.id,messages.filter(message=>message.folder_id===folder.id).length===MESSAGE_INITIAL_PAGE_SIZE));

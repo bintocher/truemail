@@ -1516,7 +1516,7 @@ impl Db {
         before_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<MessageMeta>> {
-        let limit = limit.clamp(1, 200);
+        let limit = limit.clamp(1, 500);
         if before_date.is_none() || before_id.is_none() {
             return self.list_messages(folder_id, limit).await;
         }
@@ -2953,33 +2953,34 @@ impl Db {
         stable_id: &str,
         limit: usize,
     ) -> Result<Vec<MessageMeta>> {
+        self.list_smart_folder_messages_page(stable_id, None, None, limit)
+            .await
+    }
+
+    pub async fn list_smart_folder_messages_page(
+        &self,
+        stable_id: &str,
+        before_date: Option<&str>,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MessageMeta>> {
         let folder = self
             .list_smart_folders()
             .await?
             .into_iter()
             .find(|folder| folder.id == stable_id)
             .ok_or_else(|| crate::Error::Other("умная папка не найдена".into()))?;
-        let included = self
-            .list_unified_sources()
-            .await?
-            .into_iter()
-            .filter(|source| source.included)
-            .map(|source| source.folder_id)
-            .collect::<std::collections::HashSet<_>>();
-        let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
-                    from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
-                    seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
-             FROM messages
-             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
-               AND NOT EXISTS (
-                 SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                   AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
-               )
-             ORDER BY COALESCE(date, '') DESC, id DESC",
+        let included = sqlx::query_as::<_, (i64,)>(
+            "SELECT f.id FROM folders f
+             LEFT JOIN unified_sources us ON us.folder_id=f.id
+               AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
+             WHERE COALESCE(us.included, 1)=1",
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect::<std::collections::HashSet<_>>();
         let accounts = self
             .list_accounts()
             .await?
@@ -3001,24 +3002,77 @@ impl Db {
         for (message_id, name) in label_rows {
             labels.entry(message_id).or_default().push(name);
         }
+        const SCAN_PAGE_SIZE: i64 = 1_000;
+        let page_size = limit.clamp(1, 500);
+        let mut cursor = before_date
+            .zip(before_id)
+            .map(|(date, id)| (date.to_owned(), id));
         let mut result = Vec::new();
-        for row in rows {
-            let mut message = MessageMeta::from(row);
-            if !included.contains(&message.folder_id) {
-                continue;
-            }
-            message.labels = labels.remove(&message.id).unwrap_or_default();
-            if smart_folder_matches(
-                &folder,
-                &message,
-                accounts.get(&message.account_id).map(String::as_str),
-                folders.get(&message.folder_id),
-            ) {
-                result.push(message);
-                if result.len() >= limit.clamp(1, 20_000) {
-                    break;
+        loop {
+            let rows = if let Some((date, id)) = &cursor {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(date)
+                .bind(date)
+                .bind(id)
+                .bind(SCAN_PAGE_SIZE)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(SCAN_PAGE_SIZE)
+                .fetch_all(&self.pool)
+                .await?
+            };
+            let row_count = rows.len();
+            let Some(last) = rows.last() else {
+                break;
+            };
+            let next_cursor = (last.date.clone().unwrap_or_default(), last.id);
+            for row in rows {
+                let mut message = MessageMeta::from(row);
+                if !included.contains(&message.folder_id) {
+                    continue;
+                }
+                message.labels = labels.remove(&message.id).unwrap_or_default();
+                if smart_folder_matches(
+                    &folder,
+                    &message,
+                    accounts.get(&message.account_id).map(String::as_str),
+                    folders.get(&message.folder_id),
+                ) {
+                    result.push(message);
+                    if result.len() >= page_size {
+                        return Ok(result);
+                    }
                 }
             }
+            if row_count < SCAN_PAGE_SIZE as usize {
+                break;
+            }
+            cursor = Some(next_cursor);
         }
         Ok(result)
     }
