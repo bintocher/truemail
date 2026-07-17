@@ -17,7 +17,7 @@ use truemail_core::account::{
 };
 use truemail_core::api::{McpTool, mcp_tools};
 use truemail_core::model::{
-    Account, Contact, Event, Folder, MessageFull, MessageMeta, SmartFolder,
+    Account, Contact, Event, Folder, MailRule, MailRuleInput, MessageFull, MessageMeta, SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
 use zeroize::Zeroize;
@@ -1020,6 +1020,44 @@ pub async fn save_all_attachments(
 #[tauri::command]
 pub async fn list_smart_folders(state: State<'_, AppState>) -> CmdResult<Vec<SmartFolder>> {
     Ok(core(&state).await?.db.list_smart_folders().await?)
+}
+
+#[tauri::command]
+pub async fn list_mail_rules(state: State<'_, AppState>) -> CmdResult<Vec<MailRule>> {
+    Ok(core(&state).await?.db.list_mail_rules().await?)
+}
+
+#[tauri::command]
+pub async fn save_mail_rule(
+    state: State<'_, AppState>,
+    rule: MailRuleInput,
+    apply_existing: bool,
+) -> CmdResult<MailRule> {
+    let core = core(&state).await?;
+    let saved = core.db.save_mail_rule(&rule, apply_existing).await?;
+    if saved.enabled {
+        core.db.process_mail_rules().await?;
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn set_mail_rule_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db.set_mail_rule_enabled(&id, enabled).await?;
+    if enabled {
+        core.db.process_mail_rules().await?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_mail_rule(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    Ok(core(&state).await?.db.delete_mail_rule(&id).await?)
 }
 
 #[tauri::command]

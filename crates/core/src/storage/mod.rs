@@ -100,6 +100,7 @@ impl Db {
             .map_err(|e| crate::Error::Other(format!("миграции: {e}")))?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
+        self.import_legacy_mail_rules().await?;
         Ok(())
     }
 
@@ -861,6 +862,116 @@ mod tests {
             cursors.contacts_sync_token.as_deref(),
             Some("contacts-token-2")
         );
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn mail_rules_queue_each_matching_message_once() {
+        use crate::model::{
+            AuthKind, BackendKind, MailRuleInput, NewAccount, Provider, Security, ServerConfig,
+        };
+
+        let root = std::env::temp_dir().join(format!("truemail-rules-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "rules@example.test".into(),
+                display_name: "Rules test".into(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "imap.example.test".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: None,
+                ews_url: None,
+                username: Some("rules@example.test".into()),
+                secret_ref: "test-keychain-ref".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+        for (path, name, role) in [
+            ("INBOX", "Inbox", "inbox"),
+            ("Archive", "Archive", "archive"),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders(account_id, remote_path, display_name, role)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(path)
+            .bind(name)
+            .bind(role)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert folder");
+        }
+        let (inbox_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role='inbox'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("inbox id");
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject)
+             VALUES(?, ?, 42, 'alerts@example.test', 'Build failed')",
+        )
+        .bind(account.id)
+        .bind(inbox_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert matching message");
+
+        db.save_mail_rule(
+            &MailRuleInput {
+                id: "archive-alerts".into(),
+                name: "Archive alerts".into(),
+                field: "sender".into(),
+                operator: "contains".into(),
+                value: "alerts@".into(),
+                account_id: Some(account.id),
+                action: "archive".into(),
+                folder_id: None,
+                enabled: true,
+            },
+            true,
+        )
+        .await
+        .expect("save rule");
+        assert_eq!(db.process_mail_rules().await.expect("process rule"), 1);
+        assert_eq!(db.process_mail_rules().await.expect("process again"), 0);
+
+        let operations: Vec<(String, String)> =
+            sqlx::query_as("SELECT op_kind, payload FROM outbox_ops WHERE status='pending'")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read queued operation");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "move");
+        assert!(
+            operations[0]
+                .1
+                .contains("\"target_folder_path\":\"Archive\"")
+        );
+        let (progress,): (i64,) =
+            sqlx::query_as("SELECT progress_message_id FROM mail_rules WHERE id='archive-alerts'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read rule progress");
+        assert!(progress > 0);
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

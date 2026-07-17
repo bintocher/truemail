@@ -44,6 +44,10 @@
     saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
     listSmartFolders: () => invoke("list_smart_folders"),
+    listMailRules: () => invoke("list_mail_rules"),
+    saveMailRule: (rule, applyExisting) => invoke("save_mail_rule", { rule, applyExisting }),
+    setMailRuleEnabled: (id, enabled) => invoke("set_mail_rule_enabled", { id, enabled }),
+    deleteMailRule: (id) => invoke("delete_mail_rule", { id }),
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
@@ -140,6 +144,7 @@
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
       if (savedLocale && window.applyUiCatalog) window.applyUiCatalog(await window.tm.localizationCatalog(savedLocale));
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
+      await window.reloadMailRules?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
       else await loadCoreData(accounts);

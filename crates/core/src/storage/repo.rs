@@ -2060,6 +2060,355 @@ impl Db {
         Ok(())
     }
 
+    // ---------- Правила обработки почты ----------
+
+    pub async fn import_legacy_mail_rules(&self) -> Result<()> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM mail_rules")
+            .fetch_one(&self.pool)
+            .await?;
+        if count > 0 {
+            return Ok(());
+        }
+        let Some(serialized) = self.setting("mail_rules_ui").await? else {
+            return Ok(());
+        };
+        let Ok(rules) = serde_json::from_str::<Vec<serde_json::Value>>(&serialized) else {
+            tracing::warn!("старые правила UI не импортированы: JSON повреждён");
+            return Ok(());
+        };
+        let mut tx = self.begin_write().await?;
+        for (sort_order, rule) in rules.into_iter().enumerate() {
+            let string = |key: &str| rule.get(key).and_then(|value| value.as_str());
+            let Some(id) = string("id") else { continue };
+            let Some(name) = string("name") else { continue };
+            let Some(field) = string("field") else {
+                continue;
+            };
+            let Some(operator) = string("operator") else {
+                continue;
+            };
+            let Some(value) = string("value") else {
+                continue;
+            };
+            let Some(action) = string("action") else {
+                continue;
+            };
+            if !matches!(field, "sender" | "subject")
+                || !matches!(operator, "contains" | "equals")
+                || !matches!(action, "move" | "archive" | "spam" | "trash")
+            {
+                continue;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO mail_rules(
+                    id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(field)
+            .bind(operator)
+            .bind(value)
+            .bind(rule.get("account_id").and_then(|value| value.as_i64()))
+            .bind(action)
+            .bind(rule.get("folder_id").and_then(|value| value.as_i64()))
+            .bind(
+                rule.get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+            )
+            .bind(
+                rule.get("last_id")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0),
+            )
+            .bind(sort_order as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_mail_rules(&self) -> Result<Vec<MailRule>> {
+        let rows: Vec<MailRuleRow> = sqlx::query_as(
+            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+             FROM mail_rules ORDER BY sort_order, created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn save_mail_rule(
+        &self,
+        rule: &MailRuleInput,
+        apply_existing: bool,
+    ) -> Result<MailRule> {
+        if rule.id.trim().is_empty() || rule.name.trim().is_empty() || rule.value.trim().is_empty()
+        {
+            return Err(crate::Error::AccountConfig(
+                "правилу нужны id, название и значение".into(),
+            ));
+        }
+        if !matches!(rule.field.as_str(), "sender" | "subject")
+            || !matches!(rule.operator.as_str(), "contains" | "equals")
+            || !matches!(rule.action.as_str(), "move" | "archive" | "spam" | "trash")
+        {
+            return Err(crate::Error::AccountConfig(
+                "правило содержит неподдерживаемое условие или действие".into(),
+            ));
+        }
+        let mut tx = self.begin_write().await?;
+        if let Some(account_id) = rule.account_id {
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM accounts WHERE id=? AND enabled=1")
+                    .bind(account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if exists.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "аккаунт правила не найден".into(),
+                ));
+            }
+        }
+        if rule.action == "move" {
+            let account_id = rule.account_id.ok_or_else(|| {
+                crate::Error::AccountConfig("для перемещения выберите конкретный аккаунт".into())
+            })?;
+            let folder_id = rule
+                .folder_id
+                .ok_or_else(|| crate::Error::AccountConfig("папка назначения не выбрана".into()))?;
+            let target: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM folders WHERE id=? AND account_id=?")
+                    .bind(folder_id)
+                    .bind(account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if target.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "папка назначения не принадлежит аккаунту правила".into(),
+                ));
+            }
+        }
+        let existing: Option<(i64, i64)> =
+            sqlx::query_as("SELECT progress_message_id, sort_order FROM mail_rules WHERE id=?")
+                .bind(&rule.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let progress = if apply_existing {
+            0
+        } else if let Some((progress, _)) = existing {
+            progress
+        } else {
+            sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(id), 0) FROM messages")
+                .fetch_one(&mut *tx)
+                .await?
+                .0
+        };
+        let sort_order = if let Some((_, sort_order)) = existing {
+            sort_order
+        } else {
+            sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(sort_order), -1)+1 FROM mail_rules")
+                .fetch_one(&mut *tx)
+                .await?
+                .0
+        };
+        sqlx::query(
+            "INSERT INTO mail_rules(
+                id, name, field, operator, value, account_id, action, folder_id,
+                enabled, progress_message_id, sort_order
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, field=excluded.field, operator=excluded.operator,
+                value=excluded.value, account_id=excluded.account_id,
+                action=excluded.action, folder_id=excluded.folder_id,
+                enabled=excluded.enabled, progress_message_id=excluded.progress_message_id,
+                updated_at=datetime('now')",
+        )
+        .bind(&rule.id)
+        .bind(rule.name.trim())
+        .bind(&rule.field)
+        .bind(&rule.operator)
+        .bind(rule.value.trim())
+        .bind(rule.account_id)
+        .bind(&rule.action)
+        .bind((rule.action == "move").then_some(rule.folder_id).flatten())
+        .bind(rule.enabled)
+        .bind(progress)
+        .bind(sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.list_mail_rules()
+            .await?
+            .into_iter()
+            .find(|saved| saved.id == rule.id)
+            .ok_or_else(|| crate::Error::Other("сохранённое правило не найдено".into()))
+    }
+
+    pub async fn set_mail_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let changed =
+            sqlx::query("UPDATE mail_rules SET enabled=?, updated_at=datetime('now') WHERE id=?")
+                .bind(enabled)
+                .bind(id)
+                .execute(&self.write_pool)
+                .await?;
+        if changed.rows_affected() != 1 {
+            return Err(crate::Error::Other("правило не найдено".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_mail_rule(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM mail_rules WHERE id=?")
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Match new messages and atomically queue server actions together with
+    /// rule progress. A crash can therefore cause neither a skipped message nor
+    /// a duplicate operation.
+    pub async fn process_mail_rules(&self) -> Result<usize> {
+        let mut tx = self.begin_write().await?;
+        let mut rules: Vec<MailRuleRow> = sqlx::query_as(
+            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+             FROM mail_rules WHERE enabled=1 ORDER BY sort_order, created_at, id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        if rules.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let min_progress = rules
+            .iter()
+            .map(|rule| rule.progress_message_id)
+            .min()
+            .unwrap_or(0);
+        let messages: Vec<RuleMessageRow> = sqlx::query_as(
+            "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
+                    m.remote_id, m.from_name, m.from_addr, m.subject
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.id>? AND (f.role IS NULL OR f.role NOT IN
+                    ('sent','drafts','archive','spam','trash'))
+               AND NOT EXISTS (
+                    SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
+                      AND o.op_kind IN ('move','delete')
+                      AND o.status IN ('pending','processing','retry')
+               )
+             ORDER BY m.id LIMIT 500",
+        )
+        .bind(min_progress)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut queued = 0;
+        for message in messages {
+            let matching = rules.iter().position(|rule| {
+                if message.id <= rule.progress_message_id
+                    || rule.account_id.is_some_and(|id| id != message.account_id)
+                {
+                    return false;
+                }
+                let source = if rule.field == "subject" {
+                    message.subject.clone()
+                } else {
+                    format!(
+                        "{} {}",
+                        message.from_name.as_deref().unwrap_or(""),
+                        message.from_addr.as_deref().unwrap_or("")
+                    )
+                };
+                let source = source.to_lowercase();
+                let value = rule.value.to_lowercase();
+                if rule.operator == "equals" {
+                    source == value
+                } else {
+                    source.contains(&value)
+                }
+            });
+            if let Some(index) = matching {
+                let rule = &rules[index];
+                let target = if rule.action == "move" {
+                    let folder_id = rule.folder_id.ok_or_else(|| {
+                        crate::Error::AccountConfig(format!(
+                            "у правила {} нет папки назначения",
+                            rule.name
+                        ))
+                    })?;
+                    sqlx::query_as::<_, (i64, String)>(
+                        "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                    )
+                    .bind(folder_id)
+                    .bind(message.account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, (i64, String)>(
+                        "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
+                    )
+                    .bind(message.account_id)
+                    .bind(&rule.action)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                .ok_or_else(|| {
+                    crate::Error::AccountConfig(format!(
+                        "для правила {} не найдена папка назначения",
+                        rule.name
+                    ))
+                })?;
+                if target.0 != message.folder_id {
+                    let payload = serde_json::json!({
+                        "message_id": message.id,
+                        "folder_id": message.folder_id,
+                        "folder_path": message.remote_path,
+                        "uid": message.uid,
+                        "remote_id": message.remote_id,
+                        "target_folder_id": target.0,
+                        "target_folder_path": target.1,
+                        "rule_id": rule.id,
+                    });
+                    sqlx::query(
+                        "INSERT INTO outbox_ops(
+                            account_id, message_id, op_kind, payload, status, next_attempt_at
+                         ) VALUES(?, ?, 'move', ?, 'pending', datetime('now'))",
+                    )
+                    .bind(message.account_id)
+                    .bind(message.id)
+                    .bind(payload.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                    queued += 1;
+                }
+            }
+            for rule in &mut rules {
+                if message.id > rule.progress_message_id {
+                    rule.progress_message_id = message.id;
+                }
+            }
+        }
+        for rule in &rules {
+            sqlx::query(
+                "UPDATE mail_rules SET progress_message_id=?, updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(rule.progress_message_id)
+            .bind(&rule.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(queued)
+    }
+
     // ---------- Умные папки ----------
 
     pub async fn list_smart_folders(&self) -> Result<Vec<SmartFolder>> {
@@ -2339,6 +2688,52 @@ impl From<MessageRow> for MessageMeta {
             labels: Vec::new(),
         }
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct MailRuleRow {
+    id: String,
+    name: String,
+    field: String,
+    operator: String,
+    value: String,
+    account_id: Option<i64>,
+    action: String,
+    folder_id: Option<i64>,
+    enabled: i64,
+    progress_message_id: i64,
+    sort_order: i64,
+}
+
+impl From<MailRuleRow> for MailRule {
+    fn from(rule: MailRuleRow) -> Self {
+        Self {
+            id: rule.id,
+            name: rule.name,
+            field: rule.field,
+            operator: rule.operator,
+            value: rule.value,
+            account_id: rule.account_id,
+            action: rule.action,
+            folder_id: rule.folder_id,
+            enabled: rule.enabled != 0,
+            progress_message_id: rule.progress_message_id,
+            sort_order: rule.sort_order,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RuleMessageRow {
+    id: i64,
+    account_id: i64,
+    folder_id: i64,
+    uid: i64,
+    remote_path: String,
+    remote_id: Option<String>,
+    from_name: Option<String>,
+    from_addr: Option<String>,
+    subject: String,
 }
 
 #[derive(sqlx::FromRow)]

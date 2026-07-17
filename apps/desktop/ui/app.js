@@ -101,8 +101,6 @@ let activeMessage=null;
 let activeFullMessage=null;
 let mailRules=[];
 let editingRuleId=null;
-let rulesReady=false;
-let applyingMailRules=false;
 const MESSAGE_PAGE_SIZE=100;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
@@ -567,19 +565,13 @@ function ruleDescription(rule){
 }
 function renderRulesList(){
   const list=document.getElementById('rulesList');list.innerHTML='';if(!mailRules.length){list.innerHTML=`<p class="rule-empty">${L('Правил пока нет.','No rules yet.')}</p>`;return;}
-  mailRules.forEach(rule=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div><div class="rule-row-title"></div><div class="rule-row-description"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${L('Изменить','Edit')}</button>`;row.querySelector('.rule-row-title').textContent=rule.name;row.querySelector('.rule-row-description').textContent=ruleDescription(rule);row.querySelector('.toggle').onclick=()=>{rule.enabled=!rule.enabled;row.querySelector('.toggle').classList.toggle('on',rule.enabled);persistMailRules();};row.querySelector('button').onclick=()=>openRuleEditor(null,rule);list.appendChild(row);});renderIcons(list);
+  mailRules.forEach(rule=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div><div class="rule-row-title"></div><div class="rule-row-description"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${L('Изменить','Edit')}</button>`;row.querySelector('.rule-row-title').textContent=rule.name;row.querySelector('.rule-row-description').textContent=ruleDescription(rule);row.querySelector('.toggle').onclick=async()=>{try{await window.tm.setMailRuleEnabled(rule.id,!rule.enabled);await reloadMailRules();}catch(error){showToast(error.message||String(error));}};row.querySelector('button').onclick=()=>openRuleEditor(null,rule);list.appendChild(row);});renderIcons(list);
 }
-function persistMailRules(){window.tm?.setSetting('mail_rules_ui',JSON.stringify(mailRules)).catch(console.error);}
-function mailRuleMatches(message,rule){if(rule.account_id&&message.account_id!==rule.account_id)return false;const sourceRole=coreFolders.find(folder=>folder.id===message.folder_id)?.role;if(['sent','drafts','archive','spam','trash'].includes(sourceRole))return false;const raw=rule.field==='subject'?message.subject:`${message.from?.name||''} ${message.from?.email||''}`,left=String(raw||'').toLocaleLowerCase(),right=String(rule.value||'').toLocaleLowerCase();return rule.operator==='equals'?left===right:left.includes(right);}
-async function applyMailRules(){
-  if(!rulesReady||applyingMailRules||!mailRules.some(rule=>rule.enabled!==false)||!messages.length)return;applyingMailRules=true;let changed=false;
-  try{const enabled=mailRules.filter(rule=>rule.enabled!==false),progress=new Map(enabled.map(rule=>[rule.id,rule.last_id||0])),failed=new Set(),ordered=[...messages].sort((a,b)=>a.id-b.id);for(const message of ordered){let claimed=false;for(const rule of enabled){if(failed.has(rule.id)||message.id<=progress.get(rule.id))continue;if(!claimed&&mailRuleMatches(message,rule)){claimed=true;try{if(rule.action==='move')await window.tm.moveMessagesToFolder([message.id],rule.folder_id);else await window.tm.messageAction([message.id],rule.action);changed=true;}catch(error){failed.add(rule.id);console.error('mail rule',rule.name,error);continue;}}progress.set(rule.id,message.id);}}
-    enabled.forEach(rule=>{rule.last_id=progress.get(rule.id);});persistMailRules();if(changed)setTimeout(()=>window.reloadCoreData?.().catch(console.error),350);
-  }finally{applyingMailRules=false;}
-}
+async function reloadMailRules(){mailRules=await window.tm.listMailRules();renderRulesList();}
+window.reloadMailRules=reloadMailRules;
 document.getElementById('ruleNew').onclick=()=>openRuleEditor();document.getElementById('ruleCancel').onclick=closeRuleEditor;ruleAccount.onchange=()=>populateRuleTargets();ruleAction.onchange=updateRuleActionFields;document.getElementById('ruleField').onchange=event=>{if(editingRuleId!==null)return;const value=event.target.value==='subject'?ruleEditor.dataset.sourceSubject:ruleEditor.dataset.sourceSender;if(value)document.getElementById('ruleValue').value=value;};
-document.getElementById('ruleSave').onclick=()=>{const name=document.getElementById('ruleName').value.trim(),value=document.getElementById('ruleValue').value.trim(),accountValue=ruleAccount.value,action=ruleAction.value,folderId=action==='move'?Number(ruleTarget.value):null;if(!name||!value){showToast(L('Заполните название и значение условия','Fill in the name and condition value'));return;}if(action==='move'&&!folderId){showToast(L('Выберите папку назначения','Choose a destination folder'));return;}const existing=mailRules.find(rule=>rule.id===editingRuleId),applyExisting=document.getElementById('ruleExisting').checked,maxId=messages.reduce((max,message)=>Math.max(max,message.id),0),rule={...(existing||{}),id:existing?.id||`rule-${Date.now()}`,name,field:document.getElementById('ruleField').value,operator:document.getElementById('ruleOperator').value,value,account_id:accountValue==='all'?null:Number(accountValue),action,folder_id:folderId,enabled:existing?.enabled??true,last_id:applyExisting?0:(existing?.last_id??maxId)};if(existing)mailRules[mailRules.indexOf(existing)]=rule;else mailRules.push(rule);persistMailRules();renderRulesList();closeRuleEditor();applyMailRules();showToast(L('Правило сохранено','Rule saved'));};
-document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило «${rule.name}»?`,`Delete the rule "${rule.name}"?`)))return;mailRules=mailRules.filter(item=>item!==rule);persistMailRules();renderRulesList();closeRuleEditor();};
+document.getElementById('ruleSave').onclick=async()=>{const name=document.getElementById('ruleName').value.trim(),value=document.getElementById('ruleValue').value.trim(),accountValue=ruleAccount.value,action=ruleAction.value,folderId=action==='move'?Number(ruleTarget.value):null;if(!name||!value){showToast(L('Заполните название и значение условия','Fill in the name and condition value'));return;}if(action==='move'&&!folderId){showToast(L('Выберите папку назначения','Choose a destination folder'));return;}const existing=mailRules.find(rule=>rule.id===editingRuleId),applyExisting=document.getElementById('ruleExisting').checked,rule={id:existing?.id||`rule-${Date.now()}`,name,field:document.getElementById('ruleField').value,operator:document.getElementById('ruleOperator').value,value,account_id:accountValue==='all'?null:Number(accountValue),action,folder_id:folderId,enabled:existing?.enabled??true};try{await window.tm.saveMailRule(rule,applyExisting);await reloadMailRules();closeRuleEditor();showToast(L('Правило сохранено','Rule saved'));setTimeout(()=>window.reloadCoreData?.().catch(console.error),350);}catch(error){showToast(error.message||String(error));}};
+document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило «${rule.name}»?`,`Delete the rule "${rule.name}"?`)))return;try{await window.tm.deleteMailRule(rule.id);await reloadMailRules();closeRuleEditor();}catch(error){showToast(error.message||String(error));}};
 
 /* smart folders management list */
 const builtinSmartDefaults=[
@@ -1171,7 +1163,6 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   if(storage)applyStorageStatus(storage);
   if(Object.keys(uiCatalog).length)applyUiCatalog(uiCatalog);
   requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;msgsEl.scrollTop=messageScroll;});
-  applyMailRules().catch(console.error);
 };
 let accountOauthState='';
 function isExpiredOauthCode(error){return /invalid_grant|code has expired|verification code.*expired/i.test(error?.message||String(error));}
@@ -1454,8 +1445,6 @@ window.applyCoreSettings=function(settings){
   if(settings.ui_scale)setUiScale(settings.ui_scale,false);
   if(settings.toolbar_layout){try{const state=JSON.parse(settings.toolbar_layout);state.actions?.forEach(action=>{const row=tbList.querySelector(`[data-action="${action.key}"]`);if(row){row.classList.toggle('off',!action.visible);row.querySelector('.toggle').classList.toggle('on',action.visible);row.dataset.labels=action.labels||state.labels||'text';row.querySelector('.action-label-mode').textContent=row.dataset.labels==='icons'?'Только значок':'Значок + текст';tbList.appendChild(row);}});document.querySelectorAll('#toolbarAlign button').forEach(b=>b.classList.toggle('on',b.dataset.align===state.align));applyToolbar();}catch(e){console.error(e);}}
   if(settings.smart_folders_ui){try{const saved=JSON.parse(settings.smart_folders_ui);smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(saved));renderSmartManagement();bindSmartNavigation();persistSmartFolders();}catch(e){console.error(e);}}
-  if(settings.mail_rules_ui){try{const saved=JSON.parse(settings.mail_rules_ui);mailRules=Array.isArray(saved)?saved:[];}catch(e){console.error(e);mailRules=[];}}
-  rulesReady=true;renderRulesList();
   if(settings.composer_draft){try{window.pendingComposerDraft=JSON.parse(settings.composer_draft);}catch(e){console.error(e);}}
   if(settings.search_history){try{const saved=JSON.parse(settings.search_history);if(Array.isArray(saved))searchHistory=saved.filter(value=>typeof value==='string').slice(0,10);}catch(e){console.error(e);}}
 };

@@ -6,12 +6,14 @@ mod contact;
 mod event;
 mod folder;
 mod message;
+mod rule;
 
 pub use account::*;
 pub use contact::*;
 pub use event::*;
 pub use folder::*;
 pub use message::*;
+pub use rule::*;
 
 use serde::{Deserialize, Serialize};
 

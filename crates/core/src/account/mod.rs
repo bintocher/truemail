@@ -233,6 +233,9 @@ impl AccountManager {
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
+        if let Err(error) = self.db.process_mail_rules().await {
+            tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
+        }
         Ok(discovery.messages.len())
     }
 
@@ -576,12 +579,24 @@ impl AccountManager {
                                             .await
                                         {
                                             Ok(()) => {
-                                                self.db
+                                                match self
+                                                    .db
                                                     .save_folder_sync_tokens(
                                                         account.id,
                                                         &imap.folders,
                                                     )
                                                     .await
+                                                {
+                                                    Ok(()) => {
+                                                        if let Err(error) =
+                                                            self.db.process_mail_rules().await
+                                                        {
+                                                            tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
+                                                        }
+                                                        Ok(())
+                                                    }
+                                                    Err(error) => Err(error),
+                                                }
                                             }
                                             Err(error) => Err(error),
                                         }
