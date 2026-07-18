@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "apps/desktop/src-tauri",
 ]
+exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,14 +26,17 @@ tracing-appender = "0.2.3"
 socket2 = "0.6.5"
 rfd = "0.17.2"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
-# Последняя версия, совместимая с диапазоном sqlx 0.9 (`<0.38`). Фича
-# статически собирает SQLCipher и OpenSSL для одинакового поведения на платформах.
+# SQLx 0.9 требует libsqlite3-sys <0.38. Локальный patch сохраняет совместимый
+# Rust API 0.37.0, но собирает SQLCipher 4.17.0 / SQLite 3.53.3 из vendor.
+# Фича статически собирает SQLCipher и OpenSSL одинаково на всех платформах.
 libsqlite3-sys = { version = "0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 uuid = { version = "1.23.5", features = ["v4", "serde"] }
+axum = "0.8.8"
 
 # почтовые протоколы и парсинг (см. docs/04-tech-stack.md)
-async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio"] }
+async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
+imap-proto = "0.16.7"
 mail-parser = "0.11.5"
 lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "pool", "builder", "hostname", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs"] }
 futures = "0.3.32"
@@ -53,10 +57,12 @@ quoted_printable = "0.5.2"
 keyring = "4.1.4"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
+argon2 = "0.5.3"
 
-# локализация (Fluent, см. docs/10-design.md)
-fluent = "0.17.0"
-unic-langid = { version = "0.9.6", features = ["macros"] }
+[patch.crates-io]
+# libsqlite3-sys 0.38.x не удовлетворяет диапазону SQLx 0.9 (`<0.38`).
+# Этот совместимый patch обновляет только bundled SQLCipher amalgamation.
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
 
 [profile.release]
 opt-level = 3

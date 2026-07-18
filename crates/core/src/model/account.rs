@@ -58,6 +58,7 @@ pub struct Account {
     pub imap: Option<ServerConfig>,
     pub smtp: Option<ServerConfig>,
     pub ews_url: Option<String>,
+    pub jmap_url: Option<String>,
     pub username: Option<String>,
     /// Имя записи в системном keychain; сам секрет в SQLite не хранится.
     #[serde(skip_serializing)]
@@ -81,6 +82,7 @@ pub struct NewAccount {
     pub imap: Option<ServerConfig>,
     pub smtp: Option<ServerConfig>,
     pub ews_url: Option<String>,
+    pub jmap_url: Option<String>,
     pub username: Option<String>,
     pub secret_ref: String,
     pub color: Option<String>,

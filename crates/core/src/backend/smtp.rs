@@ -1,5 +1,6 @@
 //! Отправка почты через SMTP XOAUTH2.
 
+use crate::model::Security;
 use crate::{Error, Result};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
@@ -24,7 +25,7 @@ pub struct OutgoingMessage {
     pub attachments: Vec<OutgoingAttachment>,
 }
 
-fn build_message(message: OutgoingMessage) -> Result<Message> {
+pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
@@ -36,6 +37,7 @@ fn build_message(message: OutgoingMessage) -> Result<Message> {
     }
     let mut builder = Message::builder()
         .from(mailbox(&message.from)?)
+        .message_id(None)
         .subject(message.subject);
     for address in &message.to {
         builder = builder.to(mailbox(address)?);
@@ -81,11 +83,33 @@ pub async fn send_oauth(
     access_token: &str,
     host: &str,
     port: u16,
+    security: Security,
 ) -> Result<()> {
+    send_oauth_with_raw(message, access_token, host, port, security)
+        .await
+        .map(|_| ())
+}
+
+/// Отправить MIME через SMTP и вернуть ровно те байты, которые были переданы
+/// серверу. Они нужны IMAP-клиентам для APPEND той же копии в `\Sent`: повторная
+/// сборка MIME дала бы другой Message-ID и другие границы multipart.
+pub(crate) async fn send_oauth_with_raw(
+    message: OutgoingMessage,
+    access_token: &str,
+    host: &str,
+    port: u16,
+    security: Security,
+) -> Result<Vec<u8>> {
     let from = message.from.clone();
     let email = build_message(message)?;
+    let raw = email.formatted();
     let credentials = Credentials::new(from, access_token.to_owned());
-    let transport = AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    let builder = if security == Security::Starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    };
+    let transport = builder
         .map_err(|error| Error::Backend {
             backend: "smtp".into(),
             message: error.to_string(),
@@ -96,17 +120,17 @@ pub async fn send_oauth(
         .timeout(Some(std::time::Duration::from_secs(30)))
         .build();
     transport
-        .send(email)
+        .send_raw(email.envelope(), &raw)
         .await
         .map_err(|error| Error::Backend {
             backend: "smtp".into(),
             message: error.to_string(),
         })?;
-    Ok(())
+    Ok(raw)
 }
 
 pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
-    send_oauth(message, access_token, "smtp.yandex.com", 465).await
+    send_oauth(message, access_token, "smtp.yandex.com", 465, Security::Ssl).await
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
@@ -134,6 +158,58 @@ pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<
     Ok(())
 }
 
+pub async fn send_password(
+    message: OutgoingMessage,
+    username: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    security: Security,
+) -> Result<()> {
+    send_password_with_raw(message, username, password, host, port, security)
+        .await
+        .map(|_| ())
+}
+
+pub(crate) async fn send_password_with_raw(
+    message: OutgoingMessage,
+    username: &str,
+    password: &str,
+    host: &str,
+    port: u16,
+    security: Security,
+) -> Result<Vec<u8>> {
+    if security == Security::None {
+        return Err(Error::AccountConfig(
+            "незашифрованный SMTP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
+        ));
+    }
+    let email = build_message(message)?;
+    let raw = email.formatted();
+    let builder = if security == Security::Starttls {
+        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
+    } else {
+        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    }
+    .map_err(|error| Error::Backend {
+        backend: "smtp".into(),
+        message: error.to_string(),
+    })?;
+    let transport = builder
+        .port(port)
+        .credentials(Credentials::new(username.to_owned(), password.to_owned()))
+        .timeout(Some(std::time::Duration::from_secs(30)))
+        .build();
+    transport
+        .send_raw(email.envelope(), &raw)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "smtp".into(),
+            message: error.to_string(),
+        })?;
+    Ok(raw)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +228,26 @@ mod tests {
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         assert!(runtime.block_on(send_yandex(message, "token")).is_err());
+    }
+
+    #[test]
+    fn built_message_has_stable_id_for_append_deduplication() {
+        let raw = build_message(OutgoingMessage {
+            from: "me@example.com".into(),
+            to: vec!["you@example.com".into()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "test".into(),
+            body_text: "body".into(),
+            body_html: None,
+            attachments: vec![],
+        })
+        .expect("message")
+        .formatted();
+        let headers = String::from_utf8_lossy(&raw);
+        assert!(headers.lines().any(|line| {
+            line.get(..11)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Message-ID:"))
+        }));
     }
 }

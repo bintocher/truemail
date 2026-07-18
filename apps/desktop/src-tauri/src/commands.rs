@@ -5,21 +5,30 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    str::FromStr,
     sync::Arc,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut};
 use tauri_plugin_shell::ShellExt;
+use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::account::{
-    ContactInput, EventInput, RemoteObject, configured_google_client_id,
-    configured_google_client_secret, configured_yandex_client_id,
+    ContactInput, EventInput, InboxSyncResult, RemoteObject, configured_google_client_id,
+    configured_google_client_secret, configured_microsoft_client_id, configured_microsoft_tenant,
+    configured_yandex_client_id, configured_yandex_redirect_uri,
 };
-use truemail_core::api::{McpTool, mcp_tools};
+use truemail_core::api::{
+    ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
+};
 use truemail_core::model::{
-    Account, Contact, Event, Folder, MessageFull, MessageMeta, SmartFolder,
+    Account, AuthKind, BackendKind, Contact, Event, Folder, Keybinding, MailRule, MailRuleInput,
+    MessageFull, MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature,
+    SmartFolder,
 };
 use truemail_core::storage::repo::CalendarSummary;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
 pub struct AppState {
@@ -31,6 +40,8 @@ pub struct AppState {
     pub syncing_aux: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    pub api_server: Arc<tokio::sync::Mutex<Option<truemail_core::api::RunningApiServer>>>,
+    pub shortcut_actions: Arc<std::sync::RwLock<HashMap<String, String>>>,
     // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
     // действительно завершает приложение, а не сворачивает в трей.
     pub quitting: Arc<std::sync::atomic::AtomicBool>,
@@ -39,6 +50,54 @@ pub struct AppState {
     // Куда прижимать окно уведомлений; кэш настройки notify_position,
     // чтобы позиционирование не лезло в БД (оно синхронное).
     pub notify_anchor: Arc<std::sync::Mutex<NotifyAnchor>>,
+}
+
+pub fn default_keybindings() -> Vec<Keybinding> {
+    [
+        ("toggle_window", "global", "Ctrl+Shift+M"),
+        ("compose_global", "global", "Ctrl+Shift+C"),
+        ("quick_search", "global", "Ctrl+Shift+F"),
+        ("palette", "local", "Ctrl+K"),
+        ("compose", "local", "C"),
+        ("reply", "local", "R"),
+        ("reply_all", "local", "A"),
+        ("forward", "local", "F"),
+        ("archive", "local", "E"),
+        ("snooze", "local", "H"),
+        ("next_message", "local", "J"),
+        ("prev_message", "local", "K"),
+        ("delete", "local", "Del"),
+    ]
+    .into_iter()
+    .map(|(action, scope, combo)| Keybinding {
+        action: action.into(),
+        scope: scope.into(),
+        combo: combo.into(),
+    })
+    .collect()
+}
+
+pub fn register_global_shortcuts(app: &AppHandle, bindings: &[Keybinding]) -> anyhow::Result<()> {
+    let manager = app.global_shortcut();
+    manager.unregister_all()?;
+    let mut actions = HashMap::new();
+    for binding in bindings.iter().filter(|binding| binding.scope == "global") {
+        let emitted = match binding.action.as_str() {
+            "toggle_window" => "toggle",
+            "compose_global" => "compose",
+            "quick_search" => "search",
+            _ => continue,
+        };
+        let shortcut = Shortcut::from_str(&binding.combo)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", binding.combo))?;
+        manager.register(shortcut)?;
+        actions.insert(shortcut.to_string(), emitted.to_owned());
+    }
+    *app.state::<AppState>()
+        .shortcut_actions
+        .write()
+        .map_err(|_| anyhow::anyhow!("блокировка горячих клавиш повреждена"))? = actions;
+    Ok(())
 }
 
 /// Угол экрана для окна уведомлений.
@@ -83,7 +142,7 @@ impl NotifyAnchor {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PendingOAuth {
     email: String,
     verifier: String,
@@ -95,6 +154,18 @@ pub struct PendingOAuthResponse {
     mode: String,
     state: Option<String>,
     connected: Option<ConnectedAccount>,
+    password_config: Option<PasswordConnectionInfo>,
+}
+
+#[derive(Serialize)]
+pub struct PasswordConnectionInfo {
+    provider: Provider,
+    backend_kind: BackendKind,
+    username: String,
+    imap: Option<ServerConfig>,
+    smtp: Option<ServerConfig>,
+    jmap_url: Option<String>,
+    ews_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -109,7 +180,7 @@ pub struct ConnectedAccount {
 
 #[derive(Serialize)]
 pub struct ApiError {
-    message: String,
+    pub(crate) message: String,
 }
 
 impl From<truemail_core::Error> for ApiError {
@@ -121,6 +192,106 @@ impl From<truemail_core::Error> for ApiError {
 }
 
 type CmdResult<T> = Result<T, ApiError>;
+
+fn api_error(message: impl Into<String>) -> ApiError {
+    ApiError {
+        message: message.into(),
+    }
+}
+
+const DEFAULT_UPDATE_ENDPOINT: &str = "https://chernov.gitverse.site/truemail/latest.json";
+
+fn update_manifest_endpoint() -> CmdResult<url::Url> {
+    let value = std::env::var("TRUEMAIL_UPDATE_ENDPOINT")
+        .unwrap_or_else(|_| DEFAULT_UPDATE_ENDPOINT.to_owned());
+    url::Url::parse(value.trim())
+        .map_err(|error| api_error(format!("адрес манифеста обновлений: {error}")))
+}
+
+async fn available_update(app: &AppHandle) -> CmdResult<Option<Update>> {
+    let endpoint = update_manifest_endpoint()?;
+    app.updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|error| api_error(error.to_string()))?
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| api_error(error.to_string()))?
+        .check()
+        .await
+        .map_err(|error| api_error(format!("проверка обновления: {error}")))
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UpdateInfo {
+    current_version: String,
+    available_version: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateProgress {
+    event: &'static str,
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> CmdResult<UpdateInfo> {
+    let update = available_update(&app).await?;
+    Ok(UpdateInfo {
+        current_version: app.package_info().version.to_string(),
+        available_version: update.as_ref().map(|value| value.version.clone()),
+        notes: update.and_then(|value| value.body),
+    })
+}
+
+pub async fn announce_available_update(app: AppHandle) -> CmdResult<()> {
+    let info = check_for_update(app.clone()).await?;
+    if info.available_version.is_some() {
+        let _ = app.emit("truemail-update-available", info);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> CmdResult<()> {
+    let Some(update) = available_update(&app).await? else {
+        return Err(api_error("новая версия уже не найдена"));
+    };
+    let progress_app = app.clone();
+    let finished_app = app.clone();
+    let mut downloaded = 0_u64;
+    update
+        .download_and_install(
+            move |chunk, total| {
+                downloaded = downloaded.saturating_add(chunk as u64);
+                let _ = progress_app.emit(
+                    "truemail-update-progress",
+                    UpdateProgress {
+                        event: "progress",
+                        downloaded,
+                        total,
+                    },
+                );
+            },
+            move || {
+                let _ = finished_app.emit(
+                    "truemail-update-progress",
+                    UpdateProgress {
+                        event: "finished",
+                        downloaded: 0,
+                        total: None,
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|error| api_error(format!("установка обновления: {error}")))?;
+    app.state::<AppState>()
+        .quitting
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    app.restart();
+}
 
 #[derive(Serialize)]
 pub struct BootstrapStatus {
@@ -171,12 +342,14 @@ async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
 /// Данные уходят в webview-окно "notify", которое рисует карточку с кнопками.
 fn push_notification(app: &AppHandle, payload: serde_json::Value) {
     position_notify_window(app);
-    let _ = app.emit_to("notify", "notify-push", payload);
+    let emitted = app.emit_to("notify", "notify-push", payload).is_ok();
+    let mut shown = false;
     if let Some(window) = app.get_webview_window("notify") {
         // Пока окно показано, курсор ему нужен - иначе кнопки карточки не нажать.
         let _ = window.set_ignore_cursor_events(false);
-        let _ = window.show();
+        shown = window.show().is_ok();
     }
+    tracing::info!(emitted, shown, "desktop notification dispatched");
 }
 
 /// Прижать окно уведомлений к выбранному пользователем углу основного монитора.
@@ -296,56 +469,100 @@ async fn notify_new_mail(
     push_notification(app, payload);
 }
 
+/// Первый EWS-снимок создаёт локальную базовую линию и не должен вываливать
+/// пользователю историю ящика. После появления SyncState уведомляем только о
+/// remote ID, которых до прохода не было в БД.
+fn exchange_notification_count(result: InboxSyncResult) -> Option<usize> {
+    (result.had_baseline && result.new_messages > 0).then_some(result.new_messages)
+}
+
 /// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
-/// уведомление и дозагрузка при появлении новых (IMAP IDLE к Gmail недоступен).
+/// уведомление и дозагрузка при появлении новых. Gmail API push требует
+/// внешней Cloud Pub/Sub-инфраструктуры, которой у desktop-only клиента нет.
+fn observe_gmail_message_ids(
+    observed: &mut HashMap<i64, HashSet<String>>,
+    account_id: i64,
+    ids: Vec<String>,
+) -> Option<Vec<String>> {
+    use std::collections::hash_map::Entry;
+    match observed.entry(account_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(ids.into_iter().collect());
+            None
+        }
+        Entry::Occupied(mut entry) => {
+            let seen = entry.get_mut();
+            let fresh = ids
+                .iter()
+                .filter(|id| !seen.contains(*id))
+                .cloned()
+                .collect();
+            seen.extend(ids);
+            Some(fresh)
+        }
+    }
+}
+
 async fn gmail_realtime_loop(
     core: Arc<Core>,
     app: AppHandle,
     syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
 ) {
-    let mut notified: HashSet<String> = HashSet::new();
+    let mut observed: HashMap<i64, HashSet<String>> = HashMap::new();
+    let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
         let accounts = match core.db.list_accounts().await {
             Ok(accounts) => accounts,
-            Err(_) => continue,
+            Err(_) => {
+                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                continue;
+            }
         };
         for account in accounts {
             if account.provider != truemail_core::model::Provider::Gmail {
                 continue;
             }
-            let new_ids = match core.accounts.gmail_new_message_ids(&account).await {
+            let latest_ids = match core.accounts.gmail_latest_message_ids(&account).await {
                 Ok(ids) => ids,
                 Err(_) => continue,
             };
-            // Уведомляем только о письмах, о которых ещё не сообщали (до тех пор,
-            // пока дозагрузка не запишет их в БД и они не перестанут быть "новыми").
-            let fresh: Vec<String> = new_ids
-                .into_iter()
-                .filter(|id| !notified.contains(id))
-                .collect();
-            if fresh.is_empty() {
+            // Первый снимок — только исходная точка. Наличие письма в Gmail, но
+            // отсутствие его в ещё заполняющейся локальной БД не делает письмо новым.
+            let Some(fresh) = observe_gmail_message_ids(&mut observed, account.id, latest_ids)
+            else {
+                tracing::debug!(account = %account.email, "Gmail realtime: исходный снимок сохранён");
+                continue;
+            };
+            if !fresh.is_empty() {
+                pending.entry(account.id).or_default().extend(fresh);
+            }
+            let pending_count = pending.get(&account.id).map(HashSet::len).unwrap_or(0);
+            if pending_count == 0 {
                 continue;
             }
-            for id in &fresh {
-                notified.insert(id.clone());
-            }
-            // Сначала дозагружаем (если свободно), чтобы уведомление показало
-            // отправителя и тему нового письма, а не общий счётчик.
+            // Если стартовая или ручная синхронизация ещё идёт, сохраняем новые
+            // ID в pending и ждём. Показывать последнее старое письмо из БД нельзя.
             let free = {
                 let mut guard = syncing.lock().await;
                 guard.insert(account.id)
             };
-            if free {
-                let _ = core.accounts.sync_mail_inbox(&account).await;
-                syncing.lock().await.remove(&account.id);
-                let _ = app.emit("truemail-data-changed", account.id);
+            if !free {
+                continue;
             }
-            notify_new_mail(&app, &core, &account, fresh.len()).await;
+            let synced = core.accounts.sync_mail_inbox(&account).await;
+            syncing.lock().await.remove(&account.id);
+            match synced {
+                Ok(_) => {
+                    pending.remove(&account.id);
+                    let _ = app.emit("truemail-data-changed", account.id);
+                    notify_new_mail(&app, &core, &account, pending_count).await;
+                }
+                Err(error) => {
+                    tracing::warn!(account = %account.email, %error, "Gmail realtime: не удалось загрузить новые письма");
+                }
+            }
         }
-        if notified.len() > 500 {
-            notified.clear();
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
     }
 }
 
@@ -572,6 +789,98 @@ pub async fn initialize_storage(
 }
 
 #[tauri::command]
+pub async fn export_key_backup(
+    state: State<'_, AppState>,
+    path: String,
+    mut password: String,
+) -> CmdResult<()> {
+    let _ = core(&state).await?;
+    let path = PathBuf::from(path.trim());
+    if !path.is_absolute() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Выберите полный путь для резервной копии".into(),
+        });
+    }
+    let backup = tokio::task::spawn_blocking(move || {
+        let result = truemail_core::crypto::export_key_backup(&password);
+        password.zeroize();
+        result
+    })
+    .await
+    .map_err(|error| ApiError {
+        message: format!("Создание резервной копии прервано: {error}"),
+    })??;
+    std::fs::write(&path, backup).map_err(|error| ApiError {
+        message: format!("Не удалось записать резервную копию: {error}"),
+    })?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn restore_key_backup(
+    state: State<'_, AppState>,
+    data_dir: String,
+    backup_path: String,
+    mut password: String,
+) -> CmdResult<()> {
+    if state.core.read().await.is_some() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Хранилище уже открыто; существующие ключи не перезаписываются".into(),
+        });
+    }
+    let data_dir = PathBuf::from(data_dir.trim());
+    let backup_path = PathBuf::from(backup_path.trim());
+    if !data_dir.is_absolute() || !backup_path.is_absolute() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "Выберите полные пути к архиву и резервной копии".into(),
+        });
+    }
+    if !data_dir.join("truemail.db").is_file() {
+        password.zeroize();
+        return Err(ApiError {
+            message: "В выбранной папке нет truemail.db".into(),
+        });
+    }
+    let serialized = std::fs::read_to_string(&backup_path).map_err(|error| {
+        password.zeroize();
+        ApiError {
+            message: format!("Не удалось прочитать резервную копию: {error}"),
+        }
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let result = truemail_core::crypto::restore_key_backup(&serialized, &password);
+        password.zeroize();
+        result
+    })
+    .await
+    .map_err(|error| ApiError {
+        message: format!("Восстановление ключей прервано: {error}"),
+    })??;
+
+    let opened = async {
+        truemail_core::crypto::store_data_dir(&data_dir)?;
+        Core::bootstrap(data_dir.clone()).await
+    }
+    .await;
+    let opened = match opened {
+        Ok(core) => Arc::new(core),
+        Err(error) => {
+            let _ = truemail_core::crypto::remove_installation_keys();
+            return Err(ApiError {
+                message: format!(
+                    "Ключи расшифрованы, но архив не открылся; восстановление отменено: {error}"
+                ),
+            });
+        }
+    };
+    *state.core.write().await = Some(opened);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>> {
     Ok(core(&state).await?.db.list_accounts().await?)
 }
@@ -777,6 +1086,22 @@ pub async fn message_raw(state: State<'_, AppState>, message_id: i64) -> CmdResu
     Ok(core.db.message_raw(message_id).await?)
 }
 
+/// Экспортировать исходный RFC 5322/MIME без перекодирования.
+#[tauri::command]
+pub async fn export_message_eml(
+    state: State<'_, AppState>,
+    message_id: i64,
+    dest_path: String,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.accounts.ensure_message_raw(message_id).await?;
+    let raw = core.db.message_raw_bytes(message_id).await?;
+    std::fs::write(&dest_path, raw).map_err(|error| ApiError {
+        message: format!("не удалось сохранить .eml: {error}"),
+    })?;
+    Ok(())
+}
+
 /// Одношаговая отписка (RFC 8058) - POST на List-Unsubscribe URL.
 #[tauri::command]
 pub async fn unsubscribe_one_click(url: String) -> CmdResult<u16> {
@@ -930,6 +1255,92 @@ pub async fn list_smart_folders(state: State<'_, AppState>) -> CmdResult<Vec<Sma
 }
 
 #[tauri::command]
+pub async fn save_smart_folders(
+    state: State<'_, AppState>,
+    folders: Vec<SmartFolder>,
+) -> CmdResult<()> {
+    Ok(core(&state).await?.db.save_smart_folders(&folders).await?)
+}
+
+#[tauri::command]
+pub async fn list_smart_folder_messages(
+    state: State<'_, AppState>,
+    smart_folder_id: String,
+    before_date: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<usize>,
+) -> CmdResult<Vec<MessageMeta>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_smart_folder_messages_page(
+            &smart_folder_id,
+            before_date.as_deref(),
+            before_id,
+            limit.unwrap_or(500),
+        )
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_unified_sources(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::model::UnifiedSource>> {
+    Ok(core(&state).await?.db.list_unified_sources().await?)
+}
+
+#[tauri::command]
+pub async fn set_unified_source(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    included: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_unified_source(folder_id, included)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_mail_rules(state: State<'_, AppState>) -> CmdResult<Vec<MailRule>> {
+    Ok(core(&state).await?.db.list_mail_rules().await?)
+}
+
+#[tauri::command]
+pub async fn save_mail_rule(
+    state: State<'_, AppState>,
+    rule: MailRuleInput,
+    apply_existing: bool,
+) -> CmdResult<MailRule> {
+    let core = core(&state).await?;
+    let saved = core.db.save_mail_rule(&rule, apply_existing).await?;
+    if saved.enabled {
+        core.db.process_mail_rules().await?;
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn set_mail_rule_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db.set_mail_rule_enabled(&id, enabled).await?;
+    if enabled {
+        core.db.process_mail_rules().await?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_mail_rule(state: State<'_, AppState>, id: String) -> CmdResult<()> {
+    Ok(core(&state).await?.db.delete_mail_rule(&id).await?)
+}
+
+#[tauri::command]
 pub async fn list_contacts(
     state: State<'_, AppState>,
     query: Option<String>,
@@ -1017,6 +1428,19 @@ pub async fn list_calendar_data(state: State<'_, AppState>) -> CmdResult<Calenda
     Ok(CalendarData { calendars, events })
 }
 
+#[tauri::command]
+pub async fn set_calendar_visible(
+    state: State<'_, AppState>,
+    calendar_id: i64,
+    visible: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_calendar_visible(calendar_id, visible)
+        .await?)
+}
+
 async fn account_by_id(core: &Core, account_id: i64) -> CmdResult<Account> {
     core.db
         .list_accounts()
@@ -1035,6 +1459,11 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
         }
         truemail_core::model::Provider::Gmail => {
             core.accounts.sync_google_auxiliary_account(account).await?;
+        }
+        truemail_core::model::Provider::Exchange => {
+            core.accounts
+                .sync_exchange_auxiliary_account(account)
+                .await?;
         }
         _ => {
             return Err(ApiError {
@@ -1164,6 +1593,11 @@ pub async fn create_contact(
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
+    if !matches!(account.provider, Provider::Gmail | Provider::Yandex) {
+        core.db.save_local_contact(account_id, None, &input).await?;
+        let _ = app.emit("truemail-data-changed", account_id);
+        return Ok(());
+    }
     let stored_collection: Option<(String,)> = sqlx::query_as(
         "SELECT url FROM auxiliary_collections WHERE account_id=? AND kind='carddav' LIMIT 1",
     )
@@ -1222,6 +1656,13 @@ pub async fn update_contact(
             .await
             .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
+    if row.2.is_none() {
+        core.db
+            .save_local_contact(account.id, Some(contact_id), &input)
+            .await?;
+        let _ = app.emit("truemail-data-changed", account.id);
+        return Ok(());
+    }
     let token = core.accounts.oauth_access_token(&account).await?;
     truemail_core::account::write_contact(
         account.provider,
@@ -1255,9 +1696,11 @@ pub async fn delete_contact(
             .await
             .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
-    let remote_url = row.1.as_deref().ok_or_else(|| ApiError {
-        message: "У контакта нет серверного идентификатора".into(),
-    })?;
+    let Some(remote_url) = row.1.as_deref() else {
+        core.db.hide_local_contact(contact_id).await?;
+        let _ = app.emit("truemail-data-changed", account.id);
+        return Ok(());
+    };
     let token = core.accounts.oauth_access_token(&account).await?;
     truemail_core::account::delete_contact(
         account.provider,
@@ -1479,10 +1922,6 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
                 .execute(&mut *tx)
                 .await
                 .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM messages_fts")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
             sqlx::query("DELETE FROM attachments")
                 .execute(&mut *tx)
                 .await
@@ -1518,10 +1957,7 @@ pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdR
 pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
     let core = core(&state).await?;
     for account in core.db.list_accounts().await? {
-        if !matches!(
-            account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+        if !account.enabled {
             continue;
         }
         let mut syncing = state.syncing.lock().await;
@@ -1538,12 +1974,60 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
         );
         tokio::spawn(async move {
             tracing::info!(account = %account.email, provider = ?account.provider, "mail-sync начат");
-            let state = match sync_core.accounts.sync_mail_account(&account).await {
-                Ok(result) => {
-                    tracing::info!(account = %account.email, "mail-sync завершён");
+            if account.provider == truemail_core::model::Provider::Exchange {
+                match sync_core.accounts.sync_mail_inbox_delta(&account).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            account = %account.email,
+                            messages = result.downloaded,
+                            new_messages = result.new_messages,
+                            "Exchange: свежие входящие загружены"
+                        );
+                        let _ = sync_app.emit("truemail-data-changed", account.id);
+                        if let Some(count) = exchange_notification_count(result) {
+                            notify_new_mail(&sync_app, &sync_core, &account, count).await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(account = %account.email, %error, "Exchange: быстрые входящие не загрузились");
+                    }
+                }
+            }
+            let supports_auxiliary = matches!(
+                account.provider,
+                truemail_core::model::Provider::Yandex
+                    | truemail_core::model::Provider::Gmail
+                    | truemail_core::model::Provider::Exchange
+            );
+            let mail = sync_core.accounts.sync_mail_account(&account).await;
+            // Ограничение почтового транспорта не должно останавливать
+            // независимые Calendar/Contacts/Tasks API этого же аккаунта.
+            let auxiliary = if supports_auxiliary {
+                sync_core.accounts.sync_auxiliary_account(&account).await
+            } else {
+                Ok((0, 0, 0))
+            };
+            let state = match (mail, auxiliary) {
+                (Ok(result), Ok((calendars, events, contacts))) => {
+                    tracing::info!(account = %account.email, calendars, events, contacts, "инкрементальный sync завершён");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings, "calendars": calendars, "events": events, "contacts": contacts})
+                }
+                (Ok(mut result), Err(error)) => {
+                    tracing::warn!(account = %account.email, %error, "почта обновлена, вспомогательный sync будет повторён");
+                    result.warnings.push(error.to_string());
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
-                Err(error) => {
+                (Err(mail_error), Ok((calendars, events, contacts))) if supports_auxiliary => {
+                    tracing::warn!(account = %account.email, %mail_error, calendars, events, contacts, "почта отложена, вспомогательный sync завершён");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": calendars, "events": events, "contacts": contacts})
+                }
+                (Err(mail_error), Err(auxiliary_error)) => {
+                    let error =
+                        format!("почта: {mail_error}; календарь/контакты: {auxiliary_error}");
+                    tracing::error!(account = %account.email, %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error})
+                }
+                (Err(error), Ok(_)) => {
                     tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась");
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.to_string()})
                 }
@@ -1563,8 +2047,11 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
     for account in core.db.list_accounts().await? {
         if !matches!(
             account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+            truemail_core::model::Provider::Yandex
+                | truemail_core::model::Provider::Gmail
+                | truemail_core::model::Provider::Exchange
+        ) || !account.enabled
+        {
             continue;
         }
         let mut syncing = state.syncing_aux.lock().await;
@@ -1581,18 +2068,7 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         );
         tokio::spawn(async move {
             tracing::info!(account = %account.email, provider = ?account.provider, "aux-sync начат");
-            let sync_result = match account.provider {
-                truemail_core::model::Provider::Yandex => {
-                    sync_core.accounts.sync_yandex_dav_account(&account).await
-                }
-                truemail_core::model::Provider::Gmail => {
-                    sync_core
-                        .accounts
-                        .sync_google_auxiliary_account(&account)
-                        .await
-                }
-                _ => unreachable!(),
-            };
+            let sync_result = sync_core.accounts.sync_auxiliary_account(&account).await;
             let state = match sync_result {
                 Ok((calendars, events, contacts)) => {
                     tracing::info!(account = %account.email, calendars, events, contacts, "календари, задачи и контакты обновлены");
@@ -1628,8 +2104,8 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         tokio::spawn(async move {
             let _ = prune_core.accounts.prune_all_caches_on_start().await;
         });
-        // Почти реалтайм-уведомления о новых письмах Gmail (IMAP IDLE к Gmail
-        // недоступен, поэтому лёгкий поллинг ID Входящих каждые ~25 секунд).
+        // Почти реалтайм-уведомления о новых письмах Gmail без внешнего
+        // Cloud Pub/Sub-сервера: лёгкий polling ID Входящих каждые ~25 секунд.
         let gmail_core = core.clone();
         let gmail_app = app.clone();
         let gmail_syncing = state.syncing.clone();
@@ -1638,10 +2114,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         );
     }
     for account in core.db.list_accounts().await? {
-        if !matches!(
-            account.provider,
-            truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-        ) {
+        if !account.enabled {
             continue;
         }
         let mut watching = state.watching.lock().await;
@@ -1650,12 +2123,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         }
         drop(watching);
 
-        // IMAP IDLE держим только для Yandex. У Gmail IMAP-порт 993 часто
-        // недоступен по сети (провайдерская блокировка), поэтому IDLE зацикливался
-        // на тайм-аутах подключения. Синхронизация Gmail всё равно идёт через
-        // Gmail API (периодический sync_accounts каждые 5 минут), а IMAP-discover
-        // для Gmail тяжёлый (maxResults=500 без курсора) и не годится для polling.
-        if matches!(account.provider, truemail_core::model::Provider::Yandex) {
+        // Gmail работает через отдельный лёгкий REST polling. Для остальных
+        // транспорт сам выбирает IDLE, короткий EWS watchdog или иной механизм
+        // ожидания. Exchange SyncFolderItems остаётся инкрементальным.
+        if account.provider != truemail_core::model::Provider::Gmail {
             let watch_core = core.clone();
             let watch_syncing = state.syncing.clone();
             let watch_app = app.clone();
@@ -1668,31 +2139,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     if watch_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                         break;
                     }
-                    let token = match watch_core.accounts.oauth_access_token(&watch_account).await {
-                        Ok(token) => token,
-                        Err(error) => {
-                            tracing::error!(account = %watch_account.email, %error, "не удалось прочитать OAuth-токен для IMAP IDLE");
-                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                            continue;
-                        }
-                    };
-                    let wait = match watch_account.provider {
-                        truemail_core::model::Provider::Yandex => {
-                            truemail_core::backend::wait_for_yandex_change(
-                                &watch_account.email,
-                                &token,
-                            )
-                            .await
-                        }
-                        truemail_core::model::Provider::Gmail => {
-                            truemail_core::backend::wait_for_gmail_change(
-                                &watch_account.email,
-                                &token,
-                            )
-                            .await
-                        }
-                        _ => unreachable!(),
-                    };
+                    let wait = watch_core
+                        .accounts
+                        .wait_for_mail_change(&watch_account)
+                        .await;
                     match wait {
                         Ok(()) => {
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "syncing"}));
@@ -1705,33 +2155,51 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 drop(syncing);
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
-                            match watch_core.accounts.sync_mail_inbox(&watch_account).await {
+                            let inbox_sync = if watch_account.provider
+                                == truemail_core::model::Provider::Exchange
+                            {
+                                watch_core
+                                    .accounts
+                                    .sync_mail_inbox_delta(&watch_account)
+                                    .await
+                                    .map(|result| {
+                                        (result.downloaded, exchange_notification_count(result))
+                                    })
+                            } else {
+                                watch_core
+                                    .accounts
+                                    .sync_mail_inbox(&watch_account)
+                                    .await
+                                    .map(|messages| (messages, (messages > 0).then_some(messages)))
+                            };
+                            match inbox_sync {
                                 // Плановая переустановка IDLE без новых писем (messages=0)
                                 // происходит каждые ~90с - это debug, чтобы не шуметь.
                                 // Реальные новые письма логируем на info.
-                                Ok(messages) if messages > 0 => {
+                                Ok((messages, Some(new_messages))) => {
                                     tracing::info!(
                                         account = %watch_account.email,
                                         messages,
-                                        "IMAP IDLE: входящие обновлены"
+                                        new_messages,
+                                        "почтовый транспорт: входящие обновлены"
                                     );
                                     notify_new_mail(
                                         &watch_app,
                                         &watch_core,
                                         &watch_account,
-                                        messages,
+                                        new_messages,
                                     )
                                     .await;
                                 }
-                                Ok(messages) => tracing::debug!(
+                                Ok((messages, None)) => tracing::debug!(
                                     account = %watch_account.email,
                                     messages,
-                                    "IMAP IDLE: переустановлен, новых писем нет"
+                                    "наблюдение переустановлено, новых писем нет"
                                 ),
                                 Err(error) => tracing::error!(
                                     account = %watch_account.email,
                                     %error,
-                                    "IMAP IDLE: не удалось дозагрузить входящие"
+                                    "не удалось дозагрузить входящие"
                                 ),
                             }
                             watch_syncing.lock().await.remove(&watch_account.id);
@@ -1750,9 +2218,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
                             if routine {
-                                tracing::debug!(account = %watch_account.email, %error, "IMAP IDLE переустанавливается");
+                                tracing::debug!(account = %watch_account.email, %error, "наблюдение за почтой переустанавливается");
                             } else {
-                                tracing::warn!(account = %watch_account.email, %error, "IMAP IDLE-соединение будет восстановлено");
+                                tracing::warn!(account = %watch_account.email, %error, "наблюдение за почтой будет восстановлено");
                             }
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
                             tokio::time::sleep(retry_delay).await;
@@ -1811,25 +2279,8 @@ pub async fn send_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if !matches!(
-        account.provider,
-        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-    ) {
-        return Err(ApiError {
-            message: "Отправка для этого провайдера ещё не настроена".into(),
-        });
-    }
-    let token = core.accounts.oauth_access_token(&account).await?;
     let outgoing = outgoing_message(&account, request);
-    match account.provider {
-        truemail_core::model::Provider::Yandex => {
-            truemail_core::backend::send_yandex(outgoing, &token).await?
-        }
-        truemail_core::model::Provider::Gmail => {
-            truemail_core::backend::send_gmail(outgoing, &token).await?
-        }
-        _ => unreachable!(),
-    }
+    core.accounts.send_outgoing(account.id, outgoing).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
 }
@@ -1874,14 +2325,6 @@ pub async fn schedule_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    if !matches!(
-        account.provider,
-        truemail_core::model::Provider::Yandex | truemail_core::model::Provider::Gmail
-    ) {
-        return Err(ApiError {
-            message: "Отложенная отправка для этого провайдера не настроена".into(),
-        });
-    }
     let send_at = chrono::DateTime::parse_from_rfc3339(&send_at).map_err(|_| ApiError {
         message: "Некорректная дата отложенной отправки".into(),
     })?;
@@ -1908,6 +2351,117 @@ pub async fn schedule_message(
 #[tauri::command]
 pub async fn mark_seen(state: State<'_, AppState>, message_id: i64, seen: bool) -> CmdResult<()> {
     Ok(core(&state).await?.db.mark_seen(message_id, seen).await?)
+}
+
+#[tauri::command]
+pub async fn snooze_messages(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    until: String,
+) -> CmdResult<usize> {
+    if message_ids.is_empty() {
+        return Err(ApiError {
+            message: "Не выбрано ни одного письма".into(),
+        });
+    }
+    let until = chrono::DateTime::parse_from_rfc3339(&until).map_err(|error| ApiError {
+        message: format!("неверная дата пробуждения: {error}"),
+    })?;
+    if until <= chrono::Utc::now() {
+        return Err(ApiError {
+            message: "время пробуждения должно быть в будущем".into(),
+        });
+    }
+    let until = until
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_snoozed(&message_ids, Some(&until))
+        .await?)
+}
+
+#[tauri::command]
+pub async fn unsnooze_messages(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_snoozed(&message_ids, None)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn release_due_snoozes(state: State<'_, AppState>) -> CmdResult<usize> {
+    Ok(core(&state).await?.db.release_due_snoozes().await?)
+}
+
+#[tauri::command]
+pub async fn list_signatures(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<Signature>> {
+    Ok(core(&state).await?.db.list_signatures(account_id).await?)
+}
+
+#[tauri::command]
+pub async fn save_signature(
+    state: State<'_, AppState>,
+    account_id: i64,
+    kind: String,
+    body_html: String,
+    enabled: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .upsert_signature(account_id, &kind, &body_html, enabled)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_message_templates(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<MessageTemplate>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_message_templates(account_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn save_message_template(
+    state: State<'_, AppState>,
+    id: Option<i64>,
+    account_id: i64,
+    name: String,
+    subject: String,
+    body_html: String,
+) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .save_message_template(id, account_id, &name, &subject, &body_html)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn delete_message_template(
+    state: State<'_, AppState>,
+    id: i64,
+    account_id: i64,
+) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .delete_message_template(id, account_id)
+        .await?)
 }
 
 #[tauri::command]
@@ -1984,6 +2538,79 @@ pub async fn set_setting(state: State<'_, AppState>, key: String, value: String)
     Ok(core(&state).await?.db.set_setting(&key, &value).await?)
 }
 
+#[tauri::command]
+pub async fn list_keybindings(state: State<'_, AppState>) -> CmdResult<Vec<Keybinding>> {
+    Ok(core(&state).await?.db.list_keybindings().await?)
+}
+
+#[tauri::command]
+pub async fn set_keybinding(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    action: String,
+    combo: String,
+) -> CmdResult<()> {
+    let combo = combo.trim();
+    if combo.is_empty() {
+        return Err(ApiError {
+            message: "сочетание клавиш не может быть пустым".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let previous = core.db.list_keybindings().await?;
+    let mut updated = previous.clone();
+    let binding = updated
+        .iter_mut()
+        .find(|binding| binding.action == action)
+        .ok_or_else(|| ApiError {
+            message: "неизвестное действие клавиатуры".into(),
+        })?;
+    if binding.scope == "global" {
+        Shortcut::from_str(combo).map_err(|error| ApiError {
+            message: format!("неверное сочетание клавиш: {error}"),
+        })?;
+    }
+    binding.combo = combo.to_owned();
+    let mut seen = HashSet::new();
+    if updated
+        .iter()
+        .any(|binding| !seen.insert(binding.combo.to_ascii_lowercase()))
+    {
+        return Err(ApiError {
+            message: "это сочетание уже назначено другому действию".into(),
+        });
+    }
+    if let Err(error) = register_global_shortcuts(&app, &updated) {
+        let _ = register_global_shortcuts(&app, &previous);
+        return Err(ApiError {
+            message: format!("не удалось зарегистрировать сочетание: {error}"),
+        });
+    }
+    if let Err(error) = core.db.set_keybinding(&action, combo).await {
+        let _ = register_global_shortcuts(&app, &previous);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn image_sender_trusted(state: State<'_, AppState>, sender: String) -> CmdResult<bool> {
+    Ok(core(&state).await?.db.image_sender_trusted(&sender).await?)
+}
+
+#[tauri::command]
+pub async fn set_image_sender_trusted(
+    state: State<'_, AppState>,
+    sender: String,
+    allow: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_image_sender_trusted(&sender, allow)
+        .await?)
+}
+
 fn yandex_client_id() -> CmdResult<String> {
     configured_yandex_client_id().ok_or_else(|| ApiError {
         message: "Подключение к Яндексу пока не настроено в этой сборке truemail.".into(),
@@ -2002,9 +2629,17 @@ fn google_client_credentials() -> CmdResult<(String, String)> {
     Ok((client_id, client_secret))
 }
 
-async fn receive_google_callback(
+fn microsoft_client_id() -> CmdResult<String> {
+    configured_microsoft_client_id().ok_or_else(|| ApiError {
+        message: "Outlook OAuth не настроен в этой сборке: не задан TRUEMAIL_MICROSOFT_CLIENT_ID."
+            .into(),
+    })
+}
+
+async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
+    provider: &str,
 ) -> CmdResult<String> {
     tokio::time::timeout(std::time::Duration::from_secs(300), async {
         loop {
@@ -2033,13 +2668,13 @@ async fn receive_google_callback(
             let (status, title, body) = if success {
                 (
                     "200 OK",
-                    "Gmail подключён",
+                    format!("{provider} подключён"),
                     "Авторизация завершена. Можно закрыть эту вкладку и вернуться в truemail.",
                 )
             } else {
                 (
                     "400 Bad Request",
-                    "Не удалось подключить Gmail",
+                    format!("Не удалось подключить {provider}"),
                     "Вернитесь в truemail и повторите подключение.",
                 )
             };
@@ -2054,12 +2689,12 @@ async fn receive_google_callback(
             let _ = stream.shutdown().await;
             if !valid_state {
                 return Err(ApiError {
-                    message: "Google OAuth вернул неверный state; подключение отменено".into(),
+                    message: format!("{provider} OAuth вернул неверный state; подключение отменено"),
                 });
             }
             if let Some(error) = error {
                 return Err(ApiError {
-                    message: format!("Google OAuth: {error}"),
+                    message: format!("{provider} OAuth: {error}"),
                 });
             }
             if let Some(code) = code {
@@ -2069,7 +2704,7 @@ async fn receive_google_callback(
     })
     .await
     .map_err(|_| ApiError {
-        message: "Время ожидания входа в Google истекло. Нажмите «Подключить» ещё раз.".into(),
+        message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
     })?
 }
 
@@ -2096,36 +2731,46 @@ async fn spawn_initial_mail_sync(
     }
     drop(syncing);
     let sync_set = state.syncing.clone();
+    let aux_sync_set = state.syncing_aux.clone();
     let sync_app = app.clone();
     tokio::spawn(async move {
         match core.accounts.sync_mail_account(&account).await {
             Ok(result) => {
-                tracing::info!(account = %account.email, folders = result.mail_folders, calendars = result.calendars, events = result.events, contacts = result.contacts, "фоновая синхронизация завершена")
+                tracing::info!(account = %account.email, folders = result.mail_folders, "первая синхронизация почты завершена")
             }
             Err(error) => {
-                tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась")
+                tracing::error!(account = %account.email, %error, "первая синхронизация почты не удалась")
             }
         }
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
+        if matches!(
+            account.provider,
+            Provider::Yandex | Provider::Gmail | Provider::Exchange
+        ) {
+            let mut syncing_aux = aux_sync_set.lock().await;
+            if !syncing_aux.insert(account.id) {
+                return;
+            }
+            drop(syncing_aux);
+            match core.accounts.sync_auxiliary_account(&account).await {
+                Ok((calendars, events, contacts)) => tracing::info!(
+                    account = %account.email,
+                    calendars,
+                    events,
+                    contacts,
+                    "первая синхронизация календарей и контактов завершена"
+                ),
+                Err(error) => tracing::error!(
+                    account = %account.email,
+                    %error,
+                    "первая синхронизация календарей и контактов не удалась"
+                ),
+            }
+            aux_sync_set.lock().await.remove(&account.id);
+            let _ = sync_app.emit("truemail-data-changed", account.id);
+        }
     });
-}
-
-fn unsupported_provider_message(config: &truemail_core::account::ProviderConfig) -> String {
-    let provider = format!("{:?}", config.provider);
-    let imap = config
-        .imap
-        .as_ref()
-        .map(|server| format!("{}:{}", server.host, server.port))
-        .unwrap_or_else(|| "не найден".into());
-    let smtp = config
-        .smtp
-        .as_ref()
-        .map(|server| format!("{}:{}", server.host, server.port))
-        .unwrap_or_else(|| "не найден".into());
-    format!(
-        "Определён провайдер {provider}, но OAuth для него в truemail пока не реализован. IMAP: {imap}; SMTP: {smtp}. Для Mail.ru и iCloud нужен отдельный пароль приложения; обычный пароль аккаунта использовать не следует."
-    )
 }
 
 fn open_in_yandex_browser(app: &AppHandle, url: &str) -> CmdResult<()> {
@@ -2184,31 +2829,65 @@ pub async fn begin_account_connection(
     match config.provider {
         truemail_core::model::Provider::Yandex => {
             let client_id = yandex_client_id()?;
+            // Redirect URI должен быть зарегистрирован в OAuth-приложении
+            // Яндекса с точным scheme/host/port/path.
+            let redirect_uri = configured_yandex_redirect_uri();
+            let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
+                message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
+            })?;
+            if redirect.scheme() != "http"
+                || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
+            {
+                return Err(ApiError {
+                    message: "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
+                        .into(),
+                });
+            }
+            let port = redirect.port().ok_or_else(|| ApiError {
+                message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
+            })?;
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                .await
+                .map_err(|error| ApiError {
+                    message: format!(
+                        "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
+                    ),
+                })?;
             let url = truemail_core::account::yandex_authorize_url(
                 &client_id,
                 &email,
                 &oauth_state,
                 &pkce.challenge,
+                &redirect_uri,
             )?;
             open_in_yandex_browser(&app, &url)?;
-            let mut oauth = state.oauth.lock().await;
-            oauth.clear();
-            oauth.insert(
-                oauth_state.clone(),
-                PendingOAuth {
-                    email,
-                    verifier: pkce.verifier,
-                    client_id,
-                },
-            );
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+            let token = truemail_core::account::exchange_yandex_code(
+                &client_id,
+                &code,
+                &pkce.verifier,
+                &redirect_uri,
+            )
+            .await?;
+            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+            let connected = core
+                .accounts
+                .add_yandex_oauth(&email, &display_name, token)
+                .await?;
+            let account = connected.account.clone();
+            let response = connected_response(connected);
+            spawn_initial_mail_sync(&app, &state, core, account).await;
             Ok(PendingOAuthResponse {
-                mode: "verification_code".into(),
-                state: Some(oauth_state),
-                connected: None,
+                mode: "connected".into(),
+                state: None,
+                connected: Some(response),
+                password_config: None,
             })
         }
         truemail_core::model::Provider::Gmail => {
             let (client_id, client_secret) = google_client_credentials()?;
+            let client_secret = Zeroizing::new(client_secret);
             let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
                 .await
                 .map_err(|error| ApiError {
@@ -2229,7 +2908,8 @@ pub async fn begin_account_connection(
                 &redirect_uri,
             )?;
             open_in_yandex_browser(&app, &url)?;
-            let code = receive_google_callback(listener, &oauth_state).await?;
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
             let token = truemail_core::account::exchange_google_code(
                 &client_id,
                 &client_secret,
@@ -2250,12 +2930,256 @@ pub async fn begin_account_connection(
                 mode: "connected".into(),
                 state: None,
                 connected: Some(response),
+                password_config: None,
             })
         }
-        _ => Err(ApiError {
-            message: unsupported_provider_message(&config),
+        truemail_core::model::Provider::Outlook => {
+            let client_id = microsoft_client_id()?;
+            let tenant = configured_microsoft_tenant();
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .map_err(|error| ApiError {
+                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                })?;
+            let port = listener
+                .local_addr()
+                .map_err(|error| ApiError {
+                    message: format!("не удалось определить OAuth callback: {error}"),
+                })?
+                .port();
+            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
+            let url = truemail_core::account::microsoft_authorize_url(
+                &client_id,
+                &tenant,
+                &email,
+                &oauth_state,
+                &pkce.challenge,
+                &redirect_uri,
+            )?;
+            open_in_yandex_browser(&app, &url)?;
+            let code =
+                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Microsoft").await?);
+            let token = truemail_core::account::exchange_microsoft_code(
+                &client_id,
+                &tenant,
+                &code,
+                &pkce.verifier,
+                &redirect_uri,
+            )
+            .await?;
+            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+            let connected = core
+                .accounts
+                .add_outlook_oauth(&email, &display_name, token)
+                .await?;
+            let account = connected.account.clone();
+            let response = connected_response(connected);
+            spawn_initial_mail_sync(&app, &state, core, account).await;
+            Ok(PendingOAuthResponse {
+                mode: "connected".into(),
+                state: None,
+                connected: Some(response),
+                password_config: None,
+            })
+        }
+        Provider::Mailru | Provider::Icloud | Provider::Generic => {
+            let domain = email.rsplit('@').next().unwrap_or_default();
+            Ok(PendingOAuthResponse {
+                mode: "password".into(),
+                state: None,
+                connected: None,
+                password_config: Some(PasswordConnectionInfo {
+                    provider: config.provider,
+                    backend_kind: config.backend_kind,
+                    username: email.clone(),
+                    imap: if config.backend_kind == BackendKind::Jmap {
+                        None
+                    } else {
+                        Some(config.imap.unwrap_or(ServerConfig {
+                            host: format!("imap.{domain}"),
+                            port: 993,
+                            security: Security::Ssl,
+                        }))
+                    },
+                    smtp: if config.backend_kind == BackendKind::Jmap {
+                        None
+                    } else {
+                        config.smtp.or_else(|| {
+                            (!domain.is_empty()).then(|| ServerConfig {
+                                host: format!("smtp.{domain}"),
+                                port: 465,
+                                security: Security::Ssl,
+                            })
+                        })
+                    },
+                    jmap_url: config.jmap_url,
+                    ews_url: None,
+                }),
+            })
+        }
+        Provider::Exchange => Ok(PendingOAuthResponse {
+            mode: "password".into(),
+            state: None,
+            connected: None,
+            // Autodiscover уточнит адрес EWS с учётными данными; из discover
+            // приходит только предполагаемый URL как подсказка для поля.
+            password_config: Some(PasswordConnectionInfo {
+                provider: Provider::Exchange,
+                backend_kind: BackendKind::Ews,
+                username: email.clone(),
+                imap: None,
+                smtp: None,
+                jmap_url: None,
+                ews_url: config.ews_url,
+            }),
         }),
     }
+}
+
+fn parse_security(value: &str) -> CmdResult<Security> {
+    match value {
+        "ssl" => Ok(Security::Ssl),
+        "starttls" => Ok(Security::Starttls),
+        _ => Err(ApiError {
+            message: "выберите SSL/TLS или STARTTLS".into(),
+        }),
+    }
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_password_imap(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    provider: Provider,
+    imap_host: String,
+    imap_port: u16,
+    imap_security: String,
+    smtp_host: String,
+    smtp_port: u16,
+    smtp_security: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() || imap_host.trim().is_empty() {
+        return Err(ApiError {
+            message: "укажите имя пользователя и IMAP-сервер".into(),
+        });
+    }
+    if !matches!(
+        provider,
+        Provider::Mailru | Provider::Icloud | Provider::Generic
+    ) {
+        return Err(ApiError {
+            message: "этот способ входа не подходит выбранному провайдеру".into(),
+        });
+    }
+    let config = truemail_core::account::ProviderConfig {
+        provider,
+        backend_kind: BackendKind::Imap,
+        auth_kind: if provider == Provider::Generic {
+            AuthKind::Password
+        } else {
+            AuthKind::AppPassword
+        },
+        imap: Some(ServerConfig {
+            host: imap_host.trim().to_owned(),
+            port: imap_port,
+            security: parse_security(&imap_security)?,
+        }),
+        smtp: (!smtp_host.trim().is_empty())
+            .then(|| {
+                Ok::<_, ApiError>(ServerConfig {
+                    host: smtp_host.trim().to_owned(),
+                    port: smtp_port,
+                    security: parse_security(&smtp_security)?,
+                })
+            })
+            .transpose()?,
+        ews_url: None,
+        jmap_url: None,
+    };
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_password_imap(&email, &display_name, username, &password, &config)
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn complete_exchange_ews(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    server_hint: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() {
+        return Err(ApiError {
+            message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_exchange_ews(
+            &email,
+            &display_name,
+            username,
+            &password,
+            (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
+        )
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
+}
+
+#[tauri::command]
+pub async fn complete_jmap(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    email: String,
+    username: String,
+    password: String,
+    session_url: String,
+) -> CmdResult<ConnectedAccount> {
+    let email = email.trim().to_lowercase();
+    let username = username.trim();
+    if username.is_empty() || session_url.trim().is_empty() {
+        return Err(ApiError {
+            message: "укажите имя пользователя и JMAP Session URL".into(),
+        });
+    }
+    let core = core(&state).await?;
+    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+    let connected = core
+        .accounts
+        .add_jmap_password(
+            &email,
+            &display_name,
+            username,
+            &password,
+            session_url.trim(),
+        )
+        .await?;
+    let account = connected.account.clone();
+    let response = connected_response(connected);
+    spawn_initial_mail_sync(&app, &state, core, account).await;
+    Ok(response)
 }
 
 #[tauri::command]
@@ -2265,6 +3189,7 @@ pub async fn complete_yandex_oauth(
     oauth_state: String,
     code: String,
 ) -> CmdResult<ConnectedAccount> {
+    let code = Zeroizing::new(code);
     let core = core(&state).await?;
     let pending = state
         .oauth
@@ -2275,9 +3200,13 @@ pub async fn complete_yandex_oauth(
         .ok_or_else(|| ApiError {
             message: "OAuth-сессия не найдена или устарела".into(),
         })?;
-    let token =
-        truemail_core::account::exchange_yandex_code(&pending.client_id, &code, &pending.verifier)
-            .await?;
+    let token = truemail_core::account::exchange_yandex_code(
+        &pending.client_id,
+        &code,
+        &pending.verifier,
+        "https://oauth.yandex.ru/verification_code",
+    )
+    .await?;
     state.oauth.lock().await.remove(&oauth_state);
     let email = pending.email.trim().to_lowercase();
     let display_name = email.split('@').next().unwrap_or(&email).to_owned();
@@ -2297,58 +3226,163 @@ pub fn api_tools() -> Vec<McpTool> {
     mcp_tools()
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalApiStatus {
+    pub running: bool,
+    pub port: Option<u16>,
+    pub url: Option<String>,
+}
+
+#[tauri::command]
+pub async fn external_api_status(state: State<'_, AppState>) -> CmdResult<ExternalApiStatus> {
+    let server = state.api_server.lock().await;
+    let port = server.as_ref().map(|server| server.port);
+    Ok(ExternalApiStatus {
+        running: port.is_some(),
+        port,
+        url: port.map(|port| format!("http://127.0.0.1:{port}")),
+    })
+}
+
+#[tauri::command]
+pub async fn start_external_api(
+    state: State<'_, AppState>,
+    port: Option<u16>,
+) -> CmdResult<ExternalApiStatus> {
+    let core = core(&state).await?;
+    let mut server = state.api_server.lock().await;
+    if let Some(running) = server.as_ref() {
+        return Ok(ExternalApiStatus {
+            running: true,
+            port: Some(running.port),
+            url: Some(format!("http://127.0.0.1:{}", running.port)),
+        });
+    }
+    let requested_port = port.unwrap_or(34981);
+    let running = truemail_core::api::start_server(core.clone(), requested_port).await?;
+    let actual_port = running.port;
+    *server = Some(running);
+    core.db.set_setting("external_api_enabled", "1").await?;
+    core.db
+        .set_setting("external_api_port", &requested_port.to_string())
+        .await?;
+    Ok(ExternalApiStatus {
+        running: true,
+        port: Some(actual_port),
+        url: Some(format!("http://127.0.0.1:{actual_port}")),
+    })
+}
+
+#[tauri::command]
+pub async fn stop_external_api(state: State<'_, AppState>) -> CmdResult<ExternalApiStatus> {
+    let core = core(&state).await?;
+    if let Some(server) = state.api_server.lock().await.take() {
+        server.stop();
+    }
+    core.db.set_setting("external_api_enabled", "0").await?;
+    Ok(ExternalApiStatus {
+        running: false,
+        port: None,
+        url: None,
+    })
+}
+
+#[tauri::command]
+pub async fn list_api_clients(state: State<'_, AppState>) -> CmdResult<Vec<ApiClient>> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::list_clients(core.as_ref()).await?)
+}
+
+#[tauri::command]
+pub async fn create_api_client(
+    state: State<'_, AppState>,
+    name: String,
+    caps: Vec<Capability>,
+) -> CmdResult<CreatedApiClient> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::create_client(core.as_ref(), &name, caps).await?)
+}
+
+#[tauri::command]
+pub async fn revoke_api_client(state: State<'_, AppState>, client_id: i64) -> CmdResult<bool> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::revoke_client(core.as_ref(), client_id).await?)
+}
+
+#[tauri::command]
+pub async fn list_api_audit(
+    state: State<'_, AppState>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<ApiAuditEntry>> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::list_audit(core.as_ref(), limit.unwrap_or(50)).await?)
+}
+
+#[tauri::command]
+pub async fn clear_api_audit(state: State<'_, AppState>) -> CmdResult<u64> {
+    let core = core(&state).await?;
+    Ok(truemail_core::api::clear_audit(core.as_ref()).await?)
+}
+
 #[tauri::command]
 pub fn localization_catalog(locale: String) -> HashMap<String, String> {
-    const KEYS: &[&str] = &[
-        "nav-smart-folders",
-        "nav-accounts",
-        "nav-calendar",
-        "nav-contacts",
-        "nav-all-inbox",
-        "nav-all-important",
-        "nav-all-sent",
-        "nav-all-drafts",
-        "nav-today",
-        "nav-unread",
-        "nav-with-attachments",
-        "nav-waiting-reply",
-        "folder-inbox",
-        "folder-sent",
-        "folder-drafts",
-        "folder-archive",
-        "folder-spam",
-        "folder-trash",
-        "action-reply",
-        "action-reply-all",
-        "action-forward",
-        "action-archive",
-        "action-delete",
-        "action-compose",
-        "action-send",
-        "palette-title",
-        "palette-placeholder",
-        "settings",
-        "settings-general",
-        "settings-expert-mode",
-        "settings-toolbar",
-        "settings-accounts",
-        "settings-smart",
-        "settings-unified",
-        "settings-folders",
-        "settings-calendars",
-        "settings-storage",
-        "settings-themes",
-        "settings-privacy",
-        "settings-keys",
-        "privacy-external-images",
-        "storage-data-folder",
-        "storage-encrypted",
-        "wizard-back",
-        "wizard-next",
-        "wizard-skip",
-        "wizard-connect",
-        "wizard-confirm",
-        "wizard-open-mail",
-    ];
-    truemail_core::i18n::I18n::new(&locale).catalog(KEYS)
+    truemail_core::i18n::I18n::new(&locale).catalog()
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+
+    #[test]
+    fn gmail_realtime_uses_first_snapshot_as_baseline() {
+        let mut observed = HashMap::new();
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["old".into()]),
+            None
+        );
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["new".into(), "old".into()]),
+            Some(vec!["new".into()])
+        );
+        assert_eq!(
+            observe_gmail_message_ids(&mut observed, 7, vec!["new".into(), "old".into()]),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn exchange_notifies_only_new_mail_after_baseline() {
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 50,
+                new_messages: 50,
+                had_baseline: false,
+            }),
+            None
+        );
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 2,
+                new_messages: 1,
+                had_baseline: true,
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 1,
+                new_messages: 0,
+                had_baseline: true,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn update_manifest_is_public_and_uses_https() {
+        let endpoint = url::Url::parse(DEFAULT_UPDATE_ENDPOINT).unwrap();
+        assert_eq!(endpoint.scheme(), "https");
+        assert_eq!(endpoint.host_str(), Some("chernov.gitverse.site"));
+        assert!(endpoint.path().ends_with("/latest.json"));
+    }
 }

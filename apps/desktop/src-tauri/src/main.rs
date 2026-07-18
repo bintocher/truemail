@@ -19,7 +19,7 @@ const WINDOW_STATE_FLAGS: StateFlags = StateFlags::SIZE
     .union(StateFlags::POSITION)
     .union(StateFlags::MAXIMIZED)
     .union(StateFlags::FULLSCREEN);
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::ShortcutState;
 use truemail_core::Core;
 
 /// Показать и сфокусировать главное окно (из трея/клика).
@@ -121,6 +121,10 @@ fn run() -> anyhow::Result<()> {
         })
         .map(|value| commands::NotifyAnchor::parse(&value))
         .unwrap_or_else(commands::NotifyAnchor::platform_default);
+    let initial_keybindings = core
+        .as_ref()
+        .and_then(|core| rt.block_on(core.db.list_keybindings()).ok())
+        .unwrap_or_else(commands::default_keybindings);
     let state = AppState {
         core: tokio::sync::RwLock::new(core),
         notify_anchor: Arc::new(std::sync::Mutex::new(notify_anchor)),
@@ -131,30 +135,28 @@ fn run() -> anyhow::Result<()> {
         quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        api_server: Arc::new(tokio::sync::Mutex::new(None)),
+        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
-
-    let show_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM);
-    let compose_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyC);
-    let search_shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyF);
-    let show_handler = show_shortcut;
-    let compose_handler = compose_shortcut;
-    let search_handler = search_shortcut;
     tauri::Builder::default()
+        // Должен быть первым плагином: второй процесс передаёт аргументы уже
+        // работающему экземпляру и сразу завершается.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, shortcut, event| {
                     if event.state() != ShortcutState::Pressed {
                         return;
                     }
-                    let action = if shortcut == &show_handler {
-                        "toggle"
-                    } else if shortcut == &compose_handler {
-                        "compose"
-                    } else if shortcut == &search_handler {
-                        "search"
-                    } else {
-                        return;
-                    };
+                    let action = app
+                        .state::<AppState>()
+                        .shortcut_actions
+                        .read()
+                        .ok()
+                        .and_then(|actions| actions.get(&shortcut.to_string()).cloned());
+                    let Some(action) = action else { return };
                     if let Some(window) = app.get_webview_window("main") {
                         let _ = window.show();
                         let _ = window.unminimize();
@@ -168,6 +170,7 @@ fn run() -> anyhow::Result<()> {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Окно уведомлений живёт по своим правилам: позицию ему задаёт
         // notify_position, размер - высота карточек. Плагин иначе восстанавливал
         // его позицию, размер и видимость, показывая пустое окно поверх главного.
@@ -183,9 +186,7 @@ fn run() -> anyhow::Result<()> {
         ))
         .manage(state)
         .setup(move |app| {
-            app.global_shortcut().register(show_shortcut)?;
-            app.global_shortcut().register(compose_shortcut)?;
-            app.global_shortcut().register(search_shortcut)?;
+            commands::register_global_shortcuts(app.handle(), &initial_keybindings)?;
 
             // Меню и иконка в системном трее. Приложение продолжает работать в
             // фоне (IMAP IDLE, синхронизация), даже когда окно скрыто.
@@ -256,6 +257,16 @@ fn run() -> anyhow::Result<()> {
                 let _ = window.set_ignore_cursor_events(true);
                 commands::position_notify_window(app.handle());
             }
+
+            // Не задерживаем старт и не пугаем сетевой ошибкой: при появлении
+            // подписанного релиза UI сам предложит установить новую версию.
+            let update_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                if let Err(error) = commands::announce_available_update(update_app).await {
+                    tracing::debug!(error = %error.message, "автопроверка обновлений пропущена");
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -273,6 +284,8 @@ fn run() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap_status,
             commands::initialize_storage,
+            commands::export_key_backup,
+            commands::restore_key_backup,
             commands::list_accounts,
             commands::rename_account,
             commands::set_account_color,
@@ -291,14 +304,24 @@ fn run() -> anyhow::Result<()> {
             commands::list_messages_page,
             commands::get_message,
             commands::message_raw,
+            commands::export_message_eml,
             commands::unsubscribe_one_click,
             commands::attachment_content,
             commands::save_attachment,
             commands::save_all_attachments,
             commands::list_smart_folders,
+            commands::save_smart_folders,
+            commands::list_smart_folder_messages,
+            commands::list_unified_sources,
+            commands::set_unified_source,
+            commands::list_mail_rules,
+            commands::save_mail_rule,
+            commands::set_mail_rule_enabled,
+            commands::delete_mail_rule,
             commands::list_contacts,
             commands::search,
             commands::list_calendar_data,
+            commands::set_calendar_visible,
             commands::create_event,
             commands::update_event,
             commands::delete_event,
@@ -315,15 +338,40 @@ fn run() -> anyhow::Result<()> {
             commands::send_message,
             commands::schedule_message,
             commands::mark_seen,
+            commands::snooze_messages,
+            commands::unsnooze_messages,
+            commands::release_due_snoozes,
+            commands::list_signatures,
+            commands::save_signature,
+            commands::list_message_templates,
+            commands::save_message_template,
+            commands::delete_message_template,
             commands::message_action,
             commands::move_messages_to_folder,
             commands::undo_message_action,
             commands::get_setting,
             commands::set_setting,
+            commands::list_keybindings,
+            commands::set_keybinding,
+            commands::image_sender_trusted,
+            commands::set_image_sender_trusted,
             commands::all_settings,
             commands::begin_account_connection,
+            commands::complete_password_imap,
+            commands::complete_exchange_ews,
+            commands::complete_jmap,
             commands::complete_yandex_oauth,
             commands::api_tools,
+            commands::external_api_status,
+            commands::start_external_api,
+            commands::stop_external_api,
+            commands::list_api_clients,
+            commands::create_api_client,
+            commands::revoke_api_client,
+            commands::list_api_audit,
+            commands::clear_api_audit,
+            commands::check_for_update,
+            commands::install_update,
             commands::localization_catalog,
             commands::set_autostart,
             commands::get_autostart,
@@ -335,4 +383,58 @@ fn run() -> anyhow::Result<()> {
         ])
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod command_contract_tests {
+    const MAIN: &str = include_str!("main.rs");
+    const COMMANDS: &str = include_str!("commands.rs");
+    const BRIDGE: &str = include_str!("../../ui/bridge.js");
+
+    #[test]
+    fn critical_user_flows_are_exposed_by_tauri_and_the_ui_bridge() {
+        for command in [
+            "get_message",
+            "send_message",
+            "create_event",
+            "update_event",
+            "delete_event",
+            "create_contact",
+            "update_contact",
+            "delete_contact",
+            "message_action",
+            "move_messages_to_folder",
+            "undo_message_action",
+            "check_for_update",
+            "install_update",
+        ] {
+            assert!(
+                MAIN.contains(&format!("commands::{command}")),
+                "{command} is missing from generate_handler"
+            );
+            assert!(
+                COMMANDS.contains(&format!("fn {command}(")),
+                "{command} implementation is missing"
+            );
+            assert!(
+                BRIDGE.contains(&format!("invoke(\"{command}\"")),
+                "{command} is missing from bridge.js"
+            );
+        }
+    }
+
+    #[test]
+    fn single_instance_is_registered_before_every_other_plugin() {
+        let builder = MAIN
+            .find("tauri::Builder::default()")
+            .expect("Tauri builder missing");
+        let single = MAIN
+            .find(".plugin(tauri_plugin_single_instance::init")
+            .expect("single-instance plugin missing");
+        let first_plugin = MAIN[builder..]
+            .find(".plugin(")
+            .map(|offset| builder + offset)
+            .expect("plugin registration missing");
+        assert_eq!(single, first_plugin);
+    }
 }

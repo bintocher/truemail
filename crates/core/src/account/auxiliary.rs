@@ -1,6 +1,6 @@
 //! Двусторонние операции календаря, контактов и задач для Google и Яндекса.
 
-use crate::model::Provider;
+use crate::model::{Alarm, Attendee, ContactPhone, EventClass, Provider, Transp};
 use crate::{Error, Result};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,7 @@ const GOOGLE_CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const GOOGLE_PEOPLE_BASE: &str = "https://people.googleapis.com/v1";
 const GOOGLE_TASKS_BASE: &str = "https://tasks.googleapis.com/tasks/v1";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventInput {
     pub summary: String,
     pub description: Option<String>,
@@ -20,6 +20,23 @@ pub struct EventInput {
     pub dtend: Option<String>,
     #[serde(default)]
     pub all_day: bool,
+    #[serde(default)]
+    pub attendees: Vec<Attendee>,
+    #[serde(default)]
+    pub alarms: Vec<Alarm>,
+    pub rrule: Option<String>,
+    pub recurrence_id: Option<String>,
+    pub exdates: Option<String>,
+    pub rdates: Option<String>,
+    pub timezone: Option<String>,
+    pub transp: Option<Transp>,
+    pub class: Option<EventClass>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    pub url: Option<String>,
+    pub organizer: Option<String>,
+    #[serde(default)]
+    pub sequence: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +47,8 @@ pub struct ContactInput {
     pub organization: Option<String>,
     #[serde(default)]
     pub emails: Vec<String>,
+    #[serde(default)]
+    pub phones: Vec<ContactPhone>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +115,11 @@ fn google_event_body(input: &EventInput) -> Value {
         if input.all_day {
             json!({"date": value.get(..10).unwrap_or(value)})
         } else {
-            json!({"dateTime": value})
+            let mut date = json!({"dateTime": value});
+            if let Some(timezone) = input.timezone.as_deref() {
+                date["timeZone"] = json!(timezone);
+            }
+            date
         }
     };
     let mut body = json!({
@@ -110,6 +133,72 @@ fn google_event_body(input: &EventInput) -> Value {
         .as_deref()
         .map(date)
         .unwrap_or_else(|| date(&input.dtstart));
+    body["attendees"] = json!(
+        input
+            .attendees
+            .iter()
+            .map(|attendee| json!({
+                "email": attendee.email,
+                "displayName": attendee.name,
+                "optional": attendee.role.as_deref() == Some("OPT-PARTICIPANT"),
+                "responseStatus": attendee.partstat.as_deref().map(|value| match value {
+                    "NEEDS-ACTION" => "needsAction",
+                    "ACCEPTED" => "accepted",
+                    "DECLINED" => "declined",
+                    "TENTATIVE" => "tentative",
+                    other => other,
+                }),
+            }))
+            .collect::<Vec<_>>()
+    );
+    body["reminders"] = json!({
+        "useDefault": false,
+        "overrides": input.alarms.iter().map(|alarm| json!({
+            "method": if alarm.action.eq_ignore_ascii_case("DISPLAY") {
+                "popup".to_owned()
+            } else {
+                alarm.action.to_ascii_lowercase()
+            },
+            "minutes": alarm.trigger_minutes,
+        })).collect::<Vec<_>>(),
+    });
+    let recurrence = [
+        input.rrule.as_ref().map(|value| format!("RRULE:{value}")),
+        input
+            .exdates
+            .as_ref()
+            .map(|value| format!("EXDATE:{value}")),
+        input.rdates.as_ref().map(|value| format!("RDATE:{value}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if !recurrence.is_empty() {
+        body["recurrence"] = json!(recurrence);
+    }
+    if let Some(transp) = input.transp {
+        body["transparency"] = json!(match transp {
+            Transp::Opaque => "opaque",
+            Transp::Transparent => "transparent",
+        });
+    }
+    if let Some(class) = input.class {
+        body["visibility"] = json!(match class {
+            EventClass::Public => "public",
+            EventClass::Private => "private",
+            EventClass::Confidential => "confidential",
+        });
+    }
+    if !input.categories.is_empty() || input.organizer.is_some() {
+        body["extendedProperties"] = json!({"private": {
+            "truemailCategories": input.categories.join(","),
+            "truemailOrganizer": input.organizer,
+        }});
+    }
+    if let Some(url) = input.url.as_deref() {
+        body["source"] = json!({"title": "truemail", "url": url});
+    }
+    body["sequence"] = json!(input.sequence);
     body
 }
 
@@ -236,6 +325,91 @@ fn yandex_event_body(uid: &str, input: &EventInput) -> String {
     }
     if let Some(location) = &input.location {
         lines.push(format!("LOCATION:{}", ical_escape(location)));
+    }
+    if let Some(rrule) = &input.rrule {
+        lines.push(format!("RRULE:{rrule}"));
+    }
+    if let Some(recurrence_id) = &input.recurrence_id {
+        lines.push(format!("RECURRENCE-ID:{recurrence_id}"));
+    }
+    if let Some(exdates) = &input.exdates {
+        lines.push(format!("EXDATE:{exdates}"));
+    }
+    if let Some(rdates) = &input.rdates {
+        lines.push(format!("RDATE:{rdates}"));
+    }
+    if let Some(timezone) = &input.timezone {
+        lines.push(format!("X-WR-TIMEZONE:{}", ical_escape(timezone)));
+    }
+    if let Some(transp) = input.transp {
+        lines.push(format!(
+            "TRANSP:{}",
+            match transp {
+                Transp::Opaque => "OPAQUE",
+                Transp::Transparent => "TRANSPARENT",
+            }
+        ));
+    }
+    if let Some(class) = input.class {
+        lines.push(format!(
+            "CLASS:{}",
+            match class {
+                EventClass::Public => "PUBLIC",
+                EventClass::Private => "PRIVATE",
+                EventClass::Confidential => "CONFIDENTIAL",
+            }
+        ));
+    }
+    if !input.categories.is_empty() {
+        lines.push(format!(
+            "CATEGORIES:{}",
+            input
+                .categories
+                .iter()
+                .map(|value| ical_escape(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if let Some(url) = &input.url {
+        lines.push(format!("URL:{}", ical_escape(url)));
+    }
+    if let Some(organizer) = &input.organizer {
+        lines.push(format!("ORGANIZER:mailto:{}", ical_escape(organizer)));
+    }
+    lines.push(format!("SEQUENCE:{}", input.sequence));
+    for attendee in &input.attendees {
+        let mut params = Vec::new();
+        if let Some(name) = &attendee.name {
+            params.push(format!("CN=\"{}\"", ical_escape(name).replace('"', "\\\"")));
+        }
+        if let Some(role) = &attendee.role {
+            params.push(format!("ROLE={role}"));
+        }
+        if let Some(partstat) = &attendee.partstat {
+            params.push(format!("PARTSTAT={partstat}"));
+        }
+        if attendee.rsvp {
+            params.push("RSVP=TRUE".into());
+        }
+        let params = if params.is_empty() {
+            String::new()
+        } else {
+            format!(";{}", params.join(";"))
+        };
+        lines.push(format!(
+            "ATTENDEE{params}:mailto:{}",
+            ical_escape(&attendee.email)
+        ));
+    }
+    for alarm in &input.alarms {
+        lines.extend([
+            "BEGIN:VALARM".into(),
+            format!("ACTION:{}", alarm.action),
+            format!("TRIGGER:-PT{}M", alarm.trigger_minutes.max(0)),
+            "DESCRIPTION:Reminder".into(),
+            "END:VALARM".into(),
+        ]);
     }
     lines.extend([
         "END:VEVENT".to_owned(),
@@ -377,6 +551,7 @@ fn google_contact_body(input: &ContactInput, etag: Option<&str>) -> Value {
             "familyName": input.last_name,
         }],
         "emailAddresses": input.emails.iter().map(|email| json!({"value": email})).collect::<Vec<_>>(),
+        "phoneNumbers": input.phones.iter().map(|phone| json!({"value": phone.remote_value(), "type": phone.kind.as_deref().unwrap_or("other")})).collect::<Vec<_>>(),
         "organizations": input.organization.as_ref().map(|name| vec![json!({"name": name})]).unwrap_or_default(),
     });
     if let Some(etag) = etag {
@@ -397,14 +572,22 @@ async fn write_google_contact(
         let path = format!("{}:updateContact", url.path());
         url.set_path(&path);
         url.query_pairs_mut()
-            .append_pair("updatePersonFields", "names,emailAddresses,organizations")
-            .append_pair("personFields", "names,emailAddresses,organizations");
+            .append_pair(
+                "updatePersonFields",
+                "names,emailAddresses,phoneNumbers,organizations",
+            )
+            .append_pair(
+                "personFields",
+                "names,emailAddresses,phoneNumbers,organizations",
+            );
         (Method::PATCH, url)
     } else {
         let mut url = Url::parse(&format!("{GOOGLE_PEOPLE_BASE}/people:createContact"))
             .map_err(|error| backend_error("google-contacts", error.to_string()))?;
-        url.query_pairs_mut()
-            .append_pair("personFields", "names,emailAddresses,organizations");
+        url.query_pairs_mut().append_pair(
+            "personFields",
+            "names,emailAddresses,phoneNumbers,organizations",
+        );
         (Method::POST, url)
     };
     google_json(
@@ -437,6 +620,22 @@ fn yandex_contact_body(uid: &str, input: &ContactInput) -> String {
             .iter()
             .map(|email| format!("EMAIL;TYPE=INTERNET:{}", ical_escape(email))),
     );
+    lines.extend(input.phones.iter().map(|phone| {
+        let number = ical_escape(phone.number.trim());
+        let value = match phone
+            .extension
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            Some(extension) => format!("{number};ext={}", ical_escape(extension.trim())),
+            None => number,
+        };
+        format!(
+            "TEL;TYPE={}:{}",
+            phone.kind.as_deref().unwrap_or("OTHER").to_uppercase(),
+            value
+        )
+    }));
     lines.extend(["END:VCARD".to_owned(), String::new()]);
     lines.join("\r\n")
 }
@@ -543,9 +742,38 @@ mod tests {
             dtstart: "2026-07-14T10:00:00+03:00".into(),
             dtend: Some("2026-07-14T11:00:00+03:00".into()),
             all_day: false,
+            attendees: vec![Attendee {
+                email: "guest@example.test".into(),
+                name: Some("Guest".into()),
+                role: Some("REQ-PARTICIPANT".into()),
+                partstat: Some("ACCEPTED".into()),
+                rsvp: false,
+            }],
+            alarms: vec![Alarm {
+                trigger_minutes: 10,
+                action: "POPUP".into(),
+            }],
+            rrule: Some("FREQ=WEEKLY;BYDAY=MO".into()),
+            timezone: Some("Europe/Moscow".into()),
+            transp: Some(Transp::Transparent),
+            class: Some(EventClass::Private),
+            categories: vec!["Team".into()],
+            url: Some("https://example.test/meeting".into()),
+            organizer: Some("owner@example.test".into()),
+            sequence: 2,
+            ..EventInput::default()
         });
         assert_eq!(body["summary"], "Demo");
         assert_eq!(body["start"]["dateTime"], "2026-07-14T10:00:00+03:00");
+        assert_eq!(body["start"]["timeZone"], "Europe/Moscow");
+        assert_eq!(body["recurrence"][0], "RRULE:FREQ=WEEKLY;BYDAY=MO");
+        assert_eq!(body["attendees"][0]["email"], "guest@example.test");
+        assert_eq!(body["reminders"]["overrides"][0]["minutes"], 10);
+        assert_eq!(body["visibility"], "private");
+        assert_eq!(
+            body["extendedProperties"]["private"]["truemailCategories"],
+            "Team"
+        );
     }
 
     #[test]
@@ -559,9 +787,30 @@ mod tests {
                 dtstart: "2026-07-14T10:00:00Z".into(),
                 dtend: None,
                 all_day: false,
+                attendees: vec![Attendee {
+                    email: "guest@example.test".into(),
+                    name: Some("Guest".into()),
+                    role: Some("REQ-PARTICIPANT".into()),
+                    partstat: Some("NEEDS-ACTION".into()),
+                    rsvp: true,
+                }],
+                alarms: vec![Alarm {
+                    trigger_minutes: 15,
+                    action: "DISPLAY".into(),
+                }],
+                rrule: Some("FREQ=DAILY;COUNT=3".into()),
+                exdates: Some("20260715T100000Z".into()),
+                timezone: Some("Europe/Moscow".into()),
+                organizer: Some("owner@example.test".into()),
+                sequence: 4,
+                ..EventInput::default()
             },
         );
         assert!(body.contains("SUMMARY:A\\, B"));
         assert!(body.contains("DTSTART:20260714T100000Z"));
+        assert!(body.contains("RRULE:FREQ=DAILY;COUNT=3"));
+        assert!(body.contains("ATTENDEE;CN=\"Guest\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:guest@example.test"));
+        assert!(body.contains("TRIGGER:-PT15M"));
+        assert!(body.contains("ORGANIZER:mailto:owner@example.test"));
     }
 }

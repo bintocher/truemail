@@ -34,7 +34,7 @@ fi
 echo "Создаю релиз $TAG"
 release=$(api -X POST "$API/repos/$OWNER/$REPO/releases" \
   -H 'Content-Type: application/json' \
-  -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":\"Сборки для Linux: deb, rpm, AppImage.\"}")
+  -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":\"Сборки truemail для Windows и Linux.\",\"is_authorized_only\":false}")
 
 release_id=$(printf '%s' "$release" | tr ',' '\n' | grep -m1 '"id"' | tr -dc '0-9')
 if [ -z "$release_id" ]; then

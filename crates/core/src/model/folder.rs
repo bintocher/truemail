@@ -112,17 +112,31 @@ pub struct SmartCondition {
     pub field: String, // from|to|subject|body|account|status|attachment|label|folder|date
     pub op: String,    // contains|not_contains|equals
     pub value: String,
+    pub unit: Option<String>,
+    pub value2: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartConditionGroup {
+    /// "all" (И) | "any" (ИЛИ)
+    pub logic: String,
+    pub conditions: Vec<SmartCondition>,
 }
 
 /// Умная папка (сохранённый фильтр).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmartFolder {
-    pub id: i64,
+    pub id: String,
     pub name: String,
     pub icon: Option<String>,
-    /// "all" (И) | "any" (ИЛИ)
-    pub match_logic: String,
     pub is_builtin: bool,
     pub enabled: bool,
-    pub conditions: Vec<SmartCondition>,
+    pub sort_order: i64,
+    pub groups: Vec<SmartConditionGroup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnifiedSource {
+    pub folder_id: i64,
+    pub included: bool,
 }

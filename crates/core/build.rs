@@ -1,7 +1,8 @@
 use std::{env, fs, path::PathBuf};
 
-const OAUTH_BUILD_KEYS: [&str; 3] = [
+const OAUTH_BUILD_KEYS: [&str; 4] = [
     "TRUEMAIL_YANDEX_CLIENT_ID",
+    "TRUEMAIL_YANDEX_REDIRECT_URI",
     "TRUEMAIL_GOOGLE_CLIENT_ID",
     "TRUEMAIL_GOOGLE_CLIENT_SECRET",
 ];

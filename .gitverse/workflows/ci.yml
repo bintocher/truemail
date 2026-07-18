@@ -26,3 +26,24 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
+
+  windows:
+    # Нативный host-runner обязателен: Tauri/NSIS и WebView2 нельзя проверить
+    # внутри Linux-контейнера. Стандартные метки GitVerse назначает при
+    # регистрации Windows x64 runner.
+    runs-on: [self-hosted, windows, x64]
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          .\scripts\dev.ps1 -Check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: |
+          .\scripts\dev.ps1 -Check
+          cargo test --workspace --locked

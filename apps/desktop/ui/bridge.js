@@ -13,9 +13,12 @@
   window.tm = {
     bootstrapStatus: () => invoke("bootstrap_status"),
     initializeStorage: (dataDir, locale, entropy) => invoke("initialize_storage", { dataDir, locale, entropy }),
+    exportKeyBackup: (path, password) => invoke("export_key_backup", { path, password }),
+    restoreKeyBackup: (dataDir, backupPath, password) => invoke("restore_key_backup", { dataDir, backupPath, password }),
     chooseDataDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
     chooseDir: (defaultPath) => tauri.dialog.open({ directory: true, multiple: false, defaultPath }),
     saveFileDialog: (defaultPath) => tauri.dialog.save({ defaultPath }),
+    chooseKeyBackup: (defaultPath) => tauri.dialog.open({ directory: false, multiple: false, defaultPath, filters: [{ name: "truemail key backup", extensions: ["tmkeys"] }] }),
     listAccounts: () => invoke("list_accounts"),
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
@@ -34,6 +37,7 @@
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
+    exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),
     unsubscribeOneClick: (url) => invoke("unsubscribe_one_click", { url }),
     setAutostart: (enabled) => invoke("set_autostart", { enabled }),
     getAutostart: () => invoke("get_autostart"),
@@ -41,9 +45,18 @@
     saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
     listSmartFolders: () => invoke("list_smart_folders"),
+    saveSmartFolders: (folders) => invoke("save_smart_folders", { folders }),
+    listSmartFolderMessages: (smartFolderId, beforeDate = null, beforeId = null, limit = 500) => invoke("list_smart_folder_messages", { smartFolderId, beforeDate, beforeId, limit }),
+    listUnifiedSources: () => invoke("list_unified_sources"),
+    setUnifiedSource: (folderId, included) => invoke("set_unified_source", { folderId, included }),
+    listMailRules: () => invoke("list_mail_rules"),
+    saveMailRule: (rule, applyExisting) => invoke("save_mail_rule", { rule, applyExisting }),
+    setMailRuleEnabled: (id, enabled) => invoke("set_mail_rule_enabled", { id, enabled }),
+    deleteMailRule: (id) => invoke("delete_mail_rule", { id }),
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
+    setCalendarVisible: (calendarId, visible) => invoke("set_calendar_visible", { calendarId, visible }),
     createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
     updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
     deleteEvent: (eventId) => invoke("delete_event", { eventId }),
@@ -60,20 +73,63 @@
     sendMessage: (request) => invoke("send_message", { request }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
+    snoozeMessages: (messageIds, until) => invoke("snooze_messages", { messageIds, until }),
+    unsnoozeMessages: (messageIds) => invoke("unsnooze_messages", { messageIds }),
+    releaseDueSnoozes: () => invoke("release_due_snoozes"),
+    listSignatures: (accountId) => invoke("list_signatures", { accountId }),
+    saveSignature: (accountId, kind, bodyHtml, enabled) => invoke("save_signature", { accountId, kind, bodyHtml, enabled }),
+    listMessageTemplates: (accountId) => invoke("list_message_templates", { accountId }),
+    saveMessageTemplate: (template) => invoke("save_message_template", template),
+    deleteMessageTemplate: (id, accountId) => invoke("delete_message_template", { id, accountId }),
     messageAction: (messageIds, action) => invoke("message_action", { messageIds, action }),
     moveMessagesToFolder: (messageIds, folderId) => invoke("move_messages_to_folder", { messageIds, folderId }),
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
     getSetting: (key) => invoke("get_setting", { key }),
     setSetting: (key, value) => invoke("set_setting", { key, value }),
+    listKeybindings: () => invoke("list_keybindings"),
+    setKeybinding: (action, combo) => invoke("set_keybinding", { action, combo }),
+    imageSenderTrusted: (sender) => invoke("image_sender_trusted", { sender }),
+    setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     openExternal: (url) => invoke("open_external_url", { url }),
     beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
+    completePasswordImap: (config) => invoke("complete_password_imap", config),
+    completeExchangeEws: (config) => invoke("complete_exchange_ews", config),
+    completeJmap: (config) => invoke("complete_jmap", config),
     beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
     completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
     apiTools: () => invoke("api_tools"),
-    localizationCatalog: (locale) => invoke("localization_catalog", { locale }),
+    externalApiStatus: () => invoke("external_api_status"),
+    startExternalApi: (port) => invoke("start_external_api", { port }),
+    stopExternalApi: () => invoke("stop_external_api"),
+    listApiClients: () => invoke("list_api_clients"),
+    createApiClient: (name, caps) => invoke("create_api_client", { name, caps }),
+    revokeApiClient: (clientId) => invoke("revoke_api_client", { clientId }),
+    listApiAudit: (limit = 50) => invoke("list_api_audit", { limit }),
+    clearApiAudit: () => invoke("clear_api_audit"),
+    checkForUpdate: () => invoke("check_for_update"),
+    installUpdate: () => invoke("install_update"),
   };
+  const offerUpdate = info => {
+    if (!info?.available_version) return;
+    const message = wizardLocale === "en" ? `truemail ${info.available_version} is available` : `Доступен truemail ${info.available_version}`;
+    showToast(message, L("Обновить", "Update"), async () => {
+      const status = document.getElementById("updateStatus");
+      if (status) status.textContent = L("Скачиваю и устанавливаю обновление…", "Downloading and installing the update…");
+      await window.tm.installUpdate();
+    });
+  };
+  tauri.event?.listen("truemail-update-available", event => offerUpdate(event.payload)).catch(console.error);
+  tauri.event?.listen("truemail-update-progress", event => {
+    const status = document.getElementById("updateStatus"), progress = event.payload;
+    if (!status || !progress) return;
+    if (progress.event === "finished") status.textContent = L("Обновление скачано, запускаю установку…", "Update downloaded, starting installation…");
+    else if (progress.total) {
+      const percent = Math.min(100, Math.round(progress.downloaded / progress.total * 100));
+      status.textContent = L(`Скачано ${percent}%`, `Downloaded ${percent}%`);
+    }
+  }).catch(console.error);
   tauri.event?.listen("truemail-global-shortcut", event => {
     const action = event.payload;
     if (action === "compose") document.getElementById("composeBtn")?.click();
@@ -103,8 +159,8 @@
   async function loadCoreData(accounts) {
     const folders = await Promise.all(accounts.map(account => window.tm.listFolders(account.id)));
     const allFolders = folders.flat();
-    const unifiedValues = await Promise.all(allFolders.map(folder => window.tm.getSetting(`unified_${folder.id}`)));
-    window.coreUnifiedSettings = Object.fromEntries(allFolders.map((folder,index)=>[folder.id,unifiedValues[index]]));
+    const unifiedSources = await window.tm.listUnifiedSources();
+    window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, 100)));
     const [contacts, calendarData, smartFolders, storage] = await Promise.all([
       window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),
@@ -119,6 +175,7 @@
   // Первичная загрузка только реальных данных из ядра.
   (async () => {
     try {
+      await window.localizationReady;
       const bootstrap = await window.tm.bootstrapStatus();
       window.tmStorageReady = bootstrap.ready;
       window.tmDefaultDataDir = bootstrap.data_dir;
@@ -132,31 +189,35 @@
       // молча не восстановленная настройка (так терялись show_conversations,
       // preview_lines, contacts_view, notify_position).
       const settings = await window.tm.allSettings();
+      await window.refreshKeybindings?.();
       const onboardingCompleted = settings.onboarding_completed;
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
-      if (savedLocale && window.applyUiCatalog) window.applyUiCatalog(await window.tm.localizationCatalog(savedLocale));
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
+      await window.reloadMailRules?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
       else await loadCoreData(accounts);
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
       if (accounts.length) {
+        const releaseSnoozed = async () => {
+          const released = await window.tm.releaseDueSnoozes();
+          if (released) scheduleReload(0);
+        };
+        releaseSnoozed().catch(console.error);
+        setInterval(() => releaseSnoozed().catch(console.error), 30000);
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
-        // Календарь/контакты/задачи тянем сразу при старте, а не только в 5-минутном
-        // интервале ниже - иначе они не появляются до нескольких минут после запуска.
-        window.tm.syncAuxiliaryAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере
         // появления данных, не перезагружая весь WebView.
         [3000, 10000, 30000].forEach(delay => setTimeout(() => window.reloadCoreData().catch(console.error), delay));
         // DAV не имеет push-канала: обновляем календарь и контакты отдельно,
-        // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE,
-        // Gmail подтягивается этим 5-минутным sync (IMAP 993 у Gmail часто закрыт).
+        // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE.
+        // Gmail проверяет новые ID каждые 25 секунд, а этот проход подхватывает
+        // изменения ярлыков/удаления, которые не создали новое входящее письмо.
         setInterval(() => {
           window.tm.syncAccounts().catch(console.error);
-          window.tm.syncAuxiliaryAccounts().catch(console.error);
         }, 5 * 60 * 1000);
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {

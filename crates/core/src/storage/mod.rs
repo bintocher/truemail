@@ -37,7 +37,7 @@ impl Db {
         Self::open_with_database_key(data_dir, crypto, &database_key).await
     }
 
-    async fn open_with_database_key(
+    pub(crate) async fn open_with_database_key(
         data_dir: &Path,
         crypto: Arc<StorageCrypto>,
         database_key: &DatabaseKey,
@@ -61,6 +61,15 @@ impl Db {
         // угодно: это ожидание своей очереди, а не блокировки, и оно не падает.
         let write_pool = SqlitePoolOptions::new()
             .max_connections(1)
+            // Первая полная синхронизация календаря может занимать единственный
+            // SQLCipher-писатель дольше стандартных 30 секунд sqlx. Этот пул —
+            // очередь записи, поэтому ожидаем завершения активной транзакции,
+            // а не показываем пользователю ложную ошибку хранилища.
+            .acquire_timeout(std::time::Duration::from_secs(10 * 60))
+            // Несколько аккаунтов завершают сетевую синхронизацию одновременно
+            // и штатно ждут единственного SQLCipher-писателя. До 30 секунд это
+            // нормальная очередь, а не медленное получение соединения.
+            .acquire_slow_threshold(std::time::Duration::from_secs(30))
             .connect_with(encrypted_options(&db_path, database_key, true))
             .await?;
 
@@ -89,7 +98,16 @@ impl Db {
     /// deferred стартует читателем и берёт снимок БД, а если к первой записи
     /// снимок устарел, SQLite отдаёт SQLITE_BUSY сразу, не дожидаясь ничего.
     pub async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-        Ok(self.write_pool.begin_with("BEGIN IMMEDIATE").await?)
+        let started = std::time::Instant::now();
+        let transaction = self.write_pool.begin_with("BEGIN IMMEDIATE").await?;
+        let wait = started.elapsed();
+        if wait >= std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                writer_wait_ms = wait.as_millis() as u64,
+                "SQLCipher writer queue wait"
+            );
+        }
+        Ok(transaction)
     }
 
     /// Прогнать все миграции из crates/core/migrations.
@@ -100,6 +118,7 @@ impl Db {
             .map_err(|e| crate::Error::Other(format!("миграции: {e}")))?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
+        self.import_legacy_mail_rules().await?;
         Ok(())
     }
 
@@ -231,20 +250,44 @@ fn encrypted_options(
 }
 
 async fn verify_sqlcipher(pool: &SqlitePool) -> Result<()> {
-    let version: Option<(String,)> = sqlx::query_as("PRAGMA cipher_version")
+    let cipher_version: Option<(String,)> = sqlx::query_as("PRAGMA cipher_version")
         .fetch_optional(pool)
         .await?;
-    let version = version
+    let cipher_version = cipher_version
         .map(|row| row.0)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crate::Error::Crypto("сборка SQLite не содержит SQLCipher".into()))?;
+    let (sqlite_version,): (String,) = sqlx::query_as("SELECT sqlite_version()")
+        .fetch_one(pool)
+        .await?;
+    ensure_version_at_least("SQLCipher", &cipher_version, (4, 17, 0))?;
+    ensure_version_at_least("SQLite", &sqlite_version, (3, 53, 3))?;
     let _: (i64,) = sqlx::query_as("SELECT count(*) FROM sqlite_master")
         .fetch_one(pool)
         .await
         .map_err(|error| {
             crate::Error::Crypto(format!("не удалось открыть SQLCipher БД: {error}"))
         })?;
-    tracing::info!(sqlcipher_version = %version, "SQLCipher storage opened");
+    tracing::info!(%cipher_version, %sqlite_version, "SQLCipher storage opened");
+    Ok(())
+}
+
+fn ensure_version_at_least(product: &str, actual: &str, minimum: (u64, u64, u64)) -> Result<()> {
+    let mut parts = actual
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok());
+    let parsed = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+    if parsed < minimum {
+        return Err(crate::Error::Crypto(format!(
+            "{product} {actual} устарел; требуется не ниже {}.{}.{}",
+            minimum.0, minimum.1, minimum.2
+        )));
+    }
     Ok(())
 }
 
@@ -417,11 +460,27 @@ fn escape_sql_literal(value: &str) -> String {
 mod tests {
     use super::*;
     use rand::Rng;
+    use sha2::Digest as _;
 
     fn random_key() -> [u8; 32] {
         let mut key = [0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         key
+    }
+
+    #[test]
+    fn migration_17_checksum_is_stable() {
+        let checksum =
+            sha2::Sha384::digest(include_bytes!("../../migrations/0017_mail_sync_tokens.sql"));
+        let actual = checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            actual,
+            "5fbb38197fef7288e42c44df0ccd6869e215ef42ae498c3e81b3feb6565da7c33afc70c68e865dc2b9c3937ea73c8067",
+            "applied migrations are immutable"
+        );
     }
 
     #[tokio::test]
@@ -455,6 +514,57 @@ mod tests {
         drop(db);
         let database_path = root.join("truemail.db");
         assert!(!has_plaintext_sqlite_header(&database_path).expect("read database header"));
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn sqlx_migrations_are_completed_by_the_application_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "truemail-settings-contract-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+
+        // sqlx applies the structural migration, but 0009 deliberately leaves
+        // legacy values for the application to encrypt with its storage key.
+        sqlx::migrate!("./migrations")
+            .run(&db.write_pool)
+            .await
+            .expect("run structural migrations");
+        let (before,): (Vec<u8>,) = sqlx::query_as("SELECT value FROM settings WHERE key='locale'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read structural migration value");
+        assert_eq!(before, b"ru");
+
+        // Db::migrate is the public contract and safely finishes an already
+        // structurally migrated database.
+        db.migrate().await.expect("complete application migration");
+        let (after,): (Vec<u8>,) = sqlx::query_as("SELECT value FROM settings WHERE key='locale'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read encrypted migration value");
+        assert!(after.starts_with(ENCRYPTED_SETTING_PREFIX));
+        assert_eq!(
+            db.setting("locale").await.expect("decrypt locale"),
+            Some("ru".into())
+        );
+        let (completed,): (String,) = sqlx::query_as(
+            "SELECT value FROM storage_meta WHERE key='settings_encryption_v1_vacuumed'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read completion marker");
+        assert_eq!(completed, "1");
+
+        db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 
@@ -536,13 +646,11 @@ mod tests {
 
         let root = std::env::temp_dir().join(format!("truemail-repo-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create temp data dir");
-        let db = Db::open_with_database_key(
-            &root,
-            Arc::new(StorageCrypto::from_key(random_key())),
-            &DatabaseKey::from_key(random_key()),
-        )
-        .await
-        .expect("open database");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let db =
+            Db::open_with_database_key(&root, crypto.clone(), &DatabaseKey::from_key(random_key()))
+                .await
+                .expect("open database");
         db.migrate().await.expect("migrate database");
         let account = db
             .save_account(&NewAccount {
@@ -558,6 +666,7 @@ mod tests {
                 }),
                 smtp: None,
                 ews_url: None,
+                jmap_url: None,
                 username: Some("repo@example.test".into()),
                 secret_ref: "test-keychain-ref".into(),
                 color: None,
@@ -565,6 +674,34 @@ mod tests {
             .await
             .expect("save generic account");
         assert_eq!(account.provider, Provider::Generic);
+
+        let bindings = db.list_keybindings().await.expect("list keybindings");
+        assert!(bindings.iter().any(|binding| binding.action == "compose"));
+        db.set_keybinding("compose", "N")
+            .await
+            .expect("change keybinding");
+        assert_eq!(
+            db.list_keybindings()
+                .await
+                .expect("reload keybindings")
+                .into_iter()
+                .find(|binding| binding.action == "compose")
+                .map(|binding| binding.combo),
+            Some("N".into())
+        );
+        assert!(
+            !db.image_sender_trusted("news@example.test")
+                .await
+                .expect("read missing image trust")
+        );
+        db.set_image_sender_trusted("News@Example.Test", true)
+            .await
+            .expect("trust image sender");
+        assert!(
+            db.image_sender_trusted("news@example.test")
+                .await
+                .expect("read image trust")
+        );
 
         let indexes: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type='index' AND name IN ('idx_messages_folder_date','uq_events_calendar_uid','idx_attachments_message') ORDER BY name",
@@ -588,6 +725,439 @@ mod tests {
             .await
             .expect("fts count");
         assert_eq!(before, 1);
+
+        use crate::backend::{DiscoveredFolder, DiscoveredMessage};
+        use crate::model::FolderRole;
+        let token_folder = DiscoveredFolder {
+            remote_path: "INBOX".into(),
+            display_name: "Inbox".into(),
+            role: Some(FolderRole::Inbox),
+            unread_count: 0,
+            total_count: 2,
+            uidvalidity: None,
+            uidnext: None,
+            highestmodseq: None,
+            sync_token: Some("history-123".into()),
+        };
+        db.save_discovered_folders(account.id, std::slice::from_ref(&token_folder))
+            .await
+            .expect("save folder metadata");
+        let (token_before_commit,): (Option<String>,) =
+            sqlx::query_as("SELECT sync_token FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read pending sync token");
+        assert_eq!(token_before_commit, None);
+        db.save_folder_sync_tokens(account.id, std::slice::from_ref(&token_folder))
+            .await
+            .expect("commit sync token");
+        let (token_after_commit,): (Option<String>,) =
+            sqlx::query_as("SELECT sync_token FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read committed sync token");
+        assert_eq!(token_after_commit.as_deref(), Some("history-123"));
+
+        sqlx::query("INSERT INTO folders(account_id, remote_path, display_name) VALUES(?, 'ALL', 'All Mail')")
+            .bind(account.id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert all-mail folder");
+        let (all_folder_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND remote_path='ALL'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("all-mail folder id");
+        for (target_folder, uid, remote_id) in [
+            (folder_id, 2_i64, "remote-1"),
+            (all_folder_id, 2_i64, "remote-1"),
+            (all_folder_id, 3_i64, "remote-deleted"),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, remote_id) VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(target_folder)
+            .bind(uid)
+            .bind(remote_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert Gmail projection");
+        }
+        let desired = DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 2,
+            remote_id: Some("remote-1".into()),
+            size: None,
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: Vec::new(),
+            body_fetched: true,
+        };
+        let removed = db
+            .reconcile_remote_projections(
+                account.id,
+                &[desired],
+                &["remote-1".into(), "remote-deleted".into()],
+                None,
+            )
+            .await
+            .expect("reconcile Gmail projections");
+        assert_eq!(removed, 2);
+        let remaining: Vec<(String, String)> = sqlx::query_as(
+            "SELECT m.remote_id, f.remote_path FROM messages m
+             JOIN folders f ON f.id=m.folder_id WHERE m.remote_id IS NOT NULL",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read remaining projections");
+        assert_eq!(remaining, vec![("remote-1".into(), "INBOX".into())]);
+
+        let (message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=1")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("message id for snooze");
+        assert_eq!(
+            db.set_messages_snoozed(&[message_id], Some("2099-01-01 09:00:00"))
+                .await
+                .expect("snooze message"),
+            1
+        );
+        assert!(
+            !db.list_messages(folder_id, 100)
+                .await
+                .expect("list without snoozed message")
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+        db.set_messages_snoozed(&[message_id], None)
+            .await
+            .expect("unsnooze message");
+        assert!(
+            db.list_messages(folder_id, 100)
+                .await
+                .expect("list restored message")
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+
+        db.upsert_signature(account.id, "new", "<b>Regards</b>", true)
+            .await
+            .expect("save signature");
+        let signatures = db
+            .list_signatures(account.id)
+            .await
+            .expect("list signatures");
+        assert_eq!(signatures.len(), 1);
+        assert_eq!(signatures[0].body_html, "<b>Regards</b>");
+
+        let template_id = db
+            .save_message_template(None, account.id, "Status", "Weekly", "<p>Done</p>")
+            .await
+            .expect("save template");
+        let templates = db
+            .list_message_templates(account.id)
+            .await
+            .expect("list templates");
+        assert_eq!(templates[0].id, template_id);
+        assert_eq!(templates[0].subject, "Weekly");
+        assert!(
+            db.delete_message_template(template_id, account.id)
+                .await
+                .expect("delete template")
+        );
+
+        let calendar_raw = b"From: calendar@example.test\r\nTo: repo@example.test\r\nSubject: Meeting\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=calendar\r\n\r\n--calendar\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nInvitation\r\n--calendar\r\nContent-Type: text/calendar; charset=utf-8; name=invite.ics\r\nContent-Disposition: attachment; filename=invite.ics\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n--calendar--\r\n";
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 5,
+                remote_id: Some("calendar-message".into()),
+                size: Some(calendar_raw.len() as u32),
+                seen: false,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: calendar_raw.to_vec(),
+                body_fetched: true,
+            }],
+        )
+        .await
+        .expect("save calendar attachment");
+        let (calendar_message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=5")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("calendar message id");
+        let calendar_message = db
+            .get_message(calendar_message_id)
+            .await
+            .expect("parse calendar attachment");
+        assert!(calendar_message.attachments[0].size.unwrap_or_default() > 0);
+        let (cached,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM message_content_cache WHERE message_id=?")
+                .bind(calendar_message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read MIME cache");
+        assert_eq!(cached, 1);
+        sqlx::query("UPDATE message_content_cache SET body_text='cached body' WHERE message_id=?")
+            .bind(calendar_message_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark cached body");
+        assert_eq!(
+            db.get_message(calendar_message_id)
+                .await
+                .expect("read cached MIME")
+                .body_text
+                .as_deref(),
+            Some("cached body")
+        );
+        use crate::search::{Fts5Index, SearchIndex};
+        assert!(
+            Fts5Index::new(db.clone())
+                .search("Invitation", 10)
+                .await
+                .expect("search indexed MIME body")
+                .contains(&calendar_message_id)
+        );
+        assert_eq!(
+            db.attachment_bytes(calendar_message_id, 0)
+                .await
+                .expect("calendar attachment bytes")
+                .0,
+            "invite.ics"
+        );
+
+        // Лёгкий Gmail metadata update не должен затереть уже загруженный raw,
+        // вложения или FTS-тело того же письма.
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 5,
+                remote_id: Some("calendar-message".into()),
+                size: Some(calendar_raw.len() as u32),
+                seen: true,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: b"Subject: Meeting\r\n\r\npreview".to_vec(),
+                body_fetched: false,
+            }],
+        )
+        .await
+        .expect("save metadata projection over full body");
+        assert!(
+            db.message_fetch_locator(calendar_message_id)
+                .await
+                .expect("read full-body locator")
+                .expect("full-body locator")
+                .4
+        );
+        assert_eq!(
+            db.message_raw_bytes(calendar_message_id)
+                .await
+                .expect("full raw is preserved"),
+            calendar_raw
+        );
+        assert_eq!(
+            db.get_message(calendar_message_id)
+                .await
+                .expect("attachments are preserved")
+                .attachments
+                .len(),
+            1
+        );
+
+        // Новая metadata-проекция доступна в списке, но открытие должно
+        // инициировать ленивую загрузку полного MIME.
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 6,
+                remote_id: Some("metadata-only".into()),
+                size: Some(50_000_000),
+                seen: false,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: b"Subject: Large\r\n\r\nsmall preview".to_vec(),
+                body_fetched: false,
+            }],
+        )
+        .await
+        .expect("save metadata-only message");
+        let (metadata_message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=6")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("metadata message id");
+        assert!(
+            !db.message_fetch_locator(metadata_message_id)
+                .await
+                .expect("read metadata locator")
+                .expect("metadata locator")
+                .4
+        );
+        db.store_fetched_raw(metadata_message_id, b"Subject: Large\r\n\r\nfull body")
+            .await
+            .expect("store lazy full raw");
+        assert!(
+            db.message_fetch_locator(metadata_message_id)
+                .await
+                .expect("read hydrated locator")
+                .expect("hydrated locator")
+                .4
+        );
+
+        let custom_smart = crate::model::SmartFolder {
+            id: "test-subject".into(),
+            name: "Test subject".into(),
+            icon: Some("search".into()),
+            is_builtin: false,
+            enabled: true,
+            sort_order: 99,
+            groups: vec![crate::model::SmartConditionGroup {
+                logic: "all".into(),
+                conditions: vec![crate::model::SmartCondition {
+                    field: "subject".into(),
+                    op: "contains".into(),
+                    value: "secret".into(),
+                    unit: None,
+                    value2: None,
+                }],
+            }],
+        };
+        db.save_smart_folders(std::slice::from_ref(&custom_smart))
+            .await
+            .expect("save smart folder in core");
+        assert!(
+            db.list_smart_folders()
+                .await
+                .expect("list smart folders")
+                .iter()
+                .any(|folder| folder.id == custom_smart.id)
+        );
+        let smart_messages = db
+            .list_smart_folder_messages(&custom_smart.id, 100)
+            .await
+            .expect("execute smart folder in core");
+        assert!(
+            smart_messages
+                .iter()
+                .any(|message| message.id == message_id)
+        );
+        db.set_unified_source(folder_id, false)
+            .await
+            .expect("exclude unified source");
+        assert!(
+            db.list_smart_folder_messages(&custom_smart.id, 100)
+                .await
+                .expect("execute excluded smart source")
+                .is_empty()
+        );
+        db.set_unified_source(folder_id, true)
+            .await
+            .expect("restore unified source");
+        db.save_smart_folders(&[])
+            .await
+            .expect("delete omitted custom smart folder");
+
+        let api_token = "tm_integration_test_token";
+        let api_hash = sha2::Sha256::digest(api_token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        sqlx::query(
+            "INSERT INTO api_clients(name, token_ref, token_hash, caps)
+             VALUES('integration', 'not-used-in-test', ?, '[\"read\"]')",
+        )
+        .bind(api_hash)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert API test client");
+        let api_core = Arc::new(crate::Core {
+            db: db.clone(),
+            search: Arc::new(crate::search::Fts5Index::new(db.clone())),
+            crypto: crypto.clone(),
+            accounts: crate::account::AccountManager::new(db.clone()),
+        });
+        let audit_core = api_core.clone();
+        let api_server = crate::api::start_server(api_core, 0)
+            .await
+            .expect("start loopback API");
+        let api_url = format!("http://127.0.0.1:{}", api_server.port);
+        let http = reqwest::Client::new();
+        assert_eq!(
+            http.get(format!("{api_url}/health"))
+                .send()
+                .await
+                .expect("API health")
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            http.get(format!("{api_url}/v1/tools"))
+                .send()
+                .await
+                .expect("unauthorized API")
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            http.get(format!("{api_url}/v1/tools"))
+                .bearer_auth("tm_invalid")
+                .send()
+                .await
+                .expect("invalid API token")
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let tools: serde_json::Value = http
+            .get(format!("{api_url}/v1/tools"))
+            .bearer_auth(api_token)
+            .send()
+            .await
+            .expect("authorized tools")
+            .json()
+            .await
+            .expect("tools json");
+        assert!(tools["tools"].as_array().is_some_and(|tools| {
+            tools.iter().any(|tool| tool["name"] == "list_messages")
+                && !tools.iter().any(|tool| tool["name"] == "send")
+        }));
+        assert_eq!(
+            http.post(format!("{api_url}/v1/tools/label"))
+                .bearer_auth(api_token)
+                .json(&serde_json::json!({"message_id": message_id, "label_id": 1}))
+                .send()
+                .await
+                .expect("denied API call")
+                .status(),
+            reqwest::StatusCode::FORBIDDEN
+        );
+        api_server.stop();
+        assert!(
+            crate::api::list_audit(audit_core.as_ref(), 10)
+                .await
+                .expect("API audit")
+                .iter()
+                .any(|entry| entry.action == "tool:label:denied")
+        );
+
         sqlx::query("DELETE FROM accounts WHERE id=?")
             .bind(account.id)
             .execute(&db.write_pool)
@@ -598,6 +1168,521 @@ mod tests {
             .await
             .expect("fts count after cascade");
         assert_eq!(after, 0);
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn auxiliary_deltas_preserve_unchanged_rows_and_commit_cursors() {
+        use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
+        use crate::model::{
+            Alarm, Attendee, AuthKind, BackendKind, ContactPhone, NewAccount, Provider,
+        };
+
+        fn event(id: &str, summary: &str) -> DavEvent {
+            DavEvent {
+                remote_url: Some(format!("google-event:{id}")),
+                uid: id.into(),
+                summary: summary.into(),
+                description: None,
+                location: None,
+                dtstart: "2026-07-17T10:00:00Z".into(),
+                dtend: None,
+                rrule: None,
+                recurrence_id: None,
+                exdates: None,
+                rdates: None,
+                status: Some("confirmed".into()),
+                attendees: vec![Attendee {
+                    email: format!("guest-{id}@example.test"),
+                    name: Some("Guest".into()),
+                    role: Some("REQ-PARTICIPANT".into()),
+                    partstat: Some("ACCEPTED".into()),
+                    rsvp: false,
+                }],
+                alarms: vec![Alarm {
+                    trigger_minutes: 15,
+                    action: "DISPLAY".into(),
+                }],
+                timezone: Some("Europe/Moscow".into()),
+                transp: Some("OPAQUE".into()),
+                class: Some("PRIVATE".into()),
+                categories: vec!["Demo".into()],
+                url: Some("https://example.test/event".into()),
+                organizer: Some("owner@example.test".into()),
+                sequence: 3,
+                raw: format!("event:{id}:{summary}"),
+                etag: None,
+            }
+        }
+
+        fn contact(id: &str, name: &str) -> DavContact {
+            DavContact {
+                remote_url: Some(format!("google-contact:people/{id}")),
+                uid: format!("people/{id}"),
+                display_name: name.into(),
+                first_name: None,
+                last_name: None,
+                organization: None,
+                emails: vec![format!("{id}@example.test")],
+                phones: vec![ContactPhone {
+                    number: format!("+7999000000{id}"),
+                    kind: Some("mobile".into()),
+                    extension: Some(format!("10{id}")),
+                }],
+                raw: format!("contact:{id}:{name}"),
+                etag: None,
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("truemail-aux-delta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "delta@example.test".into(),
+                display_name: "Delta test".into(),
+                provider: Provider::Gmail,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                jmap_url: None,
+                username: None,
+                secret_ref: "delta-test".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+
+        let full = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("calendar-token-1".into()),
+                sync_scope: SyncScope::Full,
+                deleted_event_urls: Vec::new(),
+                events: vec![
+                    event("event-1", "One"),
+                    event("event-2", "Two"),
+                    event("event-3", "Three"),
+                ],
+            }],
+            calendars_available: true,
+            contacts: vec![
+                contact("1", "One"),
+                contact("2", "Two"),
+                contact("3", "Three"),
+            ],
+            contact_collections: Vec::new(),
+            contacts_available: true,
+            contacts_scope: SyncScope::Full,
+            contacts_sync_token: Some("contacts-token-1".into()),
+            deleted_contact_urls: Vec::new(),
+        };
+        db.save_google_services(account.id, &full)
+            .await
+            .expect("save full auxiliary snapshot");
+        let (calendars, _) = db
+            .list_calendars_and_events()
+            .await
+            .expect("load calendars");
+        let calendar_id = calendars[0].id;
+        db.set_calendar_visible(calendar_id, false)
+            .await
+            .expect("hide calendar");
+
+        let delta = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("calendar-token-2".into()),
+                sync_scope: SyncScope::Delta,
+                deleted_event_urls: vec!["google-event:event-2".into()],
+                events: vec![event("event-1", "One updated")],
+            }],
+            calendars_available: true,
+            contacts: vec![contact("1", "One updated")],
+            contact_collections: Vec::new(),
+            contacts_available: true,
+            contacts_scope: SyncScope::Delta,
+            contacts_sync_token: Some("contacts-token-2".into()),
+            deleted_contact_urls: vec!["google-contact:people/2".into()],
+        };
+        db.save_google_services(account.id, &delta)
+            .await
+            .expect("save auxiliary delta");
+
+        let temporarily_unavailable = DavSyncResult {
+            calendars: Vec::new(),
+            calendars_available: false,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        db.save_auxiliary_data(account.id, "google", &temporarily_unavailable)
+            .await
+            .expect("preserve unavailable auxiliary data");
+
+        let events: Vec<(String,)> = sqlx::query_as("SELECT summary FROM events ORDER BY summary")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read events after delta");
+        assert_eq!(events, vec![("One updated".into(),), ("Three".into(),)]);
+        let (loaded_calendars, loaded_events) = db
+            .list_calendars_and_events()
+            .await
+            .expect("load event children");
+        assert!(!loaded_calendars[0].visible);
+        let updated = loaded_events
+            .iter()
+            .find(|event| event.summary == "One updated")
+            .expect("updated event");
+        assert_eq!(updated.attendees.len(), 1);
+        assert_eq!(updated.attendees[0].partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(updated.alarms.len(), 1);
+        assert_eq!(updated.alarms[0].trigger_minutes, 15);
+        assert_eq!(updated.timezone.as_deref(), Some("Europe/Moscow"));
+        assert_eq!(updated.transp, Some(crate::model::Transp::Opaque));
+        assert_eq!(updated.class, Some(crate::model::EventClass::Private));
+        assert_eq!(updated.categories, ["Demo"]);
+        assert_eq!(updated.url.as_deref(), Some("https://example.test/event"));
+        assert_eq!(updated.organizer.as_deref(), Some("owner@example.test"));
+        assert_eq!(updated.sequence, 3);
+        let contacts: Vec<(String,)> = sqlx::query_as(
+            "SELECT display_name FROM contacts WHERE uid NOT LIKE 'mail:%' ORDER BY display_name",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read contacts after delta");
+        assert_eq!(contacts, vec![("One updated".into(),), ("Three".into(),)]);
+        let loaded_contacts = db.list_contacts(None).await.expect("load contacts");
+        let updated_contact = loaded_contacts
+            .iter()
+            .find(|contact| contact.display_name == "One updated")
+            .expect("updated contact");
+        assert_eq!(updated_contact.phones.len(), 1);
+        assert_eq!(updated_contact.phones[0].number, "+79990000001");
+        assert_eq!(updated_contact.phones[0].kind.as_deref(), Some("mobile"));
+        assert_eq!(updated_contact.phones[0].extension.as_deref(), Some("101"));
+        db.hide_local_contact(updated_contact.id.expect("contact id"))
+            .await
+            .expect("hide contact");
+        assert!(
+            db.list_contacts(None)
+                .await
+                .expect("load visible contacts")
+                .iter()
+                .all(|contact| contact.display_name != "One updated")
+        );
+        let cursors = db
+            .auxiliary_sync_cursors(account.id)
+            .await
+            .expect("read auxiliary cursors");
+        assert_eq!(
+            cursors
+                .calendars
+                .get("google-calendar:primary")
+                .and_then(|cursor| cursor.sync_token.as_deref()),
+            Some("calendar-token-2")
+        );
+        assert_eq!(
+            cursors.contacts_sync_token.as_deref(),
+            Some("contacts-token-2")
+        );
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn mail_rules_queue_each_matching_message_once() {
+        use crate::model::{
+            AuthKind, BackendKind, MailRuleInput, NewAccount, Provider, Security, ServerConfig,
+        };
+
+        let root = std::env::temp_dir().join(format!("truemail-rules-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "rules@example.test".into(),
+                display_name: "Rules test".into(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "imap.example.test".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: None,
+                ews_url: None,
+                jmap_url: None,
+                username: Some("rules@example.test".into()),
+                secret_ref: "test-keychain-ref".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+        for (path, name, role) in [
+            ("INBOX", "Inbox", "inbox"),
+            ("Archive", "Archive", "archive"),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders(account_id, remote_path, display_name, role)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(path)
+            .bind(name)
+            .bind(role)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert folder");
+        }
+        let (inbox_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role='inbox'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("inbox id");
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject)
+             VALUES(?, ?, 42, 'alerts@example.test', 'Build failed')",
+        )
+        .bind(account.id)
+        .bind(inbox_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert matching message");
+
+        db.save_mail_rule(
+            &MailRuleInput {
+                id: "archive-alerts".into(),
+                name: "Archive alerts".into(),
+                field: "sender".into(),
+                operator: "contains".into(),
+                value: "alerts@".into(),
+                account_id: Some(account.id),
+                action: "archive".into(),
+                folder_id: None,
+                enabled: true,
+            },
+            true,
+        )
+        .await
+        .expect("save rule");
+        assert_eq!(db.process_mail_rules().await.expect("process rule"), 1);
+        assert_eq!(db.process_mail_rules().await.expect("process again"), 0);
+
+        let operations: Vec<(String, String)> =
+            sqlx::query_as("SELECT op_kind, payload FROM outbox_ops WHERE status='pending'")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read queued operation");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "move");
+        assert!(
+            operations[0]
+                .1
+                .contains("\"target_folder_path\":\"Archive\"")
+        );
+        let (progress,): (i64,) =
+            sqlx::query_as("SELECT progress_message_id FROM mail_rules WHERE id='archive-alerts'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read rule progress");
+        assert!(progress > 0);
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    #[tokio::test]
+    async fn outbox_move_retries_completes_and_can_be_undone() {
+        use crate::model::{AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
+
+        let root = std::env::temp_dir().join(format!("truemail-outbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "outbox@example.test".into(),
+                display_name: "Outbox test".into(),
+                provider: Provider::Generic,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: Some(ServerConfig {
+                    host: "imap.example.test".into(),
+                    port: 993,
+                    security: Security::Ssl,
+                }),
+                smtp: None,
+                ews_url: None,
+                jmap_url: None,
+                username: Some("outbox@example.test".into()),
+                secret_ref: "test-keychain-ref".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+        for (path, name, role) in [
+            ("INBOX", "Inbox", "inbox"),
+            ("Archive", "Archive", "archive"),
+            ("Trash", "Trash", "trash"),
+        ] {
+            sqlx::query(
+                "INSERT INTO folders(account_id, remote_path, display_name, role)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(path)
+            .bind(name)
+            .bind(role)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert folder");
+        }
+        let (inbox_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role='inbox'")
+                .bind(account.id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("inbox id");
+        let mut message_ids = Vec::new();
+        for uid in [41_i64, 42] {
+            let id = sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, subject)
+                 VALUES(?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(inbox_id)
+            .bind(uid)
+            .bind(format!("Message {uid}"))
+            .execute(&db.write_pool)
+            .await
+            .expect("insert message")
+            .last_insert_rowid();
+            message_ids.push(id);
+        }
+
+        let queued = db
+            .queue_message_action(&message_ids[..1], "archive")
+            .await
+            .expect("queue archive");
+        sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+            .bind(queued.operation_ids[0])
+            .execute(&db.write_pool)
+            .await
+            .expect("make operation due");
+        let first_claim = db
+            .claim_outbox_operations(account.id, 10)
+            .await
+            .expect("claim operation");
+        assert_eq!(first_claim.len(), 1);
+        assert_eq!(first_claim[0].op_kind, "move");
+        db.fail_outbox_operation(first_claim[0].id, "temporary network failure")
+            .await
+            .expect("schedule retry");
+        let retry: (String, i64, String) =
+            sqlx::query_as("SELECT status, attempts, last_error FROM outbox_ops WHERE id=?")
+                .bind(first_claim[0].id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read retry state");
+        assert_eq!(
+            retry,
+            ("retry".into(), 1, "temporary network failure".into())
+        );
+        sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+            .bind(first_claim[0].id)
+            .execute(&db.write_pool)
+            .await
+            .expect("make retry due");
+        let second_claim = db
+            .claim_outbox_operations(account.id, 10)
+            .await
+            .expect("claim retry");
+        assert_eq!(second_claim.len(), 1);
+        db.complete_outbox_operation(&second_claim[0])
+            .await
+            .expect("complete operation");
+        let first_exists: (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id=?")
+            .bind(message_ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .expect("check completed message");
+        assert_eq!(first_exists.0, 0);
+
+        let undo = db
+            .queue_message_action(&message_ids[1..], "trash")
+            .await
+            .expect("queue trash");
+        assert_eq!(
+            db.cancel_outbox_operations(&undo.operation_ids)
+                .await
+                .expect("undo pending action"),
+            1
+        );
+        let second_exists: (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id=?")
+            .bind(message_ids[1])
+            .fetch_one(&db.pool)
+            .await
+            .expect("check undone message");
+        assert_eq!(second_exists.0, 1);
+
+        let scheduled = db
+            .queue_scheduled_send(account.id, "{\"message\":true}", "2000-01-01 00:00:00")
+            .await
+            .expect("queue scheduled send");
+        db.convert_outbox_to_sent_append(scheduled, "{\"raw\":\"bWltZQ==\"}", "append failed")
+            .await
+            .expect("convert delivered SMTP operation");
+        let converted: (String, String, String, i64) =
+            sqlx::query_as("SELECT op_kind, payload, status, attempts FROM outbox_ops WHERE id=?")
+                .bind(scheduled)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read append-only retry");
+        assert_eq!(
+            converted,
+            (
+                "append_sent".into(),
+                "{\"raw\":\"bWltZQ==\"}".into(),
+                "retry".into(),
+                0
+            )
+        );
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const YANDEX_SCOPES: &str = "mail:imap_full mail:smtp calendar:all \
 directory:read_external_contacts directory:write_external_contacts";
@@ -14,12 +15,23 @@ pub const GOOGLE_SCOPES: &str = "https://mail.google.com/ \
 https://www.googleapis.com/auth/calendar \
 https://www.googleapis.com/auth/contacts \
 https://www.googleapis.com/auth/tasks";
+pub const MICROSOFT_SCOPES: &str = "offline_access \
+https://outlook.office.com/IMAP.AccessAsUser.All \
+https://outlook.office.com/SMTP.Send";
 
 pub fn configured_yandex_client_id() -> Option<String> {
     configured_oauth_value(
         "TRUEMAIL_YANDEX_CLIENT_ID",
         option_env!("TRUEMAIL_YANDEX_CLIENT_ID"),
     )
+}
+
+pub fn configured_yandex_redirect_uri() -> String {
+    configured_oauth_value(
+        "TRUEMAIL_YANDEX_REDIRECT_URI",
+        option_env!("TRUEMAIL_YANDEX_REDIRECT_URI"),
+    )
+    .unwrap_or_else(|| "http://127.0.0.1:34982/oauth/yandex/callback".into())
 }
 
 pub fn configured_google_client_id() -> Option<String> {
@@ -36,6 +48,21 @@ pub fn configured_google_client_secret() -> Option<String> {
     )
 }
 
+pub fn configured_microsoft_client_id() -> Option<String> {
+    configured_oauth_value(
+        "TRUEMAIL_MICROSOFT_CLIENT_ID",
+        option_env!("TRUEMAIL_MICROSOFT_CLIENT_ID"),
+    )
+}
+
+pub fn configured_microsoft_tenant() -> String {
+    configured_oauth_value(
+        "TRUEMAIL_MICROSOFT_TENANT",
+        option_env!("TRUEMAIL_MICROSOFT_TENANT"),
+    )
+    .unwrap_or_else(|| "common".into())
+}
+
 fn configured_oauth_value(environment_name: &str, compiled: Option<&str>) -> Option<String> {
     std::env::var(environment_name)
         .ok()
@@ -43,13 +70,13 @@ fn configured_oauth_value(environment_name: &str, compiled: Option<&str>) -> Opt
         .filter(|value| !value.trim().is_empty())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PkcePair {
     pub verifier: String,
     pub challenge: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct OAuthToken {
     pub access_token: String,
     #[serde(default)]
@@ -62,7 +89,7 @@ pub struct OAuthToken {
     pub scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct StoredOAuthCredential {
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -104,6 +131,7 @@ pub fn yandex_authorize_url(
     email_hint: &str,
     state: &str,
     challenge: &str,
+    redirect_uri: &str,
 ) -> Result<String> {
     if client_id.trim().is_empty() {
         return Err(Error::AccountConfig(
@@ -116,7 +144,7 @@ pub fn yandex_authorize_url(
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", client_id)
-        .append_pair("redirect_uri", "https://oauth.yandex.ru/verification_code")
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", YANDEX_SCOPES)
         .append_pair("login_hint", email_hint)
         .append_pair("force_confirm", "yes")
@@ -159,10 +187,54 @@ pub fn google_authorize_url(
     Ok(url.into())
 }
 
+fn microsoft_endpoint(tenant: &str, endpoint: &str) -> Result<Url> {
+    if tenant.is_empty()
+        || !tenant
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.'))
+    {
+        return Err(Error::AccountConfig(
+            "TRUEMAIL_MICROSOFT_TENANT содержит недопустимые символы".into(),
+        ));
+    }
+    Url::parse(&format!(
+        "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/{endpoint}"
+    ))
+    .map_err(|error| Error::Other(format!("Microsoft OAuth URL: {error}")))
+}
+
+pub fn microsoft_authorize_url(
+    client_id: &str,
+    tenant: &str,
+    email_hint: &str,
+    state: &str,
+    challenge: &str,
+    redirect_uri: &str,
+) -> Result<String> {
+    if client_id.trim().is_empty() {
+        return Err(Error::AccountConfig(
+            "не задан TRUEMAIL_MICROSOFT_CLIENT_ID".into(),
+        ));
+    }
+    let mut url = microsoft_endpoint(tenant, "authorize")?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_mode", "query")
+        .append_pair("scope", MICROSOFT_SCOPES)
+        .append_pair("login_hint", email_hint)
+        .append_pair("state", state)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256");
+    Ok(url.into())
+}
+
 pub async fn exchange_yandex_code(
     client_id: &str,
     code: &str,
     verifier: &str,
+    redirect_uri: &str,
 ) -> Result<OAuthToken> {
     let response = oauth_client("yandex-oauth")?
         .post("https://oauth.yandex.ru/token")
@@ -171,6 +243,7 @@ pub async fn exchange_yandex_code(
             ("code", code.trim()),
             ("client_id", client_id),
             ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
         ])
         .send()
         .await
@@ -206,6 +279,32 @@ pub async fn exchange_google_code(
             message: e.to_string(),
         })?;
     parse_token_response(response, "google-oauth").await
+}
+
+pub async fn exchange_microsoft_code(
+    client_id: &str,
+    tenant: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+) -> Result<OAuthToken> {
+    let response = oauth_client("microsoft-oauth")?
+        .post(microsoft_endpoint(tenant, "token")?)
+        .form(&[
+            ("client_id", client_id),
+            ("scope", MICROSOFT_SCOPES),
+            ("code", code.trim()),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "microsoft-oauth".into(),
+            message: error.to_string(),
+        })?;
+    parse_token_response(response, "microsoft-oauth").await
 }
 
 /// Продлить OAuth-токен без участия пользователя.
@@ -246,6 +345,28 @@ pub async fn refresh_google_token(
             message: e.to_string(),
         })?;
     parse_token_response(response, "google-oauth").await
+}
+
+pub async fn refresh_microsoft_token(
+    client_id: &str,
+    tenant: &str,
+    refresh_token: &str,
+) -> Result<OAuthToken> {
+    let response = oauth_client("microsoft-oauth")?
+        .post(microsoft_endpoint(tenant, "token")?)
+        .form(&[
+            ("client_id", client_id),
+            ("scope", MICROSOFT_SCOPES),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "microsoft-oauth".into(),
+            message: error.to_string(),
+        })?;
+    parse_token_response(response, "microsoft-oauth").await
 }
 
 fn oauth_client(backend: &str) -> Result<reqwest::Client> {
@@ -291,15 +412,15 @@ impl From<OAuthToken> for StoredOAuthCredential {
             .unwrap_or_default()
             .as_secs() as i64;
         Self {
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
+            access_token: token.access_token.clone(),
+            refresh_token: token.refresh_token.clone(),
             expires_at: token.expires_in.map(|seconds| now + seconds),
             token_type: if token.token_type.is_empty() {
                 "bearer".into()
             } else {
-                token.token_type
+                token.token_type.clone()
             },
-            scope: token.scope,
+            scope: token.scope.clone(),
         }
     }
 }
@@ -308,10 +429,10 @@ impl StoredOAuthCredential {
     /// Построить сохранённый токен после refresh grant. Google обычно не
     /// возвращает новый refresh_token, поэтому сохраняем предыдущий. Если
     /// провайдер ротировал токен, используем новое значение.
-    pub fn from_refresh(token: OAuthToken, previous_refresh_token: String) -> Self {
+    pub fn from_refresh(token: OAuthToken, previous_refresh_token: &str) -> Self {
         let mut credential = Self::from(token);
         if credential.refresh_token.is_none() {
-            credential.refresh_token = Some(previous_refresh_token);
+            credential.refresh_token = Some(previous_refresh_token.to_owned());
         }
         credential
     }
@@ -332,8 +453,14 @@ mod tests {
 
     #[test]
     fn authorize_url_contains_combined_scopes_and_pkce() {
-        let url =
-            yandex_authorize_url("client", "me@yandex.ru", "state", "challenge").expect("url");
+        let url = yandex_authorize_url(
+            "client",
+            "me@yandex.ru",
+            "state",
+            "challenge",
+            "http://127.0.0.1:34982/oauth/yandex/callback",
+        )
+        .expect("url");
         let parsed = Url::parse(&url).expect("parse");
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
         assert_eq!(
@@ -341,6 +468,10 @@ mod tests {
                 .get("code_challenge_method")
                 .map(|value| value.as_ref()),
             Some("S256")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|value| value.as_ref()),
+            Some("http://127.0.0.1:34982/oauth/yandex/callback")
         );
         let scopes = params.get("scope").expect("scope");
         assert!(scopes.contains("mail:imap_full"));
@@ -386,6 +517,31 @@ mod tests {
     }
 
     #[test]
+    fn microsoft_authorize_url_uses_mail_scopes_and_pkce() {
+        let url = microsoft_authorize_url(
+            "client",
+            "common",
+            "me@outlook.com",
+            "state",
+            "challenge",
+            "http://127.0.0.1:49153/oauth/microsoft/callback",
+        )
+        .expect("url");
+        let parsed = Url::parse(&url).expect("parse");
+        assert_eq!(parsed.host_str(), Some("login.microsoftonline.com"));
+        assert_eq!(parsed.path(), "/common/oauth2/v2.0/authorize");
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+        let scopes = params.get("scope").expect("scope");
+        assert!(scopes.contains("offline_access"));
+        assert!(scopes.contains("IMAP.AccessAsUser.All"));
+        assert!(scopes.contains("SMTP.Send"));
+        assert_eq!(
+            params.get("code_challenge_method").map(|v| v.as_ref()),
+            Some("S256")
+        );
+    }
+
+    #[test]
     fn refresh_preserves_previous_refresh_token_when_provider_omits_it() {
         let token = OAuthToken {
             access_token: "new-access".into(),
@@ -395,7 +551,7 @@ mod tests {
             scope: None,
         };
 
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
 
         assert_eq!(refreshed.access_token, "new-access");
         assert_eq!(refreshed.refresh_token.as_deref(), Some("old-refresh"));
@@ -421,7 +577,7 @@ mod tests {
             scope: None,
         };
 
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh".into());
+        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
 
         assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
     }

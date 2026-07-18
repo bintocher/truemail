@@ -10,10 +10,26 @@ pub struct QueuedAction {
 }
 
 /// Строка локатора письма: account_id, remote_path папки, uid, remote_id, raw_blob_ref.
-type MessageLocatorRow = (i64, String, i64, Option<String>, Option<String>);
+type MessageLocatorRow = (i64, String, i64, Option<String>, i64);
 
 /// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
 type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
+type FolderCursorRow = (
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+);
+type MessageContentCacheRow = (
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    Option<String>,
+);
 
 #[derive(Debug, Clone)]
 pub struct OutboxOperation {
@@ -26,6 +42,60 @@ pub struct OutboxOperation {
 }
 
 impl Db {
+    pub async fn list_keybindings(&self) -> Result<Vec<Keybinding>> {
+        Ok(sqlx::query_as::<_, (String, String, String)>(
+            "SELECT action, scope, combo FROM keybindings ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|(action, scope, combo)| Keybinding {
+            action,
+            scope,
+            combo,
+        })
+        .collect())
+    }
+
+    pub async fn set_keybinding(&self, action: &str, combo: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE keybindings SET combo=? WHERE action=?")
+            .bind(combo)
+            .bind(action)
+            .execute(&self.write_pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(crate::Error::Other(
+                "неизвестное действие клавиатуры".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn image_sender_trusted(&self, sender: &str) -> Result<bool> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT allow FROM image_trust WHERE sender=lower(?)")
+                .bind(sender.trim())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some_and(|(allow,)| allow != 0))
+    }
+
+    pub async fn set_image_sender_trusted(&self, sender: &str, allow: bool) -> Result<()> {
+        let sender = sender.trim().to_lowercase();
+        if sender.is_empty() {
+            return Err(crate::Error::Other("отправитель не указан".into()));
+        }
+        sqlx::query(
+            "INSERT INTO image_trust(sender, allow) VALUES(?, ?)
+             ON CONFLICT(sender) DO UPDATE SET allow=excluded.allow",
+        )
+        .bind(sender)
+        .bind(allow as i64)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
     /// Remove files no longer reachable from SQLite and report broken links.
     /// Run before background synchronization starts, so the reference snapshot
     /// cannot race a writer.
@@ -90,8 +160,8 @@ impl Db {
             "INSERT INTO accounts(
                 uuid, email, display_name, provider, backend_kind, auth_kind,
                 imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                username, secret_ref, color
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ews_url, jmap_url, username, secret_ref, color
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(email) DO UPDATE SET
                 display_name = excluded.display_name,
                 provider = excluded.provider,
@@ -103,6 +173,8 @@ impl Db {
                 smtp_host = excluded.smtp_host,
                 smtp_port = excluded.smtp_port,
                 smtp_security = excluded.smtp_security,
+                ews_url = excluded.ews_url,
+                jmap_url = excluded.jmap_url,
                 username = excluded.username,
                 secret_ref = excluded.secret_ref,
                 enabled = 1,
@@ -120,6 +192,8 @@ impl Db {
         .bind(input.smtp.as_ref().map(|server| &server.host))
         .bind(input.smtp.as_ref().map(|server| server.port as i64))
         .bind(security(input.smtp.as_ref()))
+        .bind(input.ews_url.as_deref())
+        .bind(input.jmap_url.as_deref())
         .bind(input.username.as_deref())
         .bind(&input.secret_ref)
         .bind(input.color.as_deref())
@@ -137,7 +211,7 @@ impl Db {
         let rows = sqlx::query_as::<_, AccountRow>(
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, username, secret_ref, include_in_unified, color, retention_days, enabled
+                ews_url, jmap_url, username, secret_ref, include_in_unified, color, retention_days, enabled
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
@@ -416,7 +490,6 @@ impl Db {
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
                     uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
-                    highestmodseq = coalesce(excluded.highestmodseq, folders.highestmodseq),
                     last_synced = datetime('now')",
             )
             .bind(account_id)
@@ -435,30 +508,238 @@ impl Db {
         Ok(())
     }
 
-    pub async fn folder_sync_cursors(
+    /// Remove remote folders absent from a complete provider discovery.
+    pub async fn reconcile_discovered_folders(
         &self,
         account_id: i64,
-    ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
-        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT f.remote_path, f.uidvalidity, max(m.uid)
-             FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
-             WHERE f.account_id=? GROUP BY f.id, f.remote_path, f.uidvalidity",
+        folders: &[crate::backend::DiscoveredFolder],
+    ) -> Result<usize> {
+        if folders.is_empty() {
+            return Ok(0);
+        }
+        let active = folders
+            .iter()
+            .map(|folder| folder.remote_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, f.remote_path, m.raw_blob_ref
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE f.account_id=?",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let mut blob_refs = Vec::new();
+        for (message_id, path, raw_ref) in rows {
+            if active.contains(path.as_str()) {
+                continue;
+            }
+            if let Some(reference) = raw_ref {
+                blob_refs.push(reference);
+            }
+            let attachment_refs: Vec<(Option<String>,)> =
+                sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
+                    .bind(message_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+            blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
+        }
+        let existing: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=?")
+                .bind(account_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let stale_ids = existing
             .into_iter()
-            .map(|(path, uidvalidity, last_uid)| {
-                (
-                    path,
-                    crate::backend::FolderSyncCursor {
-                        uidvalidity: uidvalidity.and_then(|value| u32::try_from(value).ok()),
-                        last_uid: last_uid.and_then(|value| u32::try_from(value).ok()),
-                    },
-                )
-            })
-            .collect())
+            .filter_map(|(id, path)| (!active.contains(path.as_str())).then_some(id))
+            .collect::<Vec<_>>();
+        if stale_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.begin_write().await?;
+        for id in &stale_ids {
+            sqlx::query("DELETE FROM folders WHERE id=? AND account_id=?")
+                .bind(id)
+                .bind(account_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        for reference in blob_refs {
+            let _ = self.blobs.remove(&reference);
+        }
+        Ok(stale_ids.len())
+    }
+
+    /// Commit opaque provider cursors only after messages and projections were
+    /// stored successfully. If an earlier step fails, the same delta is safely
+    /// requested again on the next cycle.
+    pub async fn save_folder_sync_tokens(
+        &self,
+        account_id: i64,
+        folders: &[crate::backend::DiscoveredFolder],
+    ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        for folder in folders {
+            let Some(sync_token) = folder.sync_token.as_deref() else {
+                continue;
+            };
+            sqlx::query(
+                "UPDATE folders SET sync_token=?, uidvalidity=coalesce(?, uidvalidity),
+                    uidnext=coalesce(?, uidnext),
+                    highestmodseq=coalesce(?, highestmodseq), last_synced=datetime('now')
+                 WHERE account_id=? AND remote_path=?",
+            )
+            .bind(sync_token)
+            .bind(folder.uidvalidity.map(i64::from))
+            .bind(folder.uidnext.map(i64::from))
+            .bind(
+                folder
+                    .highestmodseq
+                    .and_then(|value| i64::try_from(value).ok()),
+            )
+            .bind(account_id)
+            .bind(&folder.remote_path)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn folder_sync_cursors(
+        &self,
+        account_id: i64,
+    ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
+        let rows: Vec<FolderCursorRow> = sqlx::query_as(
+            "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid),
+                    f.highestmodseq, f.sync_token
+             FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
+             WHERE f.account_id=?
+             GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut cursors = rows
+            .into_iter()
+            .map(
+                |(path, uidvalidity, first_uid, last_uid, highestmodseq, sync_token)| {
+                    (
+                        path,
+                        crate::backend::FolderSyncCursor {
+                            uidvalidity: uidvalidity.and_then(|value| u32::try_from(value).ok()),
+                            first_uid: first_uid.and_then(|value| u32::try_from(value).ok()),
+                            last_uid: last_uid.and_then(|value| u32::try_from(value).ok()),
+                            known_uids: Vec::new(),
+                            highestmodseq: highestmodseq
+                                .and_then(|value| u64::try_from(value).ok()),
+                            sync_token,
+                        },
+                    )
+                },
+            )
+            .collect::<std::collections::HashMap<_, _>>();
+        let known_uid_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT f.remote_path, m.uid
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE f.account_id=? ORDER BY f.remote_path, m.uid",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        for (path, uid) in known_uid_rows {
+            if let Some(cursor) = cursors.get_mut(&path)
+                && let Ok(uid) = u32::try_from(uid)
+            {
+                cursor.known_uids.push(uid);
+            }
+        }
+        Ok(cursors)
+    }
+
+    /// Reconcile provider projections keyed by a stable remote ID. Gmail can
+    /// expose one message in several label-backed folders; a history delta may
+    /// remove one projection, add another, or delete the message completely.
+    ///
+    /// For a complete snapshot, IDs absent from `remote_snapshot` are removed.
+    /// IDs that were listed but whose body failed to load are retained, so a
+    /// transient API failure never destroys an otherwise valid local copy.
+    pub async fn reconcile_remote_projections(
+        &self,
+        account_id: i64,
+        messages: &[crate::backend::DiscoveredMessage],
+        changed_remote_ids: &[String],
+        remote_snapshot: Option<&[String]>,
+    ) -> Result<usize> {
+        use std::collections::{HashMap, HashSet};
+
+        let mut desired: HashMap<&str, HashSet<&str>> = HashMap::new();
+        for message in messages {
+            if let Some(remote_id) = message.remote_id.as_deref() {
+                desired
+                    .entry(remote_id)
+                    .or_default()
+                    .insert(message.folder_path.as_str());
+            }
+        }
+        let changed: HashSet<&str> = changed_remote_ids.iter().map(String::as_str).collect();
+        let snapshot: Option<HashSet<&str>> =
+            remote_snapshot.map(|ids| ids.iter().map(String::as_str).collect());
+        if changed.is_empty() && snapshot.is_none() {
+            return Ok(0);
+        }
+
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.remote_id, f.remote_path, m.raw_blob_ref
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.account_id=? AND m.remote_id IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut delete_rows = Vec::new();
+        for (id, remote_id, folder_path, raw_ref) in rows {
+            let should_check = snapshot.is_some() || changed.contains(remote_id.as_str());
+            if !should_check {
+                continue;
+            }
+            let absent_from_server = snapshot
+                .as_ref()
+                .is_some_and(|ids| !ids.contains(remote_id.as_str()));
+            let stale_projection = desired
+                .get(remote_id.as_str())
+                .is_some_and(|paths| !paths.contains(folder_path.as_str()));
+            let confirmed_deleted = snapshot.is_none()
+                && changed.contains(remote_id.as_str())
+                && !desired.contains_key(remote_id.as_str());
+            if absent_from_server || stale_projection || confirmed_deleted {
+                delete_rows.push((id, raw_ref));
+            }
+        }
+
+        let mut tx = self.begin_write().await?;
+        let mut blob_refs = Vec::new();
+        for (id, raw_ref) in &delete_rows {
+            let attachment_refs: Vec<(Option<String>,)> =
+                sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
+            if let Some(reference) = raw_ref {
+                blob_refs.push(reference.clone());
+            }
+            sqlx::query("DELETE FROM messages WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        for reference in blob_refs {
+            let _ = self.blobs.remove(&reference);
+        }
+        Ok(delete_rows.len())
     }
 
     /// Удалить локальные письма, которых больше нет на сервере, и полностью
@@ -513,6 +794,200 @@ impl Db {
         Ok(delete_ids.len())
     }
 
+    /// Apply CONDSTORE flag deltas without downloading message bodies again.
+    pub async fn apply_imap_flag_updates(
+        &self,
+        account_id: i64,
+        updates: &[crate::backend::DiscoveredFlagUpdate],
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let mut tx = self.begin_write().await?;
+        let mut changed = 0usize;
+        for update in updates {
+            let result = sqlx::query(
+                "UPDATE messages SET seen=?, flagged=?, answered=?, draft=?
+                 WHERE account_id=? AND uid=? AND folder_id=(
+                    SELECT id FROM folders WHERE account_id=? AND remote_path=?
+                 )",
+            )
+            .bind(update.seen)
+            .bind(update.flagged)
+            .bind(update.answered)
+            .bind(update.draft)
+            .bind(account_id)
+            .bind(i64::from(update.uid))
+            .bind(account_id)
+            .bind(&update.folder_path)
+            .execute(&mut *tx)
+            .await?;
+            changed += result.rows_affected() as usize;
+        }
+        tx.commit().await?;
+        tracing::info!(
+            account_id,
+            received = updates.len(),
+            changed,
+            tx_ms = started.elapsed().as_millis() as u64,
+            "IMAP flag delta applied"
+        );
+        Ok(changed)
+    }
+
+    /// Delete exact QRESYNC VANISHED UIDs without enumerating the whole mailbox.
+    pub async fn apply_imap_vanished(
+        &self,
+        account_id: i64,
+        vanished: &[(String, Vec<u32>)],
+    ) -> Result<usize> {
+        if vanished.is_empty() {
+            return Ok(0);
+        }
+        let started = std::time::Instant::now();
+        let mut tx = self.begin_write().await?;
+        let mut delete_ids = Vec::new();
+        let mut blob_refs = Vec::new();
+        for (path, uids) in vanished {
+            for uid in uids {
+                let row: Option<(i64, Option<String>)> = sqlx::query_as(
+                    "SELECT m.id, m.raw_blob_ref FROM messages m
+                     JOIN folders f ON f.id=m.folder_id
+                     WHERE m.account_id=? AND f.remote_path=? AND m.uid=?",
+                )
+                .bind(account_id)
+                .bind(path)
+                .bind(i64::from(*uid))
+                .fetch_optional(&mut *tx)
+                .await?;
+                if let Some((id, raw_ref)) = row {
+                    let attachment_refs: Vec<(Option<String>,)> =
+                        sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
+                            .bind(id)
+                            .fetch_all(&mut *tx)
+                            .await?;
+                    blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
+                    if let Some(reference) = raw_ref {
+                        blob_refs.push(reference);
+                    }
+                    delete_ids.push(id);
+                }
+            }
+        }
+        for id in &delete_ids {
+            sqlx::query("DELETE FROM messages WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        for reference in blob_refs {
+            let _ = self.blobs.remove(&reference);
+        }
+        tracing::info!(
+            account_id,
+            deleted = delete_ids.len(),
+            tx_ms = started.elapsed().as_millis() as u64,
+            "IMAP QRESYNC tombstones applied"
+        );
+        Ok(delete_ids.len())
+    }
+
+    pub async fn auxiliary_sync_cursors(
+        &self,
+        account_id: i64,
+    ) -> Result<crate::account::AuxiliarySyncCursors> {
+        use crate::account::{AuxiliarySyncCursors, CollectionCursor};
+
+        let calendar_rows: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT url, ctag, sync_token FROM calendars WHERE account_id=? AND url IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let event_etag_rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT c.url, e.remote_url, e.etag
+             FROM events e JOIN calendars c ON c.id=e.calendar_id
+             WHERE c.account_id=? AND c.url IS NOT NULL
+               AND e.remote_url IS NOT NULL AND e.etag IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let collection_rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT url, ctag, sync_token FROM auxiliary_collections WHERE account_id=?",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let contacts_sync_token: Option<(String,)> = sqlx::query_as(
+            "SELECT sync_token FROM auxiliary_sync_state WHERE account_id=? AND kind='google-contacts'",
+        )
+        .bind(account_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let contact_etag_rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT remote_url, etag FROM contacts
+             WHERE account_id=? AND remote_url IS NOT NULL AND etag IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut calendar_etags: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        > = std::collections::HashMap::new();
+        for (collection_url, resource_url, etag) in event_etag_rows {
+            calendar_etags
+                .entry(collection_url)
+                .or_default()
+                .insert(resource_url, etag);
+        }
+        let mut contact_collections = collection_rows
+            .into_iter()
+            .map(|(url, ctag, sync_token)| {
+                (
+                    url,
+                    CollectionCursor {
+                        ctag,
+                        sync_token,
+                        resource_etags: std::collections::HashMap::new(),
+                    },
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for (resource_url, etag) in contact_etag_rows {
+            if let Some((_, cursor)) = contact_collections
+                .iter_mut()
+                .filter(|(collection_url, _)| resource_url.starts_with(collection_url.as_str()))
+                .max_by_key(|(collection_url, _)| collection_url.len())
+            {
+                cursor.resource_etags.insert(resource_url, etag);
+            }
+        }
+        Ok(AuxiliarySyncCursors {
+            calendars: calendar_rows
+                .into_iter()
+                .filter_map(|(url, ctag, sync_token)| {
+                    url.map(|url| {
+                        let resource_etags = calendar_etags.remove(&url).unwrap_or_default();
+                        (
+                            url,
+                            CollectionCursor {
+                                ctag,
+                                sync_token,
+                                resource_etags,
+                            },
+                        )
+                    })
+                })
+                .collect(),
+            contact_collections,
+            contacts_sync_token: contacts_sync_token.map(|row| row.0),
+        })
+    }
+
     pub async fn save_yandex_dav(
         &self,
         account_id: i64,
@@ -557,14 +1032,16 @@ impl Db {
 
         let mut created_refs: Vec<String> = Vec::new();
         let mut calendar_rows = Vec::new();
-        for calendar in &data.calendars {
-            let mut events = Vec::new();
-            for event in &calendar.events {
-                let reference = self.blobs.put(event.raw.as_bytes())?;
-                created_refs.push(reference.clone());
-                events.push((event, reference));
+        if data.calendars_available {
+            for calendar in &data.calendars {
+                let mut events = Vec::new();
+                for event in &calendar.events {
+                    let reference = self.blobs.put(event.raw.as_bytes())?;
+                    created_refs.push(reference.clone());
+                    events.push((event, reference));
+                }
+                calendar_rows.push((calendar, events));
             }
-            calendar_rows.push((calendar, events));
         }
         let mut contact_rows = Vec::new();
         if data.contacts_available {
@@ -576,21 +1053,28 @@ impl Db {
         }
 
         let save_result: Result<(usize, usize, usize)> = async {
+            let writer_wait_started = std::time::Instant::now();
             let mut tx = self.begin_write().await?;
-            let existing_calendars: Vec<(i64,)> =
+            let writer_wait = writer_wait_started.elapsed();
+            let tx_started = std::time::Instant::now();
+            let existing_calendars: Vec<(i64,)> = if data.calendars_available {
                 sqlx::query_as("SELECT id FROM calendars WHERE account_id=? AND kind=?")
                     .bind(account_id)
                     .bind(source_kind)
                     .fetch_all(&mut *tx)
-                    .await?;
+                    .await?
+            } else {
+                Vec::new()
+            };
             let mut active_calendars = HashSet::new();
             let mut event_count = 0;
             for (calendar, events) in calendar_rows {
                 let (calendar_id,): (i64,) = sqlx::query_as(
-                    "INSERT INTO calendars(account_id, uid, name, kind, url, ctag)
-                     VALUES(?, ?, ?, ?, ?, ?)
+                    "INSERT INTO calendars(account_id, uid, name, kind, url, ctag, sync_token)
+                     VALUES(?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT DO UPDATE SET name=excluded.name, url=excluded.url,
-                         kind=excluded.kind, ctag=excluded.ctag
+                         kind=excluded.kind, ctag=excluded.ctag,
+                         sync_token=excluded.sync_token
                      RETURNING id",
                 )
                 .bind(account_id)
@@ -599,22 +1083,32 @@ impl Db {
                 .bind(source_kind)
                 .bind(&calendar.url)
                 .bind(&calendar.ctag)
+                .bind(&calendar.sync_token)
                 .fetch_one(&mut *tx)
                 .await?;
                 active_calendars.insert(calendar_id);
 
-                let existing_events: Vec<(i64,)> =
-                    sqlx::query_as("SELECT id FROM events WHERE calendar_id=?")
+                let existing_events: Vec<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM events WHERE calendar_id=?",
+                )
                         .bind(calendar_id)
                         .fetch_all(&mut *tx)
                         .await?;
+                for remote_url in &calendar.deleted_event_urls {
+                    sqlx::query("DELETE FROM events WHERE calendar_id=? AND remote_url=?")
+                        .bind(calendar_id)
+                        .bind(remote_url)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 let mut active_events = HashSet::new();
                 for (event, blob_ref) in events {
                     let (event_id,): (i64,) = sqlx::query_as(
                         "INSERT INTO events(calendar_id, uid, summary, description, location,
                                             dtstart, dtend, all_day, rrule, recurrence_id, exdates, rdates,
-                                            status, ical_ref, etag, remote_url)
-                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                            status, ical_ref, etag, remote_url, timezone, transp, class,
+                                            categories, url, organizer, sequence)
+                         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                          ON CONFLICT DO UPDATE SET summary=excluded.summary,
                             description=excluded.description, location=excluded.location,
                             dtstart=excluded.dtstart, dtend=excluded.dtend,
@@ -623,7 +1117,10 @@ impl Db {
                             exdates=excluded.exdates, rdates=excluded.rdates,
                             status=excluded.status,
                             ical_ref=excluded.ical_ref, etag=excluded.etag,
-                            remote_url=excluded.remote_url
+                            remote_url=excluded.remote_url, timezone=excluded.timezone,
+                            transp=excluded.transp, class=excluded.class,
+                            categories=excluded.categories, url=excluded.url,
+                            organizer=excluded.organizer, sequence=excluded.sequence
                          RETURNING id",
                     )
                     .bind(calendar_id)
@@ -645,17 +1142,61 @@ impl Db {
                     .bind(blob_ref)
                     .bind(&event.etag)
                     .bind(&event.remote_url)
+                    .bind(&event.timezone)
+                    .bind(&event.transp)
+                    .bind(&event.class)
+                    .bind(event.categories.join(","))
+                    .bind(&event.url)
+                    .bind(&event.organizer)
+                    .bind(event.sequence)
                     .fetch_one(&mut *tx)
                     .await?;
+                    sqlx::query("DELETE FROM event_attendees WHERE event_id=?")
+                        .bind(event_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for attendee in &event.attendees {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO event_attendees(
+                                event_id, email, name, role, partstat, rsvp
+                             ) VALUES(?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(event_id)
+                        .bind(&attendee.email)
+                        .bind(&attendee.name)
+                        .bind(&attendee.role)
+                        .bind(&attendee.partstat)
+                        .bind(attendee.rsvp)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    sqlx::query("DELETE FROM event_alarms WHERE event_id=?")
+                        .bind(event_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for alarm in &event.alarms {
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO event_alarms(
+                                event_id, trigger_minutes, action
+                             ) VALUES(?, ?, ?)",
+                        )
+                        .bind(event_id)
+                        .bind(alarm.trigger_minutes)
+                        .bind(&alarm.action)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
                     active_events.insert(event_id);
                     event_count += 1;
                 }
-                for (event_id,) in existing_events {
-                    if !active_events.contains(&event_id) {
-                        sqlx::query("DELETE FROM events WHERE id=?")
-                            .bind(event_id)
-                            .execute(&mut *tx)
-                            .await?;
+                if calendar.sync_scope == crate::account::SyncScope::Full {
+                    for (event_id,) in existing_events {
+                        if !active_events.contains(&event_id) {
+                            sqlx::query("DELETE FROM events WHERE id=?")
+                                .bind(event_id)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -669,26 +1210,42 @@ impl Db {
             }
 
             if data.contacts_available {
-                sqlx::query("DELETE FROM auxiliary_collections WHERE account_id=? AND kind='carddav'")
+                let collection_kind = if source_kind == "caldav" { "carddav" } else { source_kind };
+                sqlx::query("DELETE FROM auxiliary_collections WHERE account_id=? AND kind=?")
                     .bind(account_id)
+                    .bind(collection_kind)
                     .execute(&mut *tx)
                     .await?;
                 for collection in &data.contact_collections {
                     sqlx::query(
-                        "INSERT OR IGNORE INTO auxiliary_collections(account_id, kind, url) VALUES(?, 'carddav', ?)",
+                        "INSERT INTO auxiliary_collections(account_id, kind, url, ctag, sync_token)
+                         VALUES(?, ?, ?, ?, ?)
+                         ON CONFLICT(account_id, kind, url) DO UPDATE SET
+                            ctag=excluded.ctag, sync_token=excluded.sync_token",
                     )
                     .bind(account_id)
-                    .bind(collection)
+                    .bind(collection_kind)
+                    .bind(&collection.url)
+                    .bind(&collection.ctag)
+                    .bind(&collection.sync_token)
                     .execute(&mut *tx)
                     .await?;
                 }
                 let existing_contacts: Vec<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM contacts WHERE account_id=? AND uid NOT LIKE 'mail:%'",
+                    "SELECT id FROM contacts
+                     WHERE account_id=? AND uid NOT LIKE 'mail:%' AND uid NOT LIKE 'local:%'",
                 )
                 .bind(account_id)
                 .fetch_all(&mut *tx)
                 .await?;
                 let mut active_contacts = HashSet::new();
+                for remote_url in &data.deleted_contact_urls {
+                    sqlx::query("DELETE FROM contacts WHERE account_id=? AND remote_url=?")
+                        .bind(account_id)
+                        .bind(remote_url)
+                        .execute(&mut *tx)
+                        .await?;
+                }
                 for (contact, blob_ref) in contact_rows {
                     let (contact_id,): (i64,) = sqlx::query_as(
                         "INSERT INTO contacts(account_id, uid, display_name, first_name,
@@ -702,7 +1259,7 @@ impl Db {
                     )
                     .bind(account_id)
                     .bind(&contact.uid)
-                    .bind(&contact.display_name)
+                    .bind(clean_contact_name(&contact.display_name))
                     .bind(&contact.first_name)
                     .bind(&contact.last_name)
                     .bind(&contact.organization)
@@ -725,18 +1282,58 @@ impl Db {
                         .execute(&mut *tx)
                         .await?;
                     }
-                }
-                for (contact_id,) in existing_contacts {
-                    if !active_contacts.contains(&contact_id) {
-                        sqlx::query("DELETE FROM contacts WHERE id=?")
-                            .bind(contact_id)
-                            .execute(&mut *tx)
-                            .await?;
+                    sqlx::query("DELETE FROM contact_phones WHERE contact_id=?")
+                        .bind(contact_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for phone in &contact.phones {
+                        sqlx::query(
+                            "INSERT INTO contact_phones(contact_id, number, kind, extension)
+                             VALUES(?, ?, ?, ?)",
+                        )
+                        .bind(contact_id)
+                        .bind(&phone.number)
+                        .bind(&phone.kind)
+                        .bind(&phone.extension)
+                        .execute(&mut *tx)
+                        .await?;
                     }
+                }
+                if data.contacts_scope == crate::account::SyncScope::Full {
+                    for (contact_id,) in existing_contacts {
+                        if !active_contacts.contains(&contact_id) {
+                            sqlx::query("DELETE FROM contacts WHERE id=?")
+                                .bind(contact_id)
+                                .execute(&mut *tx)
+                                .await?;
+                        }
+                    }
+                }
+                if let Some(sync_token) = &data.contacts_sync_token {
+                    sqlx::query(
+                        "INSERT INTO auxiliary_sync_state(account_id, kind, sync_token)
+                         VALUES(?, 'google-contacts', ?)
+                         ON CONFLICT(account_id, kind) DO UPDATE SET
+                            sync_token=excluded.sync_token, updated_at=datetime('now')",
+                    )
+                    .bind(account_id)
+                    .bind(sync_token)
+                    .execute(&mut *tx)
+                    .await?;
                 }
             }
 
             tx.commit().await?;
+            tracing::info!(
+                account_id,
+                source_kind,
+                calendars = data.calendars.len(),
+                events = event_count,
+                contacts = data.contacts.len(),
+                writer_wait_ms = writer_wait.as_millis() as u64,
+                tx_ms = tx_started.elapsed().as_millis() as u64,
+                "auxiliary delta applied"
+            );
             Ok((data.calendars.len(), event_count, data.contacts.len()))
         }
         .await;
@@ -751,10 +1348,35 @@ impl Db {
             }
         };
 
-        let current_refs: HashSet<&str> = created_refs.iter().map(String::as_str).collect();
-        for (reference,) in old_event_refs.into_iter().chain(old_contact_refs) {
+        let current_event_refs: HashSet<String> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT e.ical_ref FROM events e JOIN calendars c ON c.id=e.calendar_id
+             WHERE c.account_id=? AND e.ical_ref IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.0)
+        .collect();
+        let current_contact_refs: HashSet<String> = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT vcard_ref FROM contacts WHERE account_id=? AND vcard_ref IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.0)
+        .collect();
+        for (reference,) in old_event_refs {
             if let Some(reference) = reference
-                && !current_refs.contains(reference.as_str())
+                && !current_event_refs.contains(&reference)
+            {
+                let _ = self.blobs.remove(&reference);
+            }
+        }
+        for (reference,) in old_contact_refs {
+            if let Some(reference) = reference
+                && !current_contact_refs.contains(&reference)
             {
                 let _ = self.blobs.remove(&reference);
             }
@@ -826,6 +1448,9 @@ impl Db {
                     let size = match &part.body {
                         mail_parser::PartType::Binary(bytes)
                         | mail_parser::PartType::InlineBinary(bytes) => Some(bytes.len() as i64),
+                        mail_parser::PartType::Text(text) | mail_parser::PartType::Html(text) => {
+                            Some(text.len() as i64)
+                        }
                         _ => None,
                     };
                     (
@@ -900,9 +1525,20 @@ impl Db {
         }
         let mut active_refs = HashSet::new();
         let mut stale_refs = Vec::new();
+        let mut indexed_bodies = Vec::new();
         let save_result: Result<()> = async {
-            let mut tx = self.begin_write().await?;
-            for (
+            let mut remaining = rows.into_iter();
+            loop {
+                let batch = remaining.by_ref().take(100).collect::<Vec<_>>();
+                if batch.is_empty() {
+                    break;
+                }
+                let batch_size = batch.len();
+                let writer_wait_started = std::time::Instant::now();
+                let mut tx = self.begin_write().await?;
+                let writer_wait = writer_wait_started.elapsed();
+                let tx_started = std::time::Instant::now();
+                for (
                 source,
                 message_id,
                 in_reply_to,
@@ -920,8 +1556,8 @@ impl Db {
                 spf,
                 dmarc,
                 raw_ref,
-            ) in rows
-            {
+                ) in batch
+                {
                 let folder: Option<(i64,)> = sqlx::query_as(
                     "SELECT id FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
                 )
@@ -930,36 +1566,54 @@ impl Db {
                 .fetch_optional(&mut *tx)
                 .await?;
                 let Some((folder_id,)) = folder else { continue };
-                let old_ref: Option<(Option<String>,)> = sqlx::query_as(
-                    "SELECT raw_blob_ref FROM messages WHERE folder_id=? AND uid=?",
+                let old_ref: Option<(Option<String>, i64)> = sqlx::query_as(
+                    "SELECT raw_blob_ref, body_fetched FROM messages WHERE folder_id=? AND uid=?",
                 )
                 .bind(folder_id)
                 .bind(source.uid as i64)
                 .fetch_optional(&mut *tx)
                 .await?;
                 let is_new_message = old_ref.is_none();
+                let preserve_full_body = !source.body_fetched
+                    && old_ref
+                        .as_ref()
+                        .is_some_and(|(_, body_fetched)| *body_fetched != 0);
+                let effective_ref = if preserve_full_body {
+                    old_ref
+                        .as_ref()
+                        .and_then(|(reference, _)| reference.clone())
+                        .unwrap_or_else(|| raw_ref.clone())
+                } else {
+                    raw_ref.clone()
+                };
                 sqlx::query(
                     "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched)
-                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(folder_id, uid) DO UPDATE SET
                         remote_id=coalesce(excluded.remote_id,messages.remote_id), rfc822_message_id=excluded.rfc822_message_id, in_reply_to=excluded.in_reply_to,
                         references_ids=excluded.references_ids, from_name=excluded.from_name,
                         from_addr=excluded.from_addr, to_addrs=excluded.to_addrs, cc_addrs=excluded.cc_addrs,
                         subject=excluded.subject, preview=excluded.preview, date=excluded.date, size=excluded.size,
                         seen=excluded.seen, flagged=excluded.flagged, answered=excluded.answered,
-                        draft=excluded.draft, has_attachments=excluded.has_attachments,
+                        draft=excluded.draft,
+                        has_attachments=CASE WHEN messages.body_fetched=1 AND excluded.body_fetched=0 THEN messages.has_attachments ELSE excluded.has_attachments END,
                         dkim_pass=excluded.dkim_pass, spf_pass=excluded.spf_pass,
-                        dmarc_pass=excluded.dmarc_pass, raw_blob_ref=excluded.raw_blob_ref, body_fetched=1",
+                        dmarc_pass=excluded.dmarc_pass, raw_blob_ref=excluded.raw_blob_ref,
+                        body_fetched=CASE WHEN messages.body_fetched=1 THEN 1 ELSE excluded.body_fetched END",
                 )
                 .bind(account_id).bind(folder_id).bind(source.uid as i64).bind(&source.remote_id).bind(&message_id)
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
                 .bind(source.draft as i64).bind(!attachments.is_empty() as i64).bind(dkim).bind(spf)
-                .bind(dmarc).bind(&raw_ref).execute(&mut *tx).await?;
-                active_refs.insert(raw_ref.clone());
-                if let Some((Some(reference),)) = old_ref
-                    && reference != raw_ref
+                .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64).execute(&mut *tx).await?;
+                active_refs.insert(effective_ref.clone());
+                if preserve_full_body {
+                    if raw_ref != effective_ref {
+                        stale_refs.push(raw_ref);
+                    }
+                } else if let Some((Some(reference), _)) = old_ref
+                    && reference != effective_ref
                 {
                     stale_refs.push(reference);
                 }
@@ -969,14 +1623,16 @@ impl Db {
                         .bind(source.uid as i64)
                         .fetch_one(&mut *tx)
                         .await?;
-                sqlx::query("DELETE FROM attachments WHERE message_id=?")
-                    .bind(message_row_id)
-                    .execute(&mut *tx)
-                    .await?;
-                for (filename, mime_type, size, content_id) in attachments {
-                    sqlx::query("INSERT INTO attachments(message_id, filename, mime_type, size, content_id, is_inline, fetched) VALUES(?, ?, ?, ?, ?, ?, 0)")
-                        .bind(message_row_id).bind(filename).bind(mime_type).bind(size)
-                        .bind(&content_id).bind(content_id.is_some() as i64).execute(&mut *tx).await?;
+                if !preserve_full_body {
+                    sqlx::query("DELETE FROM attachments WHERE message_id=?")
+                        .bind(message_row_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for (filename, mime_type, size, content_id) in attachments {
+                        sqlx::query("INSERT INTO attachments(message_id, filename, mime_type, size, content_id, is_inline, fetched) VALUES(?, ?, ?, ?, ?, ?, 0)")
+                            .bind(message_row_id).bind(filename).bind(mime_type).bind(size)
+                            .bind(&content_id).bind(content_id.is_some() as i64).execute(&mut *tx).await?;
+                    }
                 }
                 if let Some(parent_id) = in_reply_to.as_deref() {
                     let parent: Option<(i64, Option<i64>, Option<String>)> = sqlx::query_as(
@@ -997,13 +1653,20 @@ impl Db {
                         }
                     }
                 }
-                sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
-                    .bind(body_text)
-                    .bind(message_row_id)
-                    .execute(&mut *tx)
-                    .await?;
+                if !preserve_full_body {
+                    indexed_bodies.push((message_row_id, body_text));
+                }
+                }
+                tx.commit().await?;
+                tracing::info!(
+                    account_id,
+                    rows = batch_size,
+                    writer_wait_ms = writer_wait.as_millis() as u64,
+                    tx_ms = tx_started.elapsed().as_millis() as u64,
+                    "mail delta batch applied"
+                );
+                tokio::task::yield_now().await;
             }
-            tx.commit().await?;
             Ok(())
         }
         .await;
@@ -1021,6 +1684,14 @@ impl Db {
         }
         for reference in stale_refs {
             let _ = self.blobs.remove(&reference);
+        }
+        // Импорт не знает, какая реализация поиска выбрана приложением. Даже
+        // SQLite FTS обновляется через единый контракт SearchIndex, поэтому
+        // переход на другой индекс не потребует искать прямые SQL-записи.
+        use crate::search::{Fts5Index, SearchIndex};
+        let index = Fts5Index::new(self.clone());
+        for (message_id, body_text) in indexed_bodies {
+            index.index_body(message_id, &body_text).await?;
         }
         self.sync_contacts_from_messages(account_id).await?;
         Ok(())
@@ -1052,11 +1723,11 @@ impl Db {
             {
                 return;
             }
-            let display = name
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(&normalized)
-                .to_owned();
+            let display = clean_contact_name(
+                name.map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(&normalized),
+            );
             candidates
                 .entry(normalized)
                 .and_modify(|current| {
@@ -1122,6 +1793,7 @@ impl Db {
                     seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
              FROM messages
              WHERE folder_id = ?
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
                AND NOT EXISTS (
                  SELECT 1 FROM outbox_ops o
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
@@ -1145,7 +1817,7 @@ impl Db {
         before_id: Option<i64>,
         limit: i64,
     ) -> Result<Vec<MessageMeta>> {
-        let limit = limit.clamp(1, 200);
+        let limit = limit.clamp(1, 500);
         if before_date.is_none() || before_id.is_none() {
             return self.list_messages(folder_id, limit).await;
         }
@@ -1158,6 +1830,7 @@ impl Db {
              FROM messages
              WHERE folder_id = ?
                AND (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
                AND NOT EXISTS (
                  SELECT 1 FROM outbox_ops o
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
@@ -1178,7 +1851,8 @@ impl Db {
     pub async fn list_recent_messages(&self, limit: i64) -> Result<Vec<MessageMeta>> {
         let ids: Vec<(i64,)> = sqlx::query_as(
             "SELECT id FROM messages
-             WHERE NOT EXISTS (
+             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (
                SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                  AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
              )
@@ -1189,6 +1863,159 @@ impl Db {
         .await?;
         self.list_messages_by_ids(&ids.into_iter().map(|row| row.0).collect::<Vec<_>>())
             .await
+    }
+
+    pub async fn set_messages_snoozed(&self, ids: &[i64], until: Option<&str>) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut query =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE messages SET snoozed_until = ");
+        query.push_bind(until);
+        query.push(" WHERE id IN (");
+        let mut separated = query.separated(",");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        Ok(query
+            .build()
+            .execute(&self.write_pool)
+            .await?
+            .rows_affected() as usize)
+    }
+
+    pub async fn release_due_snoozes(&self) -> Result<usize> {
+        Ok(sqlx::query(
+            "UPDATE messages SET snoozed_until = NULL
+             WHERE snoozed_until IS NOT NULL AND snoozed_until <= datetime('now')",
+        )
+        .execute(&self.write_pool)
+        .await?
+        .rows_affected() as usize)
+    }
+
+    pub async fn list_signatures(&self, account_id: i64) -> Result<Vec<Signature>> {
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT kind, body_html, enabled FROM signatures
+             WHERE account_id = ? ORDER BY CASE kind WHEN 'new' THEN 0 ELSE 1 END",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, body_html, enabled)| Signature {
+                kind,
+                body_html,
+                enabled,
+            })
+            .collect())
+    }
+
+    pub async fn upsert_signature(
+        &self,
+        account_id: i64,
+        kind: &str,
+        body_html: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        if !matches!(kind, "new" | "reply") {
+            return Err(crate::Error::AccountConfig(
+                "вид подписи должен быть new или reply".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO signatures(account_id, kind, body_html, enabled)
+             VALUES(?, ?, ?, ?)
+             ON CONFLICT(account_id, kind) DO UPDATE SET
+               body_html=excluded.body_html, enabled=excluded.enabled",
+        )
+        .bind(account_id)
+        .bind(kind)
+        .bind(body_html)
+        .bind(enabled)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_message_templates(&self, account_id: i64) -> Result<Vec<MessageTemplate>> {
+        let rows: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
+            "SELECT id, account_id, name, subject, body_html FROM message_templates
+             WHERE account_id = ? ORDER BY name COLLATE NOCASE, id",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, account_id, name, subject, body_html)| MessageTemplate {
+                    id,
+                    account_id,
+                    name,
+                    subject,
+                    body_html,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn save_message_template(
+        &self,
+        id: Option<i64>,
+        account_id: i64,
+        name: &str,
+        subject: &str,
+        body_html: &str,
+    ) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(crate::Error::AccountConfig(
+                "название шаблона не указано".into(),
+            ));
+        }
+        if let Some(id) = id {
+            let result = sqlx::query(
+                "UPDATE message_templates SET name=?, subject=?, body_html=?, updated_at=datetime('now')
+                 WHERE id=? AND account_id=?",
+            )
+            .bind(name)
+            .bind(subject)
+            .bind(body_html)
+            .bind(id)
+            .bind(account_id)
+            .execute(&self.write_pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                return Err(crate::Error::Other("шаблон не найден".into()));
+            }
+            return Ok(id);
+        }
+        Ok(sqlx::query(
+            "INSERT INTO message_templates(account_id, name, subject, body_html)
+             VALUES(?, ?, ?, ?)",
+        )
+        .bind(account_id)
+        .bind(name)
+        .bind(subject)
+        .bind(body_html)
+        .execute(&self.write_pool)
+        .await?
+        .last_insert_rowid())
+    }
+
+    pub async fn delete_message_template(&self, id: i64, account_id: i64) -> Result<bool> {
+        Ok(
+            sqlx::query("DELETE FROM message_templates WHERE id=? AND account_id=?")
+                .bind(id)
+                .bind(account_id)
+                .execute(&self.write_pool)
+                .await?
+                .rows_affected()
+                > 0,
+        )
     }
 
     pub async fn list_messages_by_ids(&self, ids: &[i64]) -> Result<Vec<MessageMeta>> {
@@ -1217,21 +2044,21 @@ impl Db {
         Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
     }
 
-    /// Данные для докачки письма с сервера, когда локальный raw удалён прунингом:
-    /// (account_id, remote_path папки, uid, remote_id, есть ли локальный raw).
+    /// Данные для докачки письма с сервера, когда полный MIME ещё не загружен:
+    /// (account_id, remote_path папки, uid, remote_id, загружено ли тело).
     pub async fn message_fetch_locator(
         &self,
         message_id: i64,
     ) -> Result<Option<(i64, String, i64, Option<String>, bool)>> {
         let row: Option<MessageLocatorRow> = sqlx::query_as(
-            "SELECT m.account_id, f.remote_path, m.uid, m.remote_id, m.raw_blob_ref \
+            "SELECT m.account_id, f.remote_path, m.uid, m.remote_id, m.body_fetched \
              FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
         )
         .bind(message_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(account_id, path, uid, remote_id, raw_ref)| {
-            (account_id, path, uid, remote_id, raw_ref.is_some())
+        Ok(row.map(|(account_id, path, uid, remote_id, body_fetched)| {
+            (account_id, path, uid, remote_id, body_fetched != 0)
         }))
     }
 
@@ -1261,6 +2088,34 @@ impl Db {
                 .bind(message_id)
                 .fetch_one(&self.pool)
                 .await?;
+        if let Some(reference) = raw_ref.as_deref() {
+            let cached: Option<MessageContentCacheRow> = sqlx::query_as(
+                "SELECT body_html, body_text, attachments_json, has_remote_content,
+                        is_newsletter, unsubscribe_json
+                   FROM message_content_cache
+                  WHERE message_id = ? AND raw_blob_ref = ?",
+            )
+            .bind(message_id)
+            .bind(reference)
+            .fetch_optional(&self.pool)
+            .await?;
+            if let Some((body_html, body_text, attachments, remote, newsletter, unsubscribe)) =
+                cached
+            {
+                return Ok(MessageFull {
+                    meta,
+                    body_html,
+                    body_text,
+                    attachments: serde_json::from_str(&attachments)?,
+                    has_remote_content: remote != 0,
+                    is_newsletter: newsletter != 0,
+                    unsubscribe: unsubscribe
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?,
+                });
+            }
+        }
         let raw = raw_ref
             .as_deref()
             .map(|reference| self.blobs.get(reference))
@@ -1293,6 +2148,7 @@ impl Db {
                 });
                 let bytes = match &part.body {
                     PartType::Binary(bytes) | PartType::InlineBinary(bytes) => Some(bytes.as_ref()),
+                    PartType::Text(text) | PartType::Html(text) => Some(text.as_bytes()),
                     _ => None,
                 };
                 if let (Some(html), Some(id), Some(bytes)) =
@@ -1351,11 +2207,41 @@ impl Db {
                 http,
             })
         });
+        let has_remote_content = body_html
+            .as_deref()
+            .is_some_and(|html| html.contains("http://") || html.contains("https://"));
+        if let Some(reference) = raw_ref.as_deref() {
+            sqlx::query(
+                "INSERT INTO message_content_cache(
+                    message_id, raw_blob_ref, body_html, body_text, attachments_json,
+                    has_remote_content, is_newsletter, unsubscribe_json, parsed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    raw_blob_ref=excluded.raw_blob_ref, body_html=excluded.body_html,
+                    body_text=excluded.body_text, attachments_json=excluded.attachments_json,
+                    has_remote_content=excluded.has_remote_content,
+                    is_newsletter=excluded.is_newsletter,
+                    unsubscribe_json=excluded.unsubscribe_json, parsed_at=datetime('now')",
+            )
+            .bind(message_id)
+            .bind(reference)
+            .bind(&body_html)
+            .bind(&body_text)
+            .bind(serde_json::to_string(&attachments)?)
+            .bind(has_remote_content as i64)
+            .bind(is_newsletter as i64)
+            .bind(
+                unsubscribe
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .execute(&self.write_pool)
+            .await?;
+        }
         Ok(MessageFull {
             meta,
-            has_remote_content: body_html
-                .as_deref()
-                .is_some_and(|html| html.contains("http://") || html.contains("https://")),
+            has_remote_content,
             body_html,
             body_text,
             attachments,
@@ -1416,6 +2302,11 @@ impl Db {
 
     /// Сырой MIME-исходник письма (для просмотра "как есть" и диагностики).
     pub async fn message_raw(&self, message_id: i64) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.message_raw_bytes(message_id).await?).into_owned())
+    }
+
+    /// Исходные байты RFC 5322/MIME без перекодирования — для экспорта `.eml`.
+    pub async fn message_raw_bytes(&self, message_id: i64) -> Result<Vec<u8>> {
         let (raw_ref,): (Option<String>,) =
             sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
                 .bind(message_id)
@@ -1426,7 +2317,7 @@ impl Db {
             .map(|reference| self.blobs.get(reference))
             .transpose()?
             .ok_or_else(|| crate::Error::Other("исходник письма недоступен".into()))?;
-        Ok(String::from_utf8_lossy(&raw).into_owned())
+        Ok(raw)
     }
 
     /// Извлечь содержимое вложения по индексу (Attachment.id) из raw-MIME письма.
@@ -1498,7 +2389,52 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok((calendars, rows.into_iter().map(Into::into).collect()))
+        let mut events: Vec<Event> = rows.into_iter().map(Into::into).collect();
+        let indexes: std::collections::HashMap<i64, usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| event.id.map(|id| (id, index)))
+            .collect();
+        let attendee_rows: Vec<EventAttendeeRow> = sqlx::query_as(
+            "SELECT event_id, email, name, role, partstat, rsvp
+             FROM event_attendees ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for attendee in attendee_rows {
+            if let Some(index) = indexes.get(&attendee.event_id) {
+                events[*index].attendees.push(crate::model::Attendee {
+                    email: attendee.email,
+                    name: attendee.name,
+                    role: attendee.role,
+                    partstat: attendee.partstat,
+                    rsvp: attendee.rsvp != 0,
+                });
+            }
+        }
+        let alarm_rows: Vec<EventAlarmRow> = sqlx::query_as(
+            "SELECT event_id, trigger_minutes, action FROM event_alarms ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for alarm in alarm_rows {
+            if let Some(index) = indexes.get(&alarm.event_id) {
+                events[*index].alarms.push(crate::model::Alarm {
+                    trigger_minutes: alarm.trigger_minutes,
+                    action: alarm.action,
+                });
+            }
+        }
+        Ok((calendars, events))
+    }
+
+    pub async fn set_calendar_visible(&self, calendar_id: i64, visible: bool) -> Result<()> {
+        sqlx::query("UPDATE calendars SET visible=? WHERE id=?")
+            .bind(visible)
+            .bind(calendar_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
     }
 
     /// Отметить письмо прочитанным (локально; в outbox уйдёт синхронизация флага).
@@ -1711,6 +2647,21 @@ impl Db {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Вернуть в очередь операции Exchange, отложенные старой реализацией,
+    /// которая отправляла UpdateItem без обязательного ChangeKey.
+    pub async fn requeue_exchange_change_key_operations(&self, account_id: i64) -> Result<usize> {
+        let result = sqlx::query(
+            "UPDATE outbox_ops SET status='retry', attempts=0, next_attempt_at=datetime('now')
+             WHERE account_id=? AND status IN ('retry','failed')
+               AND attempts >= 7
+               AND last_error LIKE '%ChangeKey is required%'",
+        )
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
     pub async fn queue_scheduled_send(
         &self,
         account_id: i64,
@@ -1727,6 +2678,48 @@ impl Db {
         .execute(&self.write_pool)
         .await?;
         Ok(result.last_insert_rowid())
+    }
+
+    /// SMTP уже принял письмо, но IMAP APPEND серверной копии не завершился.
+    /// Повторяем только APPEND: повторная SMTP-отправка создала бы дубль у адресата.
+    pub async fn queue_sent_append(
+        &self,
+        account_id: i64,
+        payload: &str,
+        error: &str,
+    ) -> Result<i64> {
+        let result = sqlx::query(
+            "INSERT INTO outbox_ops(account_id, op_kind, payload, status, attempts,
+                                    next_attempt_at, last_error)
+             VALUES(?, 'append_sent', ?, 'retry', 0, datetime('now','+5 seconds'), ?)",
+        )
+        .bind(account_id)
+        .bind(payload)
+        .bind(error.chars().take(1000).collect::<String>())
+        .execute(&self.write_pool)
+        .await?;
+        Ok(result.last_insert_rowid())
+    }
+
+    /// Превратить scheduled `send` в append-only retry после успешного SMTP DATA.
+    pub async fn convert_outbox_to_sent_append(
+        &self,
+        id: i64,
+        payload: &str,
+        error: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE outbox_ops
+                SET op_kind='append_sent', payload=?, status='retry', attempts=0,
+                    next_attempt_at=datetime('now','+5 seconds'), last_error=?
+              WHERE id=?",
+        )
+        .bind(payload)
+        .bind(error.chars().take(1000).collect::<String>())
+        .bind(id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn complete_outbox_operation(&self, operation: &OutboxOperation) -> Result<()> {
@@ -1769,50 +2762,747 @@ impl Db {
         Ok(())
     }
 
+    // ---------- Правила обработки почты ----------
+
+    pub async fn import_legacy_mail_rules(&self) -> Result<()> {
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM mail_rules")
+            .fetch_one(&self.pool)
+            .await?;
+        if count > 0 {
+            return Ok(());
+        }
+        let Some(serialized) = self.setting("mail_rules_ui").await? else {
+            return Ok(());
+        };
+        let Ok(rules) = serde_json::from_str::<Vec<serde_json::Value>>(&serialized) else {
+            tracing::warn!("старые правила UI не импортированы: JSON повреждён");
+            return Ok(());
+        };
+        let mut tx = self.begin_write().await?;
+        for (sort_order, rule) in rules.into_iter().enumerate() {
+            let string = |key: &str| rule.get(key).and_then(|value| value.as_str());
+            let Some(id) = string("id") else { continue };
+            let Some(name) = string("name") else { continue };
+            let Some(field) = string("field") else {
+                continue;
+            };
+            let Some(operator) = string("operator") else {
+                continue;
+            };
+            let Some(value) = string("value") else {
+                continue;
+            };
+            let Some(action) = string("action") else {
+                continue;
+            };
+            if !matches!(field, "sender" | "subject")
+                || !matches!(operator, "contains" | "equals")
+                || !matches!(action, "move" | "archive" | "spam" | "trash")
+            {
+                continue;
+            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO mail_rules(
+                    id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(field)
+            .bind(operator)
+            .bind(value)
+            .bind(rule.get("account_id").and_then(|value| value.as_i64()))
+            .bind(action)
+            .bind(rule.get("folder_id").and_then(|value| value.as_i64()))
+            .bind(
+                rule.get("enabled")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(true),
+            )
+            .bind(
+                rule.get("last_id")
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0),
+            )
+            .bind(sort_order as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_mail_rules(&self) -> Result<Vec<MailRule>> {
+        let rows: Vec<MailRuleRow> = sqlx::query_as(
+            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+             FROM mail_rules ORDER BY sort_order, created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn save_mail_rule(
+        &self,
+        rule: &MailRuleInput,
+        apply_existing: bool,
+    ) -> Result<MailRule> {
+        if rule.id.trim().is_empty() || rule.name.trim().is_empty() || rule.value.trim().is_empty()
+        {
+            return Err(crate::Error::AccountConfig(
+                "правилу нужны id, название и значение".into(),
+            ));
+        }
+        if !matches!(rule.field.as_str(), "sender" | "subject")
+            || !matches!(rule.operator.as_str(), "contains" | "equals")
+            || !matches!(rule.action.as_str(), "move" | "archive" | "spam" | "trash")
+        {
+            return Err(crate::Error::AccountConfig(
+                "правило содержит неподдерживаемое условие или действие".into(),
+            ));
+        }
+        let mut tx = self.begin_write().await?;
+        if let Some(account_id) = rule.account_id {
+            let exists: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM accounts WHERE id=? AND enabled=1")
+                    .bind(account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if exists.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "аккаунт правила не найден".into(),
+                ));
+            }
+        }
+        if rule.action == "move" {
+            let account_id = rule.account_id.ok_or_else(|| {
+                crate::Error::AccountConfig("для перемещения выберите конкретный аккаунт".into())
+            })?;
+            let folder_id = rule
+                .folder_id
+                .ok_or_else(|| crate::Error::AccountConfig("папка назначения не выбрана".into()))?;
+            let target: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM folders WHERE id=? AND account_id=?")
+                    .bind(folder_id)
+                    .bind(account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if target.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "папка назначения не принадлежит аккаунту правила".into(),
+                ));
+            }
+        }
+        let existing: Option<(i64, i64)> =
+            sqlx::query_as("SELECT progress_message_id, sort_order FROM mail_rules WHERE id=?")
+                .bind(&rule.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let progress = if apply_existing {
+            0
+        } else if let Some((progress, _)) = existing {
+            progress
+        } else {
+            sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(id), 0) FROM messages")
+                .fetch_one(&mut *tx)
+                .await?
+                .0
+        };
+        let sort_order = if let Some((_, sort_order)) = existing {
+            sort_order
+        } else {
+            sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(sort_order), -1)+1 FROM mail_rules")
+                .fetch_one(&mut *tx)
+                .await?
+                .0
+        };
+        sqlx::query(
+            "INSERT INTO mail_rules(
+                id, name, field, operator, value, account_id, action, folder_id,
+                enabled, progress_message_id, sort_order
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                name=excluded.name, field=excluded.field, operator=excluded.operator,
+                value=excluded.value, account_id=excluded.account_id,
+                action=excluded.action, folder_id=excluded.folder_id,
+                enabled=excluded.enabled, progress_message_id=excluded.progress_message_id,
+                updated_at=datetime('now')",
+        )
+        .bind(&rule.id)
+        .bind(rule.name.trim())
+        .bind(&rule.field)
+        .bind(&rule.operator)
+        .bind(rule.value.trim())
+        .bind(rule.account_id)
+        .bind(&rule.action)
+        .bind((rule.action == "move").then_some(rule.folder_id).flatten())
+        .bind(rule.enabled)
+        .bind(progress)
+        .bind(sort_order)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.list_mail_rules()
+            .await?
+            .into_iter()
+            .find(|saved| saved.id == rule.id)
+            .ok_or_else(|| crate::Error::Other("сохранённое правило не найдено".into()))
+    }
+
+    pub async fn set_mail_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let changed =
+            sqlx::query("UPDATE mail_rules SET enabled=?, updated_at=datetime('now') WHERE id=?")
+                .bind(enabled)
+                .bind(id)
+                .execute(&self.write_pool)
+                .await?;
+        if changed.rows_affected() != 1 {
+            return Err(crate::Error::Other("правило не найдено".into()));
+        }
+        Ok(())
+    }
+
+    pub async fn delete_mail_rule(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM mail_rules WHERE id=?")
+            .bind(id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Match new messages and atomically queue server actions together with
+    /// rule progress. A crash can therefore cause neither a skipped message nor
+    /// a duplicate operation.
+    pub async fn process_mail_rules(&self) -> Result<usize> {
+        let mut tx = self.begin_write().await?;
+        let mut rules: Vec<MailRuleRow> = sqlx::query_as(
+            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+                    enabled, progress_message_id, sort_order
+             FROM mail_rules WHERE enabled=1 ORDER BY sort_order, created_at, id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        if rules.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+        let min_progress = rules
+            .iter()
+            .map(|rule| rule.progress_message_id)
+            .min()
+            .unwrap_or(0);
+        let messages: Vec<RuleMessageRow> = sqlx::query_as(
+            "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
+                    m.remote_id, m.from_name, m.from_addr, m.subject
+             FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.id>? AND (f.role IS NULL OR f.role NOT IN
+                    ('sent','drafts','archive','spam','trash'))
+               AND NOT EXISTS (
+                    SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
+                      AND o.op_kind IN ('move','delete')
+                      AND o.status IN ('pending','processing','retry')
+               )
+             ORDER BY m.id LIMIT 500",
+        )
+        .bind(min_progress)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut queued = 0;
+        for message in messages {
+            let matching = rules.iter().position(|rule| {
+                if message.id <= rule.progress_message_id
+                    || rule.account_id.is_some_and(|id| id != message.account_id)
+                {
+                    return false;
+                }
+                let source = if rule.field == "subject" {
+                    message.subject.clone()
+                } else {
+                    format!(
+                        "{} {}",
+                        message.from_name.as_deref().unwrap_or(""),
+                        message.from_addr.as_deref().unwrap_or("")
+                    )
+                };
+                let source = source.to_lowercase();
+                let value = rule.value.to_lowercase();
+                if rule.operator == "equals" {
+                    source == value
+                } else {
+                    source.contains(&value)
+                }
+            });
+            if let Some(index) = matching {
+                let rule = &rules[index];
+                let target = if rule.action == "move" {
+                    let folder_id = rule.folder_id.ok_or_else(|| {
+                        crate::Error::AccountConfig(format!(
+                            "у правила {} нет папки назначения",
+                            rule.name
+                        ))
+                    })?;
+                    sqlx::query_as::<_, (i64, String)>(
+                        "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                    )
+                    .bind(folder_id)
+                    .bind(message.account_id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, (i64, String)>(
+                        "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
+                    )
+                    .bind(message.account_id)
+                    .bind(&rule.action)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                }
+                .ok_or_else(|| {
+                    crate::Error::AccountConfig(format!(
+                        "для правила {} не найдена папка назначения",
+                        rule.name
+                    ))
+                })?;
+                if target.0 != message.folder_id {
+                    let payload = serde_json::json!({
+                        "message_id": message.id,
+                        "folder_id": message.folder_id,
+                        "folder_path": message.remote_path,
+                        "uid": message.uid,
+                        "remote_id": message.remote_id,
+                        "target_folder_id": target.0,
+                        "target_folder_path": target.1,
+                        "rule_id": rule.id,
+                    });
+                    sqlx::query(
+                        "INSERT INTO outbox_ops(
+                            account_id, message_id, op_kind, payload, status, next_attempt_at
+                         ) VALUES(?, ?, 'move', ?, 'pending', datetime('now'))",
+                    )
+                    .bind(message.account_id)
+                    .bind(message.id)
+                    .bind(payload.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+                    queued += 1;
+                }
+            }
+            for rule in &mut rules {
+                if message.id > rule.progress_message_id {
+                    rule.progress_message_id = message.id;
+                }
+            }
+        }
+        for rule in &rules {
+            sqlx::query(
+                "UPDATE mail_rules SET progress_message_id=?, updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(rule.progress_message_id)
+            .bind(&rule.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(queued)
+    }
+
     // ---------- Умные папки ----------
 
     pub async fn list_smart_folders(&self) -> Result<Vec<SmartFolder>> {
         let rows = sqlx::query_as::<_, SmartRow>(
-            "SELECT id, name, icon, match_logic, is_builtin, enabled
-             FROM smart_folders WHERE enabled = 1 ORDER BY sort_order, id",
+            "SELECT id, stable_id, name, icon, is_builtin, enabled, sort_order
+             FROM smart_folders ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::new();
         for r in rows {
-            let conditions = sqlx::query_as::<_, CondRow>(
-                "SELECT field, op, value FROM smart_conditions WHERE smart_folder_id = ?",
+            let condition_rows = sqlx::query_as::<_, CondRow>(
+                "SELECT field, op, value, group_index, group_logic, unit, value2
+                 FROM smart_conditions WHERE smart_folder_id = ? ORDER BY group_index, id",
             )
             .bind(r.id)
             .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|c| SmartCondition {
-                field: c.field,
-                op: c.op,
-                value: c.value,
-            })
-            .collect();
+            .await?;
+            let mut groups = Vec::<SmartConditionGroup>::new();
+            for condition in condition_rows {
+                let group_index = condition.group_index.max(0) as usize;
+                while groups.len() <= group_index {
+                    groups.push(SmartConditionGroup {
+                        logic: "all".into(),
+                        conditions: Vec::new(),
+                    });
+                }
+                groups[group_index].logic = condition.group_logic;
+                groups[group_index].conditions.push(SmartCondition {
+                    field: condition.field,
+                    op: condition.op,
+                    value: condition.value,
+                    unit: condition.unit,
+                    value2: condition.value2,
+                });
+            }
             out.push(SmartFolder {
-                id: r.id,
+                id: r.stable_id,
                 name: r.name,
                 icon: r.icon,
-                match_logic: r.match_logic,
                 is_builtin: r.is_builtin != 0,
                 enabled: r.enabled != 0,
-                conditions,
+                sort_order: r.sort_order,
+                groups,
             });
         }
         Ok(out)
     }
 
+    pub async fn save_smart_folders(&self, folders: &[SmartFolder]) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let mut stable_ids = Vec::new();
+        for (index, folder) in folders.iter().enumerate() {
+            let stable_id = folder.id.trim();
+            if stable_id.is_empty()
+                || !stable_id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || "-_".contains(character))
+            {
+                return Err(crate::Error::AccountConfig(
+                    "некорректный идентификатор умной папки".into(),
+                ));
+            }
+            if folder.name.trim().is_empty() {
+                return Err(crate::Error::AccountConfig(
+                    "название умной папки не указано".into(),
+                ));
+            }
+            stable_ids.push(stable_id.to_owned());
+            let existing: Option<(i64, i64)> =
+                sqlx::query_as("SELECT id, is_builtin FROM smart_folders WHERE stable_id=?")
+                    .bind(stable_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let database_id = if let Some((id, _)) = existing {
+                sqlx::query(
+                    "UPDATE smart_folders SET name=?, icon=?, enabled=?, sort_order=? WHERE id=?",
+                )
+                .bind(folder.name.trim())
+                .bind(&folder.icon)
+                .bind(folder.enabled)
+                .bind(index as i64)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+                id
+            } else {
+                sqlx::query(
+                    "INSERT INTO smart_folders(stable_id, name, icon, is_builtin, enabled, sort_order)
+                     VALUES(?, ?, ?, 0, ?, ?)",
+                )
+                .bind(stable_id)
+                .bind(folder.name.trim())
+                .bind(&folder.icon)
+                .bind(folder.enabled)
+                .bind(index as i64)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid()
+            };
+            sqlx::query("DELETE FROM smart_conditions WHERE smart_folder_id=?")
+                .bind(database_id)
+                .execute(&mut *tx)
+                .await?;
+            for (group_index, group) in folder.groups.iter().enumerate() {
+                let logic = if group.logic == "any" { "any" } else { "all" };
+                for condition in &group.conditions {
+                    sqlx::query(
+                        "INSERT INTO smart_conditions(smart_folder_id, field, op, value, group_index, group_logic, unit, value2)
+                         VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(database_id)
+                    .bind(&condition.field)
+                    .bind(&condition.op)
+                    .bind(&condition.value)
+                    .bind(group_index as i64)
+                    .bind(logic)
+                    .bind(&condition.unit)
+                    .bind(&condition.value2)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+        let custom_rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, stable_id FROM smart_folders WHERE is_builtin=0")
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, stable_id) in custom_rows {
+            if !stable_ids.iter().any(|value| value == &stable_id) {
+                sqlx::query("DELETE FROM smart_folders WHERE id=?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_unified_sources(&self) -> Result<Vec<UnifiedSource>> {
+        let (unified_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM unified_folders WHERE role='all'")
+                .fetch_one(&self.pool)
+                .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO unified_sources(unified_id, folder_id, included)
+             SELECT ?, id, 1 FROM folders",
+        )
+        .bind(unified_id)
+        .execute(&self.write_pool)
+        .await?;
+        let rows: Vec<(i64, bool)> = sqlx::query_as(
+            "SELECT folder_id, included FROM unified_sources WHERE unified_id=? ORDER BY folder_id",
+        )
+        .bind(unified_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(folder_id, included)| UnifiedSource {
+                folder_id,
+                included,
+            })
+            .collect())
+    }
+
+    pub async fn set_unified_source(&self, folder_id: i64, included: bool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO unified_sources(unified_id, folder_id, included)
+             SELECT id, ?, ? FROM unified_folders WHERE role='all'
+             ON CONFLICT(unified_id, folder_id) DO UPDATE SET included=excluded.included",
+        )
+        .bind(folder_id)
+        .bind(included)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_smart_folder_messages(
+        &self,
+        stable_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageMeta>> {
+        self.list_smart_folder_messages_page(stable_id, None, None, limit)
+            .await
+    }
+
+    pub async fn list_smart_folder_messages_page(
+        &self,
+        stable_id: &str,
+        before_date: Option<&str>,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MessageMeta>> {
+        let folder = self
+            .list_smart_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == stable_id)
+            .ok_or_else(|| crate::Error::Other("умная папка не найдена".into()))?;
+        let included = sqlx::query_as::<_, (i64,)>(
+            "SELECT f.id FROM folders f
+             LEFT JOIN unified_sources us ON us.folder_id=f.id
+               AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
+             WHERE COALESCE(us.included, 1)=1",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect::<std::collections::HashSet<_>>();
+        let accounts = self
+            .list_accounts()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.email))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut folders = std::collections::HashMap::new();
+        for account_id in accounts.keys() {
+            for folder in self.list_folders(*account_id).await? {
+                folders.insert(folder.id, folder);
+            }
+        }
+        let label_rows: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
+        for (message_id, name) in label_rows {
+            labels.entry(message_id).or_default().push(name);
+        }
+        const SCAN_PAGE_SIZE: i64 = 1_000;
+        let page_size = limit.clamp(1, 500);
+        let mut cursor = before_date
+            .zip(before_id)
+            .map(|(date, id)| (date.to_owned(), id));
+        let mut result = Vec::new();
+        loop {
+            let rows = if let Some((date, id)) = &cursor {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(date)
+                .bind(date)
+                .bind(id)
+                .bind(SCAN_PAGE_SIZE)
+                .fetch_all(&self.pool)
+                .await?
+            } else {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(SCAN_PAGE_SIZE)
+                .fetch_all(&self.pool)
+                .await?
+            };
+            let row_count = rows.len();
+            let Some(last) = rows.last() else {
+                break;
+            };
+            let next_cursor = (last.date.clone().unwrap_or_default(), last.id);
+            for row in rows {
+                let mut message = MessageMeta::from(row);
+                if !included.contains(&message.folder_id) {
+                    continue;
+                }
+                message.labels = labels.remove(&message.id).unwrap_or_default();
+                if smart_folder_matches(
+                    &folder,
+                    &message,
+                    accounts.get(&message.account_id).map(String::as_str),
+                    folders.get(&message.folder_id),
+                ) {
+                    result.push(message);
+                    if result.len() >= page_size {
+                        return Ok(result);
+                    }
+                }
+            }
+            if row_count < SCAN_PAGE_SIZE as usize {
+                break;
+            }
+            cursor = Some(next_cursor);
+        }
+        Ok(result)
+    }
+
     // ---------- Контакты ----------
+
+    pub async fn save_local_contact(
+        &self,
+        account_id: i64,
+        contact_id: Option<i64>,
+        input: &crate::account::ContactInput,
+    ) -> Result<i64> {
+        let mut tx = self.begin_write().await?;
+        let id = if let Some(contact_id) = contact_id {
+            sqlx::query(
+                "UPDATE contacts SET display_name=?, first_name=?, last_name=?, organization=?, hidden=0
+                 WHERE id=? AND account_id=?",
+            )
+            .bind(clean_contact_name(&input.display_name))
+            .bind(&input.first_name)
+            .bind(&input.last_name)
+            .bind(&input.organization)
+            .bind(contact_id)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
+            contact_id
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO contacts(account_id, uid, display_name, first_name, last_name, organization)
+                 VALUES(?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account_id)
+            .bind(format!("local:{}", uuid::Uuid::new_v4()))
+            .bind(clean_contact_name(&input.display_name))
+            .bind(&input.first_name)
+            .bind(&input.last_name)
+            .bind(&input.organization)
+            .execute(&mut *tx)
+            .await?;
+            result.last_insert_rowid()
+        };
+        sqlx::query("DELETE FROM contact_emails WHERE contact_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for email in &input.emails {
+            sqlx::query(
+                "INSERT OR IGNORE INTO contact_emails(contact_id, email, kind) VALUES(?, ?, 'other')",
+            )
+            .bind(id)
+            .bind(email.trim())
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query("DELETE FROM contact_phones WHERE contact_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for phone in &input.phones {
+            sqlx::query(
+                "INSERT INTO contact_phones(contact_id, number, kind, extension) VALUES(?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(phone.number.trim())
+            .bind(&phone.kind)
+            .bind(phone.extension.as_deref().map(str::trim))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn hide_local_contact(&self, contact_id: i64) -> Result<()> {
+        sqlx::query("UPDATE contacts SET hidden=1 WHERE id=?")
+            .bind(contact_id)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
 
     pub async fn list_contacts(&self, query: Option<&str>) -> Result<Vec<Contact>> {
         let like = format!("%{}%", query.unwrap_or(""));
         let rows = sqlx::query_as::<_, ContactRow>(
             "SELECT id, account_id, uid, display_name, first_name, last_name, organization, is_favorite
-             FROM contacts WHERE display_name LIKE ? ORDER BY display_name LIMIT 500",
+             FROM contacts WHERE hidden=0 AND display_name LIKE ? ORDER BY display_name LIMIT 500",
         )
         .bind(like)
         .fetch_all(&self.pool)
@@ -1832,9 +3522,185 @@ impl Db {
                     kind: row.kind,
                 })
                 .collect();
+                contact.phones = sqlx::query_as::<_, ContactPhoneRow>(
+                    "SELECT number, kind, extension FROM contact_phones WHERE contact_id = ? ORDER BY id",
+                )
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .map(|row| ContactPhone {
+                    number: row.number,
+                    kind: row.kind,
+                    extension: row.extension,
+                })
+                .collect();
             }
         }
         Ok(contacts)
+    }
+}
+
+fn smart_folder_matches(
+    folder: &SmartFolder,
+    message: &MessageMeta,
+    account_email: Option<&str>,
+    source_folder: Option<&Folder>,
+) -> bool {
+    folder.groups.iter().any(|group| {
+        let matches = |condition: &SmartCondition| {
+            smart_condition_matches(condition, message, account_email, source_folder)
+        };
+        !group.conditions.is_empty()
+            && if group.logic == "any" {
+                group.conditions.iter().any(matches)
+            } else {
+                group.conditions.iter().all(matches)
+            }
+    })
+}
+
+fn smart_condition_matches(
+    condition: &SmartCondition,
+    message: &MessageMeta,
+    account_email: Option<&str>,
+    source_folder: Option<&Folder>,
+) -> bool {
+    if condition.field == "date" {
+        let Some(raw) = message.date.as_deref() else {
+            return false;
+        };
+        let timestamp = chrono::DateTime::parse_from_rfc3339(raw)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                    .map(|value| value.and_utc())
+            });
+        let Ok(timestamp) = timestamp else {
+            return false;
+        };
+        if matches!(condition.op.as_str(), "within_last" | "older_than") {
+            let Ok(amount) = condition.value.parse::<i64>() else {
+                return false;
+            };
+            let seconds = match condition.unit.as_deref().unwrap_or("hours") {
+                "minutes" => 60,
+                "days" => 86_400,
+                "weeks" => 604_800,
+                _ => 3_600,
+            };
+            let threshold = chrono::Utc::now() - chrono::Duration::seconds(amount * seconds);
+            return if condition.op == "within_last" {
+                timestamp >= threshold
+            } else {
+                timestamp < threshold
+            };
+        }
+        let Ok(target) = chrono::NaiveDate::parse_from_str(&condition.value, "%Y-%m-%d") else {
+            return false;
+        };
+        let actual = timestamp.date_naive();
+        return match condition.op.as_str() {
+            "before" => actual < target,
+            "after" => actual > target,
+            _ => actual == target,
+        };
+    }
+
+    if condition.field == "size" {
+        let Some(bytes) = message.size else {
+            return false;
+        };
+        let factor = match condition.unit.as_deref().unwrap_or("mb") {
+            "kb" => 1_024_f64,
+            "gb" => 1_073_741_824_f64,
+            _ => 1_048_576_f64,
+        };
+        let Ok(value) = condition.value.parse::<f64>() else {
+            return false;
+        };
+        let minimum = value * factor;
+        let bytes = bytes as f64;
+        return match condition.op.as_str() {
+            "greater_than" => bytes > minimum,
+            "greater_or_equal" => bytes >= minimum,
+            "less_than" => bytes < minimum,
+            "less_or_equal" => bytes <= minimum,
+            "between" => condition
+                .value2
+                .as_deref()
+                .and_then(|value| value.parse::<f64>().ok())
+                .is_some_and(|maximum| bytes >= minimum && bytes <= maximum * factor),
+            _ => (bytes - minimum).abs() < f64::EPSILON,
+        };
+    }
+
+    let value = match condition.field.as_str() {
+        "sender" => format!(
+            "{} {}",
+            message.from.name.as_deref().unwrap_or(""),
+            message.from.email
+        ),
+        "recipient" => message
+            .to
+            .iter()
+            .chain(message.cc.iter())
+            .map(|address| {
+                format!(
+                    "{} {}",
+                    address.name.as_deref().unwrap_or(""),
+                    address.email
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        "subject" => message.subject.clone(),
+        "body" => message.preview.clone(),
+        "account" => account_email.unwrap_or_default().to_owned(),
+        "folder" => source_folder
+            .map(|folder| format!("{} {}", folder.display_name, folder.remote_path))
+            .unwrap_or_default(),
+        "folder_role" => source_folder
+            .and_then(|folder| folder.role)
+            .map(|role| role.as_str().to_owned())
+            .unwrap_or_else(|| "other".into()),
+        "read_state" => if message.flags.seen { "read" } else { "unread" }.into(),
+        "importance" => if message.flags.flagged {
+            "flagged"
+        } else {
+            "normal"
+        }
+        .into(),
+        "reply_state" => if message.flags.answered {
+            "answered"
+        } else {
+            "unanswered"
+        }
+        .into(),
+        "draft_state" => if message.flags.draft {
+            "draft"
+        } else {
+            "not_draft"
+        }
+        .into(),
+        "attachment" => if message.has_attachments {
+            "has"
+        } else {
+            "none"
+        }
+        .into(),
+        "label" => message.labels.join(" "),
+        _ => String::new(),
+    };
+    let left = value.to_lowercase();
+    let right = condition.value.to_lowercase();
+    match condition.op.as_str() {
+        "not_contains" => !left.contains(&right),
+        "equals" => left == right,
+        "not_equals" => left != right,
+        "starts_with" => left.starts_with(&right),
+        "ends_with" => left.ends_with(&right),
+        _ => left.contains(&right),
     }
 }
 
@@ -1879,6 +3745,7 @@ struct AccountRow {
     smtp_port: Option<i64>,
     smtp_security: Option<String>,
     ews_url: Option<String>,
+    jmap_url: Option<String>,
     username: Option<String>,
     secret_ref: Option<String>,
     include_in_unified: i64,
@@ -1930,6 +3797,7 @@ impl From<AccountRow> for Account {
             imap,
             smtp,
             ews_url: r.ews_url,
+            jmap_url: r.jmap_url,
             username: r.username,
             secret_ref: r.secret_ref,
             include_in_unified: r.include_in_unified != 0,
@@ -2051,19 +3919,70 @@ impl From<MessageRow> for MessageMeta {
 }
 
 #[derive(sqlx::FromRow)]
+struct MailRuleRow {
+    id: String,
+    name: String,
+    field: String,
+    operator: String,
+    value: String,
+    account_id: Option<i64>,
+    action: String,
+    folder_id: Option<i64>,
+    enabled: i64,
+    progress_message_id: i64,
+    sort_order: i64,
+}
+
+impl From<MailRuleRow> for MailRule {
+    fn from(rule: MailRuleRow) -> Self {
+        Self {
+            id: rule.id,
+            name: rule.name,
+            field: rule.field,
+            operator: rule.operator,
+            value: rule.value,
+            account_id: rule.account_id,
+            action: rule.action,
+            folder_id: rule.folder_id,
+            enabled: rule.enabled != 0,
+            progress_message_id: rule.progress_message_id,
+            sort_order: rule.sort_order,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RuleMessageRow {
+    id: i64,
+    account_id: i64,
+    folder_id: i64,
+    uid: i64,
+    remote_path: String,
+    remote_id: Option<String>,
+    from_name: Option<String>,
+    from_addr: Option<String>,
+    subject: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct SmartRow {
     id: i64,
+    stable_id: String,
     name: String,
     icon: Option<String>,
-    match_logic: String,
     is_builtin: i64,
     enabled: i64,
+    sort_order: i64,
 }
 #[derive(sqlx::FromRow)]
 struct CondRow {
     field: String,
     op: String,
     value: String,
+    group_index: i64,
+    group_logic: String,
+    unit: Option<String>,
+    value2: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -2082,6 +4001,13 @@ struct ContactRow {
 struct ContactEmailRow {
     email: String,
     kind: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ContactPhoneRow {
+    number: String,
+    kind: Option<String>,
+    extension: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2116,6 +4042,23 @@ struct EventRow {
     url: Option<String>,
     organizer: Option<String>,
     sequence: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventAttendeeRow {
+    event_id: i64,
+    email: String,
+    name: Option<String>,
+    role: Option<String>,
+    partstat: Option<String>,
+    rsvp: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct EventAlarmRow {
+    event_id: i64,
+    trigger_minutes: i32,
+    action: String,
 }
 impl From<EventRow> for Event {
     fn from(row: EventRow) -> Self {
@@ -2166,11 +4109,12 @@ impl From<ContactRow> for Contact {
             id: Some(r.id),
             account_id: r.account_id,
             uid: r.uid,
-            display_name: r.display_name,
+            display_name: clean_contact_name(&r.display_name),
             first_name: r.first_name,
             last_name: r.last_name,
             organization: r.organization,
             emails: Vec::new(),
+            phones: Vec::new(),
             is_favorite: r.is_favorite != 0,
         }
     }

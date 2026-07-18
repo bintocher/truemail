@@ -23,7 +23,9 @@ sqlx.workspace = true
 libsqlite3-sys.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+axum.workspace = true
 async-imap.workspace = true
+imap-proto.workspace = true
 futures.workspace = true
 socket2.workspace = true
 tokio-rustls.workspace = true
@@ -43,5 +45,7 @@ lettre.workspace = true
 keyring.workspace = true
 chacha20poly1305.workspace = true
 rand.workspace = true
-fluent.workspace = true
-unic-langid.workspace = true
+argon2.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winhttp = { version = "0.1.3", features = ["async"] }
