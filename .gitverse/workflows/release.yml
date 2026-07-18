@@ -58,10 +58,58 @@ jobs:
         run: |
           rm -rf dist target/release/bundle
 
-  windows:
-    # Windows-сборка идёт строго после Linux: Linux создаёт релиз, Windows
-    # добавляет NSIS и публикует общий latest.json для встроенного updater.
+  macos:
+    # Нативная arm64-сборка на Apple Silicon: .dmg для установки и .app.tar.gz
+    # для встроенного updater. Идёт после Linux, чтобы дополнить общий релиз, и
+    # до Windows, который собирает latest.json уже со всеми платформами.
     needs: linux
+    runs-on: [self-hosted, macos, arm64]
+    env:
+      # Без CI=true bundle_dmg.sh оформляет окно DMG через Finder/AppleScript и
+      # падает в headless-раннере без GUI-сессии.
+      CI: "true"
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Сборка пакетов
+        # app-бандл даёт .app.tar.gz + подпись для updater, dmg - для установки.
+        run: |
+          cd apps/desktop/src-tauri
+          cargo tauri build --bundles app,dmg
+
+      - name: Собрать список пакетов
+        run: |
+          out=dist
+          rm -rf "$out" && mkdir -p "$out"
+          find target/release/bundle -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
+            -exec cp {} "$out"/ \;
+          ls -lh "$out"
+
+      - name: Публикация релиза
+        env:
+          TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: bash scripts/publish-release.sh "$TAG" dist
+
+      - name: Убрать за собой
+        if: always()
+        run: |
+          rm -rf dist target/release/bundle
+
+  windows:
+    # Windows-сборка идёт после Linux и macOS: они наполняют общий релиз своими
+    # артефактами, а Windows добавляет NSIS и публикует latest.json со всеми
+    # платформами (linux/macos/windows) для встроенного updater.
+    needs: [linux, macos]
     runs-on: [self-hosted, windows, x64]
     defaults:
       run:

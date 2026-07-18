@@ -47,3 +47,16 @@ jobs:
         run: |
           .\scripts\dev.ps1 -Check
           cargo test --workspace --locked
+
+  macos:
+    # Нативный arm64 host-runner (Apple Silicon): macOS-специфичные ветки
+    # (keychain, tray, autostart) и Tauri-бандл нельзя проверить в Linux-раннере.
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked

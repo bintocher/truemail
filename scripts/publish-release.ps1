@@ -97,6 +97,10 @@ if (-not $windows) { throw 'Windows updater package не найден в рел�
 $platforms = [ordered]@{ 'windows-x86_64' = $windows }
 $linux = New-Platform $assets '*.AppImage'
 if ($linux) { $platforms['linux-x86_64'] = $linux }
+# macOS Apple Silicon: updater берёт .app.tar.gz и его подпись. Ключ darwin-aarch64
+# соответствует arm64-сборке из macos job.
+$macos = New-Platform $assets '*.app.tar.gz'
+if ($macos) { $platforms['darwin-aarch64'] = $macos }
 
 $version = $Tag.TrimStart('v')
 $manifest = [ordered]@{

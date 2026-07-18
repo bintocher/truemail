@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Публикация релиза truemail в GitVerse.
+# Публикация и дополнение релиза truemail в GitVerse.
 #
 # Вызов: publish-release.sh <тег> <каталог с файлами>
 # Ожидает переменную TOKEN - токен GitVerse с правом на запись в репозиторий.
 #
-# Релиз создаётся только если тега ещё нет: master собирается на каждый push,
-# а выпускать релиз нужно, когда версия в Cargo.toml выросла.
+# Скрипт идемпотентен: находит релиз по тегу или создаёт его, затем догружает
+# только недостающие файлы. Так каждый платформенный job (linux, macos) вызывает
+# один и тот же скрипт и добавляет свои артефакты в общий релиз. Релиз создаётся
+# только под новый тег - master собирается на каждый push, а выпуск нужен, когда
+# версия в Cargo.toml выросла.
 set -euo pipefail
 
 TAG="${1:?не указан тег релиза}"
@@ -25,25 +28,37 @@ api() {
   curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" "$@"
 }
 
-existing=$(api "$API/repos/$OWNER/$REPO/releases" | tr ',' '\n' | grep -c "\"$TAG\"" || true)
-if [ "$existing" != "0" ]; then
-  echo "Релиз $TAG уже опубликован - пропускаю. Подняли версию в Cargo.toml?"
-  exit 0
-fi
+# Найти релиз по тегу. Пустой вывод - релиза ещё нет.
+release_id=$(api "$API/repos/$OWNER/$REPO/releases" | TAG="$TAG" python3 -c '
+import json, os, sys
+tag = os.environ["TAG"]
+match = [r for r in json.load(sys.stdin) if r.get("tag_name") == tag]
+print(match[0]["id"] if match else "")')
 
-echo "Создаю релиз $TAG"
-release=$(api -X POST "$API/repos/$OWNER/$REPO/releases" \
-  -H 'Content-Type: application/json' \
-  -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":\"Сборки truemail для Windows и Linux.\",\"is_authorized_only\":false}")
-
-release_id=$(printf '%s' "$release" | tr ',' '\n' | grep -m1 '"id"' | tr -dc '0-9')
 if [ -z "$release_id" ]; then
-  echo "Не удалось получить id релиза. Ответ: $release" >&2
-  exit 1
+  echo "Создаю релиз $TAG"
+  release=$(api -X POST "$API/repos/$OWNER/$REPO/releases" \
+    -H 'Content-Type: application/json' \
+    -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":\"Сборки truemail для Linux, Windows и macOS.\",\"is_authorized_only\":false}")
+  release_id=$(printf '%s' "$release" | python3 -c '
+import json, sys
+print(json.load(sys.stdin).get("id", ""))')
+  if [ -z "$release_id" ]; then
+    echo "Не удалось получить id релиза. Ответ: $release" >&2
+    exit 1
+  fi
+else
+  echo "Релиз $TAG уже создан (id $release_id) - догружаю недостающие файлы"
 fi
+
+# Имена уже загруженных ассетов - чтобы не заливать один файл дважды при
+# повторном или последовательном запуске платформенных job.
+existing=$(api "$API/repos/$OWNER/$REPO/releases/$release_id/assets" | python3 -c '
+import json, sys
+print("\n".join(a.get("name", "") for a in json.load(sys.stdin)))')
 
 # deb и rpm GitVerse не принимает как файлы релиза (400), поэтому пакуем их
-# в tar.gz. AppImage заливается как есть.
+# в tar.gz. AppImage, dmg, app.tar.gz и подписи заливаются как есть.
 shopt -s nullglob
 for pkg in "$DIR"/*.deb "$DIR"/*.rpm; do
   (cd "$DIR" && tar czf "$(basename "$pkg").tar.gz" "$(basename "$pkg")" && rm -f "$(basename "$pkg")")
@@ -55,12 +70,18 @@ if [ ${#files[@]} -eq 0 ]; then
   exit 1
 fi
 
+uploaded=0
 for file in "${files[@]}"; do
   name=$(basename "$file")
+  if printf '%s\n' "$existing" | grep -qxF "$name"; then
+    echo "Файл $name уже в релизе - пропускаю"
+    continue
+  fi
   echo "Загружаю $name"
   # name обязателен отдельным полем формы: без него 422, в query-параметре - 400.
   api -X POST "$API/repos/$OWNER/$REPO/releases/$release_id/assets" \
     -F "attachment=@$file" -F "name=$name" >/dev/null
+  uploaded=$((uploaded + 1))
 done
 
-echo "Релиз $TAG опубликован: ${#files[@]} файлов"
+echo "Релиз $TAG: загружено новых файлов - $uploaded"
