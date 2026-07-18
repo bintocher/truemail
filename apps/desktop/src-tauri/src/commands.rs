@@ -178,23 +178,37 @@ pub struct ConnectedAccount {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
 pub struct ApiError {
     pub(crate) message: String,
 }
 
+// Централизованный логгинг: каждый ApiError перед возвратом в UI сериализуется
+// Tauri именно здесь, поэтому это единственная точка, где ошибку нужно
+// залогировать - независимо от того, как она была создана (From, api_error или
+// литерал). Локальный троттлинг (RateLimited) - ожидаемое состояние, пишем info;
+// остальное - warn.
+impl Serialize for ApiError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        if self.message.contains("временно ограничен") {
+            tracing::info!(error = %self.message, "команда ограничена лимитом транспорта");
+        } else {
+            tracing::warn!(error = %self.message, "команда вернула ошибку в UI");
+        }
+        let mut state = serializer.serialize_struct("ApiError", 1)?;
+        state.serialize_field("message", &self.message)?;
+        state.end()
+    }
+}
+
 impl From<truemail_core::Error> for ApiError {
     fn from(e: truemail_core::Error) -> Self {
-        let message = e.to_string();
-        // Единая точка: любая ошибка ядра, уходящая в UI, попадает и в лог.
-        // RateLimited - ожидаемый локальный троттлинг, а не сбой, поэтому info.
-        match &e {
-            truemail_core::Error::RateLimited {
-                backend, retry_at, ..
-            } => tracing::info!(backend = %backend, retry_at = %retry_at, "{message}"),
-            _ => tracing::warn!(error = %message, "команда вернула ошибку в UI"),
+        ApiError {
+            message: e.to_string(),
         }
-        ApiError { message }
     }
 }
 
