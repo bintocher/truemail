@@ -87,14 +87,18 @@ struct QuotaBucket {
 
 impl QuotaBucket {
     fn take(&mut self, cost: f64, now: Instant) -> Option<Duration> {
-        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
         self.tokens = (self.tokens + elapsed * QUOTA_UNITS_PER_SEC).min(QUOTA_BUCKET_CAPACITY);
         self.last_refill = now;
         if self.tokens >= cost {
             self.tokens -= cost;
             None
         } else {
-            Some(Duration::from_secs_f64((cost - self.tokens) / QUOTA_UNITS_PER_SEC))
+            Some(Duration::from_secs_f64(
+                (cost - self.tokens) / QUOTA_UNITS_PER_SEC,
+            ))
         }
     }
 }
