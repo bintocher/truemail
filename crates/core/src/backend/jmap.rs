@@ -426,6 +426,7 @@ impl JmapBackend {
                     answered: keyword(keywords, "$answered"),
                     draft: keyword(keywords, "$draft"),
                     raw: raw.clone(),
+                    body_fetched: true,
                 });
             }
         }
@@ -461,6 +462,8 @@ impl JmapBackend {
             reset_folders: Vec::new(),
             remote_snapshot: all_full.then(|| snapshot.into_iter().collect()),
             changed_remote_ids: changed_ids.into_iter().collect(),
+            flag_updates: Vec::new(),
+            deleted_uids: Vec::new(),
         })
     }
 
@@ -761,8 +764,9 @@ impl MailBackend for JmapBackend {
         Ok(())
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
-        self.send_message(credential, message).await
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<super::SendOutcome> {
+        self.send_message(credential, message).await?;
+        Ok(super::SendOutcome::SavedOnServer)
     }
 
     async fn fetch_message_raw(

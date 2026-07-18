@@ -20,6 +20,16 @@ pub enum Error {
     #[error("транспорт ({backend}): {message}")]
     Backend { backend: String, message: String },
 
+    /// Сервер запретил повторные запросы до указанного абсолютного момента.
+    /// Отдельный вариант позволяет сохранить deadline в БД и пережить
+    /// перезапуск desktop-приложения, не продлевая блокировку.
+    #[error("транспорт ({backend}) временно ограничен до {retry_at}: {message}")]
+    RateLimited {
+        backend: String,
+        retry_at: chrono::DateTime<chrono::Utc>,
+        message: String,
+    },
+
     #[error("аккаунт не настроен: {0}")]
     AccountConfig(String),
 

@@ -621,6 +621,7 @@ impl From<Error> for HttpError {
     fn from(error: Error) -> Self {
         let status = match error {
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
+            Error::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Error::AccountConfig(_) | Error::Json(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

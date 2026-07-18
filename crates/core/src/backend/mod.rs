@@ -8,15 +8,23 @@ mod smtp;
 
 pub use ews::{EwsBackend, discover_ews_url};
 pub use imap::{
-    DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery, apply_gmail_operation,
-    apply_password_operation, apply_yandex_operation, discover_gmail, discover_gmail_folders,
-    discover_gmail_inbox, discover_password, discover_password_folders, discover_password_inbox,
-    discover_yandex, discover_yandex_folders, discover_yandex_inbox, validate_gmail,
-    validate_password, validate_yandex, wait_for_gmail_change, wait_for_password_change,
-    wait_for_yandex_change,
+    DiscoveredFlagUpdate, DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery,
+    apply_gmail_operation, apply_password_operation, apply_yandex_operation, discover_gmail,
+    discover_gmail_folders, discover_gmail_inbox, discover_password, discover_password_folders,
+    discover_password_inbox, discover_yandex, discover_yandex_folders, discover_yandex_inbox,
+    validate_gmail, validate_password, validate_yandex, wait_for_gmail_change,
+    wait_for_password_change, wait_for_yandex_change,
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex};
+
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// Provider API отправил письмо и сам сохранил серверную копию.
+    SavedOnServer,
+    /// SMTP доставил письмо; эти точные MIME-байты ещё нужно APPEND-ить в Sent.
+    NeedsSentAppend(Vec<u8>),
+}
 
 /// ID последних писем Gmail Входящих - для быстрых уведомлений о новой почте.
 pub async fn gmail_latest_ids(access_token: &str, limit: u32) -> Result<Vec<String>> {
@@ -91,7 +99,13 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<String>;
     async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()>;
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome>;
+    async fn append_sent(&self, email: &str, credential: &str, raw: &[u8]) -> Result<()> {
+        let _ = (email, credential, raw);
+        Err(crate::Error::AccountConfig(
+            "транспорт не поддерживает отдельное сохранение в Отправленные".into(),
+        ))
+    }
     /// Докачать сырой MIME письма с сервера (кэш вычищен по глубине хранения).
     async fn fetch_message_raw(
         &self,
@@ -184,8 +198,15 @@ impl MailBackend for YandexBackend {
         imap::delete_oauth_folder("imap.yandex.ru", email, credential, remote_path).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
-        send_yandex(message, credential).await
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+        let raw =
+            smtp::send_oauth_with_raw(message, credential, "smtp.yandex.com", 465, Security::Ssl)
+                .await?;
+        Ok(SendOutcome::NeedsSentAppend(raw))
+    }
+
+    async fn append_sent(&self, email: &str, credential: &str, raw: &[u8]) -> Result<()> {
+        imap::append_oauth_sent("imap.yandex.com", email, credential, raw).await
     }
 
     async fn fetch_message_raw(
@@ -276,8 +297,9 @@ impl MailBackend for GmailBackend {
         gmail_api::delete_label(credential, remote_path).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
-        send_gmail(message, credential).await
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+        send_gmail(message, credential).await?;
+        Ok(SendOutcome::SavedOnServer)
     }
 
     async fn fetch_message_raw(
@@ -383,15 +405,20 @@ impl MailBackend for OutlookBackend {
         imap::wait_for_oauth_change("outlook.office365.com", email, credential).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
-        smtp::send_oauth(
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+        let raw = smtp::send_oauth_with_raw(
             message,
             credential,
             "smtp.office365.com",
             587,
             Security::Starttls,
         )
-        .await
+        .await?;
+        Ok(SendOutcome::NeedsSentAppend(raw))
+    }
+
+    async fn append_sent(&self, email: &str, credential: &str, raw: &[u8]) -> Result<()> {
+        imap::append_oauth_sent("outlook.office365.com", email, credential, raw).await
     }
 
     async fn fetch_message_raw(
@@ -536,17 +563,30 @@ impl MailBackend for GenericImapBackend {
         .await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
         let smtp = self.smtp.as_ref().ok_or_else(|| {
             crate::Error::AccountConfig("для аккаунта не настроен SMTP-сервер".into())
         })?;
-        send_password(
+        let raw = smtp::send_password_with_raw(
             message,
             &self.username,
             credential,
             &smtp.host,
             smtp.port,
             smtp.security,
+        )
+        .await?;
+        Ok(SendOutcome::NeedsSentAppend(raw))
+    }
+
+    async fn append_sent(&self, _email: &str, credential: &str, raw: &[u8]) -> Result<()> {
+        imap::append_password_sent(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            raw,
         )
         .await
     }

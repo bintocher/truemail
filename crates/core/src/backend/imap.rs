@@ -4,6 +4,7 @@ use crate::model::{FolderRole, Security, infer_folder_role};
 use crate::{Error, Result};
 use async_imap::{Authenticator, types::Name, types::NameAttribute};
 use futures::TryStreamExt;
+use imap_proto::{AttributeValue, MailboxDatum, Response, ResponseCode, Status};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpStream;
@@ -30,7 +31,19 @@ pub struct FolderSyncCursor {
     pub uidvalidity: Option<u32>,
     pub first_uid: Option<u32>,
     pub last_uid: Option<u32>,
+    pub known_uids: Vec<u32>,
+    pub highestmodseq: Option<u64>,
     pub sync_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscoveredFlagUpdate {
+    pub folder_path: String,
+    pub uid: u32,
+    pub seen: bool,
+    pub flagged: bool,
+    pub answered: bool,
+    pub draft: bool,
 }
 
 #[derive(Debug)]
@@ -44,10 +57,149 @@ pub struct DiscoveredMessage {
     pub answered: bool,
     pub draft: bool,
     pub raw: Vec<u8>,
+    /// `false` означает лёгкую проекцию заголовков/preview: полный MIME будет
+    /// лениво загружен при открытии письма.
+    pub body_fetched: bool,
 }
 
 type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
 const MESSAGE_FETCH_ITEMS: &str = "(UID BODY.PEEK[] FLAGS RFC822.SIZE)";
+
+fn uid_set(uids: &[u32]) -> String {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < sorted.len() {
+        let start = sorted[index];
+        let mut end = start;
+        while index + 1 < sorted.len() && sorted[index + 1] == end.saturating_add(1) {
+            index += 1;
+            end = sorted[index];
+        }
+        if start == end {
+            ranges.push(start.to_string());
+        } else {
+            ranges.push(format!("{start}:{end}"));
+        }
+        index += 1;
+    }
+    ranges.join(",")
+}
+
+async fn select_qresync(
+    session: &mut OAuthSession,
+    mailbox_name: &str,
+    uidvalidity: u32,
+    highestmodseq: u64,
+    known_uids: &[u32],
+) -> Result<(
+    async_imap::types::Mailbox,
+    Vec<u32>,
+    Vec<DiscoveredFlagUpdate>,
+)> {
+    if mailbox_name.contains(['\r', '\n']) {
+        return Err(Error::Backend {
+            backend: "imap-qresync".into(),
+            message: "недопустимое имя mailbox".into(),
+        });
+    }
+    let quoted_mailbox = format!(
+        "\"{}\"",
+        mailbox_name.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    let known = uid_set(known_uids);
+    let command =
+        format!("SELECT {quoted_mailbox} (QRESYNC ({uidvalidity} {highestmodseq} {known}))");
+    let request_id = session
+        .run_command(command)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-qresync".into(),
+            message: error.to_string(),
+        })?;
+    let mut mailbox = async_imap::types::Mailbox::default();
+    let mut vanished = Vec::new();
+    let mut flag_updates = Vec::new();
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-qresync".into(),
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| Error::Backend {
+                backend: "imap-qresync".into(),
+                message: "сервер закрыл соединение во время SELECT QRESYNC".into(),
+            })?;
+        match response.parsed() {
+            Response::MailboxData(MailboxDatum::Exists(value)) => mailbox.exists = *value,
+            Response::MailboxData(MailboxDatum::Recent(value)) => mailbox.recent = *value,
+            Response::Data {
+                code: Some(code), ..
+            } => match code {
+                ResponseCode::UidValidity(value) => mailbox.uid_validity = Some(*value),
+                ResponseCode::UidNext(value) => mailbox.uid_next = Some(*value),
+                ResponseCode::HighestModSeq(value) => mailbox.highest_modseq = Some(*value),
+                ResponseCode::Unseen(value) => mailbox.unseen = Some(*value),
+                _ => {}
+            },
+            Response::Vanished { uids, .. } => {
+                for range in uids {
+                    vanished.extend(range.clone());
+                }
+            }
+            Response::Fetch(_, attributes) => {
+                let uid = attributes.iter().find_map(|attribute| match attribute {
+                    AttributeValue::Uid(uid) => Some(*uid),
+                    _ => None,
+                });
+                let flags = attributes.iter().find_map(|attribute| match attribute {
+                    AttributeValue::Flags(flags) => Some(flags),
+                    _ => None,
+                });
+                if let (Some(uid), Some(flags)) = (uid, flags) {
+                    flag_updates.push(DiscoveredFlagUpdate {
+                        folder_path: mailbox_name.to_owned(),
+                        uid,
+                        seen: flags.iter().any(|flag| flag.eq_ignore_ascii_case("\\Seen")),
+                        flagged: flags
+                            .iter()
+                            .any(|flag| flag.eq_ignore_ascii_case("\\Flagged")),
+                        answered: flags
+                            .iter()
+                            .any(|flag| flag.eq_ignore_ascii_case("\\Answered")),
+                        draft: flags
+                            .iter()
+                            .any(|flag| flag.eq_ignore_ascii_case("\\Draft")),
+                    });
+                }
+            }
+            Response::Done {
+                tag,
+                status,
+                information,
+                ..
+            } if tag == &request_id => {
+                if *status == Status::Ok {
+                    vanished.sort_unstable();
+                    vanished.dedup();
+                    return Ok((mailbox, vanished, flag_updates));
+                }
+                return Err(Error::Backend {
+                    backend: "imap-qresync".into(),
+                    message: information
+                        .as_deref()
+                        .unwrap_or("SELECT QRESYNC отклонён сервером")
+                        .to_owned(),
+                });
+            }
+            _ => {}
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ImapDiscovery {
@@ -59,6 +211,10 @@ pub struct ImapDiscovery {
     pub remote_snapshot: Option<Vec<String>>,
     /// Remote IDs whose folder projections may have changed in this delta.
     pub changed_remote_ids: Vec<String>,
+    /// Flag-only changes returned by IMAP CONDSTORE without downloading MIME bodies.
+    pub flag_updates: Vec<DiscoveredFlagUpdate>,
+    /// Exact expunged UIDs reported by QRESYNC VANISHED, scoped per mailbox.
+    pub deleted_uids: Vec<(String, Vec<u32>)>,
 }
 
 struct OAuth2<'a> {
@@ -215,6 +371,118 @@ async fn connect_tls_client(
             })?;
     }
     Ok(client)
+}
+
+fn sent_mailbox_candidate(remote_path: &str, special_use_sent: bool) -> bool {
+    if special_use_sent {
+        return true;
+    }
+    let display_name = decode_modified_utf7(remote_path).unwrap_or_else(|| remote_path.to_owned());
+    infer_folder_role(remote_path, &display_name) == Some(FolderRole::Sent)
+}
+
+fn mime_message_id(raw: &[u8]) -> Option<String> {
+    raw.split(|byte| *byte == b'\n')
+        .map(|line| {
+            std::str::from_utf8(line)
+                .unwrap_or_default()
+                .trim_end_matches('\r')
+        })
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("Message-ID")
+                .then(|| value.trim().to_owned())
+        })
+        .filter(|value| !value.is_empty() && !value.contains(['\r', '\n']))
+}
+
+async fn append_sent(mut session: OAuthSession, raw: &[u8]) -> Result<()> {
+    let names: Vec<Name> = session
+        .list(Some(""), Some("*"))
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-sent-list".into(),
+            message: error.to_string(),
+        })?
+        .try_collect()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-sent-list".into(),
+            message: error.to_string(),
+        })?;
+    let sent = names
+        .iter()
+        .find(|name| {
+            name.attributes()
+                .iter()
+                .any(|attribute| matches!(attribute, NameAttribute::Sent))
+        })
+        .or_else(|| {
+            names
+                .iter()
+                .find(|name| sent_mailbox_candidate(name.name(), false))
+        })
+        .map(|name| name.name().to_owned())
+        .ok_or_else(|| Error::Backend {
+            backend: "imap-sent-append".into(),
+            message: "сервер не объявил папку отправленных (\\Sent)".into(),
+        })?;
+    if let Some(message_id) = mime_message_id(raw) {
+        session
+            .select(&sent)
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-sent-select".into(),
+                message: format!("{sent}: {error}"),
+            })?;
+        let quoted = message_id.replace('\\', "\\\\").replace('"', "\\\"");
+        let existing = session
+            .uid_search(format!("HEADER Message-ID \"{quoted}\""))
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-sent-search".into(),
+                message: format!("{sent}: {error}"),
+            })?;
+        if !existing.is_empty() {
+            tracing::info!(sent, message_id, "серверная Sent-копия уже существует");
+            let _ = session.logout().await;
+            return Ok(());
+        }
+    }
+    session
+        .append(&sent, Some("(\\Seen)"), None, raw)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-sent-append".into(),
+            message: format!("{sent}: {error}"),
+        })?;
+    let _ = session.logout().await;
+    Ok(())
+}
+
+pub(crate) async fn append_oauth_sent(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    raw: &[u8],
+) -> Result<()> {
+    append_sent(connect_oauth(host, email, access_token).await?, raw).await
+}
+
+pub(crate) async fn append_password_sent(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    raw: &[u8],
+) -> Result<()> {
+    append_sent(
+        connect_password(host, port, security, username, password).await?,
+        raw,
+    )
+    .await
 }
 
 pub(crate) async fn rename_oauth_folder(
@@ -675,35 +943,162 @@ async fn fetch_incremental_messages(
     cursor: Option<&FolderSyncCursor>,
     limit: usize,
     retention_days: Option<i64>,
-) -> Result<(Vec<DiscoveredMessage>, Vec<u32>, bool)> {
-    if folder.total_count == 0 {
-        return Ok((Vec::new(), Vec::new(), false));
-    }
-    let mailbox = session
-        .select(&folder.remote_path)
-        .await
+    condstore: bool,
+    qresync: bool,
+) -> Result<(
+    Vec<DiscoveredMessage>,
+    Vec<u32>,
+    bool,
+    bool,
+    Vec<DiscoveredFlagUpdate>,
+    Vec<u32>,
+)> {
+    let qresync_selection = if qresync {
+        if let Some(cursor) = cursor
+            && let (Some(uidvalidity), Some(highestmodseq)) =
+                (cursor.uidvalidity, cursor.highestmodseq)
+            && !cursor.known_uids.is_empty()
+        {
+            match select_qresync(
+                session,
+                &folder.remote_path,
+                uidvalidity,
+                highestmodseq,
+                &cursor.known_uids,
+            )
+            .await
+            {
+                Ok(selection) => Some(selection),
+                Err(error) => {
+                    tracing::warn!(folder = %folder.remote_path, %error, "IMAP QRESYNC rejected; falling back to CONDSTORE");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let qresync_used = qresync_selection.is_some();
+    let (mailbox, vanished_uids, mut flag_updates) = if let Some(selection) = qresync_selection {
+        selection
+    } else {
+        let mailbox = if condstore {
+            session.select_condstore(&folder.remote_path).await
+        } else {
+            session.select(&folder.remote_path).await
+        }
         .map_err(|error| Error::Backend {
             backend: "imap-select".into(),
             message: format!("{}: {error}", folder.remote_path),
         })?;
+        (mailbox, Vec::new(), Vec::new())
+    };
     folder.uidvalidity = mailbox.uid_validity;
     folder.uidnext = mailbox.uid_next;
     folder.highestmodseq = mailbox.highest_modseq;
-    let mut uids: Vec<_> = session
-        .uid_search("ALL")
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-search".into(),
-            message: format!("{}: {error}", folder.remote_path),
-        })?
-        .into_iter()
-        .collect();
-    uids.sort_unstable();
     let uidvalidity_changed = cursor.is_some_and(|cursor| {
         cursor.uidvalidity.is_some()
             && mailbox.uid_validity.is_some()
             && cursor.uidvalidity != mailbox.uid_validity
     });
+    let now = chrono::Utc::now().timestamp();
+    let last_full_reconcile = cursor
+        .and_then(|value| value.sync_token.as_deref())
+        .and_then(|value| value.strip_prefix("imap-reconcile:"))
+        .and_then(|value| value.parse::<i64>().ok());
+    let full_snapshot = cursor.is_none()
+        || uidvalidity_changed
+        || last_full_reconcile.is_none_or(|last| now.saturating_sub(last) >= 24 * 60 * 60);
+    let mut uids: Vec<u32> = if full_snapshot {
+        session
+            .uid_search("ALL")
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-search".into(),
+                message: format!("{}: {error}", folder.remote_path),
+            })?
+            .into_iter()
+            .collect()
+    } else if let Some(last_uid) = cursor.and_then(|value| value.last_uid) {
+        let first_new = last_uid.saturating_add(1);
+        if mailbox
+            .uid_next
+            .is_some_and(|uid_next| uid_next <= first_new)
+        {
+            Vec::new()
+        } else {
+            session
+                .uid_search(format!("UID {first_new}:*"))
+                .await
+                .map_err(|error| Error::Backend {
+                    backend: "imap-search".into(),
+                    message: format!("{}: {error}", folder.remote_path),
+                })?
+                .into_iter()
+                .collect()
+        }
+    } else {
+        Vec::new()
+    };
+    uids.sort_unstable();
+    if full_snapshot {
+        folder.sync_token = Some(format!("imap-reconcile:{now}"));
+    } else {
+        folder.sync_token = cursor.and_then(|value| value.sync_token.clone());
+    }
+    if condstore
+        && !qresync_used
+        && !uidvalidity_changed
+        && let Some(previous_modseq) = cursor.and_then(|value| value.highestmodseq)
+        && mailbox
+            .highest_modseq
+            .is_some_and(|current| current > previous_modseq)
+    {
+        let fetched = session
+            .uid_fetch(
+                "1:*",
+                format!("(UID FLAGS MODSEQ) (CHANGEDSINCE {previous_modseq})"),
+            )
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-condstore".into(),
+                message: format!("{}: {error}", folder.remote_path),
+            })?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-condstore".into(),
+                message: format!("{}: {error}", folder.remote_path),
+            })?;
+        for fetch in fetched {
+            let Some(uid) = fetch.uid else { continue };
+            if cursor
+                .and_then(|value| value.last_uid)
+                .is_some_and(|last_uid| uid > last_uid)
+            {
+                continue;
+            }
+            let flags = fetch.flags().collect::<Vec<_>>();
+            flag_updates.push(DiscoveredFlagUpdate {
+                folder_path: folder.remote_path.clone(),
+                uid,
+                seen: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+                flagged: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+                answered: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Answered)),
+                draft: flags
+                    .iter()
+                    .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
+            });
+        }
+    }
     let retained_uids = match retention_days {
         Some(days) if days > 0 => {
             let since = (chrono::Utc::now().date_naive() - chrono::Duration::days(days))
@@ -721,7 +1116,8 @@ async fn fetch_incremental_messages(
             retained.sort_unstable();
             retained
         }
-        Some(_) => uids.clone(),
+        Some(_) if full_snapshot => uids.clone(),
+        Some(_) => Vec::new(),
         None => Vec::new(),
     };
     let selected = if !uidvalidity_changed
@@ -748,7 +1144,14 @@ async fn fetch_incremental_messages(
         uids[uids.len().saturating_sub(limit)..].to_vec()
     };
     if selected.is_empty() {
-        return Ok((Vec::new(), uids, uidvalidity_changed));
+        return Ok((
+            Vec::new(),
+            uids,
+            uidvalidity_changed,
+            full_snapshot,
+            flag_updates,
+            vanished_uids,
+        ));
     }
     let mut messages = Vec::with_capacity(selected.len());
     for chunk in selected.chunks(limit.max(1)) {
@@ -794,10 +1197,18 @@ async fn fetch_incremental_messages(
                     .iter()
                     .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
                 raw: raw.to_vec(),
+                body_fetched: true,
             });
         }
     }
-    Ok((messages, uids, uidvalidity_changed))
+    Ok((
+        messages,
+        uids,
+        uidvalidity_changed,
+        full_snapshot,
+        flag_updates,
+        vanished_uids,
+    ))
 }
 
 /// Быстрая дозагрузка входящих после IMAP IDLE-события.
@@ -828,6 +1239,15 @@ async fn discover_inbox(
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
     let mut folders = list_oauth_folders(&mut session).await?;
+    let capabilities = session
+        .capabilities()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-capability".into(),
+            message: error.to_string(),
+        })?;
+    let qresync = capabilities.has_str("QRESYNC");
+    let condstore = capabilities.has_str("CONDSTORE") || qresync;
     let inbox = folders
         .iter_mut()
         .find(|folder| folder.role == Some(FolderRole::Inbox))
@@ -836,16 +1256,33 @@ async fn discover_inbox(
             message: "папка INBOX не найдена".into(),
         })?;
     let path = inbox.remote_path.clone();
-    let (messages, uids, reset) =
-        fetch_incremental_messages(&mut session, inbox, cursors.get(&path), 500, None).await?;
+    let (messages, uids, reset, full_snapshot, flag_updates, vanished_uids) =
+        fetch_incremental_messages(
+            &mut session,
+            inbox,
+            cursors.get(&path),
+            500,
+            None,
+            condstore,
+            qresync,
+        )
+        .await?;
     let _ = session.logout().await;
     Ok(ImapDiscovery {
         folders,
         messages,
-        server_uids: vec![(path.clone(), uids)],
-        reset_folders: reset.then_some(path).into_iter().collect(),
+        server_uids: full_snapshot
+            .then_some((path.clone(), uids))
+            .into_iter()
+            .collect(),
+        reset_folders: reset.then_some(path.clone()).into_iter().collect(),
         remote_snapshot: None,
         changed_remote_ids: Vec::new(),
+        flag_updates,
+        deleted_uids: (!vanished_uids.is_empty())
+            .then_some((path, vanished_uids))
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -966,23 +1403,60 @@ async fn discover_session(
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
     let mut folders = list_oauth_folders(&mut session).await?;
+    let capabilities = session
+        .capabilities()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-capability".into(),
+            message: error.to_string(),
+        })?;
+    let qresync = capabilities.has_str("QRESYNC");
+    let condstore = qresync || capabilities.has_str("CONDSTORE");
+    tracing::debug!(qresync, condstore, "IMAP incremental capabilities");
     let mut messages = Vec::new();
     let mut server_uids = Vec::new();
     let mut reset_folders = Vec::new();
+    let mut flag_updates = Vec::new();
+    let mut deleted_uids = Vec::new();
     for folder in &mut folders {
         let path = folder.remote_path.clone();
+        let folder_started = std::time::Instant::now();
         match fetch_incremental_messages(
             &mut session,
             folder,
             cursors.get(&path),
             500,
             Some(retention_days),
+            condstore,
+            qresync,
         )
         .await
         {
-            Ok((mut folder_messages, uids, reset)) => {
+            Ok((
+                mut folder_messages,
+                uids,
+                reset,
+                full_snapshot,
+                mut folder_flag_updates,
+                vanished,
+            )) => {
+                tracing::info!(
+                    collection = %path,
+                    scope = if full_snapshot { "full-reconcile" } else { "delta" },
+                    messages = folder_messages.len(),
+                    flag_updates = folder_flag_updates.len(),
+                    snapshot_uids = if full_snapshot { uids.len() } else { 0 },
+                    network_ms = folder_started.elapsed().as_millis() as u64,
+                    "IMAP collection delta fetched"
+                );
                 messages.append(&mut folder_messages);
-                server_uids.push((path.clone(), uids));
+                flag_updates.append(&mut folder_flag_updates);
+                if !vanished.is_empty() {
+                    deleted_uids.push((path.clone(), vanished));
+                }
+                if full_snapshot {
+                    server_uids.push((path.clone(), uids));
+                }
                 if reset {
                     reset_folders.push(path);
                 }
@@ -1000,6 +1474,8 @@ async fn discover_session(
         reset_folders,
         remote_snapshot: None,
         changed_remote_ids: Vec::new(),
+        flag_updates,
+        deleted_uids,
     })
 }
 
@@ -1168,7 +1644,15 @@ fn encode_modified_utf7(value: &str) -> String {
 
 #[cfg(test)]
 mod utf7_tests {
-    use super::{MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7};
+    use super::{
+        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, mime_message_id,
+        sent_mailbox_candidate, uid_set,
+    };
+
+    #[test]
+    fn qresync_known_uids_are_compacted_without_inventing_gaps() {
+        assert_eq!(uid_set(&[9, 2, 3, 4, 9, 12, 13]), "2:4,9,12:13");
+    }
 
     #[test]
     fn message_fetch_never_marks_mail_as_seen() {
@@ -1193,5 +1677,27 @@ mod utf7_tests {
             decode_modified_utf7(&encoded).as_deref(),
             Some("Архив & old")
         );
+    }
+
+    #[test]
+    fn recognizes_sent_mailbox_by_special_use_or_localized_name() {
+        assert!(sent_mailbox_candidate("anything", true));
+        assert!(sent_mailbox_candidate("Sent Items", false));
+        assert!(sent_mailbox_candidate(
+            "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-",
+            false
+        ));
+        assert!(!sent_mailbox_candidate("INBOX", false));
+    }
+
+    #[test]
+    fn extracts_message_id_for_idempotent_sent_append() {
+        let raw =
+            b"From: me@example.test\r\nMessage-ID: <stable@example.test>\r\nSubject: x\r\n\r\nbody";
+        assert_eq!(
+            mime_message_id(raw).as_deref(),
+            Some("<stable@example.test>")
+        );
+        assert_eq!(mime_message_id(b"Subject: none\r\n\r\nbody"), None);
     }
 }

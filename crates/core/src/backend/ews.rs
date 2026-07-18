@@ -4,14 +4,18 @@ use super::{
     DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery, MailBackend,
     OutgoingMessage,
 };
-use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
+use crate::account::{
+    AuxiliarySyncCursors, DavCalendar, DavCollection, DavContact, DavEvent, DavSyncResult,
+    SyncScope,
+};
 use crate::model::{ContactPhone, FolderRole, infer_folder_role};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use roxmltree::{Document, Node};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SOAP_NS: &str = "http://schemas.xmlsoap.org/soap/envelope/";
 const MSG_NS: &str = "http://schemas.microsoft.com/exchange/services/2006/messages";
@@ -27,6 +31,48 @@ pub struct EwsBackend {
 struct EwsResponse {
     status: u16,
     body: String,
+}
+
+const MAIL_SYNC_TOKEN_PREFIX: &str = "ews-sync-v1:";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct MailSyncToken {
+    hierarchy: Option<String>,
+    items: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct HierarchySync {
+    sync_state: String,
+    deleted_folder_ids: Vec<String>,
+    initial: bool,
+}
+
+#[derive(Debug, Default)]
+struct ItemSync {
+    sync_state: String,
+    changed_ids: Vec<String>,
+    deleted_ids: Vec<String>,
+    initial: bool,
+}
+
+fn encode_mail_sync_token(token: &MailSyncToken) -> Result<String> {
+    let json = serde_json::to_vec(token)?;
+    Ok(format!(
+        "{MAIL_SYNC_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    ))
+}
+
+fn decode_mail_sync_token(value: Option<&str>) -> MailSyncToken {
+    let Some(value) = value.and_then(|value| value.strip_prefix(MAIL_SYNC_TOKEN_PREFIX)) else {
+        return MailSyncToken::default();
+    };
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()
+        .and_then(|json| serde_json::from_slice(&json).ok())
+        .unwrap_or_default()
 }
 
 fn backend_error(kind: &str, message: impl ToString) -> Error {
@@ -66,12 +112,71 @@ fn response_error(body: &str) -> Option<String> {
     let response = document
         .descendants()
         .find(|node| node.is_element() && node.attribute("ResponseClass") == Some("Error"))?;
-    Some(
-        node_text(response, "MessageText")
-            .or_else(|| node_text(response, "ResponseCode"))
-            .unwrap_or("Exchange вернул ошибку")
-            .to_owned(),
-    )
+    let code = node_text(response, "ResponseCode");
+    let text = node_text(response, "MessageText");
+    Some(match (code, text) {
+        (Some(code), Some(text)) => format!("{code}: {text}"),
+        (Some(code), None) => code.to_owned(),
+        (None, Some(text)) => text.to_owned(),
+        (None, None) => "Exchange вернул ошибку".to_owned(),
+    })
+}
+
+fn is_invalid_sync_state(error: &Error) -> bool {
+    error.to_string().contains("ErrorInvalidSyncStateData")
+}
+
+fn sync_state(xml: &str) -> Result<String> {
+    let document = Document::parse(xml).map_err(|error| backend_error("sync-xml", error))?;
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "SyncState")
+        .and_then(|node| node.text())
+        .map(str::to_owned)
+        .ok_or_else(|| backend_error("sync", "Exchange не вернул SyncState"))
+}
+
+fn sync_page_complete(xml: &str, name: &str) -> Result<bool> {
+    let document = Document::parse(xml).map_err(|error| backend_error("sync-xml", error))?;
+    Ok(document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == name)
+        .and_then(|node| node.text())
+        .is_none_or(|value| value.eq_ignore_ascii_case("true")))
+}
+
+fn change_ids(xml: &str, item_kind: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let document = Document::parse(xml).map_err(|error| backend_error("sync-xml", error))?;
+    let mut changed = HashSet::new();
+    let mut deleted = HashSet::new();
+    for action in document.descendants().filter(|node| {
+        node.is_element()
+            && matches!(
+                node.tag_name().name(),
+                "Create" | "Update" | "Delete" | "ReadFlagChange"
+            )
+            && node
+                .ancestors()
+                .any(|parent| parent.is_element() && parent.tag_name().name() == "Changes")
+    }) {
+        let Some(id) = action
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == item_kind)
+            .and_then(|node| node.attribute("Id"))
+        else {
+            continue;
+        };
+        if action.tag_name().name() == "Delete" {
+            deleted.insert(id.to_owned());
+        } else {
+            changed.insert(id.to_owned());
+        }
+    }
+    let mut changed = changed.into_iter().collect::<Vec<_>>();
+    let mut deleted = deleted.into_iter().collect::<Vec<_>>();
+    changed.sort();
+    deleted.sort();
+    Ok((changed, deleted))
 }
 
 #[cfg(windows)]
@@ -272,25 +377,153 @@ impl EwsBackend {
         Ok(response.body)
     }
 
-    async fn folders(&self, password: &str) -> Result<Vec<DiscoveredFolder>> {
-        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
-        let response = self.soap(password, "FindFolder", body).await?;
-        parse_folders(&response)
-    }
-
-    async fn messages_in_folder(
+    async fn sync_folder_hierarchy_pages(
         &self,
         password: &str,
-        folder: &DiscoveredFolder,
-        limit: usize,
-    ) -> Result<(Vec<DiscoveredMessage>, Vec<u32>)> {
-        let body = format!(
-            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
-            limit,
-            escape(&folder.remote_path)
-        );
-        let response = self.soap(password, "FindItem", &body).await?;
-        let ids = parse_item_ids(&response)?;
+        initial_state: Option<&str>,
+    ) -> Result<HierarchySync> {
+        let initial = initial_state.is_none();
+        let mut state = initial_state.map(str::to_owned);
+        let mut deleted = HashSet::new();
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(backend_error(
+                    "sync",
+                    "SyncFolderHierarchy превысил 10000 страниц",
+                ));
+            }
+            let previous_state = state.clone();
+            let state_xml = state
+                .as_deref()
+                .map(|value| format!("<m:SyncState>{}</m:SyncState>", escape(value)))
+                .unwrap_or_default();
+            let body = format!(
+                r#"<m:SyncFolderHierarchy>
+ <m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape>
+ <m:SyncFolderId><t:DistinguishedFolderId Id="msgfolderroot"/></m:SyncFolderId>
+ {state_xml}
+</m:SyncFolderHierarchy>"#
+            );
+            let response = self.soap(password, "SyncFolderHierarchy", &body).await?;
+            state = Some(sync_state(&response)?);
+            let (_, page_deleted) = change_ids(&response, "FolderId")?;
+            deleted.extend(page_deleted);
+            if sync_page_complete(&response, "IncludesLastFolderInRange")? {
+                let mut deleted_folder_ids = deleted.into_iter().collect::<Vec<_>>();
+                deleted_folder_ids.sort();
+                return Ok(HierarchySync {
+                    sync_state: state.unwrap_or_default(),
+                    deleted_folder_ids,
+                    initial,
+                });
+            }
+            if state == previous_state {
+                return Err(backend_error(
+                    "sync",
+                    "SyncFolderHierarchy не продвинул SyncState",
+                ));
+            }
+        }
+    }
+
+    async fn sync_folder_hierarchy(
+        &self,
+        password: &str,
+        state: Option<&str>,
+    ) -> Result<HierarchySync> {
+        match self.sync_folder_hierarchy_pages(password, state).await {
+            Err(error) if state.is_some() && is_invalid_sync_state(&error) => {
+                self.sync_folder_hierarchy_pages(password, None).await
+            }
+            result => result,
+        }
+    }
+
+    async fn sync_folder_items_pages(
+        &self,
+        password: &str,
+        folder_id_xml: &str,
+        initial_state: Option<&str>,
+    ) -> Result<ItemSync> {
+        let initial = initial_state.is_none();
+        let mut state = initial_state.map(str::to_owned);
+        let mut changed = HashSet::new();
+        let mut deleted = HashSet::new();
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > 10_000 {
+                return Err(backend_error(
+                    "sync",
+                    "SyncFolderItems превысил 10000 страниц",
+                ));
+            }
+            let previous_state = state.clone();
+            let state_xml = state
+                .as_deref()
+                .map(|value| format!("<m:SyncState>{}</m:SyncState>", escape(value)))
+                .unwrap_or_default();
+            let body = format!(
+                r#"<m:SyncFolderItems>
+ <m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape>
+ <m:SyncFolderId>{folder_id_xml}</m:SyncFolderId>
+ {state_xml}
+ <m:MaxChangesReturned>512</m:MaxChangesReturned>
+ <m:SyncScope>NormalItems</m:SyncScope>
+</m:SyncFolderItems>"#
+            );
+            let response = self.soap(password, "SyncFolderItems", &body).await?;
+            state = Some(sync_state(&response)?);
+            let (page_changed, page_deleted) = change_ids(&response, "ItemId")?;
+            changed.extend(page_changed);
+            deleted.extend(page_deleted);
+            if sync_page_complete(&response, "IncludesLastItemInRange")? {
+                let mut changed_ids = changed.into_iter().collect::<Vec<_>>();
+                let mut deleted_ids = deleted.into_iter().collect::<Vec<_>>();
+                changed_ids.sort();
+                deleted_ids.sort();
+                return Ok(ItemSync {
+                    sync_state: state.unwrap_or_default(),
+                    changed_ids,
+                    deleted_ids,
+                    initial,
+                });
+            }
+            if state == previous_state {
+                return Err(backend_error(
+                    "sync",
+                    "SyncFolderItems не продвинул SyncState",
+                ));
+            }
+        }
+    }
+
+    async fn sync_folder_items(
+        &self,
+        password: &str,
+        folder_id_xml: &str,
+        state: Option<&str>,
+    ) -> Result<ItemSync> {
+        match self
+            .sync_folder_items_pages(password, folder_id_xml, state)
+            .await
+        {
+            Err(error) if state.is_some() && is_invalid_sync_state(&error) => {
+                self.sync_folder_items_pages(password, folder_id_xml, None)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    async fn messages_by_ids(
+        &self,
+        password: &str,
+        folder_path: &str,
+        ids: &[String],
+    ) -> Result<Vec<DiscoveredMessage>> {
         let mut messages = Vec::new();
         for chunk in ids.chunks(50) {
             let item_ids = chunk
@@ -301,10 +534,219 @@ impl EwsBackend {
                 r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape><t:IncludeMimeContent>true</t:IncludeMimeContent></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
             );
             let response = self.soap(password, "GetItem", &body).await?;
-            messages.extend(parse_messages(&response, &folder.remote_path)?);
+            messages.extend(parse_messages(&response, folder_path)?);
         }
-        let uids = messages.iter().map(|message| message.uid).collect();
-        Ok((messages, uids))
+        Ok(messages)
+    }
+
+    async fn recent_messages_in_folder(
+        &self,
+        password: &str,
+        folder: &DiscoveredFolder,
+        limit: usize,
+        retention_days: Option<i64>,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        let restriction = retention_days
+            .filter(|days| *days > 0)
+            .map(|days| {
+                let since = chrono::Utc::now() - chrono::Duration::days(days);
+                format!(
+                    r#"<m:Restriction><t:IsGreaterThanOrEqualTo><t:FieldURI FieldURI="item:DateTimeReceived"/><t:FieldURIOrConstant><t:Constant Value="{}"/></t:FieldURIOrConstant></t:IsGreaterThanOrEqualTo></m:Restriction>"#,
+                    since.format("%Y-%m-%dT%H:%M:%SZ")
+                )
+            })
+            .unwrap_or_default();
+        let body = format!(
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>{restriction}<m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            limit,
+            escape(&folder.remote_path)
+        );
+        let response = self.soap(password, "FindItem", &body).await?;
+        let ids = parse_item_ids(&response)?;
+        self.messages_by_ids(password, &folder.remote_path, &ids)
+            .await
+    }
+
+    async fn folders(&self, password: &str) -> Result<Vec<DiscoveredFolder>> {
+        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
+        let response = self.soap(password, "FindFolder", body).await?;
+        parse_folders(&response)
+    }
+
+    async fn discover_incremental(
+        &self,
+        password: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
+    ) -> Result<ImapDiscovery> {
+        let hierarchy_state = cursors
+            .values()
+            .map(|cursor| decode_mail_sync_token(cursor.sync_token.as_deref()))
+            .find_map(|token| token.hierarchy);
+        let hierarchy = self
+            .sync_folder_hierarchy(password, hierarchy_state.as_deref())
+            .await?;
+        let mut folders = self.folders(password).await?;
+        let current_folder_ids = folders
+            .iter()
+            .map(|folder| folder.remote_path.clone())
+            .collect::<HashSet<_>>();
+        let mut deleted_folder_ids = hierarchy
+            .deleted_folder_ids
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if hierarchy.initial {
+            deleted_folder_ids.extend(
+                cursors
+                    .keys()
+                    .filter(|id| !current_folder_ids.contains(*id))
+                    .cloned(),
+            );
+        }
+
+        let mut messages = Vec::new();
+        let mut server_uids = deleted_folder_ids
+            .iter()
+            .cloned()
+            .map(|id| (id, Vec::new()))
+            .collect::<Vec<_>>();
+        let mut reset_folders = deleted_folder_ids.into_iter().collect::<Vec<_>>();
+        let mut changed_remote_ids = HashSet::new();
+        for folder in &mut folders {
+            let folder_started = std::time::Instant::now();
+            let previous = decode_mail_sync_token(
+                cursors
+                    .get(&folder.remote_path)
+                    .and_then(|cursor| cursor.sync_token.as_deref()),
+            );
+            let folder_xml = format!(r#"<t:FolderId Id="{}"/>"#, escape(&folder.remote_path));
+            let sync = match self
+                .sync_folder_items(password, &folder_xml, previous.items.as_deref())
+                .await
+            {
+                Ok(sync) => sync,
+                Err(error) => {
+                    tracing::warn!(folder = %folder.display_name, %error, "EWS: инкрементальная синхронизация папки пропущена");
+                    continue;
+                }
+            };
+            changed_remote_ids.extend(sync.deleted_ids.iter().cloned());
+            let mut found = if sync.initial {
+                self.recent_messages_in_folder(password, folder, 500, Some(retention_days))
+                    .await?
+            } else {
+                self.messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
+                    .await?
+            };
+            tracing::info!(
+                provider = "exchange-ews",
+                collection = %folder.display_name,
+                scope = if sync.initial { "full-reconcile" } else { "delta" },
+                changed_ids = sync.changed_ids.len(),
+                deleted_ids = sync.deleted_ids.len(),
+                downloaded = found.len(),
+                network_ms = folder_started.elapsed().as_millis() as u64,
+                "EWS collection delta fetched"
+            );
+            changed_remote_ids.extend(found.iter().filter_map(|message| message.remote_id.clone()));
+            messages.append(&mut found);
+            if sync.initial {
+                server_uids.push((
+                    folder.remote_path.clone(),
+                    sync.changed_ids.iter().map(|id| stable_uid(id)).collect(),
+                ));
+                reset_folders.push(folder.remote_path.clone());
+            }
+            folder.sync_token = Some(encode_mail_sync_token(&MailSyncToken {
+                hierarchy: Some(hierarchy.sync_state.clone()),
+                items: Some(sync.sync_state),
+            })?);
+        }
+        server_uids.sort_by(|left, right| left.0.cmp(&right.0));
+        reset_folders.sort();
+        let mut changed_remote_ids = changed_remote_ids.into_iter().collect::<Vec<_>>();
+        changed_remote_ids.sort();
+        Ok(ImapDiscovery {
+            folders,
+            messages,
+            server_uids,
+            reset_folders,
+            remote_snapshot: None,
+            changed_remote_ids,
+            flag_updates: Vec::new(),
+            deleted_uids: Vec::new(),
+        })
+    }
+
+    async fn discover_inbox_incremental(
+        &self,
+        password: &str,
+        cursors: &HashMap<String, FolderSyncCursor>,
+    ) -> Result<ImapDiscovery> {
+        let mut folders = self.folders(password).await?;
+        let inbox_index = folders
+            .iter()
+            .position(|folder| folder.role == Some(FolderRole::Inbox))
+            .ok_or_else(|| backend_error("folders", "папка Входящие не найдена"))?;
+        let folder = &mut folders[inbox_index];
+        let previous = decode_mail_sync_token(
+            cursors
+                .get(&folder.remote_path)
+                .and_then(|cursor| cursor.sync_token.as_deref()),
+        );
+        if previous.items.is_none() {
+            let messages = self
+                .recent_messages_in_folder(password, folder, 50, None)
+                .await?;
+            return Ok(ImapDiscovery {
+                folders,
+                messages,
+                server_uids: Vec::new(),
+                reset_folders: Vec::new(),
+                remote_snapshot: None,
+                changed_remote_ids: Vec::new(),
+                flag_updates: Vec::new(),
+                deleted_uids: Vec::new(),
+            });
+        }
+        let folder_xml = format!(r#"<t:FolderId Id="{}"/>"#, escape(&folder.remote_path));
+        let sync = self
+            .sync_folder_items(password, &folder_xml, previous.items.as_deref())
+            .await?;
+        let messages = self
+            .messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
+            .await?;
+        let server_uids = if sync.initial {
+            vec![(
+                folder.remote_path.clone(),
+                sync.changed_ids.iter().map(|id| stable_uid(id)).collect(),
+            )]
+        } else {
+            Vec::new()
+        };
+        let reset_folders = sync
+            .initial
+            .then(|| folder.remote_path.clone())
+            .into_iter()
+            .collect();
+        let mut changed_remote_ids = sync.changed_ids.clone();
+        changed_remote_ids.extend(sync.deleted_ids);
+        changed_remote_ids.sort();
+        changed_remote_ids.dedup();
+        folder.sync_token = Some(encode_mail_sync_token(&MailSyncToken {
+            hierarchy: previous.hierarchy,
+            items: Some(sync.sync_state),
+        })?);
+        Ok(ImapDiscovery {
+            folders,
+            messages,
+            server_uids,
+            reset_folders,
+            remote_snapshot: None,
+            changed_remote_ids,
+            flag_updates: Vec::new(),
+            deleted_uids: Vec::new(),
+        })
     }
 
     async fn raw_item(&self, password: &str, item_id: &str) -> Result<Vec<u8>> {
@@ -345,41 +787,130 @@ impl EwsBackend {
     /// почта при этом должна продолжать работать. Поэтому сбой любой из коллекций
     /// не роняет всю синхронизацию - только помечает её недоступной, чтобы
     /// save_auxiliary_data не удалил локальные данные из-за временной ошибки.
-    pub async fn auxiliary(&self, password: &str) -> Result<DavSyncResult> {
-        let (calendars, calendar_available) = match self.calendar_events(password).await {
-            Ok(events) => (
-                vec![DavCalendar {
-                    url: "ews-calendar:calendar".into(),
-                    name: "Exchange".into(),
-                    ctag: None,
-                    sync_token: None,
-                    sync_scope: SyncScope::Full,
-                    deleted_event_urls: Vec::new(),
-                    events,
-                }],
-                true,
-            ),
+    pub async fn auxiliary(
+        &self,
+        password: &str,
+        cursors: &AuxiliarySyncCursors,
+    ) -> Result<DavSyncResult> {
+        let calendar_url = "ews-calendar:calendar";
+        let calendar_state = cursors
+            .calendars
+            .get(calendar_url)
+            .and_then(|cursor| cursor.sync_token.as_deref());
+        let calendar_folder = r#"<t:DistinguishedFolderId Id="calendar"/>"#;
+        let (calendars, calendar_available) = match self
+            .sync_folder_items(password, calendar_folder, calendar_state)
+            .await
+        {
+            Ok(sync) => {
+                match async {
+                    let events = if sync.initial {
+                        self.calendar_events(password).await?
+                    } else {
+                        self.calendar_events_by_ids(password, &sync.changed_ids)
+                            .await?
+                    };
+                    Ok::<_, Error>(vec![DavCalendar {
+                        url: calendar_url.into(),
+                        name: "Exchange".into(),
+                        ctag: None,
+                        sync_token: Some(sync.sync_state),
+                        sync_scope: if sync.initial {
+                            SyncScope::Full
+                        } else {
+                            SyncScope::Delta
+                        },
+                        deleted_event_urls: sync
+                            .deleted_ids
+                            .into_iter()
+                            .map(|id| format!("ews-event:{id}"))
+                            .collect(),
+                        events,
+                    }])
+                }
+                .await
+                {
+                    Ok(calendars) => (calendars, true),
+                    Err(error) => {
+                        tracing::warn!(%error, "EWS: календарь пропущен");
+                        (Vec::new(), false)
+                    }
+                }
+            }
             Err(error) => {
                 tracing::warn!(%error, "EWS: календарь пропущен");
                 (Vec::new(), false)
             }
         };
-        let (contacts, contacts_available) = match self.contact_entries(password).await {
-            Ok(contacts) => (contacts, true),
+        let contacts_url = "ews-contacts:contacts";
+        let contacts_folder = r#"<t:DistinguishedFolderId Id="contacts"/>"#;
+        let contacts_result = self
+            .sync_folder_items(
+                password,
+                contacts_folder,
+                cursors
+                    .contact_collections
+                    .get(contacts_url)
+                    .and_then(|cursor| cursor.sync_token.as_deref()),
+            )
+            .await;
+        let (
+            contacts,
+            contacts_available,
+            contacts_scope,
+            contact_collections,
+            deleted_contact_urls,
+        ) = match contacts_result {
+            Ok(sync) => match self.contacts_by_ids(password, &sync.changed_ids).await {
+                Ok(contacts) => (
+                    contacts,
+                    true,
+                    if sync.initial {
+                        SyncScope::Full
+                    } else {
+                        SyncScope::Delta
+                    },
+                    vec![DavCollection {
+                        url: contacts_url.into(),
+                        ctag: None,
+                        sync_token: Some(sync.sync_state),
+                    }],
+                    sync.deleted_ids
+                        .into_iter()
+                        .map(|id| format!("ews-contact:{id}"))
+                        .collect(),
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "EWS: контакты пропущены");
+                    (
+                        Vec::new(),
+                        false,
+                        SyncScope::Unchanged,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                }
+            },
             Err(error) => {
                 tracing::warn!(%error, "EWS: контакты пропущены");
-                (Vec::new(), false)
+                (
+                    Vec::new(),
+                    false,
+                    SyncScope::Unchanged,
+                    Vec::new(),
+                    Vec::new(),
+                )
             }
         };
         Ok(DavSyncResult {
             calendars,
             calendars_available: calendar_available,
             contacts,
-            contact_collections: Vec::new(),
+            contact_collections,
             contacts_available,
-            contacts_scope: SyncScope::Full,
+            contacts_scope,
             contacts_sync_token: None,
-            deleted_contact_urls: Vec::new(),
+            deleted_contact_urls,
         })
     }
 
@@ -412,31 +943,38 @@ impl EwsBackend {
         Ok(events)
     }
 
-    async fn contact_entries(&self, password: &str) -> Result<Vec<DavContact>> {
-        let mut contacts = Vec::new();
-        let mut offset = 0usize;
-        loop {
+    async fn calendar_events_by_ids(
+        &self,
+        password: &str,
+        ids: &[String],
+    ) -> Result<Vec<DavEvent>> {
+        let mut events = Vec::new();
+        for chunk in ids.chunks(50) {
+            let item_ids = chunk
+                .iter()
+                .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
+                .collect::<String>();
             let body = format!(
-                r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="500" Offset="{offset}" BasePoint="Beginning"/><m:ParentFolderIds><t:DistinguishedFolderId Id="contacts"/></m:ParentFolderIds></m:FindItem>"#
+                r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
             );
-            let response = self.soap(password, "FindItem", &body).await?;
-            let ids = parse_item_ids(&response)?;
-            let page_size = ids.len();
-            for chunk in ids.chunks(50) {
-                let item_ids = chunk
-                    .iter()
-                    .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
-                    .collect::<String>();
-                let body = format!(
-                    r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
-                );
-                let response = self.soap(password, "GetItem", &body).await?;
-                contacts.extend(parse_contacts(&response)?);
-            }
-            if page_size == 0 || includes_last_item(&response) {
-                break;
-            }
-            offset += page_size;
+            let response = self.soap(password, "GetItem", &body).await?;
+            events.extend(parse_calendar_items(&response)?);
+        }
+        Ok(events)
+    }
+
+    async fn contacts_by_ids(&self, password: &str, ids: &[String]) -> Result<Vec<DavContact>> {
+        let mut contacts = Vec::new();
+        for chunk in ids.chunks(50) {
+            let item_ids = chunk
+                .iter()
+                .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
+                .collect::<String>();
+            let body = format!(
+                r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
+            );
+            let response = self.soap(password, "GetItem", &body).await?;
+            contacts.extend(parse_contacts(&response)?);
         }
         Ok(contacts)
     }
@@ -499,19 +1037,6 @@ fn parse_item_ids(xml: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-fn includes_last_item(xml: &str) -> bool {
-    Document::parse(xml)
-        .ok()
-        .and_then(|document| {
-            document
-                .descendants()
-                .find(|node| node.is_element() && node.tag_name().name() == "RootFolder")
-                .and_then(|node| node.attribute("IncludesLastItemInRange"))
-                .map(|value| value.eq_ignore_ascii_case("true"))
-        })
-        .unwrap_or(true)
-}
-
 fn stable_uid(id: &str) -> u32 {
     let digest = Sha256::digest(id.as_bytes());
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).max(1)
@@ -547,6 +1072,7 @@ fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>
             answered: false,
             draft: node_text(message, "IsDraft") == Some("true"),
             raw,
+            body_fetched: true,
         });
     }
     Ok(messages)
@@ -840,41 +1366,11 @@ impl MailBackend for EwsBackend {
         &self,
         _email: &str,
         credential: &str,
-        _cursors: &HashMap<String, FolderSyncCursor>,
-        _retention_days: i64,
+        cursors: &HashMap<String, FolderSyncCursor>,
+        retention_days: i64,
     ) -> Result<ImapDiscovery> {
-        let folders = self.folders(credential).await?;
-        let mut messages = Vec::new();
-        // Exchange возвращает вместе с обычными папками множество пустых
-        // служебных папок. Запрос FindItem к каждой из них может ждать до
-        // таймаута, хотя загружать там нечего. Входящие обрабатываем первыми,
-        // остальные пустые папки сразу пропускаем.
-        let mut ordered_folders = folders.iter().collect::<Vec<_>>();
-        ordered_folders.sort_by_key(|folder| folder.role != Some(FolderRole::Inbox));
-        for folder in ordered_folders {
-            if folder.total_count == 0 && folder.role != Some(FolderRole::Inbox) {
-                continue;
-            }
-            match self.messages_in_folder(credential, folder, 500).await {
-                Ok((mut found, _uids)) => {
-                    messages.append(&mut found);
-                }
-                Err(error) => {
-                    tracing::warn!(folder = %folder.display_name, %error, "EWS: папка пропущена")
-                }
-            }
-        }
-        Ok(ImapDiscovery {
-            folders,
-            messages,
-            // FindItem загружает ограниченное окно, поэтому его UID нельзя
-            // использовать как полный снимок папки: иначе старые письма будут
-            // ошибочно удалены из локального кэша.
-            server_uids: Vec::new(),
-            reset_folders: Vec::new(),
-            remote_snapshot: None,
-            changed_remote_ids: Vec::new(),
-        })
+        self.discover_incremental(credential, cursors, retention_days)
+            .await
     }
 
     async fn discover_folders(
@@ -889,24 +1385,9 @@ impl MailBackend for EwsBackend {
         &self,
         _email: &str,
         credential: &str,
-        _cursors: &HashMap<String, FolderSyncCursor>,
+        cursors: &HashMap<String, FolderSyncCursor>,
     ) -> Result<ImapDiscovery> {
-        let folders = self.folders(credential).await?;
-        let inbox = folders
-            .iter()
-            .find(|folder| folder.role == Some(FolderRole::Inbox))
-            .ok_or_else(|| backend_error("folders", "папка Входящие не найдена"))?;
-        // Сначала отдаём небольшой свежий срез, чтобы Входящие появились в UI
-        // после одного GetItem, пока полная синхронизация идёт в фоне.
-        let (messages, _uids) = self.messages_in_folder(credential, inbox, 50).await?;
-        Ok(ImapDiscovery {
-            folders,
-            messages,
-            server_uids: Vec::new(),
-            reset_folders: Vec::new(),
-            remote_snapshot: None,
-            changed_remote_ids: Vec::new(),
-        })
+        self.discover_inbox_incremental(credential, cursors).await
     }
 
     async fn apply_operation(
@@ -992,7 +1473,7 @@ impl MailBackend for EwsBackend {
         Ok(())
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<()> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<super::SendOutcome> {
         let mime = super::smtp::build_message(message)?.formatted();
         let encoded = base64::engine::general_purpose::STANDARD.encode(mime);
         let item = format!(
@@ -1001,7 +1482,8 @@ impl MailBackend for EwsBackend {
         let body = format!(
             r#"<m:CreateItem MessageDisposition="SendAndSaveCopy"><m:SavedItemFolderId><t:DistinguishedFolderId Id="sentitems"/></m:SavedItemFolderId><m:Items>{item}</m:Items></m:CreateItem>"#
         );
-        self.soap(credential, "CreateItem", &body).await.map(|_| ())
+        self.soap(credential, "CreateItem", &body).await?;
+        Ok(super::SendOutcome::SavedOnServer)
     }
 
     async fn fetch_message_raw(
@@ -1081,5 +1563,62 @@ mod tests {
     fn malformed_auxiliary_xml_is_an_error() {
         assert!(parse_calendar_items("<broken").is_err());
         assert!(parse_contacts("<broken").is_err());
+    }
+
+    #[test]
+    fn mail_sync_token_round_trips_both_ews_states() {
+        let token = MailSyncToken {
+            hierarchy: Some("hierarchy+/=".into()),
+            items: Some("items+/=".into()),
+        };
+        let encoded = encode_mail_sync_token(&token).expect("encode EWS sync token");
+        assert!(encoded.starts_with(MAIL_SYNC_TOKEN_PREFIX));
+        assert_eq!(decode_mail_sync_token(Some(&encoded)), token);
+        assert_eq!(
+            decode_mail_sync_token(Some("legacy-or-corrupted")),
+            MailSyncToken::default()
+        );
+    }
+
+    #[test]
+    fn parses_all_sync_folder_item_change_kinds() {
+        let xml = r#"<SyncFolderItemsResponseMessage ResponseClass="Success">
+ <SyncState>next-state</SyncState>
+ <IncludesLastItemInRange>false</IncludesLastItemInRange>
+ <Changes>
+  <Create><Message><ItemId Id="created"/></Message></Create>
+  <Update><Message><ItemId Id="updated"/></Message></Update>
+  <Delete><ItemId Id="deleted"/></Delete>
+  <ReadFlagChange><ItemId Id="read-flag"/><IsRead>true</IsRead></ReadFlagChange>
+ </Changes>
+</SyncFolderItemsResponseMessage>"#;
+        assert_eq!(sync_state(xml).unwrap(), "next-state");
+        assert!(!sync_page_complete(xml, "IncludesLastItemInRange").unwrap());
+        let (changed, deleted) = change_ids(xml, "ItemId").expect("parse item changes");
+        assert_eq!(changed, ["created", "read-flag", "updated"]);
+        assert_eq!(deleted, ["deleted"]);
+    }
+
+    #[test]
+    fn parses_sync_folder_hierarchy_deletion_and_completion() {
+        let xml = r#"<SyncFolderHierarchyResponseMessage ResponseClass="Success">
+ <SyncState>hierarchy-state</SyncState>
+ <IncludesLastFolderInRange>true</IncludesLastFolderInRange>
+ <Changes><Delete><FolderId Id="removed-folder"/></Delete></Changes>
+</SyncFolderHierarchyResponseMessage>"#;
+        assert!(sync_page_complete(xml, "IncludesLastFolderInRange").unwrap());
+        let (_, deleted) = change_ids(xml, "FolderId").expect("parse hierarchy changes");
+        assert_eq!(deleted, ["removed-folder"]);
+    }
+
+    #[test]
+    fn preserves_invalid_sync_state_response_code() {
+        let xml = r#"<SyncFolderItemsResponseMessage ResponseClass="Error">
+ <MessageText>The synchronization state data is invalid.</MessageText>
+ <ResponseCode>ErrorInvalidSyncStateData</ResponseCode>
+</SyncFolderItemsResponseMessage>"#;
+        let error = response_error(xml).expect("response error");
+        assert!(error.contains("ErrorInvalidSyncStateData"));
+        assert!(error.contains("synchronization state data is invalid"));
     }
 }

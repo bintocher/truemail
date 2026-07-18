@@ -27,11 +27,40 @@ pub use oauth::{
 use crate::Result;
 use crate::backend::{
     EwsBackend, GenericImapBackend, GmailBackend, JmapBackend, MailBackend, OutlookBackend,
-    YandexBackend,
+    SendOutcome, YandexBackend,
 };
-use crate::model::{Account, AuthKind, BackendKind, NewAccount, Provider, Security, ServerConfig};
+use crate::model::{
+    Account, AuthKind, BackendKind, FolderRole, NewAccount, Provider, Security, ServerConfig,
+};
 use crate::storage::Db;
+use base64::Engine as _;
 use zeroize::Zeroizing;
+
+fn sent_append_payload(raw: &[u8]) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "raw": base64::engine::general_purpose::STANDARD.encode(raw)
+    }))?)
+}
+
+fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
+    let payload: serde_json::Value = serde_json::from_str(payload)?;
+    let raw = payload["raw"].as_str().ok_or_else(|| {
+        crate::Error::AccountConfig("append_sent outbox: нет MIME payload".into())
+    })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|error| crate::Error::AccountConfig(format!("append_sent outbox: {error}")))
+}
+
+/// Результат короткой синхронизации Входящих. `new_messages` считает только
+/// remote ID, которых не было в локальной БД до этого прохода; повторно
+/// полученные EWS Modified-события поэтому не создают уведомления.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InboxSyncResult {
+    pub downloaded: usize,
+    pub new_messages: usize,
+    pub had_baseline: bool,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SyncKind {
@@ -42,6 +71,28 @@ enum SyncKind {
 #[cfg(test)]
 mod sync_registry_tests {
     use super::*;
+
+    fn gmail_account(id: i64) -> Account {
+        Account {
+            id,
+            uuid: uuid::Uuid::new_v4().to_string(),
+            email: "test@gmail.com".into(),
+            display_name: "Gmail".into(),
+            provider: Provider::Gmail,
+            backend_kind: BackendKind::Imap,
+            auth_kind: AuthKind::Oauth2,
+            imap: None,
+            smtp: None,
+            ews_url: None,
+            jmap_url: None,
+            username: None,
+            secret_ref: Some("unused-in-test".into()),
+            include_in_unified: true,
+            color: None,
+            retention_days: 30,
+            enabled: true,
+        }
+    }
 
     #[tokio::test]
     async fn serializes_same_account_and_scope_inside_core() {
@@ -72,7 +123,7 @@ mod sync_registry_tests {
             registry
                 .exclusive(7, SyncKind::Auxiliary, async { Ok::<_, crate::Error>(()) })
                 .await
-                .is_ok()
+                .is_err()
         );
 
         release.notify_one();
@@ -84,27 +135,86 @@ mod sync_registry_tests {
                 .is_ok()
         );
     }
+
+    #[tokio::test]
+    async fn gmail_retry_after_survives_a_new_account_manager() {
+        let root = std::env::temp_dir().join(format!(
+            "truemail-gmail-retry-after-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = std::sync::Arc::new(crate::crypto::StorageCrypto::from_key(rand::random()));
+        let database_key = crate::crypto::DatabaseKey::from_key(rand::random());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = gmail_account(42);
+        let retry_at = chrono::Utc::now() + chrono::Duration::minutes(15);
+
+        let first = AccountManager::new(db.clone());
+        first
+            .remember_gmail_rate_limit(
+                &account,
+                &crate::Error::RateLimited {
+                    backend: "gmail-api".into(),
+                    retry_at,
+                    message: "test quota".into(),
+                },
+            )
+            .await;
+        drop(first);
+
+        let restarted = AccountManager::new(db.clone());
+        let error = restarted
+            .ensure_gmail_mail_allowed(&account)
+            .await
+            .expect_err("persisted deadline must block HTTP after restart");
+        match error {
+            crate::Error::RateLimited {
+                backend,
+                retry_at: stored,
+                message,
+            } => {
+                assert_eq!(backend, "gmail-api");
+                assert_eq!(stored.timestamp_millis(), retry_at.timestamp_millis());
+                assert!(message.contains("HTTP-запрос не отправлен"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            restarted
+                .process_mail_outbox(&account)
+                .await
+                .expect("empty outbox must not touch Gmail transport"),
+            0
+        );
+
+        drop(restarted);
+        db.close().await;
+        drop(db);
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
 }
 
 #[derive(Default)]
 struct SyncRegistry {
-    locks: tokio::sync::Mutex<
-        std::collections::HashMap<(i64, SyncKind), std::sync::Arc<tokio::sync::Semaphore>>,
-    >,
+    locks:
+        tokio::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Semaphore>>>,
 }
 
 impl SyncRegistry {
     async fn exclusive<T>(
         &self,
         account_id: i64,
-        kind: SyncKind,
+        _kind: SyncKind,
         operation: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         let semaphore = self
             .locks
             .lock()
             .await
-            .entry((account_id, kind))
+            .entry(account_id)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)))
             .clone();
         let _permit = semaphore.try_acquire_owned().map_err(|_| {
@@ -142,6 +252,82 @@ impl AccountManager {
             refresh_lock: tokio::sync::Mutex::new(()),
             sync_registry: SyncRegistry::default(),
             exchange_outbox_repaired: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    fn gmail_rate_limit_key(account_id: i64) -> String {
+        format!("gmail_api_retry_at:{account_id}")
+    }
+
+    /// Не выпускать Gmail HTTP-запрос раньше серверного Retry-After даже после
+    /// перезапуска приложения. Значение хранится в зашифрованной settings.
+    async fn ensure_gmail_mail_allowed(&self, account: &Account) -> Result<()> {
+        if account.provider != Provider::Gmail {
+            return Ok(());
+        }
+        let key = Self::gmail_rate_limit_key(account.id);
+        let Some(value) = self.db.setting(&key).await? else {
+            return Ok(());
+        };
+        let Ok(retry_at) = chrono::DateTime::parse_from_rfc3339(&value) else {
+            tracing::warn!(account = %account.email, value, "повреждён сохранённый Gmail Retry-After; значение проигнорировано");
+            return Ok(());
+        };
+        let retry_at = retry_at.with_timezone(&chrono::Utc);
+        let now = chrono::Utc::now();
+        if retry_at <= now {
+            return Ok(());
+        }
+        let seconds = (retry_at - now).num_seconds().max(1);
+        Err(crate::Error::RateLimited {
+            backend: "gmail-api".into(),
+            retry_at,
+            message: format!(
+                "сохранённый Retry-After ещё действует ({seconds} с); HTTP-запрос не отправлен"
+            ),
+        })
+    }
+
+    async fn remember_gmail_rate_limit(&self, account: &Account, error: &crate::Error) {
+        if account.provider != Provider::Gmail {
+            return;
+        }
+        let crate::Error::RateLimited {
+            backend, retry_at, ..
+        } = error
+        else {
+            return;
+        };
+        if backend != "gmail-api" {
+            return;
+        }
+        let key = Self::gmail_rate_limit_key(account.id);
+        let existing = match self.db.setting(&key).await {
+            Ok(value) => value,
+            Err(read_error) => {
+                tracing::warn!(account = %account.email, %read_error, "Gmail Retry-After не прочитан перед обновлением");
+                None
+            }
+        };
+        let existing_retry_at = existing
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&chrono::Utc));
+        if existing_retry_at.is_some_and(|stored| stored >= *retry_at) {
+            return;
+        }
+        let value = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        match self.db.set_setting(&key, &value).await {
+            Ok(()) => tracing::info!(
+                account = %account.email,
+                retry_at = %value,
+                "Gmail Retry-After сохранён и переживёт перезапуск"
+            ),
+            Err(write_error) => tracing::warn!(
+                account = %account.email,
+                %write_error,
+                "Gmail Retry-After не удалось сохранить"
+            ),
         }
     }
 
@@ -237,6 +423,7 @@ impl AccountManager {
     }
 
     async fn mail_credential(&self, account: &Account) -> Result<Zeroizing<String>> {
+        self.ensure_gmail_mail_allowed(account).await?;
         if account.auth_kind == AuthKind::Oauth2 {
             return self.oauth_access_token(account).await;
         }
@@ -362,23 +549,62 @@ impl AccountManager {
         if account.provider != Provider::Gmail {
             return Ok(Vec::new());
         }
+        self.ensure_gmail_mail_allowed(account).await?;
         let token = self.oauth_access_token(account).await?;
-        crate::backend::gmail_latest_ids(&token, 25).await
+        let result = crate::backend::gmail_latest_ids(&token, 25).await;
+        if let Err(error) = &result {
+            self.remember_gmail_rate_limit(account, error).await;
+        }
+        result
     }
 
-    /// Дозагрузить только последние входящие после события IMAP IDLE.
-    pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
+    /// Дозагрузить только последние входящие и отдельно посчитать действительно
+    /// новые письма. Exchange использует этот результат для watchdog-уведомлений.
+    pub async fn sync_mail_inbox_delta(&self, account: &Account) -> Result<InboxSyncResult> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
-        let discovery = backend
+        let discovery_result = backend
             .discover_inbox(&account.email, &access_token, &cursors)
-            .await?;
+            .await;
+        if let Err(error) = &discovery_result {
+            self.remember_gmail_rate_limit(account, error).await;
+        }
+        let discovery = discovery_result?;
+        let had_baseline = discovery
+            .folders
+            .iter()
+            .find(|folder| folder.role == Some(FolderRole::Inbox))
+            .and_then(|folder| cursors.get(&folder.remote_path))
+            .and_then(|cursor| cursor.sync_token.as_deref())
+            .is_some_and(|value| !value.is_empty());
+        let downloaded = discovery.messages.len();
+        let mut remote_ids = discovery
+            .messages
+            .iter()
+            .filter_map(|message| message.remote_id.clone())
+            .collect::<Vec<_>>();
+        remote_ids.sort();
+        remote_ids.dedup();
+        let new_messages = self
+            .db
+            .unknown_remote_ids(account.id, &remote_ids)
+            .await?
+            .len();
         self.db
             .save_discovered_folders(account.id, &discovery.folders)
             .await?;
         self.db
             .reconcile_imap_snapshot(account.id, &discovery.server_uids, &discovery.reset_folders)
+            .await?;
+        self.db
+            .reconcile_discovered_folders(account.id, &discovery.folders)
+            .await?;
+        self.db
+            .apply_imap_vanished(account.id, &discovery.deleted_uids)
+            .await?;
+        self.db
+            .apply_imap_flag_updates(account.id, &discovery.flag_updates)
             .await?;
         self.db
             .reconcile_remote_projections(
@@ -397,7 +623,16 @@ impl AccountManager {
         if let Err(error) = self.db.process_mail_rules().await {
             tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
         }
-        Ok(discovery.messages.len())
+        Ok(InboxSyncResult {
+            downloaded,
+            new_messages,
+            had_baseline,
+        })
+    }
+
+    /// Совместимый интерфейс для IMAP/Gmail: количество загруженных изменений.
+    pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
+        Ok(self.sync_mail_inbox_delta(account).await?.downloaded)
     }
 
     /// Гарантировать наличие сырого MIME письма локально. Если кэш был вычищен
@@ -540,7 +775,8 @@ impl AccountManager {
             .clone()
             .unwrap_or_else(|| account.email.clone());
         let backend = EwsBackend { endpoint, username };
-        let data = backend.auxiliary(&credential).await?;
+        let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
+        let data = backend.auxiliary(&credential, &cursors).await?;
         self.db
             .save_auxiliary_data(account.id, "exchange", &data)
             .await
@@ -573,9 +809,29 @@ impl AccountManager {
             .ok_or_else(|| crate::Error::AccountConfig("аккаунт отправителя не найден".into()))?;
         message.from = account.email.clone();
         let credential = self.mail_credential(&account).await?;
-        Self::mail_backend(&account)?
-            .send(message, &credential)
-            .await
+        let backend = Self::mail_backend(&account)?;
+        let provider = backend.provider_id();
+        if let SendOutcome::NeedsSentAppend(raw) = backend.send(message, &credential).await?
+            && let Err(error) = backend.append_sent(&account.email, &credential, &raw).await
+        {
+            let payload = sent_append_payload(&raw)?;
+            self.db
+                .queue_sent_append(account.id, &payload, &error.to_string())
+                .await?;
+            tracing::warn!(
+                account = %account.email,
+                provider,
+                %error,
+                "SMTP доставил письмо; сохранение в Отправленные поставлено в отдельный retry"
+            );
+            return Ok(());
+        }
+        tracing::info!(
+            account = %account.email,
+            provider,
+            "письмо отправлено, серверная копия сохранена"
+        );
+        Ok(())
     }
 
     /// Ждать серверное изменение через механизм выбранного транспорта.
@@ -588,8 +844,6 @@ impl AccountManager {
 
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
-        let token = self.mail_credential(account).await?;
-        let backend = Self::mail_backend(account)?;
         if account.provider == Provider::Exchange
             && !self
                 .exchange_outbox_repaired
@@ -606,12 +860,48 @@ impl AccountManager {
                 .insert(account.id);
         }
         let operations = self.db.claim_outbox_operations(account.id, 50).await?;
+        if operations.is_empty() {
+            return Ok(0);
+        }
+        // Не трогаем transport/OAuth/quota gate, когда отправлять нечего.
+        let token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
         let mut completed = 0;
         for operation in operations {
             let applied = if operation.op_kind == "send" {
                 match serde_json::from_str::<crate::backend::OutgoingMessage>(&operation.payload) {
-                    Ok(message) => backend.send(message, &token).await,
+                    Ok(message) => match backend.send(message, &token).await {
+                        Ok(SendOutcome::SavedOnServer) => Ok(()),
+                        Ok(SendOutcome::NeedsSentAppend(raw)) => {
+                            match backend.append_sent(&account.email, &token, &raw).await {
+                                Ok(()) => Ok(()),
+                                Err(error) => {
+                                    let payload = sent_append_payload(&raw)?;
+                                    self.db
+                                        .convert_outbox_to_sent_append(
+                                            operation.id,
+                                            &payload,
+                                            &error.to_string(),
+                                        )
+                                        .await?;
+                                    tracing::warn!(
+                                        account = %account.email,
+                                        operation = operation.id,
+                                        %error,
+                                        "SMTP доставил scheduled-письмо; retry продолжит только IMAP APPEND"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(crate::Error::Json(error)),
+                }
+            } else if operation.op_kind == "append_sent" {
+                match sent_append_raw(&operation.payload) {
+                    Ok(raw) => backend.append_sent(&account.email, &token, &raw).await,
+                    Err(error) => Err(error),
                 }
             } else {
                 backend
@@ -1116,6 +1406,27 @@ impl AccountManager {
                             .await
                         {
                             Ok(_) => {
+                                if let Err(error) = self
+                                    .db
+                                    .reconcile_discovered_folders(account.id, &imap.folders)
+                                    .await
+                                {
+                                    warnings.push(format!("Удалённые папки не очищены: {error}"));
+                                }
+                                if let Err(error) = self
+                                    .db
+                                    .apply_imap_vanished(account.id, &imap.deleted_uids)
+                                    .await
+                                {
+                                    warnings.push(format!("Удаления IMAP не сохранились: {error}"));
+                                }
+                                if let Err(error) = self
+                                    .db
+                                    .apply_imap_flag_updates(account.id, &imap.flag_updates)
+                                    .await
+                                {
+                                    warnings.push(format!("Флаги писем не сохранились: {error}"));
+                                }
                                 match self
                                     .db
                                     .reconcile_remote_projections(
@@ -1172,6 +1483,7 @@ impl AccountManager {
                 }
             }
             Err(error) => {
+                self.remember_gmail_rate_limit(account, &error).await;
                 warnings.push(format!(
                     "Почта подключена, первая синхронизация отложена: {error}"
                 ));

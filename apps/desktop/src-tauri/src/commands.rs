@@ -15,7 +15,7 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use truemail_core::Core;
 use truemail_core::account::{
-    ContactInput, EventInput, RemoteObject, configured_google_client_id,
+    ContactInput, EventInput, InboxSyncResult, RemoteObject, configured_google_client_id,
     configured_google_client_secret, configured_microsoft_client_id, configured_microsoft_tenant,
     configured_yandex_client_id, configured_yandex_redirect_uri,
 };
@@ -342,12 +342,14 @@ async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
 /// Данные уходят в webview-окно "notify", которое рисует карточку с кнопками.
 fn push_notification(app: &AppHandle, payload: serde_json::Value) {
     position_notify_window(app);
-    let _ = app.emit_to("notify", "notify-push", payload);
+    let emitted = app.emit_to("notify", "notify-push", payload).is_ok();
+    let mut shown = false;
     if let Some(window) = app.get_webview_window("notify") {
         // Пока окно показано, курсор ему нужен - иначе кнопки карточки не нажать.
         let _ = window.set_ignore_cursor_events(false);
-        let _ = window.show();
+        shown = window.show().is_ok();
     }
+    tracing::info!(emitted, shown, "desktop notification dispatched");
 }
 
 /// Прижать окно уведомлений к выбранному пользователем углу основного монитора.
@@ -465,6 +467,13 @@ async fn notify_new_mail(
         }),
     };
     push_notification(app, payload);
+}
+
+/// Первый EWS-снимок создаёт локальную базовую линию и не должен вываливать
+/// пользователю историю ящика. После появления SyncState уведомляем только о
+/// remote ID, которых до прохода не было в БД.
+fn exchange_notification_count(result: InboxSyncResult) -> Option<usize> {
+    (result.had_baseline && result.new_messages > 0).then_some(result.new_messages)
 }
 
 /// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
@@ -1966,22 +1975,59 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
         tokio::spawn(async move {
             tracing::info!(account = %account.email, provider = ?account.provider, "mail-sync начат");
             if account.provider == truemail_core::model::Provider::Exchange {
-                match sync_core.accounts.sync_mail_inbox(&account).await {
-                    Ok(messages) => {
-                        tracing::info!(account = %account.email, messages, "Exchange: свежие входящие загружены");
+                match sync_core.accounts.sync_mail_inbox_delta(&account).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            account = %account.email,
+                            messages = result.downloaded,
+                            new_messages = result.new_messages,
+                            "Exchange: свежие входящие загружены"
+                        );
                         let _ = sync_app.emit("truemail-data-changed", account.id);
+                        if let Some(count) = exchange_notification_count(result) {
+                            notify_new_mail(&sync_app, &sync_core, &account, count).await;
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(account = %account.email, %error, "Exchange: быстрые входящие не загрузились");
                     }
                 }
             }
-            let state = match sync_core.accounts.sync_mail_account(&account).await {
-                Ok(result) => {
-                    tracing::info!(account = %account.email, "mail-sync завершён");
+            let supports_auxiliary = matches!(
+                account.provider,
+                truemail_core::model::Provider::Yandex
+                    | truemail_core::model::Provider::Gmail
+                    | truemail_core::model::Provider::Exchange
+            );
+            let mail = sync_core.accounts.sync_mail_account(&account).await;
+            // Ограничение почтового транспорта не должно останавливать
+            // независимые Calendar/Contacts/Tasks API этого же аккаунта.
+            let auxiliary = if supports_auxiliary {
+                sync_core.accounts.sync_auxiliary_account(&account).await
+            } else {
+                Ok((0, 0, 0))
+            };
+            let state = match (mail, auxiliary) {
+                (Ok(result), Ok((calendars, events, contacts))) => {
+                    tracing::info!(account = %account.email, calendars, events, contacts, "инкрементальный sync завершён");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings, "calendars": calendars, "events": events, "contacts": contacts})
+                }
+                (Ok(mut result), Err(error)) => {
+                    tracing::warn!(account = %account.email, %error, "почта обновлена, вспомогательный sync будет повторён");
+                    result.warnings.push(error.to_string());
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
-                Err(error) => {
+                (Err(mail_error), Ok((calendars, events, contacts))) if supports_auxiliary => {
+                    tracing::warn!(account = %account.email, %mail_error, calendars, events, contacts, "почта отложена, вспомогательный sync завершён");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": calendars, "events": events, "contacts": contacts})
+                }
+                (Err(mail_error), Err(auxiliary_error)) => {
+                    let error =
+                        format!("почта: {mail_error}; календарь/контакты: {auxiliary_error}");
+                    tracing::error!(account = %account.email, %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error})
+                }
+                (Err(error), Ok(_)) => {
                     tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась");
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.to_string()})
                 }
@@ -2078,11 +2124,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         drop(watching);
 
         // Gmail работает через отдельный лёгкий REST polling. Для остальных
-        // транспорт сам выбирает IDLE, EWS/JMAP polling или иной механизм ожидания.
-        if !matches!(
-            account.provider,
-            truemail_core::model::Provider::Gmail | truemail_core::model::Provider::Exchange
-        ) {
+        // транспорт сам выбирает IDLE, короткий EWS watchdog или иной механизм
+        // ожидания. Exchange SyncFolderItems остаётся инкрементальным.
+        if account.provider != truemail_core::model::Provider::Gmail {
             let watch_core = core.clone();
             let watch_syncing = state.syncing.clone();
             let watch_app = app.clone();
@@ -2111,25 +2155,43 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 drop(syncing);
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
-                            match watch_core.accounts.sync_mail_inbox(&watch_account).await {
+                            let inbox_sync = if watch_account.provider
+                                == truemail_core::model::Provider::Exchange
+                            {
+                                watch_core
+                                    .accounts
+                                    .sync_mail_inbox_delta(&watch_account)
+                                    .await
+                                    .map(|result| {
+                                        (result.downloaded, exchange_notification_count(result))
+                                    })
+                            } else {
+                                watch_core
+                                    .accounts
+                                    .sync_mail_inbox(&watch_account)
+                                    .await
+                                    .map(|messages| (messages, (messages > 0).then_some(messages)))
+                            };
+                            match inbox_sync {
                                 // Плановая переустановка IDLE без новых писем (messages=0)
                                 // происходит каждые ~90с - это debug, чтобы не шуметь.
                                 // Реальные новые письма логируем на info.
-                                Ok(messages) if messages > 0 => {
+                                Ok((messages, Some(new_messages))) => {
                                     tracing::info!(
                                         account = %watch_account.email,
                                         messages,
+                                        new_messages,
                                         "почтовый транспорт: входящие обновлены"
                                     );
                                     notify_new_mail(
                                         &watch_app,
                                         &watch_core,
                                         &watch_account,
-                                        messages,
+                                        new_messages,
                                     )
                                     .await;
                                 }
-                                Ok(messages) => tracing::debug!(
+                                Ok((messages, None)) => tracing::debug!(
                                     account = %watch_account.email,
                                     messages,
                                     "наблюдение переустановлено, новых писем нет"
@@ -3285,6 +3347,34 @@ mod update_tests {
         assert_eq!(
             observe_gmail_message_ids(&mut observed, 7, vec!["new".into(), "old".into()]),
             Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn exchange_notifies_only_new_mail_after_baseline() {
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 50,
+                new_messages: 50,
+                had_baseline: false,
+            }),
+            None
+        );
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 2,
+                new_messages: 1,
+                had_baseline: true,
+            }),
+            Some(1)
+        );
+        assert_eq!(
+            exchange_notification_count(InboxSyncResult {
+                downloaded: 1,
+                new_messages: 0,
+                had_baseline: true,
+            }),
+            None
         );
     }
 

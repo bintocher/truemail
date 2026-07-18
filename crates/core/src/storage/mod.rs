@@ -98,7 +98,16 @@ impl Db {
     /// deferred стартует читателем и берёт снимок БД, а если к первой записи
     /// снимок устарел, SQLite отдаёт SQLITE_BUSY сразу, не дожидаясь ничего.
     pub async fn begin_write(&self) -> Result<sqlx::Transaction<'static, sqlx::Sqlite>> {
-        Ok(self.write_pool.begin_with("BEGIN IMMEDIATE").await?)
+        let started = std::time::Instant::now();
+        let transaction = self.write_pool.begin_with("BEGIN IMMEDIATE").await?;
+        let wait = started.elapsed();
+        if wait >= std::time::Duration::from_secs(1) {
+            tracing::warn!(
+                writer_wait_ms = wait.as_millis() as u64,
+                "SQLCipher writer queue wait"
+            );
+        }
+        Ok(transaction)
     }
 
     /// Прогнать все миграции из crates/core/migrations.
@@ -241,20 +250,44 @@ fn encrypted_options(
 }
 
 async fn verify_sqlcipher(pool: &SqlitePool) -> Result<()> {
-    let version: Option<(String,)> = sqlx::query_as("PRAGMA cipher_version")
+    let cipher_version: Option<(String,)> = sqlx::query_as("PRAGMA cipher_version")
         .fetch_optional(pool)
         .await?;
-    let version = version
+    let cipher_version = cipher_version
         .map(|row| row.0)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| crate::Error::Crypto("сборка SQLite не содержит SQLCipher".into()))?;
+    let (sqlite_version,): (String,) = sqlx::query_as("SELECT sqlite_version()")
+        .fetch_one(pool)
+        .await?;
+    ensure_version_at_least("SQLCipher", &cipher_version, (4, 17, 0))?;
+    ensure_version_at_least("SQLite", &sqlite_version, (3, 53, 3))?;
     let _: (i64,) = sqlx::query_as("SELECT count(*) FROM sqlite_master")
         .fetch_one(pool)
         .await
         .map_err(|error| {
             crate::Error::Crypto(format!("не удалось открыть SQLCipher БД: {error}"))
         })?;
-    tracing::info!(sqlcipher_version = %version, "SQLCipher storage opened");
+    tracing::info!(%cipher_version, %sqlite_version, "SQLCipher storage opened");
+    Ok(())
+}
+
+fn ensure_version_at_least(product: &str, actual: &str, minimum: (u64, u64, u64)) -> Result<()> {
+    let mut parts = actual
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok());
+    let parsed = (
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+        parts.next().unwrap_or_default(),
+    );
+    if parsed < minimum {
+        return Err(crate::Error::Crypto(format!(
+            "{product} {actual} устарел; требуется не ниже {}.{}.{}",
+            minimum.0, minimum.1, minimum.2
+        )));
+    }
     Ok(())
 }
 
@@ -764,6 +797,7 @@ mod tests {
             answered: false,
             draft: false,
             raw: Vec::new(),
+            body_fetched: true,
         };
         let removed = db
             .reconcile_remote_projections(
@@ -853,6 +887,7 @@ mod tests {
                 answered: false,
                 draft: false,
                 raw: calendar_raw.to_vec(),
+                body_fetched: true,
             }],
         )
         .await
@@ -902,6 +937,90 @@ mod tests {
                 .expect("calendar attachment bytes")
                 .0,
             "invite.ics"
+        );
+
+        // Лёгкий Gmail metadata update не должен затереть уже загруженный raw,
+        // вложения или FTS-тело того же письма.
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 5,
+                remote_id: Some("calendar-message".into()),
+                size: Some(calendar_raw.len() as u32),
+                seen: true,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: b"Subject: Meeting\r\n\r\npreview".to_vec(),
+                body_fetched: false,
+            }],
+        )
+        .await
+        .expect("save metadata projection over full body");
+        assert!(
+            db.message_fetch_locator(calendar_message_id)
+                .await
+                .expect("read full-body locator")
+                .expect("full-body locator")
+                .4
+        );
+        assert_eq!(
+            db.message_raw_bytes(calendar_message_id)
+                .await
+                .expect("full raw is preserved"),
+            calendar_raw
+        );
+        assert_eq!(
+            db.get_message(calendar_message_id)
+                .await
+                .expect("attachments are preserved")
+                .attachments
+                .len(),
+            1
+        );
+
+        // Новая metadata-проекция доступна в списке, но открытие должно
+        // инициировать ленивую загрузку полного MIME.
+        db.save_discovered_messages(
+            account.id,
+            &[DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 6,
+                remote_id: Some("metadata-only".into()),
+                size: Some(50_000_000),
+                seen: false,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw: b"Subject: Large\r\n\r\nsmall preview".to_vec(),
+                body_fetched: false,
+            }],
+        )
+        .await
+        .expect("save metadata-only message");
+        let (metadata_message_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=6")
+                .bind(folder_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("metadata message id");
+        assert!(
+            !db.message_fetch_locator(metadata_message_id)
+                .await
+                .expect("read metadata locator")
+                .expect("metadata locator")
+                .4
+        );
+        db.store_fetched_raw(metadata_message_id, b"Subject: Large\r\n\r\nfull body")
+            .await
+            .expect("store lazy full raw");
+        assert!(
+            db.message_fetch_locator(metadata_message_id)
+                .await
+                .expect("read hydrated locator")
+                .expect("hydrated locator")
+                .4
         );
 
         let custom_smart = crate::model::SmartFolder {
@@ -1541,6 +1660,29 @@ mod tests {
             .await
             .expect("check undone message");
         assert_eq!(second_exists.0, 1);
+
+        let scheduled = db
+            .queue_scheduled_send(account.id, "{\"message\":true}", "2000-01-01 00:00:00")
+            .await
+            .expect("queue scheduled send");
+        db.convert_outbox_to_sent_append(scheduled, "{\"raw\":\"bWltZQ==\"}", "append failed")
+            .await
+            .expect("convert delivered SMTP operation");
+        let converted: (String, String, String, i64) =
+            sqlx::query_as("SELECT op_kind, payload, status, attempts FROM outbox_ops WHERE id=?")
+                .bind(scheduled)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read append-only retry");
+        assert_eq!(
+            converted,
+            (
+                "append_sent".into(),
+                "{\"raw\":\"bWltZQ==\"}".into(),
+                "retry".into(),
+                0
+            )
+        );
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

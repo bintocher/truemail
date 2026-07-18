@@ -13,6 +13,43 @@ use url::Url;
 const CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const PEOPLE_CONNECTIONS: &str = "https://people.googleapis.com/v1/people/me/connections";
 const TASKS_BASE: &str = "https://tasks.googleapis.com/tasks/v1";
+const CALENDAR_CURSOR_PREFIX: &str = "google-calendar-v1:";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleCalendarCursor {
+    sync_token: String,
+    last_full: String,
+    consecutive_expired: u8,
+}
+
+fn decode_calendar_cursor(value: Option<&str>) -> Option<GoogleCalendarCursor> {
+    let value = value?;
+    if let Some(json) = value.strip_prefix(CALENDAR_CURSOR_PREFIX) {
+        serde_json::from_str(json).ok()
+    } else {
+        Some(GoogleCalendarCursor {
+            sync_token: value.to_owned(),
+            last_full: String::new(),
+            consecutive_expired: 0,
+        })
+    }
+}
+
+fn encode_calendar_cursor(cursor: &GoogleCalendarCursor) -> Result<String> {
+    Ok(format!(
+        "{CALENDAR_CURSOR_PREFIX}{}",
+        serde_json::to_string(cursor)?
+    ))
+}
+
+fn calendar_full_is_fresh(cursor: &GoogleCalendarCursor) -> bool {
+    chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
+        .map(|last| {
+            chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
+                < chrono::Duration::days(1)
+        })
+        .unwrap_or(false)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -414,7 +451,31 @@ async fn fetch_calendars(
                 .calendars
                 .get(&source_url)
                 .and_then(|cursor| cursor.sync_token.clone());
-            let mut requested_token = stored_token.clone();
+            let stored_cursor = decode_calendar_cursor(stored_token.as_deref());
+            if let Some(cursor) = stored_cursor.as_ref()
+                && cursor.consecutive_expired >= 2
+                && calendar_full_is_fresh(cursor)
+            {
+                tracing::info!(
+                    provider = "google-calendar",
+                    collection = %source_url,
+                    "Google Calendar collection unchanged; unsupported syncToken is in daily cooldown"
+                );
+                calendars.push(DavCalendar {
+                    url: source_url,
+                    name: calendar.summary,
+                    ctag: calendar.etag.or(calendar.description),
+                    sync_token: stored_token,
+                    sync_scope: SyncScope::Delta,
+                    deleted_event_urls: Vec::new(),
+                    events: Vec::new(),
+                });
+                continue;
+            }
+            let mut requested_token = stored_cursor
+                .as_ref()
+                .map(|cursor| cursor.sync_token.clone());
+            let mut rebaseline_after_expired = false;
             let (events, deleted_event_urls, sync_token, sync_scope) = 'retry: loop {
                 let mut events = Vec::new();
                 let mut deleted_event_urls = Vec::new();
@@ -439,6 +500,20 @@ async fn fetch_calendars(
                         {
                             SyncResponse::Data(page) => page,
                             SyncResponse::Expired if requested_token.is_some() => {
+                                if let Some(cursor) = stored_cursor.as_ref()
+                                    && cursor.consecutive_expired >= 1
+                                    && calendar_full_is_fresh(cursor)
+                                {
+                                    let mut cooldown = cursor.clone();
+                                    cooldown.consecutive_expired = 2;
+                                    break 'retry (
+                                        Vec::new(),
+                                        Vec::new(),
+                                        encode_calendar_cursor(&cooldown)?,
+                                        SyncScope::Delta,
+                                    );
+                                }
+                                rebaseline_after_expired = true;
                                 requested_token = None;
                                 continue 'retry;
                             }
@@ -469,9 +544,19 @@ async fn fetch_calendars(
                     }
                     event_page_token = event_page.next_page_token;
                     if event_page_token.is_none() {
-                        let sync_token = event_page.next_sync_token.ok_or_else(|| {
+                        let next_sync_token = event_page.next_sync_token.ok_or_else(|| {
                             api_error("google-calendar", "Google не вернул nextSyncToken")
                         })?;
+                        let sync_token = if rebaseline_after_expired {
+                            encode_calendar_cursor(&GoogleCalendarCursor {
+                                sync_token: next_sync_token,
+                                last_full: chrono::Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                consecutive_expired: 1,
+                            })?
+                        } else {
+                            next_sync_token
+                        };
                         break 'retry (
                             events,
                             deleted_event_urls,
@@ -485,6 +570,14 @@ async fn fetch_calendars(
                     }
                 }
             };
+            tracing::info!(
+                provider = "google-calendar",
+                collection = %source_url,
+                scope = ?sync_scope,
+                changed = events.len(),
+                deleted = deleted_event_urls.len(),
+                "Google Calendar collection delta fetched"
+            );
             calendars.push(DavCalendar {
                 url: source_url,
                 name: calendar.summary,
@@ -639,6 +732,34 @@ fn task_event(list_id: &str, task: GoogleTask) -> Option<DavEvent> {
     })
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct GoogleTasksCursor {
+    updated_min: String,
+    last_full: String,
+}
+
+fn decode_tasks_cursor(value: Option<&str>) -> Option<GoogleTasksCursor> {
+    let value = value?;
+    if let Some(json) = value.strip_prefix("google-tasks-v1:") {
+        serde_json::from_str(json).ok()
+    } else {
+        // Legacy cursor contained only updatedMin. Treat its timestamp as the
+        // last reconciliation so upgraded installations naturally perform a
+        // full scoped pass once it becomes one day old.
+        Some(GoogleTasksCursor {
+            updated_min: value.to_owned(),
+            last_full: value.to_owned(),
+        })
+    }
+}
+
+fn encode_tasks_cursor(cursor: &GoogleTasksCursor) -> Result<String> {
+    Ok(format!(
+        "google-tasks-v1:{}",
+        serde_json::to_string(cursor)?
+    ))
+}
+
 async fn fetch_task_calendars(
     client: &Client,
     access_token: &str,
@@ -658,12 +779,32 @@ async fn fetch_task_calendars(
         let page: TaskListsPage = get_json(client, url, access_token, "google-tasks").await?;
         for list in page.items {
             let source_url = format!("google-tasks:{}", list.id);
-            let updated_min = cursors
+            let previous_cursor = cursors
                 .calendars
                 .get(&source_url)
-                .and_then(|cursor| cursor.sync_token.as_deref());
-            let mut events = Vec::new();
-            let mut deleted_event_urls = Vec::new();
+                .and_then(|cursor| decode_tasks_cursor(cursor.sync_token.as_deref()));
+            let full_reconciliation = previous_cursor.as_ref().is_none_or(|cursor| {
+                chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
+                    .map(|last| {
+                        chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
+                            >= chrono::Duration::days(1)
+                    })
+                    .unwrap_or(true)
+            });
+            let updated_min = if full_reconciliation {
+                None
+            } else {
+                previous_cursor.as_ref().and_then(|cursor| {
+                    chrono::DateTime::parse_from_rfc3339(&cursor.updated_min)
+                        .ok()
+                        .map(|value| {
+                            (value.with_timezone(&chrono::Utc) - chrono::Duration::minutes(5))
+                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        })
+                })
+            };
+            let mut events_by_url = std::collections::HashMap::new();
+            let mut deleted_event_urls = std::collections::HashSet::new();
             let mut task_page_token: Option<String> = None;
             loop {
                 let mut tasks_url = api_url(TASKS_BASE, &["lists", &list.id, "tasks"])?;
@@ -673,7 +814,7 @@ async fn fetch_task_calendars(
                     .append_pair("showCompleted", "true")
                     .append_pair("showHidden", "true")
                     .append_pair("showDeleted", "true");
-                if let Some(updated_min) = updated_min {
+                if let Some(updated_min) = updated_min.as_deref() {
                     tasks_url
                         .query_pairs_mut()
                         .append_pair("updatedMin", updated_min);
@@ -686,13 +827,16 @@ async fn fetch_task_calendars(
                 for task in task_page.items {
                     let remote_url = format!("google-task:{}", task.id);
                     if task.deleted {
-                        deleted_event_urls.push(remote_url);
+                        events_by_url.remove(&remote_url);
+                        deleted_event_urls.insert(remote_url);
                     } else if let Some(event) = task_event(&list.id, task) {
-                        events.push(event);
+                        deleted_event_urls.remove(&remote_url);
+                        events_by_url.insert(remote_url, event);
                     } else if updated_min.is_some() {
                         // A task that lost its due/completed date no longer
                         // belongs in the calendar projection.
-                        deleted_event_urls.push(remote_url);
+                        events_by_url.remove(&remote_url);
+                        deleted_event_urls.insert(remote_url);
                     }
                 }
                 task_page_token = task_page.next_page_token;
@@ -700,18 +844,36 @@ async fn fetch_task_calendars(
                     break;
                 }
             }
+            let next_cursor = GoogleTasksCursor {
+                updated_min: next_updated_min.clone(),
+                last_full: if full_reconciliation {
+                    next_updated_min.clone()
+                } else {
+                    previous_cursor
+                        .map(|cursor| cursor.last_full)
+                        .unwrap_or_else(|| next_updated_min.clone())
+                },
+            };
+            tracing::info!(
+                provider = "google-tasks",
+                collection = %source_url,
+                scope = if full_reconciliation { "full" } else { "delta" },
+                changed = events_by_url.len(),
+                deleted = deleted_event_urls.len(),
+                "Google Tasks collection delta fetched"
+            );
             calendars.push(DavCalendar {
                 url: source_url,
                 name: format!("Google Tasks · {}", list.title),
                 ctag: list.etag,
-                sync_token: Some(next_updated_min.clone()),
-                sync_scope: if updated_min.is_some() {
-                    SyncScope::Delta
-                } else {
+                sync_token: Some(encode_tasks_cursor(&next_cursor)?),
+                sync_scope: if full_reconciliation {
                     SyncScope::Full
+                } else {
+                    SyncScope::Delta
                 },
-                deleted_event_urls,
-                events,
+                deleted_event_urls: deleted_event_urls.into_iter().collect(),
+                events: events_by_url.into_values().collect(),
             });
         }
         page_token = page.next_page_token;
@@ -816,5 +978,39 @@ mod tests {
             deleted: false,
         };
         assert!(task_event("list", task).is_none());
+    }
+
+    #[test]
+    fn google_tasks_cursor_preserves_last_full_reconciliation() {
+        let cursor = GoogleTasksCursor {
+            updated_min: "2026-07-18T01:00:00Z".into(),
+            last_full: "2026-07-17T01:00:00Z".into(),
+        };
+        let encoded = encode_tasks_cursor(&cursor).expect("encode cursor");
+        let decoded = decode_tasks_cursor(Some(&encoded)).expect("decode cursor");
+        assert_eq!(decoded.updated_min, cursor.updated_min);
+        assert_eq!(decoded.last_full, cursor.last_full);
+    }
+
+    #[test]
+    fn google_calendar_cursor_round_trips_expiry_cooldown() {
+        let cursor = GoogleCalendarCursor {
+            sync_token: "opaque-token".into(),
+            last_full: "2026-07-18T01:00:00Z".into(),
+            consecutive_expired: 2,
+        };
+        let encoded = encode_calendar_cursor(&cursor).expect("encode cursor");
+        let decoded = decode_calendar_cursor(Some(&encoded)).expect("decode cursor");
+        assert_eq!(decoded.sync_token, cursor.sync_token);
+        assert_eq!(decoded.last_full, cursor.last_full);
+        assert_eq!(decoded.consecutive_expired, 2);
+    }
+
+    #[test]
+    fn legacy_google_calendar_token_remains_usable() {
+        let decoded = decode_calendar_cursor(Some("legacy-opaque-token")).expect("legacy cursor");
+        assert_eq!(decoded.sync_token, "legacy-opaque-token");
+        assert_eq!(decoded.consecutive_expired, 0);
+        assert!(!calendar_full_is_fresh(&decoded));
     }
 }

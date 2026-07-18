@@ -169,9 +169,9 @@ dependencies = [
 
 [[package]]
 name = "async-imap"
-version = "0.11.2"
+version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a78dceaba06f029d8f4d7df20addd4b7370a30206e3926267ecda2915b0f3f66"
+checksum = "9a6728e0f7931b36d725ac234fcb02539e9f7888dbeaaa8a18d9ea5792181570"
 dependencies = [
  "async-channel 2.5.0",
  "async-compression",
@@ -2881,8 +2881,6 @@ dependencies = [
 [[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
 dependencies = [
  "cc",
  "openssl-sys",
@@ -6258,6 +6256,7 @@ dependencies = [
  "futures",
  "hickory-resolver",
  "hkdf 0.13.0",
+ "imap-proto",
  "keyring",
  "lettre",
  "libsqlite3-sys",

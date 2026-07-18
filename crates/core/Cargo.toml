@@ -25,6 +25,7 @@ chrono.workspace = true
 uuid.workspace = true
 axum.workspace = true
 async-imap.workspace = true
+imap-proto.workspace = true
 futures.workspace = true
 socket2.workspace = true
 tokio-rustls.workspace = true

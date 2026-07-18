@@ -209,9 +209,6 @@
         setInterval(() => releaseSnoozed().catch(console.error), 30000);
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
-        // Календарь/контакты/задачи тянем сразу при старте, а не только в 5-минутном
-        // интервале ниже - иначе они не появляются до нескольких минут после запуска.
-        window.tm.syncAuxiliaryAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере
         // появления данных, не перезагружая весь WebView.
         [3000, 10000, 30000].forEach(delay => setTimeout(() => window.reloadCoreData().catch(console.error), delay));
@@ -221,7 +218,6 @@
         // изменения ярлыков/удаления, которые не создали новое входящее письмо.
         setInterval(() => {
           window.tm.syncAccounts().catch(console.error);
-          window.tm.syncAuxiliaryAccounts().catch(console.error);
         }, 5 * 60 * 1000);
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
