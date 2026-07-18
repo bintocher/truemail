@@ -5,19 +5,32 @@ function folderIcon(folder){return folder.role==='sent'?'send':folder.role==='dr
 async function openRawViewer(messageId){
   if(messageId==null)return;
   const overlay=document.createElement('div');overlay.className='raw-overlay';
-  overlay.innerHTML=`<div class="raw-box"><div class="raw-head"><button class="btn raw-back">← ${L('Назад','Back')}</button><span class="raw-title">${L('Исходный текст письма','Message source')}</span><button class="btn primary raw-copy">${L('Копировать','Copy')}</button></div><textarea class="raw-text" readonly spellcheck="false"></textarea></div>`;
+  overlay.innerHTML=`<div class="raw-box"><div class="raw-head"><button class="btn raw-back">← ${L('Назад','Back')}</button><span class="raw-title">${L('Исходный текст письма','Message source')}</span><button class="btn raw-eml">${L('Сохранить .eml','Save .eml')}</button><button class="btn primary raw-copy">${L('Копировать','Copy')}</button></div><textarea class="raw-text" readonly spellcheck="false"></textarea></div>`;
   document.body.appendChild(overlay);
   const ta=overlay.querySelector('.raw-text');ta.value=L('Загрузка…','Loading…');
   try{ta.value=await window.tm.messageRaw(messageId);}catch(error){ta.value=error.message||String(error);}
   function close(){overlay.remove();document.removeEventListener('keydown',key);}
   function key(e){if(e.key==='Escape')close();}
   overlay.querySelector('.raw-back').onclick=close;
+  overlay.querySelector('.raw-eml').onclick=()=>saveMessageAsEml(messageId);
   overlay.querySelector('.raw-copy').onclick=async()=>{
     try{await navigator.clipboard.writeText(ta.value);}catch{ta.select();document.execCommand('copy');}
     showToast(L('Исходный текст скопирован','Source copied'));
   };
   overlay.onclick=e=>{if(e.target===overlay)close();};
   document.addEventListener('keydown',key);
+}
+// Сохранить письмо на диск как .eml: raw MIME через готовую команду ядра.
+async function saveMessageAsEml(messageId){
+  if(messageId==null)return;
+  const message=(activeMessage&&activeMessage.id===messageId)?activeMessage:messages.find(item=>item.id===messageId);
+  const base=String(message?.subject||'message').replace(/[\\/:*?"<>|\r\n\t]+/g,'_').trim().slice(0,80)||'message';
+  try{
+    const path=await window.tm.saveFileDialog(`${base}.eml`);
+    if(!path)return;
+    await window.tm.exportMessageEml(messageId,path);
+    showToast(L('Письмо сохранено как .eml','Message saved as .eml'));
+  }catch(error){showToast(error.message||String(error));}
 }
 const isImageAttachment=att=>String(att.mime_type||'').toLowerCase().startsWith('image/');
 // Компактная панель вложений над телом: 1 строка плашек, "ещё +N" с разворотом.

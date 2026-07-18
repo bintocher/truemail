@@ -175,11 +175,12 @@ function buildContextMenu(){
   ctxmenu.innerHTML='';
   tbActions.forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
   const sep=document.createElement('div');sep.className='tmsep';ctxmenu.appendChild(sep);
-  (smartIsEnglish()?[['flag','flag','Flag'],['raw','edit','View source'],['create-rule','filter','Create rule']]:[['flag','flag','Флажок'],['raw','edit','Исходный текст'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;ctxmenu.appendChild(item);});
+  (smartIsEnglish()?[['flag','flag','Flag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Флажок'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;ctxmenu.appendChild(item);});
   renderIcons(ctxmenu);
 }
 ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;ctxmenu.classList.remove('open');const action=item.dataset.contextAction;
   if(action==='raw'){openRawViewer(activeMessage?.id);return;}
+  if(action==='eml'){saveMessageAsEml(activeMessage?.id);return;}
   if(action==='create-rule'){openRuleEditor(activeMessage);return;}
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
   executeToolbarAction(action);
