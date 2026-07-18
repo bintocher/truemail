@@ -142,7 +142,7 @@
   .msg:hover{background:var(--hover);} .msg.active{background:var(--active);}
   .msg.active::before{content:"";position:absolute;left:0;top:10px;width:3px;height:36px;background:var(--accent);border-radius:0 3px 3px 0;}
   .avawrap{position:relative;width:32px;height:32px;flex:none;}
-  .ava{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:#fff;font-weight:600;font-size:12px;}
+  .ava{width:32px;height:32px;border-radius:8px;display:grid;place-items:center;color:#fff;font-weight:600;font-size:12px;flex-shrink:0;}
   .avawrap .abadge{position:absolute;right:-2px;bottom:-2px;width:11px;height:11px;border-radius:4px;border:2px solid var(--bg);}
   .msg .body{min-width:0;} .msg .l1{display:flex;align-items:center;gap:7px;}
   .msg .from{font-weight:550;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}

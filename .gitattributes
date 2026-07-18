@@ -1,2 +1,6 @@
 crates/core/migrations/*.sql text eol=lf
 *.rs text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.js text eol=lf
