@@ -535,7 +535,7 @@ async fn gmail_realtime_loop(
         let accounts = match core.db.list_accounts().await {
             Ok(accounts) => accounts,
             Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
             }
         };

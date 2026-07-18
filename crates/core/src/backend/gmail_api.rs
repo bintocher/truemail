@@ -17,10 +17,11 @@ const GMAIL_BASE: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 // Cold start must establish historyId quickly enough for the realtime loop.
 // Backfill therefore advances by one small, persisted page per sync instead
 // of attempting to download the whole mailbox before saving the cursor.
-// Raw MIME includes attachments and one message can already be large. Keep
-// backfill to one item per pass so archive hydration cannot monopolize the
-// account actor or delay realtime history processing beyond the UI SLO.
-const BACKFILL_PAGE_SIZE: u32 = 1;
+// Backfill тянет только metadata писем (raw качается лениво при открытии),
+// поэтому страницу можно укрупнить: клиентский токен-бакет держит суммарный
+// поток под лимитом Gmail, а крупная страница убирает обвязку labels/history на
+// каждое письмо при холодной загрузке архива.
+const BACKFILL_PAGE_SIZE: u32 = 25;
 const MESSAGE_GET_CONCURRENCY: usize = 2;
 const MESSAGE_GETS_PER_QUOTA_WINDOW: usize = 200;
 const QUOTA_WINDOW: Duration = Duration::from_secs(60);
@@ -67,6 +68,74 @@ impl GmailRequestGate {
 
 fn gmail_request_gate() -> &'static tokio::sync::Mutex<GmailRequestGate> {
     GMAIL_REQUEST_GATE.get_or_init(|| tokio::sync::Mutex::new(GmailRequestGate::default()))
+}
+
+// Клиентский ограничитель частоты под лимит Gmail: 250 quota units на
+// пользователя в секунду. Держим равномерный поток с запасом (пополнение ниже
+// потолка), чтобы залпы get/list/history не выбивали длинный серверный
+// Retry-After. Токен-бакет глобальный: у типичного пользователя один-два Gmail,
+// а суммарный поток так гарантированно не превысит per-user лимит.
+const QUOTA_UNITS_PER_SEC: f64 = 200.0;
+const QUOTA_BUCKET_CAPACITY: f64 = 250.0;
+
+static GMAIL_QUOTA_BUCKET: OnceLock<tokio::sync::Mutex<QuotaBucket>> = OnceLock::new();
+
+struct QuotaBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl QuotaBucket {
+    fn take(&mut self, cost: f64, now: Instant) -> Option<Duration> {
+        let elapsed = now.saturating_duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * QUOTA_UNITS_PER_SEC).min(QUOTA_BUCKET_CAPACITY);
+        self.last_refill = now;
+        if self.tokens >= cost {
+            self.tokens -= cost;
+            None
+        } else {
+            Some(Duration::from_secs_f64((cost - self.tokens) / QUOTA_UNITS_PER_SEC))
+        }
+    }
+}
+
+fn gmail_quota_bucket() -> &'static tokio::sync::Mutex<QuotaBucket> {
+    GMAIL_QUOTA_BUCKET.get_or_init(|| {
+        tokio::sync::Mutex::new(QuotaBucket {
+            tokens: QUOTA_BUCKET_CAPACITY,
+            last_refill: Instant::now(),
+        })
+    })
+}
+
+// Стоимость метода Gmail в quota units по официальному прайслисту.
+fn request_quota_cost(url: &Url) -> f64 {
+    let path = url.path();
+    if path.contains("/history") {
+        2.0
+    } else if path.ends_with("/profile") || path.contains("/labels") {
+        1.0
+    } else if path.ends_with("/send") {
+        100.0
+    } else {
+        // messages.list, messages.get, modify/trash и прочее - 5 units.
+        5.0
+    }
+}
+
+// Дождаться, пока в бакете накопится cost units, затем списать их. Ожидание
+// идёт вне gate-мьютекса, поэтому не блокирует учёт серверного Retry-After.
+async fn gmail_acquire_quota(cost: f64) {
+    loop {
+        let wait = {
+            let mut bucket = gmail_quota_bucket().lock().await;
+            bucket.take(cost, Instant::now())
+        };
+        match wait {
+            None => return,
+            Some(delay) => tokio::time::sleep(delay).await,
+        }
+    }
 }
 
 // Gmail отдаёт поле raw как base64url, но для части писем - с padding '='.
@@ -316,8 +385,14 @@ async fn execute_request(
     allow_not_found: bool,
 ) -> Result<Option<Response>> {
     let may_retry = method == Method::GET;
+    let cost = request_quota_cost(&url);
     let mut attempt = 0;
     loop {
+        // Клиентский throttle: не отправляем запрос, пока в бакете не наберётся
+        // его стоимость. Ждём ДО взятия gate, чтобы sleep не сериализовал учёт
+        // серверного Retry-After. Каждый повтор (retry) тратит кванты заново -
+        // это новый HTTP-запрос.
+        gmail_acquire_quota(cost).await;
         // Keep request initiation process-wide serial. Most importantly, a
         // second startup/realtime task waiting here observes a quota deadline
         // set by the first 429 and never sends another HTTP request.
