@@ -185,9 +185,16 @@ pub struct ApiError {
 
 impl From<truemail_core::Error> for ApiError {
     fn from(e: truemail_core::Error) -> Self {
-        ApiError {
-            message: e.to_string(),
+        let message = e.to_string();
+        // Единая точка: любая ошибка ядра, уходящая в UI, попадает и в лог.
+        // RateLimited - ожидаемый локальный троттлинг, а не сбой, поэтому info.
+        match &e {
+            truemail_core::Error::RateLimited {
+                backend, retry_at, ..
+            } => tracing::info!(backend = %backend, retry_at = %retry_at, "{message}"),
+            _ => tracing::warn!(error = %message, "команда вернула ошибку в UI"),
         }
+        ApiError { message }
     }
 }
 
