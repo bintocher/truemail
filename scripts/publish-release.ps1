@@ -5,6 +5,8 @@ param(
     [string]$Directory
 )
 
+# ASCII-only: Windows PowerShell 5.1 reads .ps1 without BOM as ANSI, so any
+# Cyrillic here would corrupt parsing on the runner. Keep messages in English.
 $ErrorActionPreference = 'Stop'
 $owner = 'chernov'
 $repo = 'truemail'
@@ -12,10 +14,10 @@ $api = 'https://api.gitverse.ru'
 $accept = 'application/vnd.gitverse.object+json;version=1'
 
 if (-not $env:TOKEN) {
-    throw 'TOKEN не задан: добавьте секрет TRUEMAIL_GITVERSE_TOKEN'
+    throw 'TOKEN is not set: add the TRUEMAIL_GITVERSE_TOKEN secret'
 }
 if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
-    throw "Каталог пакетов не найден: $Directory"
+    throw "Package directory not found: $Directory"
 }
 
 $headers = @{
@@ -40,7 +42,7 @@ function Get-Release {
     $releases = @(Invoke-GitVerse "$api/repos/$owner/$repo/releases")
     $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
     if (-not $release) {
-        throw "Релиз $Tag не найден: Linux job должен создать его первым"
+        throw "Release $Tag not found: the Linux job must create it first"
     }
     $release
 }
@@ -51,17 +53,17 @@ function Get-Assets([object]$Release) {
 
 function Add-Asset([long]$ReleaseId, [System.IO.FileInfo]$File, [string[]]$ExistingNames) {
     if ($ExistingNames -contains $File.Name) {
-        Write-Host "Файл $($File.Name) уже есть в релизе"
+        Write-Host "Asset $($File.Name) already in release"
         return
     }
-    Write-Host "Загружаю $($File.Name)"
+    Write-Host "Uploading $($File.Name)"
     & curl.exe --silent --show-error --fail-with-body `
         -H "Authorization: Bearer $env:TOKEN" `
         -H "Accept: $accept" `
         -X POST "$api/repos/$owner/$repo/releases/$ReleaseId/assets" `
         -F "attachment=@$($File.FullName)" -F "name=$($File.Name)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "Не удалось загрузить $($File.Name)"
+        throw "Failed to upload $($File.Name)"
     }
 }
 
@@ -71,13 +73,13 @@ function Read-AssetText([object]$Asset) {
 }
 
 function New-Platform([object[]]$Assets, [string]$PackagePattern) {
-    $package = $Assets | Where-Object { $_.name -like $PackagePattern -and $_.name -notlike '*.sig' } |
+    $package = $Assets | Where-Object { $_.name -like $PackagePattern -and $_.name -notlike '*.sig*' } |
         Select-Object -First 1
     if (-not $package) { return $null }
-    # Подписи заливаются под .sig.txt (GitVerse отклоняет расширение .sig).
+    # Signatures are uploaded as .sig.txt (GitVerse rejects the .sig extension).
     $signature = $Assets | Where-Object { $_.name -eq "$($package.name).sig.txt" } | Select-Object -First 1
     if (-not $signature) {
-        throw "Для $($package.name) не найдена подпись"
+        throw "Signature not found for $($package.name)"
     }
     [ordered]@{
         signature = Read-AssetText $signature
@@ -86,7 +88,7 @@ function New-Platform([object[]]$Assets, [string]$PackagePattern) {
 }
 
 $release = Get-Release
-# GitVerse отклоняет расширение .sig (400) - заливаем подписи как .sig.txt.
+# GitVerse rejects the .sig extension (400) - upload signatures as .sig.txt.
 Get-ChildItem -LiteralPath $Directory -Filter *.sig | ForEach-Object {
     Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).txt"
 }
@@ -98,19 +100,19 @@ Get-ChildItem -LiteralPath $Directory -File | ForEach-Object {
 
 $assets = Get-Assets $release
 $windows = New-Platform $assets '*.exe'
-if (-not $windows) { throw 'Windows updater package не найден в релизе' }
+if (-not $windows) { throw 'Windows updater package not found in release' }
 $platforms = [ordered]@{ 'windows-x86_64' = $windows }
 $linux = New-Platform $assets '*.AppImage'
 if ($linux) { $platforms['linux-x86_64'] = $linux }
-# macOS Apple Silicon: updater берёт .app.tar.gz и его подпись. Ключ darwin-aarch64
-# соответствует arm64-сборке из macos job.
+# macOS Apple Silicon: updater uses .app.tar.gz and its signature. The key
+# darwin-aarch64 matches the arm64 build from the macos job.
 $macos = New-Platform $assets '*.app.tar.gz'
 if ($macos) { $platforms['darwin-aarch64'] = $macos }
 
 $version = $Tag.TrimStart('v')
 $manifest = [ordered]@{
     version = $version
-    notes = "Обновление truemail $Tag"
+    notes = "truemail update $Tag"
     pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
     platforms = $platforms
 }
@@ -125,8 +127,8 @@ $manifestPath = Join-Path $Directory 'latest.json'
 $existingNames = @($assets | ForEach-Object { $_.name })
 Add-Asset $release.id (Get-Item -LiteralPath $manifestPath) $existingNames
 
-# GitVerse Pages уже публикует website/. Обновляем только манифест, а [skip ci]
-# не запускает повторную сборку релиза из служебного коммита.
+# GitVerse Pages already serves website/. Update only the manifest; [skip ci]
+# avoids triggering another release build from this service commit.
 $contentUri = "$api/repos/$owner/$repo/contents/website/latest.json?ref=master"
 $current = Invoke-GitVerse $contentUri
 $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$manifestJson`n"))
@@ -138,4 +140,4 @@ Invoke-GitVerse "$api/repos/$owner/$repo/contents/website/latest.json" 'Put' ([o
     signoff = $false
 }) | Out-Null
 
-Write-Host "Релиз $Tag дополнен, latest.json опубликован"
+Write-Host "Release $Tag updated, latest.json published"
