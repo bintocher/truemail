@@ -13,6 +13,10 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     env:
       OPENSSL_NO_VENDOR: 1
+      # linuxdeploy собирает AppImage через FUSE-монтирование, а в LXC-раннере
+      # FUSE недоступен. Эта переменная переключает AppImage-инструменты на
+      # распаковку вместо монтирования - иначе "failed to run linuxdeploy".
+      APPIMAGE_EXTRACT_AND_RUN: "1"
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
