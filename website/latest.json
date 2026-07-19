@@ -1,15 +1,19 @@
 {
-  "version": "0.1.0",
-  "notes": "Текущая версия канала обновлений truemail.",
-  "pub_date": "2026-07-17T00:00:00Z",
+  "version": "0.1.3",
+  "notes": "truemail update v0.1.3",
+  "pub_date": "2026-07-19T22:20:37Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRTzJDSDNXTjdXdmNDcGRzT0xXOThuY0plR3d6Rkd6SVo4UWNrUjY5aTdzSHdFc0Fpa2FPWlBKcE5CR0xmR2sxZlpOQ1ozNEJyZ0RtZCtBUmdFRnFhTU82MEJKeEhCT0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3NzYxCWZpbGU6dHJ1ZW1haWwtdXBkYXRlLmtleS5wdWIKZmxjeFYwSllIZXVrL0V1cDVaZ3lXS0s1UzZ5c1VYVDZoeUhtSERyTTZvVmRkZEN0MmF5NVpVM0tZS0tNTTRrZHlpTmRWMnBSSFZybytuMGhJZlB5QXc9PQo=",
-      "url": "https://chernov.gitverse.site/truemail/"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTcEdhQWppYkhFRlp4S0xucWoxWnVLVFQ0TEh6N0gxVDh6WTd2NFoxU0xROTZVUk1iRld3UFcxVUVWSTRUb3NRMnhYbFIzQ1lXS2VzcXcrMmhPZXhPY0tiaS83U2FpQVFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDk5NDY0CWZpbGU6dHJ1ZW1haWxfMC4xLjNfeDY0LXNldHVwLmV4ZQpOSmZNUXJ1Vkg1cnZCSkFRVHpuZFRpT2krRzVpZWRWRUxHUHl1cTdsbUdhMXd4Q01wSUR6VTNnbXl1a3JONkk3TWxTTWV3WFlOVjR0UGJPdVBSRFBEUT09Cg==",
+      "url": "https://gitverse.ru/api/attachments/5e78b8ea-3d94-4b75-b8be-bb826b8b332a"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRTzJDSDNXTjdXdmNDcGRzT0xXOThuY0plR3d6Rkd6SVo4UWNrUjY5aTdzSHdFc0Fpa2FPWlBKcE5CR0xmR2sxZlpOQ1ozNEJyZ0RtZCtBUmdFRnFhTU82MEJKeEhCT0FzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3NzYxCWZpbGU6dHJ1ZW1haWwtdXBkYXRlLmtleS5wdWIKZmxjeFYwSllIZXVrL0V1cDVaZ3lXS0s1UzZ5c1VYVDZoeUhtSERyTTZvVmRkZEN0MmF5NVpVM0tZS0tNTTRrZHlpTmRWMnBSSFZybytuMGhJZlB5QXc9PQo=",
-      "url": "https://chernov.gitverse.site/truemail/"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTcEdhQWppYkhFRlZBZExORy95aDJva2pocTQzVE9UMGd4a3RlMnRMVEJoMk10bkNVY3hCMGcweUtKZVJLcUROams4bDR0VHZqR2IrRjNyeWZ2eFJrSURaalN4LytxTHd3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDU5NjU3CWZpbGU6dHJ1ZW1haWxfMC4xLjNfYW1kNjQuQXBwSW1hZ2UKVGxHdVJVOUx4VTVJaVllTDIxcUdBK1hLYnVqRWt2OVd0cWpidUMwWkg3V1dYQTBFOVVJdjZLdzI3MFVIN1diSjI3Z3Bsc05seFY5RTZJTzlNVHJtRGc9PQo=",
+      "url": "https://gitverse.ru/api/attachments/6c26c81d-7a42-4e51-8e1e-d8364d1174d2"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTcEdhQWppYkhFRlhsbjAwWVpPV1JUQmlhVTdFcVdLWlppZ2hvZENiSTNXbFhNMXBEM3dIaU5EWnFSSERlZVlKWXVXYWNkbWcwakJjRHVLYytodHA1cWFYZE1JV0xQL0EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDYwMDU2CWZpbGU6dHJ1ZW1haWwuYXBwLnRhci5negpJUU5zdHRnbVRXV0Q0ZndrTmV4QUFia3ljL2czSXpDeElmUkxOazlvV1FNYWc4V2g4WmdTRVJUOWNDcTFqbTlwN1hEN3dienZXN3dXenJmQzg1Q2tDUT09Cg==",
+      "url": "https://gitverse.ru/api/attachments/7c9402b9-85bf-4b7d-9b38-24ad17040be9"
     }
   }
 }
