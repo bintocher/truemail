@@ -74,7 +74,8 @@ function New-Platform([object[]]$Assets, [string]$PackagePattern) {
     $package = $Assets | Where-Object { $_.name -like $PackagePattern -and $_.name -notlike '*.sig' } |
         Select-Object -First 1
     if (-not $package) { return $null }
-    $signature = $Assets | Where-Object { $_.name -eq "$($package.name).sig" } | Select-Object -First 1
+    # Подписи заливаются под .sig.txt (GitVerse отклоняет расширение .sig).
+    $signature = $Assets | Where-Object { $_.name -eq "$($package.name).sig.txt" } | Select-Object -First 1
     if (-not $signature) {
         throw "Для $($package.name) не найдена подпись"
     }
@@ -85,6 +86,10 @@ function New-Platform([object[]]$Assets, [string]$PackagePattern) {
 }
 
 $release = Get-Release
+# GitVerse отклоняет расширение .sig (400) - заливаем подписи как .sig.txt.
+Get-ChildItem -LiteralPath $Directory -Filter *.sig | ForEach-Object {
+    Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).txt"
+}
 $existingAssets = Get-Assets $release
 $existingNames = @($existingAssets | ForEach-Object { $_.name })
 Get-ChildItem -LiteralPath $Directory -File | ForEach-Object {

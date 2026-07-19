@@ -58,10 +58,17 @@ import json, sys
 print("\n".join(a.get("name", "") for a in json.load(sys.stdin)))')
 
 # deb и rpm GitVerse не принимает как файлы релиза (400), поэтому пакуем их
-# в tar.gz. AppImage, dmg, app.tar.gz и подписи заливаются как есть.
+# в tar.gz. AppImage, dmg, app.tar.gz заливаются как есть.
 shopt -s nullglob
 for pkg in "$DIR"/*.deb "$DIR"/*.rpm; do
   (cd "$DIR" && tar czf "$(basename "$pkg").tar.gz" "$(basename "$pkg")" && rm -f "$(basename "$pkg")")
+done
+
+# Расширение .sig GitVerse тоже отклоняет (400). Подписи updater нужны только
+# как текст в latest.json, поэтому заливаем их под .sig.txt (publish-release.ps1
+# читает их по этому имени при сборке манифеста).
+for sig in "$DIR"/*.sig; do
+  mv "$sig" "$sig.txt"
 done
 
 files=("$DIR"/*)
