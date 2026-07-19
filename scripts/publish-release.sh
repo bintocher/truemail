@@ -37,9 +37,20 @@ print(match[0]["id"] if match else "")')
 
 if [ -z "$release_id" ]; then
   echo "Создаю релиз $TAG"
+  # Описание релиза - список изменений из docs/RELEASE_NOTES.md (обновляется
+  # перед выпуском). Fallback, если файла нет.
+  notes_file="$(dirname "$0")/../docs/RELEASE_NOTES.md"
+  body=$(TAG="$TAG" python3 -c '
+import json, os, sys
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8").read().strip()
+except OSError:
+    text = "truemail " + os.environ["TAG"]
+print(json.dumps(text))' "$notes_file")
   release=$(api -X POST "$API/repos/$OWNER/$REPO/releases" \
     -H 'Content-Type: application/json' \
-    -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":\"Сборки truemail для Linux, Windows и macOS.\",\"is_authorized_only\":false}")
+    -d "{\"tag_name\":\"$TAG\",\"name\":\"truemail $TAG\",\"body\":$body,\"is_authorized_only\":false}")
   release_id=$(printf '%s' "$release" | python3 -c '
 import json, sys
 print(json.load(sys.stdin).get("id", ""))')
