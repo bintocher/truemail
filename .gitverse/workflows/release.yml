@@ -74,9 +74,8 @@ jobs:
 
   macos:
     # Нативная arm64-сборка на Apple Silicon: .dmg для установки и .app.tar.gz
-    # для встроенного updater. Идёт после Linux, чтобы дополнить общий релиз, и
-    # до Windows, который собирает latest.json уже со всеми платформами.
-    needs: linux
+    # для встроенного updater. Идёт ПАРАЛЛЕЛЬНО с linux/windows на своём раннере;
+    # publish-release.sh идемпотентен (создаёт релиз или дополняет).
     runs-on: [self-hosted, macos, arm64]
     env:
       # Без CI=true bundle_dmg.sh оформляет окно DMG через Finder/AppleScript и
@@ -120,10 +119,8 @@ jobs:
           rm -rf dist target/release/bundle
 
   windows:
-    # Windows-сборка идёт после Linux и macOS: они наполняют общий релиз своими
-    # артефактами, а Windows добавляет NSIS и публикует latest.json со всеми
-    # платформами (linux/macos/windows) для встроенного updater.
-    needs: [linux, macos]
+    # NSIS-инсталлятор. Идёт ПАРАЛЛЕЛЬНО с linux/macos на своём раннере, заливает
+    # свои артефакты в общий релиз. latest.json собирает отдельный job manifest.
     runs-on: [self-hosted, windows, x64]
     defaults:
       run:
@@ -166,8 +163,30 @@ jobs:
           }
           Get-ChildItem dist | Format-Table Name, Length
 
-      - name: Дополнить релиз и опубликовать latest.json
+      - name: Публикация релиза
         env:
           TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
           TAG: ${{ steps.version.outputs.tag }}
         run: .\scripts\publish-release.ps1 -Tag $env:TAG -Directory dist
+
+      - name: Убрать за собой
+        if: always()
+        run: Remove-Item -Recurse -Force dist, target\release\bundle -EA 0
+
+  manifest:
+    # Собирает updater latest.json из артефактов ВСЕХ платформ. Единственный job
+    # с зависимостью - он должен видеть уже загруженные пакеты linux/macos/windows.
+    needs: [linux, macos, windows]
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+      - name: Собрать и опубликовать latest.json
+        env:
+          TOKEN: ${{ secrets.TRUEMAIL_GITVERSE_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: bash scripts/publish-manifest.sh "$TAG"

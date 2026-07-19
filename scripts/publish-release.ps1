@@ -5,8 +5,10 @@ param(
     [string]$Directory
 )
 
-# ASCII-only: Windows PowerShell 5.1 reads .ps1 without BOM as ANSI, so any
-# Cyrillic here would corrupt parsing on the runner. Keep messages in English.
+# Заливает артефакты Windows-сборки в релиз. latest.json собирает отдельный job
+# manifest (publish-manifest.sh) из артефактов всех платформ.
+# ASCII-only: Windows PowerShell 5.1 читает .ps1 без BOM как ANSI, кириллица
+# сломала бы парсинг на раннере.
 $ErrorActionPreference = 'Stop'
 $owner = 'chernov'
 $repo = 'truemail'
@@ -25,26 +27,23 @@ $headers = @{
     Accept = $accept
 }
 
-function Invoke-GitVerse([string]$Uri, [string]$Method = 'Get', [object]$Body = $null) {
-    $arguments = @{
-        Uri = $Uri
-        Method = $Method
-        Headers = $headers
-    }
-    if ($null -ne $Body) {
-        $arguments.ContentType = 'application/json'
-        $arguments.Body = $Body | ConvertTo-Json -Depth 10 -Compress
-    }
-    Invoke-RestMethod @arguments
+function Invoke-GitVerse([string]$Uri) {
+    Invoke-RestMethod -Uri $Uri -Method Get -Headers $headers
 }
 
 function Get-Release {
     $releases = @(Invoke-GitVerse "$api/repos/$owner/$repo/releases")
     $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
-    if (-not $release) {
-        throw "Release $Tag not found: the Linux job must create it first"
-    }
-    $release
+    if ($release) { return $release }
+    # Релиза ещё нет (linux/macos сборки идут параллельно) - создаём его.
+    $body = @{
+        tag_name = $Tag
+        name = "truemail $Tag"
+        body = "truemail $Tag"
+        is_authorized_only = $false
+    } | ConvertTo-Json -Compress
+    Invoke-RestMethod -Uri "$api/repos/$owner/$repo/releases" -Method Post `
+        -Headers $headers -ContentType 'application/json' -Body $body
 }
 
 function Get-Assets([object]$Release) {
@@ -67,87 +66,13 @@ function Add-Asset([long]$ReleaseId, [System.IO.FileInfo]$File, [string[]]$Exist
     }
 }
 
-function Read-AssetText([object]$Asset) {
-    $response = Invoke-WebRequest -Uri $Asset.browser_download_url -Headers $headers -UseBasicParsing
-    $response.Content.Trim()
-}
-
-function New-Platform([object[]]$Assets, [string]$PackagePattern) {
-    $package = $Assets | Where-Object { $_.name -like $PackagePattern -and $_.name -notlike '*.sig*' } |
-        Select-Object -First 1
-    if (-not $package) { return $null }
-    # Signatures are uploaded as .sig.txt (GitVerse rejects .sig). The Windows
-    # installer is wrapped in .zip (GitVerse rejects .exe), but its signature
-    # belongs to the .exe inside, so strip a trailing .zip to find the .sig.txt.
-    $sigBase = $package.name -replace '\.zip$', ''
-    $signature = $Assets | Where-Object { $_.name -eq "$sigBase.sig.txt" } | Select-Object -First 1
-    if (-not $signature) {
-        throw "Signature not found for $($package.name)"
-    }
-    [ordered]@{
-        signature = Read-AssetText $signature
-        url = $package.browser_download_url
-    }
-}
-
 $release = Get-Release
 # GitVerse rejects the .sig extension (400) - upload signatures as .sig.txt.
 Get-ChildItem -LiteralPath $Directory -Filter *.sig | ForEach-Object {
     Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).txt"
 }
-$existingAssets = Get-Assets $release
-$existingNames = @($existingAssets | ForEach-Object { $_.name })
+$existingNames = @((Get-Assets $release) | ForEach-Object { $_.name })
 Get-ChildItem -LiteralPath $Directory -File | ForEach-Object {
     Add-Asset $release.id $_ $existingNames
 }
-
-$assets = Get-Assets $release
-$windows = New-Platform $assets '*.exe.zip'
-if (-not $windows) { throw 'Windows updater package not found in release' }
-$platforms = [ordered]@{ 'windows-x86_64' = $windows }
-$linux = New-Platform $assets '*.AppImage'
-if ($linux) { $platforms['linux-x86_64'] = $linux }
-# macOS Apple Silicon: updater uses .app.tar.gz and its signature. The key
-# darwin-aarch64 matches the arm64 build from the macos job.
-$macos = New-Platform $assets '*.app.tar.gz'
-if ($macos) { $platforms['darwin-aarch64'] = $macos }
-
-$version = $Tag.TrimStart('v')
-$manifest = [ordered]@{
-    version = $version
-    notes = "truemail update $Tag"
-    pub_date = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-    platforms = $platforms
-}
-$manifestJson = $manifest | ConvertTo-Json -Depth 10
-$manifestPath = Join-Path $Directory 'latest.json'
-[System.IO.File]::WriteAllText(
-    [System.IO.Path]::GetFullPath($manifestPath),
-    "$manifestJson`n",
-    [System.Text.UTF8Encoding]::new($false)
-)
-
-$existingNames = @($assets | ForEach-Object { $_.name })
-Add-Asset $release.id (Get-Item -LiteralPath $manifestPath) $existingNames
-
-# GitVerse Pages already serves website/. Update only the manifest; [skip ci]
-# avoids triggering another release build from this service commit. If the file
-# does not exist yet, create it (no sha). Any failure here is non-fatal - the
-# release assets (including latest.json) are already published above.
-$contentUri = "$api/repos/$owner/$repo/contents/website/latest.json?ref=master"
-try {
-    $current = $null
-    try { $current = Invoke-GitVerse $contentUri } catch { $current = $null }
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$manifestJson`n"))
-    $putBody = [ordered]@{
-        branch = 'master'
-        content = $encoded
-        message = "chore: publish updater manifest for $Tag [skip ci]"
-        signoff = $false
-    }
-    if ($current -and $current.sha) { $putBody.sha = $current.sha }
-    Invoke-GitVerse "$api/repos/$owner/$repo/contents/website/latest.json" 'Put' $putBody | Out-Null
-    Write-Host "Release $Tag updated, latest.json published"
-} catch {
-    Write-Host "Warning: could not update website/latest.json ($_). Release assets are published."
-}
+Write-Host "Windows artifacts published to release $Tag"
