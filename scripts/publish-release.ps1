@@ -76,8 +76,11 @@ function New-Platform([object[]]$Assets, [string]$PackagePattern) {
     $package = $Assets | Where-Object { $_.name -like $PackagePattern -and $_.name -notlike '*.sig*' } |
         Select-Object -First 1
     if (-not $package) { return $null }
-    # Signatures are uploaded as .sig.txt (GitVerse rejects the .sig extension).
-    $signature = $Assets | Where-Object { $_.name -eq "$($package.name).sig.txt" } | Select-Object -First 1
+    # Signatures are uploaded as .sig.txt (GitVerse rejects .sig). The Windows
+    # installer is wrapped in .zip (GitVerse rejects .exe), but its signature
+    # belongs to the .exe inside, so strip a trailing .zip to find the .sig.txt.
+    $sigBase = $package.name -replace '\.zip$', ''
+    $signature = $Assets | Where-Object { $_.name -eq "$sigBase.sig.txt" } | Select-Object -First 1
     if (-not $signature) {
         throw "Signature not found for $($package.name)"
     }
@@ -99,7 +102,7 @@ Get-ChildItem -LiteralPath $Directory -File | ForEach-Object {
 }
 
 $assets = Get-Assets $release
-$windows = New-Platform $assets '*.exe'
+$windows = New-Platform $assets '*.exe.zip'
 if (-not $windows) { throw 'Windows updater package not found in release' }
 $platforms = [ordered]@{ 'windows-x86_64' = $windows }
 $linux = New-Platform $assets '*.AppImage'
@@ -128,16 +131,23 @@ $existingNames = @($assets | ForEach-Object { $_.name })
 Add-Asset $release.id (Get-Item -LiteralPath $manifestPath) $existingNames
 
 # GitVerse Pages already serves website/. Update only the manifest; [skip ci]
-# avoids triggering another release build from this service commit.
+# avoids triggering another release build from this service commit. If the file
+# does not exist yet, create it (no sha). Any failure here is non-fatal - the
+# release assets (including latest.json) are already published above.
 $contentUri = "$api/repos/$owner/$repo/contents/website/latest.json?ref=master"
-$current = Invoke-GitVerse $contentUri
-$encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$manifestJson`n"))
-Invoke-GitVerse "$api/repos/$owner/$repo/contents/website/latest.json" 'Put' ([ordered]@{
-    branch = 'master'
-    content = $encoded
-    sha = $current.sha
-    message = "chore: publish updater manifest for $Tag [skip ci]"
-    signoff = $false
-}) | Out-Null
-
-Write-Host "Release $Tag updated, latest.json published"
+try {
+    $current = $null
+    try { $current = Invoke-GitVerse $contentUri } catch { $current = $null }
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("$manifestJson`n"))
+    $putBody = [ordered]@{
+        branch = 'master'
+        content = $encoded
+        message = "chore: publish updater manifest for $Tag [skip ci]"
+        signoff = $false
+    }
+    if ($current -and $current.sha) { $putBody.sha = $current.sha }
+    Invoke-GitVerse "$api/repos/$owner/$repo/contents/website/latest.json" 'Put' $putBody | Out-Null
+    Write-Host "Release $Tag updated, latest.json published"
+} catch {
+    Write-Host "Warning: could not update website/latest.json ($_). Release assets are published."
+}

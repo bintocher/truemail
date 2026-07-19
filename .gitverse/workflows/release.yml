@@ -157,6 +157,13 @@ jobs:
             Copy-Item -Destination dist
           if (-not (Get-ChildItem dist -Filter '*.exe')) { throw 'NSIS installer not found' }
           if (-not (Get-ChildItem dist -Filter '*.exe.sig')) { throw 'NSIS signature not found' }
+          # GitVerse отклоняет расширение .exe (400), поэтому пакуем инсталлятор
+          # в .zip. Tauri updater для windows распаковывает .zip и проверяет .exe
+          # его подписью (.exe.sig), поэтому подпись сохраняем как есть.
+          Get-ChildItem dist -Filter '*.exe' | ForEach-Object {
+            Compress-Archive -Path $_.FullName -DestinationPath "$($_.FullName).zip" -Force
+            Remove-Item -LiteralPath $_.FullName -Force
+          }
           Get-ChildItem dist | Format-Table Name, Length
 
       - name: Дополнить релиз и опубликовать latest.json
