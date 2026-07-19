@@ -8,6 +8,11 @@ on:
     branches: [master]
   workflow_dispatch:
 
+# Новый push в master отменяет предыдущий незавершённый релизный прогон.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   linux:
     runs-on: [self-hosted, linux, x64]

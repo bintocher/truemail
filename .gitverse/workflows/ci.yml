@@ -1,13 +1,19 @@
 name: Rust CI
 
-# Проверки идут в dev, где ведётся разработка, и в master - там они последняя
-# защита перед сборкой релиза. Плюс на каждый pull request dev -> master.
+# Проверки идут в dev (разработка) и на каждый pull request dev -> master.
+# На master ci не дублируем: там release.yml всё равно собирает и проверяет.
 on:
   push:
-    branches: [dev, master]
+    branches: [dev]
   pull_request:
     branches: [master]
   workflow_dispatch:
+
+# Новый push в ту же ветку отменяет предыдущий незавершённый прогон - очередь
+# на единственном windows-раннере не копится.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   check:
