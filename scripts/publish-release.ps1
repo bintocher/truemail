@@ -7,8 +7,9 @@ param(
 
 # Заливает артефакты Windows-сборки в релиз. latest.json собирает отдельный job
 # manifest (publish-manifest.sh) из артефактов всех платформ.
-# ASCII-only: Windows PowerShell 5.1 читает .ps1 без BOM как ANSI, кириллица
-# сломала бы парсинг на раннере.
+# Все запросы идут через curl.exe: PowerShell Invoke-RestMethod не отправляет
+# обязательный GitVerse-заголовок Accept ...;version=1 как надо, из-за чего GET
+# возвращает 404. ASCII-only (PS 5.1 читает .ps1 без BOM как ANSI).
 $ErrorActionPreference = 'Stop'
 $owner = 'chernov'
 $repo = 'truemail'
@@ -22,57 +23,52 @@ if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
     throw "Package directory not found: $Directory"
 }
 
-$headers = @{
-    Authorization = "Bearer $env:TOKEN"
-    Accept = $accept
+function Api-Get([string]$Path) {
+    $out = & curl.exe --silent --show-error --fail-with-body `
+        -H "Authorization: Bearer $env:TOKEN" -H "Accept: $accept" "$api$Path"
+    if ($LASTEXITCODE -ne 0) { throw "GET $Path failed: $out" }
+    if (-not $out) { return $null }
+    return $out | ConvertFrom-Json
 }
 
-function Invoke-GitVerse([string]$Uri) {
-    Invoke-RestMethod -Uri $Uri -Method Get -Headers $headers
-}
-
-function Get-Release {
-    $releases = @(Invoke-GitVerse "$api/repos/$owner/$repo/releases")
+function Get-ReleaseId {
+    $releases = @(Api-Get "/repos/$owner/$repo/releases")
     $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
-    if ($release) { return $release }
-    # Релиза ещё нет (linux/macos сборки идут параллельно) - создаём его.
-    $body = @{
-        tag_name = $Tag
-        name = "truemail $Tag"
-        body = "truemail $Tag"
-        is_authorized_only = $false
-    } | ConvertTo-Json -Compress
-    Invoke-RestMethod -Uri "$api/repos/$owner/$repo/releases" -Method Post `
-        -Headers $headers -ContentType 'application/json' -Body $body
-}
-
-function Get-Assets([object]$Release) {
-    @(Invoke-GitVerse "$api/repos/$owner/$repo/releases/$($Release.id)/assets")
-}
-
-function Add-Asset([long]$ReleaseId, [System.IO.FileInfo]$File, [string[]]$ExistingNames) {
-    if ($ExistingNames -contains $File.Name) {
-        Write-Host "Asset $($File.Name) already in release"
-        return
-    }
-    Write-Host "Uploading $($File.Name)"
-    & curl.exe --silent --show-error --fail-with-body `
-        -H "Authorization: Bearer $env:TOKEN" `
-        -H "Accept: $accept" `
-        -X POST "$api/repos/$owner/$repo/releases/$ReleaseId/assets" `
-        -F "attachment=@$($File.FullName)" -F "name=$($File.Name)" | Out-Null
+    if ($release) { return $release.id }
+    # Релиза ещё нет (сборки идут параллельно) - создаём его.
+    $body = "{`"tag_name`":`"$Tag`",`"name`":`"truemail $Tag`",`"body`":`"truemail $Tag`",`"is_authorized_only`":false}"
+    $out = & curl.exe --silent --show-error --fail-with-body `
+        -H "Authorization: Bearer $env:TOKEN" -H "Accept: $accept" `
+        -H "Content-Type: application/json" -X POST -d $body "$api/repos/$owner/$repo/releases"
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to upload $($File.Name)"
+        # Возможна гонка: другой job создал релиз между GET и POST. Перечитываем.
+        $releases = @(Api-Get "/repos/$owner/$repo/releases")
+        $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
+        if ($release) { return $release.id }
+        throw "Failed to create release: $out"
     }
+    return ($out | ConvertFrom-Json).id
 }
 
-$release = Get-Release
+$releaseId = Get-ReleaseId
+
 # GitVerse rejects the .sig extension (400) - upload signatures as .sig.txt.
 Get-ChildItem -LiteralPath $Directory -Filter *.sig | ForEach-Object {
     Rename-Item -LiteralPath $_.FullName -NewName "$($_.Name).txt"
 }
-$existingNames = @((Get-Assets $release) | ForEach-Object { $_.name })
+
+$existing = @(Api-Get "/repos/$owner/$repo/releases/$releaseId/assets") | ForEach-Object { $_.name }
+
 Get-ChildItem -LiteralPath $Directory -File | ForEach-Object {
-    Add-Asset $release.id $_ $existingNames
+    if ($existing -contains $_.Name) {
+        Write-Host "Asset $($_.Name) already in release"
+        return
+    }
+    Write-Host "Uploading $($_.Name)"
+    & curl.exe --silent --show-error --fail-with-body `
+        -H "Authorization: Bearer $env:TOKEN" -H "Accept: $accept" `
+        -X POST "$api/repos/$owner/$repo/releases/$releaseId/assets" `
+        -F "attachment=@$($_.FullName)" -F "name=$($_.Name)" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Failed to upload $($_.Name)" }
 }
 Write-Host "Windows artifacts published to release $Tag"
