@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Собирает updater-манифест latest.json из уже загруженных ассетов релиза и
-# публикует его. Запускается ОТДЕЛЬНЫМ job после параллельных сборок linux/macos/
-# windows - поэтому в релизе к этому моменту есть артефакты всех платформ.
+# Собирает updater-манифест из артефактов релиза и публикует его в
+# website/latest.json (GitVerse Pages = updater endpoint). Запускается отдельным
+# job после параллельных сборок linux/macos/windows.
 #
-# Вызов: publish-manifest.sh <тег>
-# Ожидает TOKEN - токен GitVerse с правом на запись.
+# Вызов: publish-manifest.sh <тег>. Ожидает TOKEN.
+#
+# Особенности GitVerse, вычлененные вручную:
+# - attachments (browser_download_url) отдаются БЕЗ Authorization; с ним 401;
+# - .json нельзя залить как ассет релиза (400), поэтому манифест кладём только
+#   в website/latest.json через contents API.
 set -euo pipefail
 
 TAG="${1:?не указан тег релиза}"
@@ -18,123 +22,74 @@ if [ -z "${TOKEN:-}" ]; then
   exit 1
 fi
 
-api() { curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" "$@"; }
-
-release_id=$(api "$API/repos/$OWNER/$REPO/releases" | TAG="$TAG" python3 -c '
+release_id=$(curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" \
+  "$API/repos/$OWNER/$REPO/releases" | TAG="$TAG" python3 -c '
 import json, os, sys
 tag = os.environ["TAG"]
 m = [r for r in json.load(sys.stdin) if r.get("tag_name") == tag]
 print(m[0]["id"] if m else "")')
-if [ -z "$release_id" ]; then
-  echo "Релиз $TAG не найден" >&2
-  exit 1
-fi
+[ -n "$release_id" ] || { echo "Релиз $TAG не найден" >&2; exit 1; }
 
-assets_json=$(api "$API/repos/$OWNER/$REPO/releases/$release_id/assets")
-
-# Скачать текст ассета-подписи по имени (.sig.txt лежит как обычный файл).
-sig_text() {
-  local url="$1"
-  curl -sSL -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" "$url"
-}
+assets=$(curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" \
+  "$API/repos/$OWNER/$REPO/releases/$release_id/assets")
 
 version="${TAG#v}"
-
-# Собираем platforms{} из троек: ключ платформы, шаблон пакета, шаблон подписи.
-# Подпись windows - от .exe внутри .zip, поэтому .exe.sig.txt (без .zip).
-manifest=$(ASSETS="$assets_json" VER="$version" TAG="$TAG" python3 - "$TOKEN" <<'PY'
-import json, os, sys, urllib.request
-
-token = sys.argv[1]
+manifest=$(ASSETS="$assets" VER="$version" TAG="$TAG" python3 <<'PY'
+import json, os, subprocess, datetime
 assets = json.loads(os.environ["ASSETS"])
-by_name = {a["name"]: a for a in assets}
+by = {a["name"]: a for a in assets}
 
-def find(suffix, exclude=None):
-    for a in assets:
-        n = a["name"]
-        if n.endswith(suffix) and (exclude is None or not n.endswith(exclude)):
-            return a
-    return None
+def dl(url):
+    # Без Authorization - иначе GitVerse отдаёт 401.
+    return subprocess.run(["curl", "-sL", url], capture_output=True, text=True).stdout.strip()
 
-def sig_text(url):
-    req = urllib.request.Request(url, headers={
-        "Authorization": "Bearer " + token,
-        "Accept": "application/vnd.gitverse.object+json;version=1",
-    })
-    with urllib.request.urlopen(req) as r:
-        return r.read().decode("utf-8").strip()
-
-platforms = {}
-# (ключ, пакет-suffix, exclude, база-подписи)
 specs = [
-    ("windows-x86_64", ".exe.zip", None, lambda n: n[:-4]),          # setup.exe.zip -> setup.exe(.sig.txt)
-    ("linux-x86_64",   ".AppImage", None, lambda n: n),
-    ("darwin-aarch64", ".app.tar.gz", None, lambda n: n),
+    ("windows-x86_64", ".exe.zip", lambda n: n[:-4] + ".sig.txt"),   # setup.exe.zip -> setup.exe.sig.txt
+    ("linux-x86_64",   ".AppImage", lambda n: n + ".sig.txt"),
+    ("darwin-aarch64", ".app.tar.gz", lambda n: n + ".sig.txt"),
 ]
-for key, suf, exc, sigbase in specs:
-    pkg = find(suf, exc)
+platforms = {}
+for key, suf, signame in specs:
+    pkg = next((a for a in assets if a["name"].endswith(suf)), None)
     if not pkg:
         continue
-    signame = sigbase(pkg["name"]) + ".sig.txt"
-    sig = by_name.get(signame)
+    sig = by.get(signame(pkg["name"]))
     if not sig:
-        sys.stderr.write("нет подписи %s для %s\n" % (signame, pkg["name"]))
         continue
     platforms[key] = {
-        "signature": sig_text(sig["browser_download_url"]),
+        "signature": dl(sig["browser_download_url"]),
         "url": pkg["browser_download_url"],
     }
-
 if not platforms:
-    sys.stderr.write("не найдено ни одной платформы для манифеста\n")
-    sys.exit(1)
-
-manifest = {
+    raise SystemExit("нет ни одной платформы для манифеста")
+m = {
     "version": os.environ["VER"],
     "notes": "truemail update " + os.environ["TAG"],
-    "pub_date": "1970-01-01T00:00:00Z",
+    "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "platforms": platforms,
 }
-print(json.dumps(manifest, ensure_ascii=False, indent=2))
+print(json.dumps(m, ensure_ascii=False, indent=2))
 PY
 )
 
-# Проставить реальную дату публикации (Python в CI без сети времени берёт из системы).
-manifest=$(printf '%s' "$manifest" | python3 -c '
-import json, sys, datetime
-d = json.load(sys.stdin)
-d["pub_date"] = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-print(json.dumps(d, ensure_ascii=False, indent=2))')
-
 printf '%s\n' "$manifest" > latest.json
-echo "Собран latest.json:"; cat latest.json
+echo "Собран latest.json ($(printf '%s' "$manifest" | python3 -c 'import json,sys;print(", ".join(json.load(sys.stdin)["platforms"]))'))"
 
-# Залить latest.json как ассет (перезаписать, если уже есть).
-existing_id=$(printf '%s' "$assets_json" | python3 -c '
-import json, sys
-m = [a["id"] for a in json.load(sys.stdin) if a["name"] == "latest.json"]
-print(m[0] if m else "")')
-if [ -n "$existing_id" ]; then
-  api -X DELETE "$API/repos/$OWNER/$REPO/releases/$release_id/assets/$existing_id" >/dev/null || true
-fi
-api -X POST "$API/repos/$OWNER/$REPO/releases/$release_id/assets" \
-  -F "attachment=@latest.json" -F "name=latest.json" >/dev/null
-echo "latest.json загружен в релиз"
-
-# Обновить website/latest.json для GitVerse Pages (updater endpoint). Не фатально.
-if content=$(api "$API/repos/$OWNER/$REPO/contents/website/latest.json?ref=master" 2>/dev/null); then
-  sha=$(printf '%s' "$content" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("sha",""))')
-else
-  sha=""
-fi
+# Публикуем только в website/latest.json (updater endpoint). .json нельзя залить
+# ассетом релиза. Обновление или создание файла (sha только если файл есть).
+sha=$(curl -sS -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" \
+  "$API/repos/$OWNER/$REPO/contents/website/latest.json?ref=master" \
+  | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("sha",""))
+except Exception: print("")' 2>/dev/null || true)
 encoded=$(base64 -w0 latest.json 2>/dev/null || base64 latest.json | tr -d '\n')
-body=$(python3 -c '
-import json, sys
-sha = sys.argv[1]
-b = {"branch":"master","content":sys.argv[2],"message":"chore: publish updater manifest for %s [skip ci]" % sys.argv[3],"signoff":False}
-if sha: b["sha"] = sha
-print(json.dumps(b))' "$sha" "$encoded" "$TAG")
-printf '%s' "$body" | api -X PUT -H 'Content-Type: application/json' -d @- \
-  "$API/repos/$OWNER/$REPO/contents/website/latest.json" >/dev/null 2>&1 \
-  && echo "website/latest.json обновлён" \
-  || echo "website/latest.json не обновлён (не фатально)"
+body=$(SHA="$sha" ENC="$encoded" TAG="$TAG" python3 -c '
+import json, os
+b = {"branch":"master","content":os.environ["ENC"],
+     "message":"chore: publish updater manifest for %s [skip ci]" % os.environ["TAG"],"signoff":False}
+if os.environ["SHA"]: b["sha"] = os.environ["SHA"]
+print(json.dumps(b))')
+printf '%s' "$body" | curl -sS --fail-with-body -H "Authorization: Bearer $TOKEN" -H "$ACCEPT" \
+  -H 'Content-Type: application/json' -X PUT -d @- \
+  "$API/repos/$OWNER/$REPO/contents/website/latest.json" >/dev/null
+echo "website/latest.json опубликован"
