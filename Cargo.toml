@@ -66,6 +66,9 @@ libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# thin-LTO вместо full: почти та же оптимизация, но линковка кратно быстрее и
+# параллельная. codegen-units=16 задействует все ядра раннера при компиляции
+# крейта - full LTO + codegen-units=1 были главным тормозом CI-сборки.
+lto = "thin"
+codegen-units = 16
 strip = true
