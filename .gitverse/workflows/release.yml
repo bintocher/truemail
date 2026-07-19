@@ -33,10 +33,14 @@ jobs:
 
       - name: Сборка пакетов
         # deb и rpm - для Debian/Ubuntu и Fedora/CentOS, AppImage - для всех
-        # остальных дистрибутивов, включая Arch.
+        # остальных дистрибутивов, включая Arch. AppImage через linuxdeploy на
+        # LXC нестабилен (flaky FUSE), поэтому он best-effort и не валит релиз -
+        # deb/rpm собираются обязательно, а target уже скомпилирован (второй
+        # вызов только бандлит).
         run: |
           cd apps/desktop/src-tauri
-          cargo tauri build --bundles deb,rpm,appimage
+          cargo tauri build --bundles deb,rpm
+          cargo tauri build --bundles appimage || echo "::warning::AppImage bundle failed (linuxdeploy), continuing without it"
 
       - name: Собрать список пакетов
         id: artifacts
