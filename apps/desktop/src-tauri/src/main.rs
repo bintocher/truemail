@@ -260,11 +260,18 @@ fn run() -> anyhow::Result<()> {
 
             // Не задерживаем старт и не пугаем сетевой ошибкой: при появлении
             // подписанного релиза UI сам предложит установить новую версию.
+            // Проверяем через 8 с после запуска и далее периодически, чтобы
+            // обновление находилось само и без перезапуска приложения.
             let update_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-                if let Err(error) = commands::announce_available_update(update_app).await {
-                    tracing::debug!(error = %error.message, "автопроверка обновлений пропущена");
+                loop {
+                    if let Err(error) =
+                        commands::announce_available_update(update_app.clone()).await
+                    {
+                        tracing::debug!(error = %error.message, "автопроверка обновлений пропущена");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
                 }
             });
             Ok(())
