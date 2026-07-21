@@ -199,6 +199,23 @@ type MessageLocatorRow = (i64, String, i64, Option<String>, i64);
 
 /// Строка метаданных письма для уведомления: id, from_name, from_addr, subject, preview.
 type NotificationPreviewRow = (i64, Option<String>, Option<String>, String, Option<String>);
+
+/// Строка удалённой на сервере встречи: id, summary, dtstart, location,
+/// organizer, число участников. Читается до DELETE - после него участников
+/// уже не сосчитать.
+type DeletedEventRow = (i64, String, String, Option<String>, Option<String>, i64);
+
+/// Что вернул upsert встречи (RETURNING): id, summary, dtstart, dtend, status,
+/// location, organizer. Отсюда берётся и дельта изменений для уведомлений.
+type SavedEventRow = (
+    i64,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 type FolderCursorRow = (
     String,
     Option<i64>,
@@ -1326,8 +1343,7 @@ impl Db {
                 }
                 let track_changes = calendar.sync_scope != crate::account::SyncScope::Full;
                 for remote_url in &calendar.deleted_event_urls {
-                    let deleted: Option<(i64, String, String, Option<String>, Option<String>, i64)> =
-                        sqlx::query_as(
+                    let deleted: Option<DeletedEventRow> = sqlx::query_as(
                             "SELECT e.id, e.summary, e.dtstart, e.location, e.organizer,
                                     (SELECT COUNT(*) FROM event_attendees a WHERE a.event_id = e.id)
                              FROM events e
@@ -1389,15 +1405,7 @@ impl Db {
                     // снёс бы и всех участников - от отменённой встречи не осталось бы
                     // ничего, кроме названия. Поэтому такому событию меняем только статус.
                     let cancel_snippet = event.dtstart.trim().is_empty();
-                    let saved: Option<(
-                        i64,
-                        String,
-                        String,
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                        Option<String>,
-                    )> = if cancel_snippet {
+                    let saved: Option<SavedEventRow> = if cancel_snippet {
                         sqlx::query_as(
                             "UPDATE events SET status=?, etag=COALESCE(?, etag)
                              WHERE calendar_id=? AND uid=?

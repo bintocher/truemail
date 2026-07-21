@@ -1564,10 +1564,10 @@ fn attendees_xml(attendees: &[&Attendee]) -> String {
 }
 
 /// Поля CalendarItem в порядке, требуемом схемой EWS (CalendarItemType
-/// наследует ItemType): Subject/Body/ReminderIsSet/ReminderMinutesBeforeStart
-/// - из общей части ItemType, дальше Start/End/IsAllDayEvent/Location/
-/// RequiredAttendees/OptionalAttendees - уже из calendar-специфичной части.
-/// Для CreateItem все поля идут одним блоком <t:CalendarItem> и порядок
+/// наследует ItemType). Сначала общая часть ItemType: Subject, Body,
+/// ReminderIsSet, ReminderMinutesBeforeStart. Дальше calendar-специфичная:
+/// Start, End, IsAllDayEvent, Location, RequiredAttendees, OptionalAttendees.
+/// Для CreateItem все поля идут одним блоком `t:CalendarItem` и порядок
 /// критичен (нарушение схемы = ErrorSchemaValidation); для UpdateItem тот же
 /// список оборачивается по одному полю на SetItemField, там порядок между
 /// полями уже не важен.

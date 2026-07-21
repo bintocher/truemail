@@ -506,8 +506,8 @@ fn dedupe_notified_keys<T: Eq + std::hash::Hash + Clone>(
 ) -> Vec<T> {
     let fresh: Vec<T> = ids
         .iter()
-        .cloned()
         .filter(|id| !notified.contains(id))
+        .cloned()
         .collect();
     notified.extend(fresh.iter().cloned());
     // Не даём множеству бесконечно расти в течение сессии (тот же приём, что
