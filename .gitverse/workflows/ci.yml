@@ -45,7 +45,10 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     defaults:
       run:
-        shell: powershell
+        # pwsh (PowerShell 7), а не встроенный powershell 5.1: у 5.1 своя
+        # кодировка вывода и другое поведение разворачивания массивов,
+        # из-за которого уже ломалась публикация релиза.
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
       - name: Formatting

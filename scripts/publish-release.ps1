@@ -9,7 +9,8 @@ param(
 # manifest (publish-manifest.sh) из артефактов всех платформ.
 # Все запросы идут через curl.exe: PowerShell Invoke-RestMethod не отправляет
 # обязательный GitVerse-заголовок Accept ...;version=1 как надо, из-за чего GET
-# возвращает 404. ASCII-only (PS 5.1 читает .ps1 без BOM как ANSI).
+# возвращает 404.
+# Требуется pwsh 7+ (задан в workflow как shell: pwsh).
 $ErrorActionPreference = 'Stop'
 $owner = 'chernov'
 $repo = 'truemail'
@@ -31,12 +32,11 @@ function Api-Get([string]$Path) {
     return $out | ConvertFrom-Json
 }
 
-# Возвращает ровно один id или $null. Отдельная функция потому, что PS 5.1 на
-# вложенном массиве (@() поверх результата ConvertFrom-Json) разворачивает
-# свойство по всем элементам сразу: $release.id молча давал "id1 id2", и такая
-# склейка уходила прямо в URL следующего запроса.
+# Возвращает ровно один id или $null. Явный перебор, а не $_.id на результате
+# Where-Object: свойство, взятое с коллекции, разворачивается по всем её
+# элементам, и склеенный "id1 id2" уходил прямо в URL следующего запроса.
 function Find-ReleaseId([object]$Releases) {
-    foreach ($item in @($Releases | ForEach-Object { $_ })) {
+    foreach ($item in @($Releases)) {
         if ($item.tag_name -eq $Tag) { return [string]$item.id }
     }
     return $null

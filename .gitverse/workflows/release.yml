@@ -124,7 +124,10 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     defaults:
       run:
-        shell: powershell
+        # pwsh (PowerShell 7), а не встроенный powershell 5.1: именно на 5.1
+        # $release.id разворачивался по всем элементам массива и склеенный id
+        # уходил в URL, из-за чего публикация Windows-артефактов падала.
+        shell: pwsh
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TRUEMAIL_TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
