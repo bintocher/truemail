@@ -1185,7 +1185,8 @@ mod tests {
     async fn auxiliary_deltas_preserve_unchanged_rows_and_commit_cursors() {
         use crate::account::{DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope};
         use crate::model::{
-            Alarm, Attendee, AuthKind, BackendKind, ContactPhone, NewAccount, Provider,
+            Alarm, Attendee, AuthKind, BackendKind, ContactAddress, ContactPhone, NewAccount,
+            Provider,
         };
 
         fn event(id: &str, summary: &str) -> DavEvent {
@@ -1238,6 +1239,14 @@ mod tests {
                     number: format!("+7999000000{id}"),
                     kind: Some("mobile".into()),
                     extension: Some(format!("10{id}")),
+                }],
+                addresses: vec![ContactAddress {
+                    kind: Some("home".into()),
+                    street: Some(format!("ул. Тестовая, {id}")),
+                    city: Some("Москва".into()),
+                    region: None,
+                    postal_code: Some("101000".into()),
+                    country: Some("Россия".into()),
                 }],
                 raw: format!("contact:{id}:{name}"),
                 etag: None,
@@ -1390,6 +1399,20 @@ mod tests {
         assert_eq!(updated_contact.phones[0].number, "+79990000001");
         assert_eq!(updated_contact.phones[0].kind.as_deref(), Some("mobile"));
         assert_eq!(updated_contact.phones[0].extension.as_deref(), Some("101"));
+        // Почтовые адреса переживают дельту так же, как телефоны, и читаются
+        // одним запросом на всю книгу (см. list_contacts).
+        assert_eq!(updated_contact.addresses.len(), 1);
+        assert_eq!(
+            updated_contact.addresses[0].street.as_deref(),
+            Some("ул. Тестовая, 1")
+        );
+        assert_eq!(updated_contact.addresses[0].city.as_deref(), Some("Москва"));
+        assert_eq!(updated_contact.addresses[0].region, None);
+        assert_eq!(
+            updated_contact.addresses[0].postal_code.as_deref(),
+            Some("101000")
+        );
+        assert_eq!(updated_contact.addresses[0].kind.as_deref(), Some("home"));
         db.hide_local_contact(updated_contact.id.expect("contact id"))
             .await
             .expect("hide contact");

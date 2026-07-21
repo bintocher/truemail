@@ -3,7 +3,8 @@
 
 use super::dav::{DavAuth, apply_dav_auth, dav_auth_scheme};
 use crate::model::{
-    Alarm, Attendee, AuthKind, ContactPhone, Event, EventClass, Provider, RsvpResponse, Transp,
+    Alarm, Attendee, AuthKind, ContactAddress, ContactPhone, Event, EventClass, Provider,
+    RsvpResponse, Transp,
 };
 use crate::{Error, Result};
 use reqwest::{Client, Method};
@@ -70,6 +71,8 @@ pub struct ContactInput {
     pub emails: Vec<String>,
     #[serde(default)]
     pub phones: Vec<ContactPhone>,
+    #[serde(default)]
+    pub addresses: Vec<ContactAddress>,
 }
 
 #[derive(Debug, Clone)]
@@ -693,6 +696,14 @@ fn google_contact_body(input: &ContactInput, etag: Option<&str>) -> Value {
         "emailAddresses": input.emails.iter().map(|email| json!({"value": email})).collect::<Vec<_>>(),
         "phoneNumbers": input.phones.iter().map(|phone| json!({"value": phone.remote_value(), "type": phone.kind.as_deref().unwrap_or("other")})).collect::<Vec<_>>(),
         "organizations": input.organization.as_ref().map(|name| vec![json!({"name": name})]).unwrap_or_default(),
+        "addresses": input.addresses.iter().filter(|address| !address.is_empty()).map(|address| json!({
+            "type": address.kind.as_deref().unwrap_or("other"),
+            "streetAddress": address.street,
+            "city": address.city,
+            "region": address.region,
+            "postalCode": address.postal_code,
+            "country": address.country,
+        })).collect::<Vec<_>>(),
     });
     if let Some(etag) = etag {
         body["etag"] = json!(etag);
@@ -714,11 +725,11 @@ async fn write_google_contact(
         url.query_pairs_mut()
             .append_pair(
                 "updatePersonFields",
-                "names,emailAddresses,phoneNumbers,organizations",
+                "names,emailAddresses,phoneNumbers,organizations,addresses",
             )
             .append_pair(
                 "personFields",
-                "names,emailAddresses,phoneNumbers,organizations",
+                "names,emailAddresses,phoneNumbers,organizations,addresses",
             );
         (Method::PATCH, url)
     } else {
@@ -726,7 +737,7 @@ async fn write_google_contact(
             .map_err(|error| backend_error("google-contacts", error.to_string()))?;
         url.query_pairs_mut().append_pair(
             "personFields",
-            "names,emailAddresses,phoneNumbers,organizations",
+            "names,emailAddresses,phoneNumbers,organizations,addresses",
         );
         (Method::POST, url)
     };
@@ -776,8 +787,44 @@ fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
             value
         )
     }));
+    lines.extend(
+        input
+            .addresses
+            .iter()
+            .filter(|address| !address.is_empty())
+            .map(|address| {
+                format!(
+                    "ADR;TYPE={}:{}",
+                    address.kind.as_deref().unwrap_or("other").to_uppercase(),
+                    vcard_adr_value(address)
+                )
+            }),
+    );
     lines.extend(["END:VCARD".to_owned(), String::new()]);
     lines.join("\r\n")
+}
+
+/// Значение ADR из RFC 6350: семь компонент через точку с запятой, первые две
+/// (почтовый ящик и расширенный адрес) всегда пустые - модель их не хранит.
+/// Разделители ставим сами, а внутри каждой компоненты точки с запятой и
+/// запятые экранируются (ical_escape), иначе адрес "дом 1, корп. 2" разъехался
+/// бы по чужим позициям.
+pub(crate) fn vcard_adr_value(address: &ContactAddress) -> String {
+    let part = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .map(ical_escape)
+            .unwrap_or_default()
+    };
+    format!(
+        ";;{};{};{};{};{}",
+        part(&address.street),
+        part(&address.city),
+        part(&address.region),
+        part(&address.postal_code),
+        part(&address.country)
+    )
 }
 
 /// Создать или изменить контакт. Для нового CardDAV-контакта `collection_url`
@@ -906,6 +953,50 @@ mod tests {
         assert_eq!(
             body["extendedProperties"]["private"]["truemailCategories"],
             "Team"
+        );
+    }
+
+    #[test]
+    fn builds_vcard_address_with_escaped_components() {
+        let body = dav_contact_body(
+            "uid-1",
+            &ContactInput {
+                display_name: "Иван".into(),
+                first_name: None,
+                last_name: None,
+                organization: None,
+                emails: Vec::new(),
+                phones: Vec::new(),
+                addresses: vec![
+                    ContactAddress {
+                        kind: Some("home".into()),
+                        street: Some("ул. Ленина, 1; корп. 2".into()),
+                        city: Some("Москва".into()),
+                        region: None,
+                        postal_code: Some("101000".into()),
+                        country: Some("Россия".into()),
+                    },
+                    // Пустой адрес в vCard не уходит.
+                    ContactAddress::default(),
+                ],
+            },
+        );
+        assert!(
+            body.contains("ADR;TYPE=HOME:;;ул. Ленина\\, 1\\; корп. 2;Москва;;101000;Россия\r\n")
+        );
+        assert_eq!(body.matches("ADR;").count(), 1);
+    }
+
+    #[test]
+    fn builds_vcard_address_value_with_seven_components() {
+        // Даже у полупустого адреса позиции должны сохраняться, иначе город
+        // при чтении окажется в регионе.
+        assert_eq!(
+            vcard_adr_value(&ContactAddress {
+                city: Some("Казань".into()),
+                ..ContactAddress::default()
+            }),
+            ";;;Казань;;;"
         );
     }
 

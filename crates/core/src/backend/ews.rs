@@ -8,7 +8,7 @@ use crate::account::{
     AuxiliarySyncCursors, ContactInput, DavCalendar, DavCollection, DavContact, DavEvent,
     DavSyncResult, EventInput, SyncScope,
 };
-use crate::model::{Attendee, ContactPhone, FolderRole, infer_folder_role};
+use crate::model::{Attendee, ContactAddress, ContactPhone, FolderRole, infer_folder_role};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -986,7 +986,7 @@ impl EwsBackend {
         item_id: &str,
     ) -> Result<ContactRemoteState> {
         let body = format!(
-            r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="contacts:EmailAddresses"/><t:FieldURI FieldURI="contacts:PhoneNumbers"/></t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:GetItem>"#,
+            r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="contacts:EmailAddresses"/><t:FieldURI FieldURI="contacts:PhoneNumbers"/><t:FieldURI FieldURI="contacts:PhysicalAddresses"/></t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:GetItem>"#,
             escape(item_id)
         );
         let response = self.soap(password, "GetItem", &body).await?;
@@ -1513,6 +1513,31 @@ fn parse_contacts(xml: &str) -> Result<Vec<DavContact>> {
                 ))
             })
             .collect::<Vec<_>>();
+        let addresses = item
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Entry")
+            .filter(|node| {
+                node.parent()
+                    .is_some_and(|parent| parent.tag_name().name() == "PhysicalAddresses")
+            })
+            .map(|node| {
+                let part = |name: &str| {
+                    node_text(node, name)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                };
+                ContactAddress {
+                    kind: node.attribute("Key").map(address_kind),
+                    street: part("Street"),
+                    city: part("City"),
+                    region: part("State"),
+                    postal_code: part("PostalCode"),
+                    country: part("CountryOrRegion"),
+                }
+            })
+            .filter(|address| !address.is_empty())
+            .collect::<Vec<_>>();
         let raw = build_vcard(
             id,
             &display_name,
@@ -1521,6 +1546,7 @@ fn parse_contacts(xml: &str) -> Result<Vec<DavContact>> {
             organization.as_deref(),
             &emails,
             &phones,
+            &addresses,
         );
         contacts.push(DavContact {
             remote_url: Some(format!("ews-contact:{id}")),
@@ -1531,6 +1557,7 @@ fn parse_contacts(xml: &str) -> Result<Vec<DavContact>> {
             organization,
             emails,
             phones,
+            addresses,
             raw,
             etag: None,
         });
@@ -1549,6 +1576,28 @@ fn phone_kind(key: &str) -> String {
     .to_owned()
 }
 
+/// Ключ словаря PhysicalAddresses (Home|Business|Other) в тип нашей модели.
+fn address_kind(key: &str) -> String {
+    match key {
+        "Home" => "home",
+        "Business" => "work",
+        _ => "other",
+    }
+    .to_owned()
+}
+
+/// Обратное преобразование: тип адреса в FieldIndex EWS. Второго адреса того
+/// же вида словарь не допускает - в отличие от телефонов, "2"-вариантов ключа
+/// у PhysicalAddresses в схеме нет, поэтому повторный home/work на сервер не
+/// уедет (см. used в contact_addresses_xml).
+fn ews_address_key(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("home") => "Home",
+        Some("work") => "Business",
+        _ => "Other",
+    }
+}
+
 fn build_vcard(
     uid: &str,
     display_name: &str,
@@ -1557,6 +1606,7 @@ fn build_vcard(
     organization: Option<&str>,
     emails: &[String],
     phones: &[ContactPhone],
+    addresses: &[ContactAddress],
 ) -> String {
     let mut lines = vec![
         "BEGIN:VCARD".to_owned(),
@@ -1589,6 +1639,24 @@ fn build_vcard(
             "TEL;TYPE={}:{}",
             phone.kind.as_deref().unwrap_or("other").to_uppercase(),
             value
+        ));
+    }
+    for address in addresses {
+        let part = |value: &Option<String>| {
+            value
+                .as_deref()
+                .map(str::trim)
+                .map(ical_escape)
+                .unwrap_or_default()
+        };
+        lines.push(format!(
+            "ADR;TYPE={}:;;{};{};{};{};{}",
+            address.kind.as_deref().unwrap_or("other").to_uppercase(),
+            part(&address.street),
+            part(&address.city),
+            part(&address.region),
+            part(&address.postal_code),
+            part(&address.country)
         ));
     }
     lines.push("END:VCARD".to_owned());
@@ -2377,6 +2445,47 @@ fn contact_phones_xml(phones: &[ContactPhone]) -> String {
         .collect()
 }
 
+/// Подполя адреса в порядке схемы EWS (PhysicalAddressType): Street, City,
+/// State, CountryOrRegion, PostalCode. Порядок здесь не косметика - Exchange
+/// отвергает Entry с переставленными элементами.
+const ADDRESS_PARTS: [&str; 5] = ["Street", "City", "State", "CountryOrRegion", "PostalCode"];
+
+fn address_part<'a>(address: &'a ContactAddress, part: &str) -> Option<&'a str> {
+    let value = match part {
+        "Street" => &address.street,
+        "City" => &address.city,
+        "State" => &address.region,
+        "CountryOrRegion" => &address.country,
+        _ => &address.postal_code,
+    };
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn contact_addresses_xml(addresses: &[ContactAddress]) -> String {
+    let mut used = HashSet::new();
+    addresses
+        .iter()
+        .filter(|address| !address.is_empty())
+        .filter_map(|address| {
+            let key = ews_address_key(address.kind.as_deref());
+            if !used.insert(key) {
+                return None;
+            }
+            let body = ADDRESS_PARTS
+                .iter()
+                .filter_map(|part| {
+                    address_part(address, part)
+                        .map(|value| format!("<t:{part}>{}</t:{part}>", escape(value)))
+                })
+                .collect::<String>();
+            Some(format!(r#"<t:Entry Key="{key}">{body}</t:Entry>"#))
+        })
+        .collect()
+}
+
 /// Поля Contact в порядке схемы EWS (ContactItemType): DisplayName/GivenName/
 /// CompanyName идут в начале, EmailAddresses/PhoneNumbers - следом, а
 /// Surname в самой схеме стоит куда дальше (после SpouseName) - неочевидно,
@@ -2410,6 +2519,14 @@ fn contact_item_xml(input: &ContactInput) -> String {
             contact_emails_xml(&input.emails)
         ));
     }
+    // PhysicalAddresses в ContactItemType стоят между EmailAddresses и
+    // PhoneNumbers - порядок полей внутри t:Contact схема проверяет.
+    let addresses = contact_addresses_xml(&input.addresses);
+    if !addresses.is_empty() {
+        body.push_str(&format!(
+            "<t:PhysicalAddresses>{addresses}</t:PhysicalAddresses>"
+        ));
+    }
     if !input.phones.is_empty() {
         body.push_str(&format!(
             "<t:PhoneNumbers>{}</t:PhoneNumbers>",
@@ -2438,6 +2555,11 @@ struct ContactRemoteState {
     change_key: String,
     email_keys: Vec<String>,
     phone_keys: Vec<String>,
+    /// Заполненные подполя почтовых адресов парами (FieldIndex, элемент):
+    /// ("Home", "Street"). Индексированное свойство здесь - каждое подполе
+    /// по отдельности (contacts:PhysicalAddress:Street), так что и удалять
+    /// приходится их поштучно.
+    address_fields: Vec<(String, String)>,
 }
 
 /// Ключи словарной записи EWS отдаёт атрибутом Key у t:Entry. Пустые Entry
@@ -2452,6 +2574,29 @@ fn contact_entry_keys(item: Node<'_, '_>, dictionary: &str) -> Vec<String> {
         })
         .filter(|node| node.text().is_some_and(|value| !value.trim().is_empty()))
         .filter_map(|node| node.attribute("Key").map(str::to_owned))
+        .collect()
+}
+
+/// В отличие от почт и телефонов, Entry словаря PhysicalAddresses не содержит
+/// текста - только вложенные Street/City/State/CountryOrRegion/PostalCode.
+/// Поэтому contact_entry_keys здесь не годится: он отбросил бы такие Entry как
+/// пустые, и убранный адрес остался бы на сервере навсегда.
+fn contact_address_fields(item: Node<'_, '_>) -> Vec<(String, String)> {
+    item.descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Entry")
+        .filter(|node| {
+            node.parent()
+                .is_some_and(|parent| parent.tag_name().name() == "PhysicalAddresses")
+        })
+        .filter_map(|node| node.attribute("Key").map(|key| (key, node)))
+        .flat_map(|(key, node)| {
+            node.children()
+                .filter(|child| child.is_element())
+                .filter(|child| child.text().is_some_and(|value| !value.trim().is_empty()))
+                .filter(|child| ADDRESS_PARTS.contains(&child.tag_name().name()))
+                .map(|child| (key.to_owned(), child.tag_name().name().to_owned()))
+                .collect::<Vec<_>>()
+        })
         .collect()
 }
 
@@ -2471,6 +2616,7 @@ fn parse_contact_remote_state(xml: &str) -> Result<ContactRemoteState> {
         change_key,
         email_keys: contact_entry_keys(item, "EmailAddresses"),
         phone_keys: contact_entry_keys(item, "PhoneNumbers"),
+        address_fields: contact_address_fields(item),
     })
 }
 
@@ -2500,9 +2646,7 @@ fn delete_contact_item_body(item_id: &str) -> String {
 ///
 /// Хвостом идут DeleteItemField по тем ключам, которые были заполнены на
 /// сервере (previous) и не попали в новый набор - именно они стирают убранные
-/// телефоны и адреса электронной почты. Почтовые адреса (PhysicalAddresses)
-/// здесь не трогаются: ContactInput их не несёт, то есть "новых данных" для
-/// них нет, и любой DeleteItemField по ним стирал бы адрес, заведённый в OWA.
+/// телефоны, адреса электронной почты и почтовые адреса.
 /// Схема EWS (NonEmptyArrayOfItemChangeDescriptionsType)
 /// это choice с unbounded, порядок между Set и Delete ей безразличен, важен
 /// лишь порядок полей внутри одного t:Contact - а тут в каждом SetItemField
@@ -2572,6 +2716,26 @@ fn contact_item_updates(input: &ContactInput, previous: &ContactRemoteState) -> 
         ));
         phone_keys.push(key.to_owned());
     }
+    // Каждое подполе адреса - собственное индексированное свойство, поэтому на
+    // один адрес приходится до пяти SetItemField.
+    let mut used_addresses = HashSet::new();
+    let mut address_fields = Vec::new();
+    for address in input.addresses.iter().filter(|value| !value.is_empty()) {
+        let key = ews_address_key(address.kind.as_deref());
+        if !used_addresses.insert(key) {
+            continue;
+        }
+        for part in ADDRESS_PARTS {
+            let Some(value) = address_part(address, part) else {
+                continue;
+            };
+            updates.push_str(&format!(
+                r#"<t:SetItemField><t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:{part}" FieldIndex="{key}"/><t:Contact><t:PhysicalAddresses><t:Entry Key="{key}"><t:{part}>{}</t:{part}></t:Entry></t:PhysicalAddresses></t:Contact></t:SetItemField>"#,
+                escape(value)
+            ));
+            address_fields.push((key.to_owned(), part.to_owned()));
+        }
+    }
     updates.push_str(&contact_deleted_index_fields(
         "contacts:EmailAddress",
         &previous.email_keys,
@@ -2587,7 +2751,37 @@ fn contact_item_updates(input: &ContactInput, previous: &ContactRemoteState) -> 
         &previous.phone_keys,
         &phone_keys,
     ));
+    updates.push_str(&contact_deleted_address_fields(
+        &previous.address_fields,
+        &address_fields,
+    ));
     updates
+}
+
+/// DeleteItemField по подполям адресов, которые были заполнены на сервере и
+/// пропали из новых данных. Отдельно от contact_deleted_index_fields: у
+/// адресов FieldURI зависит от подполя, а ключ (FieldIndex) - от вида адреса.
+fn contact_deleted_address_fields(
+    previous: &[(String, String)],
+    current: &[(String, String)],
+) -> String {
+    let current: HashSet<(&str, &str)> = current
+        .iter()
+        .map(|(key, part)| (key.as_str(), part.as_str()))
+        .collect();
+    let mut emitted = HashSet::new();
+    previous
+        .iter()
+        .filter(|(key, part)| !current.contains(&(key.as_str(), part.as_str())))
+        .filter(|(key, part)| emitted.insert((key.as_str(), part.as_str())))
+        .map(|(key, part)| {
+            format!(
+                r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:{}" FieldIndex="{}"/></t:DeleteItemField>"#,
+                escape(part),
+                escape(key)
+            )
+        })
+        .collect()
 }
 
 /// DeleteItemField по каждому ключу, который был на сервере, но пропал из
@@ -3277,6 +3471,14 @@ mod tests {
                     extension: None,
                 },
             ],
+            addresses: vec![ContactAddress {
+                kind: Some("home".into()),
+                street: Some("ул. Ленина, 1".into()),
+                city: Some("Москва".into()),
+                region: None,
+                postal_code: Some("101000".into()),
+                country: Some("Россия".into()),
+            }],
         }
     }
 
@@ -3322,6 +3524,12 @@ mod tests {
                 "EmailAddress3".into(),
             ],
             phone_keys: vec!["BusinessPhone".into(), "BusinessPhone2".into()],
+            address_fields: vec![
+                ("Home".into(), "Street".into()),
+                ("Home".into(), "City".into()),
+                ("Home".into(), "CountryOrRegion".into()),
+                ("Home".into(), "PostalCode".into()),
+            ],
         }
     }
 
@@ -3356,6 +3564,7 @@ mod tests {
                 "BusinessPhone".into(),
                 "BusinessPhone2".into(),
             ],
+            address_fields: Vec::new(),
         };
         let input = ContactInput {
             display_name: "Иванов".into(),
@@ -3368,6 +3577,7 @@ mod tests {
                 kind: Some("mobile".into()),
                 extension: None,
             }],
+            addresses: Vec::new(),
         };
         let body = update_contact_item_body("contact-1", &previous, &input);
         assert!(body.contains(
@@ -3407,6 +3617,7 @@ mod tests {
             change_key: "change-1".into(),
             email_keys: Vec::new(),
             phone_keys: vec!["AssistantPhone".into(), "AssistantPhone".into()],
+            address_fields: Vec::new(),
         };
         let input = ContactInput {
             display_name: "Иванов".into(),
@@ -3415,6 +3626,7 @@ mod tests {
             organization: None,
             emails: Vec::new(),
             phones: Vec::new(),
+            addresses: Vec::new(),
         };
         let body = update_contact_item_body("contact-1", &previous, &input);
         assert_eq!(body.matches("<t:DeleteItemField>").count(), 1);
@@ -3429,6 +3641,118 @@ mod tests {
         // Пустые Entry не считаем заполненными - стирать там нечего.
         assert_eq!(state.email_keys, ["EmailAddress1"]);
         assert_eq!(state.phone_keys, ["MobilePhone"]);
+    }
+
+    #[test]
+    fn contact_item_xml_puts_physical_addresses_between_emails_and_phones() {
+        let xml = contact_item_xml(&sample_contact_input());
+        assert!(xml.contains(r#"<t:Entry Key="Home"><t:Street>ул. Ленина, 1</t:Street><t:City>Москва</t:City><t:CountryOrRegion>Россия</t:CountryOrRegion><t:PostalCode>101000</t:PostalCode></t:Entry>"#));
+        // Незаполненный регион не превращается в пустой элемент.
+        assert!(!xml.contains("<t:State>"));
+        let emails_at = xml.find("EmailAddresses").unwrap();
+        let addresses_at = xml.find("PhysicalAddresses").unwrap();
+        let phones_at = xml.find("PhoneNumbers").unwrap();
+        assert!(emails_at < addresses_at);
+        assert!(addresses_at < phones_at);
+    }
+
+    #[test]
+    fn contact_addresses_xml_keeps_only_first_address_of_each_kind() {
+        let addresses = vec![
+            ContactAddress {
+                kind: Some("work".into()),
+                city: Some("Москва".into()),
+                ..ContactAddress::default()
+            },
+            ContactAddress {
+                kind: Some("work".into()),
+                city: Some("Казань".into()),
+                ..ContactAddress::default()
+            },
+            ContactAddress::default(),
+        ];
+        let xml = contact_addresses_xml(&addresses);
+        assert_eq!(xml.matches("<t:Entry").count(), 1);
+        assert!(xml.contains(r#"<t:Entry Key="Business"><t:City>Москва</t:City></t:Entry>"#));
+    }
+
+    #[test]
+    fn update_contact_item_body_sets_each_address_part_separately() {
+        let body = update_contact_item_body(
+            "contact-1",
+            &sample_contact_state(),
+            &sample_contact_input(),
+        );
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:Street" FieldIndex="Home"/>"#
+        ));
+        assert!(
+            body.contains(r#"<t:Entry Key="Home"><t:PostalCode>101000</t:PostalCode></t:Entry>"#)
+        );
+        // Состояние на сервере совпадает с новыми данными - удалять нечего.
+        assert!(!body.contains("DeleteItemField"));
+    }
+
+    #[test]
+    fn update_contact_item_body_deletes_address_parts_dropped_from_input() {
+        // На сервере был домашний адрес целиком, в новых данных остался только
+        // город, а рабочий адрес исчез вовсе.
+        let previous = ContactRemoteState {
+            change_key: "change-1".into(),
+            email_keys: Vec::new(),
+            phone_keys: Vec::new(),
+            address_fields: vec![
+                ("Home".into(), "Street".into()),
+                ("Home".into(), "City".into()),
+                ("Home".into(), "PostalCode".into()),
+                ("Business".into(), "Street".into()),
+            ],
+        };
+        let input = ContactInput {
+            display_name: "Иванов".into(),
+            first_name: None,
+            last_name: None,
+            organization: None,
+            emails: Vec::new(),
+            phones: Vec::new(),
+            addresses: vec![ContactAddress {
+                kind: Some("home".into()),
+                city: Some("Москва".into()),
+                ..ContactAddress::default()
+            }],
+        };
+        let body = update_contact_item_body("contact-1", &previous, &input);
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:Street" FieldIndex="Home"/></t:DeleteItemField>"#
+        ));
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:PostalCode" FieldIndex="Home"/></t:DeleteItemField>"#
+        ));
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:Street" FieldIndex="Business"/></t:DeleteItemField>"#
+        ));
+        // Оставшийся город записывается, а не стирается.
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:PhysicalAddress:City" FieldIndex="Home"/>"#
+        ));
+        assert!(!body.contains(
+            r#"FieldURI="contacts:PhysicalAddress:City" FieldIndex="Home"/></t:DeleteItemField>"#
+        ));
+    }
+
+    #[test]
+    fn parses_contact_remote_state_address_parts_from_nested_entries() {
+        // Entry адреса не содержит текста - только вложенные элементы, поэтому
+        // читается отдельно от почт и телефонов (см. contact_address_fields).
+        let xml = r#"<Envelope><Contact><ItemId Id="contact-1" ChangeKey="ck-7"/><PhysicalAddresses><Entry Key="Home"><Street>ул. Ленина, 1</Street><City>Москва</City><State>  </State></Entry><Entry Key="Business"/></PhysicalAddresses></Contact></Envelope>"#;
+        let state = parse_contact_remote_state(xml).expect("contact state");
+        assert_eq!(
+            state.address_fields,
+            [
+                ("Home".to_owned(), "Street".to_owned()),
+                ("Home".to_owned(), "City".to_owned()),
+            ]
+        );
     }
 
     #[test]

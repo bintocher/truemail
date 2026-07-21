@@ -53,6 +53,35 @@ impl ContactPhone {
     }
 }
 
+/// Почтовый адрес контакта: компоненты ADR из vCard (RFC 6350) без почтового
+/// ящика и расширенного адреса - ими никто не пользуется, а при записи мы
+/// оставляем соответствующие позиции пустыми.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ContactAddress {
+    /// home | work | other
+    pub kind: Option<String>,
+    pub street: Option<String>,
+    pub city: Option<String>,
+    pub region: Option<String>,
+    pub postal_code: Option<String>,
+    pub country: Option<String>,
+}
+
+impl ContactAddress {
+    /// Пустой адрес хранить и отправлять незачем - ни одной заполненной части.
+    pub fn is_empty(&self) -> bool {
+        [
+            &self.street,
+            &self.city,
+            &self.region,
+            &self.postal_code,
+            &self.country,
+        ]
+        .iter()
+        .all(|value| value.as_deref().is_none_or(|value| value.trim().is_empty()))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
     pub id: Option<i64>,
@@ -65,6 +94,8 @@ pub struct Contact {
     pub emails: Vec<ContactEmail>,
     #[serde(default)]
     pub phones: Vec<ContactPhone>,
+    #[serde(default)]
+    pub addresses: Vec<ContactAddress>,
     pub is_favorite: bool,
     /// true, если контакт существует только в локальной БД - провайдер
     /// аккаунта не поддерживает запись контактов (см. auxiliary::write_contact),

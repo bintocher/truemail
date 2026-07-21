@@ -1682,6 +1682,26 @@ impl Db {
                         .execute(&mut *tx)
                         .await?;
                     }
+                    sqlx::query("DELETE FROM contact_addresses WHERE contact_id=?")
+                        .bind(contact_id)
+                        .execute(&mut *tx)
+                        .await?;
+                    for address in &contact.addresses {
+                        sqlx::query(
+                            "INSERT INTO contact_addresses(contact_id, kind, street, city,
+                                                           region, postal_code, country)
+                             VALUES(?, ?, ?, ?, ?, ?, ?)",
+                        )
+                        .bind(contact_id)
+                        .bind(&address.kind)
+                        .bind(&address.street)
+                        .bind(&address.city)
+                        .bind(&address.region)
+                        .bind(&address.postal_code)
+                        .bind(&address.country)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
                 }
                 if data.contacts_scope == crate::account::SyncScope::Full {
                     for (contact_id,) in existing_contacts {
@@ -4094,6 +4114,26 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
+        sqlx::query("DELETE FROM contact_addresses WHERE contact_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for address in input.addresses.iter().filter(|value| !value.is_empty()) {
+            sqlx::query(
+                "INSERT INTO contact_addresses(contact_id, kind, street, city,
+                                               region, postal_code, country)
+                 VALUES(?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&address.kind)
+            .bind(address.street.as_deref().map(str::trim))
+            .bind(address.city.as_deref().map(str::trim))
+            .bind(address.region.as_deref().map(str::trim))
+            .bind(address.postal_code.as_deref().map(str::trim))
+            .bind(address.country.as_deref().map(str::trim))
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(id)
     }
@@ -4173,6 +4213,27 @@ impl Db {
                     number: row.number,
                     kind: row.kind,
                     extension: row.extension,
+                });
+            }
+        }
+        let address_rows = sqlx::query_as::<_, ContactAddressRow>(
+            "SELECT a.contact_id, a.kind, a.street, a.city, a.region, a.postal_code, a.country
+             FROM contact_addresses a JOIN contacts c ON c.id = a.contact_id
+             WHERE c.hidden=0 AND c.display_name LIKE ?
+             ORDER BY a.id",
+        )
+        .bind(&like)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in address_rows {
+            if let Some(index) = positions.get(&row.contact_id) {
+                contacts[*index].addresses.push(ContactAddress {
+                    kind: row.kind,
+                    street: row.street,
+                    city: row.city,
+                    region: row.region,
+                    postal_code: row.postal_code,
+                    country: row.country,
                 });
             }
         }
@@ -4658,6 +4719,17 @@ struct ContactPhoneRow {
     extension: Option<String>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ContactAddressRow {
+    contact_id: i64,
+    kind: Option<String>,
+    street: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CalendarSummary {
     pub id: i64,
@@ -4769,6 +4841,7 @@ impl From<ContactRow> for Contact {
             organization: r.organization,
             emails: Vec::new(),
             phones: Vec::new(),
+            addresses: Vec::new(),
             is_favorite: r.is_favorite != 0,
             is_local_only: r.remote_url.is_none(),
         }

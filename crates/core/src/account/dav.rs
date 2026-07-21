@@ -4,7 +4,9 @@
 //! параметром (заданы вручную или найдены через RFC 6764 - SRV-записи в
 //! discover_srv, .well-known-редирект в discover_well_known), а схема
 //! авторизации выбирается через DavAuth.
-use crate::model::{Alarm, Attendee, AuthKind, ContactPhone, Provider, clean_contact_name};
+use crate::model::{
+    Alarm, Attendee, AuthKind, ContactAddress, ContactPhone, Provider, clean_contact_name,
+};
 use crate::{Error, Result};
 use hickory_resolver::proto::rr::RData;
 use reqwest::{Client, Method, StatusCode};
@@ -222,6 +224,7 @@ pub struct DavContact {
     pub organization: Option<String>,
     pub emails: Vec<String>,
     pub phones: Vec<ContactPhone>,
+    pub addresses: Vec<ContactAddress>,
     pub raw: String,
     pub etag: Option<String>,
 }
@@ -1384,6 +1387,17 @@ fn parse_contact(
         })
         .filter(|phone| !phone.number.is_empty())
         .collect();
+    let addresses = unfolded(&raw)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.split(';')
+                .next()
+                .filter(|key| key.eq_ignore_ascii_case("ADR"))?;
+            Some(parse_adr(key, &decode_property(key, value)))
+        })
+        .filter(|address| !address.is_empty())
+        .collect();
     Some(DavContact {
         remote_url,
         uid: prop(&raw, "UID")?,
@@ -1395,9 +1409,67 @@ fn parse_contact(
         organization: prop(&raw, "ORG"),
         emails,
         phones,
+        addresses,
         raw,
         etag,
     })
+}
+
+/// Разбить значение vCard на компоненты по неэкранированным точкам с запятой и
+/// снять экранирование внутри каждой из них. Обычный split(';') здесь не
+/// годится: "ул. Ленина\; дом 1" - одна компонента, а не две.
+fn split_vcard_components(value: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut escaped = false;
+    for ch in value.chars() {
+        let current = parts.last_mut().expect("хотя бы одна компонента есть");
+        if escaped {
+            escaped = false;
+            match ch {
+                'n' | 'N' => current.push('\n'),
+                other => current.push(other),
+            }
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            ';' => parts.push(String::new()),
+            other => current.push(other),
+        }
+    }
+    parts
+}
+
+/// ADR из RFC 6350: pobox;ext;street;city;region;postal;country. Недостающие
+/// компоненты (серверы часто обрывают значение на середине) считаем пустыми.
+fn parse_adr(key: &str, value: &str) -> ContactAddress {
+    let parts = split_vcard_components(value);
+    let part = |index: usize| {
+        parts
+            .get(index)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    let kind = key
+        .split(';')
+        .skip(1)
+        .flat_map(|part| {
+            part.split_once('=')
+                .filter(|(name, _)| name.eq_ignore_ascii_case("TYPE"))
+                .map(|(_, value)| value)
+                .unwrap_or(part)
+                .split(',')
+        })
+        .map(str::to_lowercase)
+        .find(|value| matches!(value.as_str(), "home" | "work" | "other"));
+    ContactAddress {
+        kind,
+        street: part(2),
+        city: part(3),
+        region: part(4),
+        postal_code: part(5),
+        country: part(6),
+    }
 }
 
 #[cfg(test)]
@@ -1717,6 +1789,40 @@ mod tests {
         assert_eq!(contact.phones[0].number, "+79990000000");
         assert_eq!(contact.phones[0].kind.as_deref(), Some("mobile"));
         assert_eq!(contact.phones[0].extension.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn parses_vcard_addresses_with_escaping_and_missing_components() {
+        let raw = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:1\r\nFN:Иван\r\n\
+             ADR;TYPE=HOME:;;ул. Ленина\\, 1\\; корп. 2;Москва;;101000;Россия\r\n\
+             ADR;TYPE=WORK:;;;Казань\r\n\
+             ADR:;;;;;;\r\n\
+             END:VCARD";
+        let contact = parse_contact(raw.to_owned(), None, None).expect("valid contact");
+        // Полностью пустой ADR в модель не попадает.
+        assert_eq!(contact.addresses.len(), 2);
+        let home = &contact.addresses[0];
+        assert_eq!(home.kind.as_deref(), Some("home"));
+        assert_eq!(home.street.as_deref(), Some("ул. Ленина, 1; корп. 2"));
+        assert_eq!(home.city.as_deref(), Some("Москва"));
+        assert_eq!(home.region, None);
+        assert_eq!(home.postal_code.as_deref(), Some("101000"));
+        assert_eq!(home.country.as_deref(), Some("Россия"));
+        // Оборванное значение: недостающие компоненты пусты, а не ошибка.
+        let work = &contact.addresses[1];
+        assert_eq!(work.kind.as_deref(), Some("work"));
+        assert_eq!(work.street, None);
+        assert_eq!(work.city.as_deref(), Some("Казань"));
+        assert_eq!(work.country, None);
+    }
+
+    #[test]
+    fn splits_vcard_components_only_on_unescaped_separators() {
+        assert_eq!(
+            split_vcard_components("a\\;b;c\\,d;\\\\e"),
+            ["a;b", "c,d", "\\e"]
+        );
+        assert_eq!(split_vcard_components(";;"), ["", "", ""]);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use super::dav::{
     AuxiliarySyncCursors, DavCalendar, DavContact, DavEvent, DavSyncResult, SyncScope,
 };
-use crate::model::{Alarm, Attendee, ContactPhone, clean_contact_name};
+use crate::model::{Alarm, Attendee, ContactAddress, ContactPhone, clean_contact_name};
 use crate::{Error, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -184,6 +184,8 @@ struct GooglePerson {
     phone_numbers: Vec<PersonPhone>,
     #[serde(default)]
     organizations: Vec<PersonOrganization>,
+    #[serde(default)]
+    addresses: Vec<PersonAddress>,
     metadata: Option<PersonMetadata>,
 }
 
@@ -216,6 +218,18 @@ struct PersonPhone {
 #[derive(Debug, Deserialize, Serialize)]
 struct PersonOrganization {
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PersonAddress {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    street_address: Option<String>,
+    city: Option<String>,
+    region: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,7 +702,7 @@ async fn fetch_contacts(
                 .append_pair("pageSize", "1000")
                 .append_pair(
                     "personFields",
-                    "metadata,names,emailAddresses,phoneNumbers,organizations",
+                    "metadata,names,emailAddresses,phoneNumbers,organizations,addresses",
                 )
                 .append_pair("requestSyncToken", "true");
             if let Some(token) = requested_token.as_deref() {
@@ -736,6 +750,19 @@ async fn fetch_contacts(
                     })
                     .filter(|phone| !phone.number.is_empty())
                     .collect();
+                let addresses: Vec<ContactAddress> = person
+                    .addresses
+                    .iter()
+                    .map(|item| ContactAddress {
+                        kind: item.kind.clone(),
+                        street: item.street_address.clone(),
+                        city: item.city.clone(),
+                        region: item.region.clone(),
+                        postal_code: item.postal_code.clone(),
+                        country: item.country.clone(),
+                    })
+                    .filter(|address| !address.is_empty())
+                    .collect();
                 let display_name = name
                     .and_then(|value| value.display_name.clone())
                     .or_else(|| emails.first().cloned())
@@ -753,6 +780,7 @@ async fn fetch_contacts(
                         .and_then(|value| value.name.clone()),
                     emails,
                     phones,
+                    addresses,
                     raw,
                     etag: person.etag,
                 });
