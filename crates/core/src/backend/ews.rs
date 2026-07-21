@@ -897,7 +897,11 @@ impl EwsBackend {
     }
 
     /// Создать контакт в адресной книге Exchange.
-    pub async fn create_contact_item(&self, password: &str, input: &ContactInput) -> Result<String> {
+    pub async fn create_contact_item(
+        &self,
+        password: &str,
+        input: &ContactInput,
+    ) -> Result<String> {
         let body = create_contact_item_body(input);
         let response = self.soap(password, "CreateItem", &body).await?;
         parse_created_item_id(&response)
@@ -1529,8 +1533,17 @@ fn ews_event_datetime(value: &str, all_day: bool) -> Result<String> {
         });
     }
     chrono::DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .map_err(|error| backend_error("event-datetime", format!("некорректная дата события: {error}")))
+        .map(|dt| {
+            dt.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        })
+        .map_err(|error| {
+            backend_error(
+                "event-datetime",
+                format!("некорректная дата события: {error}"),
+            )
+        })
 }
 
 fn attendees_xml(attendees: &[&Attendee]) -> String {
@@ -1654,7 +1667,11 @@ fn create_calendar_item_body(input: &EventInput) -> Result<String> {
     ))
 }
 
-fn update_calendar_item_body(item_id: &str, change_key: &str, input: &EventInput) -> Result<String> {
+fn update_calendar_item_body(
+    item_id: &str,
+    change_key: &str,
+    input: &EventInput,
+) -> Result<String> {
     let disposition = calendar_send_disposition(input);
     let updates = calendar_item_fields(input)?
         .into_iter()
@@ -1759,7 +1776,11 @@ fn contact_item_xml(input: &ContactInput) -> String {
         "<t:DisplayName>{}</t:DisplayName>",
         escape(&input.display_name)
     );
-    if let Some(first) = input.first_name.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(first) = input
+        .first_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         body.push_str(&format!("<t:GivenName>{}</t:GivenName>", escape(first)));
     }
     if let Some(company) = input
@@ -1767,7 +1788,10 @@ fn contact_item_xml(input: &ContactInput) -> String {
         .as_deref()
         .filter(|value| !value.is_empty())
     {
-        body.push_str(&format!("<t:CompanyName>{}</t:CompanyName>", escape(company)));
+        body.push_str(&format!(
+            "<t:CompanyName>{}</t:CompanyName>",
+            escape(company)
+        ));
     }
     if !input.emails.is_empty() {
         body.push_str(&format!(
@@ -1818,7 +1842,11 @@ fn contact_item_updates(input: &ContactInput) -> String {
         r#"<t:SetItemField><t:FieldURI FieldURI="contacts:DisplayName"/><t:Contact><t:DisplayName>{}</t:DisplayName></t:Contact></t:SetItemField>"#,
         escape(&input.display_name)
     );
-    if let Some(first) = input.first_name.as_deref().filter(|value| !value.is_empty()) {
+    if let Some(first) = input
+        .first_name
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
         updates.push_str(&format!(
             r#"<t:SetItemField><t:FieldURI FieldURI="contacts:GivenName"/><t:Contact><t:GivenName>{}</t:GivenName></t:Contact></t:SetItemField>"#,
             escape(first)
@@ -1854,7 +1882,11 @@ fn contact_item_updates(input: &ContactInput) -> String {
         ));
     }
     let mut used = HashSet::new();
-    for phone in input.phones.iter().filter(|phone| !phone.number.trim().is_empty()) {
+    for phone in input
+        .phones
+        .iter()
+        .filter(|phone| !phone.number.trim().is_empty())
+    {
         let Some(key) = ews_phone_key(phone.kind.as_deref(), &mut used) else {
             continue;
         };
@@ -1934,7 +1966,10 @@ impl MailBackend for EwsBackend {
                     r#"<m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
                     escape(item_id),
                     escape(change_key.as_deref().unwrap_or_default()),
-                    flag_update_fields(payload["seen"].as_bool().unwrap_or(false), payload["flagged"].as_bool())
+                    flag_update_fields(
+                        payload["seen"].as_bool().unwrap_or(false),
+                        payload["flagged"].as_bool()
+                    )
                 ),
             ),
             "move" => (
@@ -2249,8 +2284,8 @@ mod tests {
 
     #[test]
     fn update_calendar_item_body_carries_change_key_and_disposition() {
-        let body =
-            update_calendar_item_body("item-1", "change-1", &sample_event_input()).expect("build body");
+        let body = update_calendar_item_body("item-1", "change-1", &sample_event_input())
+            .expect("build body");
         assert!(body.contains(r#"<t:ItemId Id="item-1" ChangeKey="change-1"/>"#));
         assert!(body.contains(r#"SendMeetingInvitationsOrCancellations="SendToNone""#));
         assert!(body.contains(r#"<t:FieldURI FieldURI="item:Subject"/>"#));

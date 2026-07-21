@@ -1777,8 +1777,14 @@ mod utf7_tests {
 
     #[test]
     fn flag_commands_set_seen_and_flagged_independently() {
-        assert_eq!(imap_store_commands(true, None), vec!["+FLAGS.SILENT (\\Seen)"]);
-        assert_eq!(imap_store_commands(false, None), vec!["-FLAGS.SILENT (\\Seen)"]);
+        assert_eq!(
+            imap_store_commands(true, None),
+            vec!["+FLAGS.SILENT (\\Seen)"]
+        );
+        assert_eq!(
+            imap_store_commands(false, None),
+            vec!["-FLAGS.SILENT (\\Seen)"]
+        );
         assert_eq!(
             imap_store_commands(true, Some(true)),
             vec!["+FLAGS.SILENT (\\Seen)", "+FLAGS.SILENT (\\Flagged)"]

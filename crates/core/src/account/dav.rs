@@ -30,7 +30,9 @@ pub fn resolve_yandex_bases(
     carddav_url: Option<&str>,
 ) -> (String, String) {
     (
-        caldav_url.map(str::to_owned).unwrap_or_else(|| YANDEX_CALDAV_BASE.to_owned()),
+        caldav_url
+            .map(str::to_owned)
+            .unwrap_or_else(|| YANDEX_CALDAV_BASE.to_owned()),
         carddav_url
             .map(str::to_owned)
             .unwrap_or_else(|| YANDEX_CARDDAV_BASE.to_owned()),
@@ -65,7 +67,11 @@ pub struct DavAuth {
 }
 
 impl DavAuth {
-    pub fn new(scheme: DavAuthScheme, identity: impl Into<String>, secret: impl Into<String>) -> Self {
+    pub fn new(
+        scheme: DavAuthScheme,
+        identity: impl Into<String>,
+        secret: impl Into<String>,
+    ) -> Self {
         Self {
             scheme,
             identity: identity.into(),
@@ -253,7 +259,16 @@ async fn dav_request_response(
     // CalDAV-реализации, как Яндекс, ждут тот же токен через Basic). Один
     // молчаливый фолбэк на 401 - не перебор схем на каждый запрос.
     if response.status == StatusCode::UNAUTHORIZED && auth.scheme == DavAuthScheme::Bearer {
-        return dav_send(client, &method, url, depth, body, DavAuthScheme::BasicToken, auth).await;
+        return dav_send(
+            client,
+            &method,
+            url,
+            depth,
+            body,
+            DavAuthScheme::BasicToken,
+            auth,
+        )
+        .await;
     }
     Ok(response)
 }
@@ -318,8 +333,7 @@ async fn discover_home(
     home_tag: &str,
     auth: &DavAuth,
 ) -> Result<String> {
-    let principal_xml =
-        dav_request(client, "PROPFIND", base, "0", PRINCIPAL_BODY, auth).await?;
+    let principal_xml = dav_request(client, "PROPFIND", base, "0", PRINCIPAL_BODY, auth).await?;
     let principal_doc = Document::parse(&principal_xml).map_err(|e| Error::Backend {
         backend: "dav-xml".into(),
         message: e.to_string(),
@@ -635,8 +649,7 @@ async fn request_sync_collection(
     auth: &DavAuth,
 ) -> Result<SyncReportOutcome> {
     let body = sync_collection_body(sync_token);
-    let response =
-        dav_request_response(client, "REPORT", collection_url, "0", &body, auth).await?;
+    let response = dav_request_response(client, "REPORT", collection_url, "0", &body, auth).await?;
     if response.status == StatusCode::MULTI_STATUS || response.status.is_success() {
         return parse_sync_collection(&response.body, collection_url)
             .map(SyncReportOutcome::Success);
@@ -1710,7 +1723,10 @@ mod tests {
         let discovered = discover_well_known(&origin, WELL_KNOWN_CALDAV).await;
 
         server.abort();
-        assert_eq!(discovered.as_deref(), Some(format!("{origin}/dav/principal/").as_str()));
+        assert_eq!(
+            discovered.as_deref(),
+            Some(format!("{origin}/dav/principal/").as_str())
+        );
     }
 
     #[tokio::test]

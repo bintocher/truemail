@@ -1581,7 +1581,8 @@ mod tests {
             None,
             vec![guest_a.clone()],
         );
-        quiet_only_description.description = Some("другое описание, без смысловых изменений".into());
+        quiet_only_description.description =
+            Some("другое описание, без смысловых изменений".into());
 
         let delta = DavSyncResult {
             calendars: vec![DavCalendar {

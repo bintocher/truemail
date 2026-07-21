@@ -655,10 +655,7 @@ fn calendar_change_tag(kind: CalendarChangeKind) -> &'static str {
 /// необязательны - у встречи без организатора (создана самим пользователем в
 /// локальном календаре) остаётся только счётчик, а у встречи без участников
 /// строки не будет вовсе, вместо пустой "Участников: 0".
-fn calendar_change_details(
-    change: &CalendarChange,
-    catalog: &truemail_core::i18n::I18n,
-) -> String {
+fn calendar_change_details(change: &CalendarChange, catalog: &truemail_core::i18n::I18n) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(organizer) = change
         .organizer
@@ -843,7 +840,9 @@ async fn notify_calendar_changes(
         .collect();
     let fresh_keys: HashSet<String> = {
         let mut guard = notified.lock().await;
-        dedupe_notified_keys(&mut guard, &keys).into_iter().collect()
+        dedupe_notified_keys(&mut guard, &keys)
+            .into_iter()
+            .collect()
     };
     let fresh: Vec<&CalendarChange> = future
         .into_iter()
@@ -1723,7 +1722,11 @@ fn safe_attachment_name(filename: &str) -> String {
     const FALLBACK: &str = "attachment";
     // Берём только последний компонент пути - откидываем и '/', и '\', так
     // что вложенные и родительские каталоги в имени не имеют силы.
-    let last = filename.rsplit(['/', '\\']).next().unwrap_or(filename).trim();
+    let last = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim();
     let mut name = if last.is_empty() || last == "." || last == ".." {
         FALLBACK.to_owned()
     } else {
@@ -1757,7 +1760,8 @@ fn safe_attachment_name(filename: &str) -> String {
     let stem = name.split('.').next().unwrap_or(&name);
     let reserved = matches!(
         stem.to_ascii_uppercase().as_str(),
-        "CON" | "PRN"
+        "CON"
+            | "PRN"
             | "AUX"
             | "NUL"
             | "COM1"
@@ -2113,7 +2117,7 @@ pub async fn create_event(
             },
             &input,
         )
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account_id);
     Ok(())
@@ -2149,7 +2153,7 @@ pub async fn update_event(
             },
             &input,
         )
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
@@ -2178,7 +2182,7 @@ pub async fn delete_event(
     // ews_url и username из аккаунта, которых у свободной функции нет.
     core.accounts
         .delete_event(&account, &row.1, remote_url, row.3.as_deref())
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
@@ -2291,7 +2295,7 @@ pub async fn create_contact(
             },
             &input,
         )
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account_id);
     Ok(())
@@ -2332,7 +2336,7 @@ pub async fn update_contact(
             },
             &input,
         )
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
@@ -2361,7 +2365,7 @@ pub async fn delete_contact(
     // ews_url и username из аккаунта, которых у свободной функции нет.
     core.accounts
         .delete_contact(&account, remote_url, row.2.as_deref())
-    .await?;
+        .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
@@ -2861,7 +2865,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             let inbox_sync = if watch_account.provider
                                 == truemail_core::model::Provider::Exchange
                             {
-                                watch_core.accounts.sync_mail_inbox_delta(&watch_account).await
+                                watch_core
+                                    .accounts
+                                    .sync_mail_inbox_delta(&watch_account)
+                                    .await
                             } else {
                                 watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
@@ -4168,8 +4175,18 @@ mod calendar_change_notify_tests {
         let now = chrono::Utc::now();
         let yesterday = (now - chrono::Duration::days(1)).to_rfc3339();
         let in_an_hour = (now + chrono::Duration::hours(1)).to_rfc3339();
-        let past = change(CalendarChangeKind::Rescheduled, Some(&yesterday), None, None);
-        let future = change(CalendarChangeKind::Rescheduled, Some(&in_an_hour), None, None);
+        let past = change(
+            CalendarChangeKind::Rescheduled,
+            Some(&yesterday),
+            None,
+            None,
+        );
+        let future = change(
+            CalendarChangeKind::Rescheduled,
+            Some(&in_an_hour),
+            None,
+            None,
+        );
         let unparsable = change(CalendarChangeKind::Created, Some("не дата"), None, None);
         assert!(
             !is_future_calendar_change(&past, now),
@@ -4184,8 +4201,18 @@ mod calendar_change_notify_tests {
 
     #[test]
     fn calendar_change_key_distinguishes_kind_on_same_event() {
-        let rescheduled = change(CalendarChangeKind::Rescheduled, Some("2026-07-21T10:00:00Z"), None, None);
-        let cancelled = change(CalendarChangeKind::Cancelled, Some("2026-07-21T10:00:00Z"), None, None);
+        let rescheduled = change(
+            CalendarChangeKind::Rescheduled,
+            Some("2026-07-21T10:00:00Z"),
+            None,
+            None,
+        );
+        let cancelled = change(
+            CalendarChangeKind::Cancelled,
+            Some("2026-07-21T10:00:00Z"),
+            None,
+            None,
+        );
         assert_ne!(
             calendar_change_key(&rescheduled),
             calendar_change_key(&cancelled),
@@ -4196,7 +4223,9 @@ mod calendar_change_notify_tests {
     #[test]
     fn format_event_local_has_no_seconds_or_timezone_suffix() {
         use chrono::TimeZone;
-        let value = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 10, 30, 0).unwrap();
+        let value = chrono::Utc
+            .with_ymd_and_hms(2026, 7, 20, 10, 30, 0)
+            .unwrap();
         let text = format_event_local(value);
         assert_eq!(text.matches(':').count(), 1, "часы:минуты без секунд");
         assert!(
@@ -4218,12 +4247,25 @@ mod calendar_change_notify_tests {
         assert_eq!(payload["change"], "rescheduled");
         assert_eq!(payload["subject"], "Обсуждение релиза");
         let preview = payload["preview"].as_str().unwrap().to_owned();
-        assert!(preview.contains("было") && preview.contains("стало"), "{preview}");
+        assert!(
+            preview.contains("было") && preview.contains("стало"),
+            "{preview}"
+        );
 
-        let cancelled = change(CalendarChangeKind::Cancelled, Some("2026-07-21T11:30:00Z"), None, None);
+        let cancelled = change(
+            CalendarChangeKind::Cancelled,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            None,
+        );
         let payload = calendar_change_payload(1, &cancelled, &catalog);
         assert_eq!(payload["change"], "cancelled");
-        assert!(payload["preview"].as_str().unwrap().contains("Была назначена"));
+        assert!(
+            payload["preview"]
+                .as_str()
+                .unwrap()
+                .contains("Была назначена")
+        );
 
         let location = change(
             CalendarChangeKind::LocationChanged,
@@ -4235,11 +4277,21 @@ mod calendar_change_notify_tests {
         assert_eq!(payload["change"], "location");
         assert_eq!(payload["preview"], "Новое место: Переговорка 3");
 
-        let location_removed = change(CalendarChangeKind::LocationChanged, Some("2026-07-21T11:30:00Z"), None, None);
+        let location_removed = change(
+            CalendarChangeKind::LocationChanged,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            None,
+        );
         let payload = calendar_change_payload(1, &location_removed, &catalog);
         assert_eq!(payload["preview"], "Место встречи убрано");
 
-        let attendees = change(CalendarChangeKind::AttendeesChanged, Some("2026-07-21T11:30:00Z"), None, None);
+        let attendees = change(
+            CalendarChangeKind::AttendeesChanged,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            None,
+        );
         let payload = calendar_change_payload(1, &attendees, &catalog);
         assert_eq!(payload["change"], "attendees");
         assert_eq!(payload["preview"], "Изменился список участников");
@@ -4261,7 +4313,12 @@ mod calendar_change_notify_tests {
         );
         assert_eq!(payload["brand"], "Календарь");
 
-        let renamed = change(CalendarChangeKind::Renamed, Some("2026-07-21T11:30:00Z"), None, None);
+        let renamed = change(
+            CalendarChangeKind::Renamed,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            None,
+        );
         let payload = calendar_change_payload(1, &renamed, &catalog);
         assert_eq!(payload["change"], "renamed");
         assert_eq!(payload["preview"], "Прежнее название: Планёрка");
@@ -4270,7 +4327,12 @@ mod calendar_change_notify_tests {
     #[test]
     fn calendar_change_details_lists_organizer_and_attendee_count() {
         let catalog = truemail_core::i18n::I18n::new("ru");
-        let created = change(CalendarChangeKind::Created, Some("2026-07-21T11:30:00Z"), None, None);
+        let created = change(
+            CalendarChangeKind::Created,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            None,
+        );
         assert_eq!(
             calendar_change_details(&created, &catalog),
             "Организатор: lead@example.com, участников: 3"
@@ -4296,7 +4358,10 @@ mod calendar_change_notify_tests {
         );
         let payload = calendar_change_payload(1, &rescheduled, &catalog);
         let preview = payload["preview"].as_str().unwrap().to_owned();
-        assert!(preview.contains("was") && preview.contains("became"), "{preview}");
+        assert!(
+            preview.contains("was") && preview.contains("became"),
+            "{preview}"
+        );
         assert_eq!(payload["brand"], "Calendar");
         assert_eq!(payload["title"], "Event rescheduled");
     }
@@ -4306,7 +4371,12 @@ mod calendar_change_notify_tests {
         let catalog = truemail_core::i18n::I18n::new("ru");
         let changes: Vec<CalendarChange> = (0..4)
             .map(|i| {
-                let mut item = change(CalendarChangeKind::Created, Some("2026-07-21T10:00:00Z"), None, None);
+                let mut item = change(
+                    CalendarChangeKind::Created,
+                    Some("2026-07-21T10:00:00Z"),
+                    None,
+                    None,
+                );
                 item.event_id = i;
                 item
             })

@@ -265,9 +265,18 @@ mod attendance_tests {
         assert_eq!(RsvpResponse::Accepted.partstat(), "ACCEPTED");
         assert_eq!(RsvpResponse::Declined.partstat(), "DECLINED");
         assert_eq!(RsvpResponse::Tentative.partstat(), "TENTATIVE");
-        assert_eq!(RsvpResponse::parse("accepted"), Some(RsvpResponse::Accepted));
-        assert_eq!(RsvpResponse::parse("declined"), Some(RsvpResponse::Declined));
-        assert_eq!(RsvpResponse::parse("tentative"), Some(RsvpResponse::Tentative));
+        assert_eq!(
+            RsvpResponse::parse("accepted"),
+            Some(RsvpResponse::Accepted)
+        );
+        assert_eq!(
+            RsvpResponse::parse("declined"),
+            Some(RsvpResponse::Declined)
+        );
+        assert_eq!(
+            RsvpResponse::parse("tentative"),
+            Some(RsvpResponse::Tentative)
+        );
         assert_eq!(RsvpResponse::parse("needs-action"), None);
     }
 }

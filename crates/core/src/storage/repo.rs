@@ -2674,8 +2674,7 @@ impl Db {
         );
         // Плейсхолдеры формируются только из числа id (не из пользовательских
         // данных), сами значения передаются через bind - инъекция невозможна.
-        let mut query =
-            sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql)).bind(account_id);
+        let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql)).bind(account_id);
         for id in remote_ids {
             query = query.bind(id);
         }
@@ -2922,12 +2921,14 @@ impl Db {
         account_email: &str,
         partstat: &str,
     ) -> Result<()> {
-        sqlx::query("UPDATE event_attendees SET partstat=? WHERE event_id=? AND lower(email)=lower(?)")
-            .bind(partstat)
-            .bind(event_id)
-            .bind(account_email)
-            .execute(&self.write_pool)
-            .await?;
+        sqlx::query(
+            "UPDATE event_attendees SET partstat=? WHERE event_id=? AND lower(email)=lower(?)",
+        )
+        .bind(partstat)
+        .bind(event_id)
+        .bind(account_email)
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 
@@ -4829,7 +4830,11 @@ mod notification_lookup_tests {
             .await
             .expect("query inbox ids");
 
-        assert_eq!(ids, vec![inbox_message_id], "письмо из архива не должно попасть в выборку");
+        assert_eq!(
+            ids,
+            vec![inbox_message_id],
+            "письмо из архива не должно попасть в выборку"
+        );
     }
 
     #[tokio::test]
@@ -4851,7 +4856,11 @@ mod notification_lookup_tests {
         .fetch_all(&db.write_pool)
         .await
         .expect("query outbox_ops");
-        assert_eq!(rows.len(), 1, "должна остаться ровно одна pending 'flag'-операция");
+        assert_eq!(
+            rows.len(),
+            1,
+            "должна остаться ровно одна pending 'flag'-операция"
+        );
         serde_json::from_str(&rows[0].0).expect("payload must be valid JSON")
     }
 

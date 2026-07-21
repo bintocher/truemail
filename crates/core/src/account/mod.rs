@@ -247,7 +247,9 @@ mod sync_registry_tests {
             let error = manager
                 .auxiliary_credential(&password_account)
                 .await
-                .expect_err("password-family account without secret_ref must fail before keychain access");
+                .expect_err(
+                    "password-family account without secret_ref must fail before keychain access",
+                );
             assert!(
                 matches!(&error, crate::Error::AccountConfig(message) if message.contains("пароль")),
                 "unexpected error for {auth_kind:?}: {error}"
@@ -484,7 +486,9 @@ impl AccountManager {
         // (как в sync_mail_account_inner) - так UI сразу видит новую папку,
         // а не только remote_path, о котором знает только что созданный backend.
         if let Ok(folders) = backend.discover_folders(&account.email, &token).await {
-            self.db.save_discovered_folders(account.id, &folders).await?;
+            self.db
+                .save_discovered_folders(account.id, &folders)
+                .await?;
         }
         Ok(())
     }
@@ -887,7 +891,10 @@ impl AccountManager {
     /// почты. Найденные адреса сохраняются на аккаунте, чтобы не искать их
     /// заново при каждой синхронизации. SRV-записи (_caldavs._tcp) не
     /// проверяются - см. dav::discover_well_known.
-    async fn resolve_dav_bases(&self, account: &Account) -> Result<(Option<String>, Option<String>)> {
+    async fn resolve_dav_bases(
+        &self,
+        account: &Account,
+    ) -> Result<(Option<String>, Option<String>)> {
         if account.provider == Provider::Yandex {
             let (cal, card) = dav::resolve_yandex_bases(
                 account.caldav_url.as_deref(),
@@ -918,7 +925,10 @@ impl AccountManager {
     /// IMAP-синхронизацию. Работает для любого провайдера с известными или
     /// обнаруженными DAV-адресами (см. resolve_dav_bases) - раньше это было
     /// жёстко привязано к Яндексу.
-    pub async fn sync_dav_auxiliary_account(&self, account: &Account) -> Result<AuxiliarySaveResult> {
+    pub async fn sync_dav_auxiliary_account(
+        &self,
+        account: &Account,
+    ) -> Result<AuxiliarySaveResult> {
         self.sync_registry
             .exclusive(
                 account.id,
@@ -938,7 +948,10 @@ impl AccountManager {
         let secret = self.auxiliary_credential(account).await?;
         let auth = dav::DavAuth::new(
             dav::dav_auth_scheme(account.provider, account.auth_kind),
-            account.username.clone().unwrap_or_else(|| account.email.clone()),
+            account
+                .username
+                .clone()
+                .unwrap_or_else(|| account.email.clone()),
             secret.as_str(),
         );
         let (caldav_base, carddav_base) = self.resolve_dav_bases(account).await?;
@@ -1057,14 +1070,18 @@ impl AccountManager {
         match account.provider {
             Provider::Gmail => {
                 let token = self.oauth_access_token(account).await?;
-                let attendees = auxiliary::updated_attendees(&event.attendees, &account.email, response);
+                let attendees =
+                    auxiliary::updated_attendees(&event.attendees, &account.email, response);
                 let remote_url = remote.remote_url.ok_or_else(|| {
                     crate::Error::AccountConfig("у события нет серверного идентификатора".into())
                 })?;
                 auxiliary::respond_to_google_event(calendar_source, remote_url, &attendees, &token)
                     .await
             }
-            Provider::Yandex | Provider::Icloud | Provider::Mailru | Provider::Outlook
+            Provider::Yandex
+            | Provider::Icloud
+            | Provider::Mailru
+            | Provider::Outlook
             | Provider::Generic => {
                 self.respond_to_dav_event(account, calendar_source, remote, event, response)
                     .await
@@ -1083,7 +1100,9 @@ impl AccountManager {
                     crate::Error::AccountConfig("у события нет серверного идентификатора".into())
                 })?;
                 let item_id = remote_url.strip_prefix("ews-event:").ok_or_else(|| {
-                    crate::Error::AccountConfig("неизвестный серверный идентификатор события".into())
+                    crate::Error::AccountConfig(
+                        "неизвестный серверный идентификатор события".into(),
+                    )
                 })?;
                 backend
                     .respond_to_calendar_item(&credential, item_id, response)
@@ -1138,7 +1157,11 @@ impl AccountManager {
             return match remote.remote_url {
                 Some(url) => {
                     backend
-                        .update_calendar_item(&credential, Self::ews_item_id(url, "ews-event:")?, input)
+                        .update_calendar_item(
+                            &credential,
+                            Self::ews_item_id(url, "ews-event:")?,
+                            input,
+                        )
                         .await
                 }
                 // ItemId созданного элемента намеренно отбрасываем: как и в
@@ -1203,7 +1226,11 @@ impl AccountManager {
             return match remote.remote_url {
                 Some(url) => {
                     backend
-                        .update_contact_item(&credential, Self::ews_item_id(url, "ews-contact:")?, input)
+                        .update_contact_item(
+                            &credential,
+                            Self::ews_item_id(url, "ews-contact:")?,
+                            input,
+                        )
                         .await
                 }
                 None => backend
@@ -1287,7 +1314,9 @@ impl AccountManager {
             .iter()
             .find(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))
             .ok_or_else(|| {
-                crate::Error::AccountConfig("пользователь не найден среди участников события".into())
+                crate::Error::AccountConfig(
+                    "пользователь не найден среди участников события".into(),
+                )
             })?;
         let ics = auxiliary::imip_reply_body(&uid, &organizer, event.sequence, own);
         let subject = format!("Re: {}", event.summary);
@@ -1708,7 +1737,8 @@ impl AccountManager {
         // Код уже обменян и одноразовый, поэтому токен сначала надёжно
         // сохраняется. Проверки доступа быстрые; их временный сбой становится
         // предупреждением и не заставляет пользователя получать новый код.
-        let dav_auth = dav::DavAuth::new(dav::DavAuthScheme::BasicToken, email, access_token.as_str());
+        let dav_auth =
+            dav::DavAuth::new(dav::DavAuthScheme::BasicToken, email, access_token.as_str());
         let (mail_access, dav_access) = tokio::join!(
             YandexBackend.validate(email, &access_token),
             validate_dav(&dav_auth, YANDEX_CALDAV_BASE, YANDEX_CARDDAV_BASE)

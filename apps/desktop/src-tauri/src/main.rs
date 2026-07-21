@@ -127,7 +127,10 @@ fn run() -> anyhow::Result<()> {
                 .with_env_filter(filter)
                 .with_ansi(false)
                 .init();
-            eprintln!("не удалось создать файловый логгер в {}: {error}; логи будут только в stdout", log_dir.display());
+            eprintln!(
+                "не удалось создать файловый логгер в {}: {error}; логи будут только в stdout",
+                log_dir.display()
+            );
         }
     }
     tracing::info!(log_dir = %log_dir.display(), "логирование инициализировано");
@@ -167,7 +170,9 @@ fn run() -> anyhow::Result<()> {
         api_server: Arc::new(tokio::sync::Mutex::new(None)),
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже

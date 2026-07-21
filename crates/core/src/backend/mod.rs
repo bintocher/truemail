@@ -116,11 +116,12 @@ async fn ensure_unsubscribe_target_is_public(
             first = Some(addr);
         }
     }
-    first.ok_or_else(|| crate::Error::Backend {
-        backend: "unsubscribe".into(),
-        message: "хост отписки не резолвится ни в один адрес".into(),
-    })
-    .map(Some)
+    first
+        .ok_or_else(|| crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: "хост отписки не резолвится ни в один адрес".into(),
+        })
+        .map(Some)
 }
 
 fn reject_if_disallowed(ip: std::net::IpAddr) -> Result<()> {
@@ -527,8 +528,14 @@ impl MailBackend for OutlookBackend {
         parent_path: Option<&str>,
         name: &str,
     ) -> Result<String> {
-        imap::create_oauth_folder("outlook.office365.com", email, credential, parent_path, name)
-            .await
+        imap::create_oauth_folder(
+            "outlook.office365.com",
+            email,
+            credential,
+            parent_path,
+            name,
+        )
+        .await
     }
 
     async fn rename_folder(
@@ -788,7 +795,14 @@ mod unsubscribe_ssrf_tests {
 
     #[test]
     fn blocks_ipv4_loopback_and_private_ranges() {
-        for ip in ["127.0.0.1", "10.0.0.1", "172.16.0.5", "192.168.1.1", "169.254.1.1", "0.0.0.0"] {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.5",
+            "192.168.1.1",
+            "169.254.1.1",
+            "0.0.0.0",
+        ] {
             assert!(
                 is_disallowed_unsubscribe_ip(ip.parse().unwrap()),
                 "{ip} должен быть запрещён"
@@ -809,13 +823,19 @@ mod unsubscribe_ssrf_tests {
     #[test]
     fn blocks_ipv4_mapped_private_address() {
         // ::ffff:127.0.0.1 - тот же loopback, только в IPv6-обёртке.
-        assert!(is_disallowed_unsubscribe_ip("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_disallowed_unsubscribe_ip(
+            "::ffff:127.0.0.1".parse().unwrap()
+        ));
     }
 
     #[test]
     fn allows_ordinary_public_addresses() {
-        assert!(!is_disallowed_unsubscribe_ip("93.184.216.34".parse().unwrap()));
-        assert!(!is_disallowed_unsubscribe_ip("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()));
+        assert!(!is_disallowed_unsubscribe_ip(
+            "93.184.216.34".parse().unwrap()
+        ));
+        assert!(!is_disallowed_unsubscribe_ip(
+            "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()
+        ));
     }
 
     #[tokio::test]

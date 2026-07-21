@@ -20,7 +20,11 @@ use url::Url;
 fn is_dav_provider(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Yandex | Provider::Icloud | Provider::Mailru | Provider::Outlook | Provider::Generic
+        Provider::Yandex
+            | Provider::Icloud
+            | Provider::Mailru
+            | Provider::Outlook
+            | Provider::Generic
     )
 }
 
@@ -643,7 +647,12 @@ pub(crate) async fn respond_to_google_event(
 /// только за себя, весь список участников исходного события сюда не кладут.
 /// UID, ORGANIZER и SEQUENCE переносятся из исходного события без изменений,
 /// DTSTAMP - момент отправки ответа.
-pub(crate) fn imip_reply_body(uid: &str, organizer: &str, sequence: i64, attendee: &Attendee) -> String {
+pub(crate) fn imip_reply_body(
+    uid: &str,
+    organizer: &str,
+    sequence: i64,
+    attendee: &Attendee,
+) -> String {
     let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut params = vec![format!(
         "PARTSTAT={}",
