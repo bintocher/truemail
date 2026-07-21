@@ -31,10 +31,20 @@ function Api-Get([string]$Path) {
     return $out | ConvertFrom-Json
 }
 
+# Возвращает ровно один id или $null. Отдельная функция потому, что PS 5.1 на
+# вложенном массиве (@() поверх результата ConvertFrom-Json) разворачивает
+# свойство по всем элементам сразу: $release.id молча давал "id1 id2", и такая
+# склейка уходила прямо в URL следующего запроса.
+function Find-ReleaseId([object]$Releases) {
+    foreach ($item in @($Releases | ForEach-Object { $_ })) {
+        if ($item.tag_name -eq $Tag) { return [string]$item.id }
+    }
+    return $null
+}
+
 function Get-ReleaseId {
-    $releases = @(Api-Get "/repos/$owner/$repo/releases")
-    $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
-    if ($release) { return $release.id }
+    $found = Find-ReleaseId (Api-Get "/repos/$owner/$repo/releases")
+    if ($found) { return $found }
     # Релиза ещё нет (сборки идут параллельно) - создаём его.
     $body = "{`"tag_name`":`"$Tag`",`"name`":`"truemail $Tag`",`"body`":`"truemail $Tag`",`"is_authorized_only`":false}"
     $out = & curl.exe --silent --show-error --fail-with-body `
@@ -42,15 +52,19 @@ function Get-ReleaseId {
         -H "Content-Type: application/json" -X POST -d $body "$api/repos/$owner/$repo/releases"
     if ($LASTEXITCODE -ne 0) {
         # Возможна гонка: другой job создал релиз между GET и POST. Перечитываем.
-        $releases = @(Api-Get "/repos/$owner/$repo/releases")
-        $release = $releases | Where-Object { $_.tag_name -eq $Tag } | Select-Object -First 1
-        if ($release) { return $release.id }
+        $found = Find-ReleaseId (Api-Get "/repos/$owner/$repo/releases")
+        if ($found) { return $found }
         throw "Failed to create release: $out"
     }
-    return ($out | ConvertFrom-Json).id
+    return [string]($out | ConvertFrom-Json).id
 }
 
 $releaseId = Get-ReleaseId
+# Пустой или склеенный id превратится в мусорный URL, а GitVerse ответит на него
+# невнятной ошибкой - лучше остановиться здесь с понятным текстом.
+if ($releaseId -notmatch '^\d+$') {
+    throw "Unexpected release id for ${Tag}: '$releaseId'"
+}
 
 # GitVerse rejects the .sig extension (400) - upload signatures as .sig.txt.
 Get-ChildItem -LiteralPath $Directory -Filter *.sig | ForEach-Object {
