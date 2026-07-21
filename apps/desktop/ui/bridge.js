@@ -31,6 +31,7 @@
     messageLabelIds: (messageId) => invoke("message_label_ids", { messageId }),
     listFolders: (accountId) => invoke("list_folders", { accountId }),
     setFolderRole: (accountId, role, folderId) => invoke("set_folder_role", { accountId, role, folderId }),
+    createFolder: (accountId, parentFolderId, name) => invoke("create_folder", { accountId, parentFolderId, name }),
     renameFolder: (folderId, newName) => invoke("rename_folder", { folderId, newName }),
     deleteFolder: (folderId) => invoke("delete_folder", { folderId }),
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
@@ -60,6 +61,7 @@
     createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
     updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
     deleteEvent: (eventId) => invoke("delete_event", { eventId }),
+    respondToEvent: (eventId, response) => invoke("respond_to_event", { eventId, response }),
     createContact: (accountId, input) => invoke("create_contact", { accountId, input }),
     updateContact: (contactId, input) => invoke("update_contact", { contactId, input }),
     deleteContact: (contactId) => invoke("delete_contact", { contactId }),
@@ -73,6 +75,7 @@
     sendMessage: (request) => invoke("send_message", { request }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
+    markFlagged: (messageId, flagged) => invoke("mark_flagged", { messageId, flagged }),
     snoozeMessages: (messageIds, until) => invoke("snooze_messages", { messageIds, until }),
     unsnoozeMessages: (messageIds) => invoke("unsnooze_messages", { messageIds }),
     releaseDueSnoozes: () => invoke("release_due_snoozes"),
@@ -140,8 +143,14 @@
   tauri.event?.listen("truemail-open-message", async event => {
     const id = Number(event.payload);
     if (!Number.isFinite(id)) return;
-    await window.reloadCoreData?.().catch(() => {});
-    window.openMessageById?.(id);
+    try { await window.reloadCoreData?.(); } catch (_) {}
+    await window.openMessageById?.(id);
+  }).catch(console.error);
+
+  // Переход в календарь по клику "Открыть" в карточке изменения встречи.
+  tauri.event?.listen("truemail-open-event", event => {
+    const payload = event.payload || {};
+    window.openCalendarEventById?.(payload.event_id ?? null, payload.start ?? null);
   }).catch(console.error);
 
   let reloadTimer = null;

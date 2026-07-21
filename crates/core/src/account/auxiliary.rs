@@ -1,11 +1,28 @@
-//! Двусторонние операции календаря, контактов и задач для Google и Яндекса.
+//! Двусторонние операции календаря, контактов и задач: Google Calendar/People
+//! REST API и CalDAV/CardDAV (Яндекс и любой другой DAV-совместимый сервер).
 
-use crate::model::{Alarm, Attendee, ContactPhone, EventClass, Provider, Transp};
+use super::dav::{DavAuth, apply_dav_auth, dav_auth_scheme};
+use crate::model::{
+    Alarm, Attendee, AuthKind, ContactPhone, Event, EventClass, Provider, RsvpResponse, Transp,
+};
 use crate::{Error, Result};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use url::Url;
+
+/// Провайдеры, к которым применим общий CalDAV/CardDAV-путь записи. Яндекс -
+/// не единственный: iCloud, Mail.ru, Outlook (если у него настроен DAV) и
+/// generic-серверы читаются и пишутся одинаково, различается только
+/// авторизация (см. dav_auth_scheme в dav.rs). Exchange сюда не входит - у
+/// него собственный протокол EWS без поддержки записи календаря/контактов
+/// через auxiliary.rs.
+fn is_dav_provider(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Yandex | Provider::Icloud | Provider::Mailru | Provider::Outlook | Provider::Generic
+    )
+}
 
 const GOOGLE_CALENDAR_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const GOOGLE_PEOPLE_BASE: &str = "https://people.googleapis.com/v1";
@@ -297,7 +314,7 @@ fn ical_date(value: &str, all_day: bool) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
-fn yandex_event_body(uid: &str, input: &EventInput) -> String {
+fn dav_event_body(uid: &str, input: &EventInput) -> String {
     let start_key = if input.all_day {
         "DTSTART;VALUE=DATE"
     } else {
@@ -419,20 +436,20 @@ fn yandex_event_body(uid: &str, input: &EventInput) -> String {
     lines.join("\r\n")
 }
 
-async fn yandex_dav_write(
+/// PUT/DELETE ресурса CalDAV/CardDAV с ETag-прекондициями (If-None-Match
+/// при создании, If-Match при изменении). Работает для любого DAV-сервера,
+/// не только для Яндекса - разница только в auth (см. DavAuth в dav.rs).
+async fn dav_write(
     method: Method,
     url: &str,
-    email: &str,
-    access_token: &str,
+    auth: &DavAuth,
     content_type: Option<&str>,
     body: Option<String>,
     etag: Option<&str>,
     create: bool,
 ) -> Result<()> {
     let client = client()?;
-    let mut request = client
-        .request(method, url)
-        .basic_auth(email, Some(access_token));
+    let mut request = apply_dav_auth(client.request(method, url), auth.scheme, auth);
     if let Some(content_type) = content_type {
         request = request.header("Content-Type", content_type);
     }
@@ -447,24 +464,23 @@ async fn yandex_dav_write(
     let response = request
         .send()
         .await
-        .map_err(|error| backend_error("yandex-dav-write", error.to_string()))?;
+        .map_err(|error| backend_error("dav-write", error.to_string()))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(backend_error(
-            "yandex-dav-write",
+            "dav-write",
             format!("{url}: HTTP {status}: {body}"),
         ));
     }
     Ok(())
 }
 
-async fn write_yandex_event(
+async fn write_dav_event(
     calendar_source: &str,
     remote: RemoteObject<'_>,
     input: &EventInput,
-    email: &str,
-    access_token: &str,
+    auth: &DavAuth,
 ) -> Result<()> {
     let create = remote.remote_url.is_none();
     let uid = remote
@@ -476,15 +492,14 @@ async fn write_yandex_event(
         None => Url::parse(calendar_source)
             .and_then(|base| base.join(&format!("{uid}.ics")))
             .map(String::from)
-            .map_err(|error| backend_error("yandex-caldav", error.to_string()))?,
+            .map_err(|error| backend_error("dav-caldav", error.to_string()))?,
     };
-    yandex_dav_write(
+    dav_write(
         Method::PUT,
         &url,
-        email,
-        access_token,
+        auth,
         Some("text/calendar; charset=utf-8"),
-        Some(yandex_event_body(&uid, input)),
+        Some(dav_event_body(&uid, input)),
         remote.etag,
         create,
     )
@@ -494,6 +509,7 @@ async fn write_yandex_event(
 /// Создать или изменить событие/задачу на сервере.
 pub async fn write_event(
     provider: Provider,
+    auth_kind: AuthKind,
     email: &str,
     access_token: &str,
     calendar_source: &str,
@@ -502,8 +518,9 @@ pub async fn write_event(
 ) -> Result<()> {
     match provider {
         Provider::Gmail => write_google_event(calendar_source, remote, input, access_token).await,
-        Provider::Yandex => {
-            write_yandex_event(calendar_source, remote, input, email, access_token).await
+        provider if is_dav_provider(provider) => {
+            let auth = DavAuth::new(dav_auth_scheme(provider, auth_kind), email, access_token);
+            write_dav_event(calendar_source, remote, input, &auth).await
         }
         _ => Err(backend_error(
             "auxiliary",
@@ -515,6 +532,7 @@ pub async fn write_event(
 /// Удалить событие/задачу на сервере.
 pub async fn delete_event(
     provider: Provider,
+    auth_kind: AuthKind,
     email: &str,
     access_token: &str,
     calendar_source: &str,
@@ -523,24 +541,137 @@ pub async fn delete_event(
 ) -> Result<()> {
     match provider {
         Provider::Gmail => delete_google_event(calendar_source, remote_url, access_token).await,
-        Provider::Yandex => {
-            yandex_dav_write(
-                Method::DELETE,
-                remote_url,
-                email,
-                access_token,
-                None,
-                None,
-                etag,
-                false,
-            )
-            .await
+        provider if is_dav_provider(provider) => {
+            let auth = DavAuth::new(dav_auth_scheme(provider, auth_kind), email, access_token);
+            dav_write(Method::DELETE, remote_url, &auth, None, None, etag, false).await
         }
         _ => Err(backend_error(
             "auxiliary",
             "удаление события для провайдера не поддерживается",
         )),
     }
+}
+
+/// Клонировать участников события, заменив PARTSTAT своей записи на ответ
+/// пользователя. RSVP не трогаем - решение, нужен ли ответ вообще, приняла
+/// приглашающая сторона, отвечающий его не меняет.
+pub(crate) fn updated_attendees(
+    attendees: &[Attendee],
+    own_email: &str,
+    response: RsvpResponse,
+) -> Vec<Attendee> {
+    attendees
+        .iter()
+        .cloned()
+        .map(|mut attendee| {
+            if attendee.email.eq_ignore_ascii_case(own_email) {
+                attendee.partstat = Some(response.partstat().to_owned());
+            }
+            attendee
+        })
+        .collect()
+}
+
+/// Превратить сохранённое событие в EventInput для повторной записи на
+/// сервер (используется при ответе на приглашение - PUT своей копии с
+/// обновлённым PARTSTAT участника, см. respond_to_event в mod.rs).
+pub(crate) fn event_to_input(event: &Event, attendees: Vec<Attendee>) -> EventInput {
+    EventInput {
+        summary: event.summary.clone(),
+        description: event.description.clone(),
+        location: event.location.clone(),
+        dtstart: event.dtstart.clone(),
+        dtend: event.dtend.clone(),
+        all_day: event.all_day,
+        attendees,
+        alarms: event.alarms.clone(),
+        rrule: event.rrule.clone(),
+        recurrence_id: event.recurrence_id.clone(),
+        exdates: event.exdates.clone(),
+        rdates: event.rdates.clone(),
+        timezone: event.timezone.clone(),
+        transp: event.transp,
+        class: event.class,
+        categories: event.categories.clone(),
+        url: event.url.clone(),
+        organizer: event.organizer.clone(),
+        sequence: event.sequence,
+    }
+}
+
+fn google_response_status(value: &str) -> &'static str {
+    match value {
+        "ACCEPTED" => "accepted",
+        "DECLINED" => "declined",
+        "TENTATIVE" => "tentative",
+        _ => "needsAction",
+    }
+}
+
+/// Ответить на приглашение в Google Calendar: events.patch с обновлённым
+/// responseStatus своего участника и sendUpdates=all - Google сам разошлёт
+/// уведомление организатору, отдельного письма отправлять не нужно. Патч
+/// заменяет весь список attendees целиком (частичное обновление элемента
+/// массива Calendar API не поддерживает), поэтому здесь нужен полный список
+/// с уже применённым своим ответом (см. updated_attendees).
+pub(crate) async fn respond_to_google_event(
+    calendar_source: &str,
+    remote_url: &str,
+    attendees: &[Attendee],
+    access_token: &str,
+) -> Result<()> {
+    let calendar_id = strip_remote(calendar_source, "google-calendar:")?;
+    let event_id = strip_remote(remote_url, "google-event:")?;
+    let mut url = api_url(
+        GOOGLE_CALENDAR_BASE,
+        &["calendars", calendar_id, "events", event_id],
+    )?;
+    url.query_pairs_mut().append_pair("sendUpdates", "all");
+    let body = json!({
+        "attendees": attendees.iter().map(|attendee| json!({
+            "email": attendee.email,
+            "displayName": attendee.name,
+            "responseStatus": attendee.partstat.as_deref().map(google_response_status),
+        })).collect::<Vec<_>>(),
+    });
+    google_json(Method::PATCH, url, access_token, Some(body)).await
+}
+
+/// Собрать iMIP REPLY (RFC 5546) - вложение письма-ответа на приглашение для
+/// провайдеров без серверной рассылки (CalDAV/Yandex). В VEVENT нарочно
+/// остаётся только строка ATTENDEE самого отвечающего - REPLY это ответ
+/// только за себя, весь список участников исходного события сюда не кладут.
+/// UID, ORGANIZER и SEQUENCE переносятся из исходного события без изменений,
+/// DTSTAMP - момент отправки ответа.
+pub(crate) fn imip_reply_body(uid: &str, organizer: &str, sequence: i64, attendee: &Attendee) -> String {
+    let dtstamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let mut params = vec![format!(
+        "PARTSTAT={}",
+        attendee.partstat.as_deref().unwrap_or("NEEDS-ACTION")
+    )];
+    if let Some(name) = &attendee.name {
+        params.push(format!("CN=\"{}\"", ical_escape(name).replace('"', "\\\"")));
+    }
+    let lines = vec![
+        "BEGIN:VCALENDAR".to_owned(),
+        "VERSION:2.0".to_owned(),
+        "PRODID:-//truemail//EN".to_owned(),
+        "METHOD:REPLY".to_owned(),
+        "BEGIN:VEVENT".to_owned(),
+        format!("UID:{uid}"),
+        format!("DTSTAMP:{dtstamp}"),
+        format!("SEQUENCE:{sequence}"),
+        format!("ORGANIZER:mailto:{}", ical_escape(organizer)),
+        format!(
+            "ATTENDEE;{}:mailto:{}",
+            params.join(";"),
+            ical_escape(&attendee.email)
+        ),
+        "END:VEVENT".to_owned(),
+        "END:VCALENDAR".to_owned(),
+        String::new(),
+    ];
+    lines.join("\r\n")
 }
 
 fn google_contact_body(input: &ContactInput, etag: Option<&str>) -> Value {
@@ -599,7 +730,7 @@ async fn write_google_contact(
     .await
 }
 
-fn yandex_contact_body(uid: &str, input: &ContactInput) -> String {
+fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
     let mut lines = vec![
         "BEGIN:VCARD".to_owned(),
         "VERSION:3.0".to_owned(),
@@ -644,6 +775,7 @@ fn yandex_contact_body(uid: &str, input: &ContactInput) -> String {
 /// должен указывать на найденную адресную книгу.
 pub async fn write_contact(
     provider: Provider,
+    auth_kind: AuthKind,
     email: &str,
     access_token: &str,
     collection_url: Option<&str>,
@@ -652,7 +784,8 @@ pub async fn write_contact(
 ) -> Result<()> {
     match provider {
         Provider::Gmail => write_google_contact(remote, input, access_token).await,
-        Provider::Yandex => {
+        provider if is_dav_provider(provider) => {
+            let auth = DavAuth::new(dav_auth_scheme(provider, auth_kind), email, access_token);
             let create = remote.remote_url.is_none();
             let uid = remote
                 .uid
@@ -663,23 +796,22 @@ pub async fn write_contact(
                 None => {
                     let collection = collection_url.ok_or_else(|| {
                         backend_error(
-                            "yandex-carddav",
+                            "dav-carddav",
                             "адресная книга ещё не обнаружена; сначала выполните синхронизацию",
                         )
                     })?;
                     Url::parse(collection)
                         .and_then(|base| base.join(&format!("{uid}.vcf")))
                         .map(String::from)
-                        .map_err(|error| backend_error("yandex-carddav", error.to_string()))?
+                        .map_err(|error| backend_error("dav-carddav", error.to_string()))?
                 }
             };
-            yandex_dav_write(
+            dav_write(
                 Method::PUT,
                 &url,
-                email,
-                access_token,
+                &auth,
                 Some("text/vcard; charset=utf-8"),
-                Some(yandex_contact_body(&uid, input)),
+                Some(dav_contact_body(&uid, input)),
                 remote.etag,
                 create,
             )
@@ -695,6 +827,7 @@ pub async fn write_contact(
 /// Удалить контакт на сервере.
 pub async fn delete_contact(
     provider: Provider,
+    auth_kind: AuthKind,
     email: &str,
     access_token: &str,
     remote_url: &str,
@@ -709,18 +842,9 @@ pub async fn delete_contact(
             url.set_path(&path);
             google_json(Method::DELETE, url, access_token, None).await
         }
-        Provider::Yandex => {
-            yandex_dav_write(
-                Method::DELETE,
-                remote_url,
-                email,
-                access_token,
-                None,
-                None,
-                etag,
-                false,
-            )
-            .await
+        provider if is_dav_provider(provider) => {
+            let auth = DavAuth::new(dav_auth_scheme(provider, auth_kind), email, access_token);
+            dav_write(Method::DELETE, remote_url, &auth, None, None, etag, false).await
         }
         _ => Err(backend_error(
             "auxiliary",
@@ -778,7 +902,7 @@ mod tests {
 
     #[test]
     fn builds_rfc5545_event_for_yandex() {
-        let body = yandex_event_body(
+        let body = dav_event_body(
             "uid",
             &EventInput {
                 summary: "A, B".into(),
@@ -812,5 +936,47 @@ mod tests {
         assert!(body.contains("ATTENDEE;CN=\"Guest\";ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:guest@example.test"));
         assert!(body.contains("TRIGGER:-PT15M"));
         assert!(body.contains("ORGANIZER:mailto:owner@example.test"));
+    }
+
+    #[test]
+    fn imip_reply_has_single_attendee_and_preserves_uid_and_sequence() {
+        let attendee = Attendee {
+            email: "user@example.test".into(),
+            name: Some("User".into()),
+            role: Some("REQ-PARTICIPANT".into()),
+            partstat: Some("ACCEPTED".into()),
+            rsvp: true,
+        };
+        let body = imip_reply_body("event-uid-1", "owner@example.test", 3, &attendee);
+        assert!(body.contains("METHOD:REPLY"));
+        assert!(body.contains("UID:event-uid-1"));
+        assert!(body.contains("SEQUENCE:3"));
+        assert!(body.contains("ORGANIZER:mailto:owner@example.test"));
+        assert_eq!(body.matches("ATTENDEE").count(), 1);
+        assert!(body.contains("PARTSTAT=ACCEPTED"));
+        assert!(body.contains("mailto:user@example.test"));
+    }
+
+    #[test]
+    fn updated_attendees_only_touches_own_partstat_case_insensitively() {
+        let attendees = vec![
+            Attendee {
+                email: "User@Example.Test".into(),
+                name: None,
+                role: Some("REQ-PARTICIPANT".into()),
+                partstat: Some("NEEDS-ACTION".into()),
+                rsvp: true,
+            },
+            Attendee {
+                email: "other@example.test".into(),
+                name: None,
+                role: Some("REQ-PARTICIPANT".into()),
+                partstat: Some("ACCEPTED".into()),
+                rsvp: false,
+            },
+        ];
+        let updated = updated_attendees(&attendees, "user@example.test", RsvpResponse::Declined);
+        assert_eq!(updated[0].partstat.as_deref(), Some("DECLINED"));
+        assert_eq!(updated[1].partstat.as_deref(), Some("ACCEPTED"));
     }
 }

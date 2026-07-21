@@ -11,8 +11,10 @@ pub use auxiliary::{
     write_event,
 };
 pub use dav::{
-    AuxiliarySyncCursors, CollectionCursor, DavCalendar, DavCollection, DavContact, DavEvent,
-    DavSyncResult, SyncScope, sync_yandex_dav, validate_yandex_dav,
+    AuxiliarySyncCursors, CollectionCursor, DavAuth, DavAuthScheme, DavCalendar, DavCollection,
+    DavContact, DavEvent, DavSyncResult, SyncScope, WELL_KNOWN_CALDAV, WELL_KNOWN_CARDDAV,
+    YANDEX_CALDAV_BASE, YANDEX_CARDDAV_BASE, dav_auth_scheme, discover_well_known,
+    resolve_yandex_bases, sync_dav_account, validate_dav,
 };
 pub use google_services::sync_google_services;
 pub use oauth::{
@@ -33,6 +35,7 @@ use crate::model::{
     Account, AuthKind, BackendKind, FolderRole, NewAccount, Provider, Security, ServerConfig,
 };
 use crate::storage::Db;
+use crate::storage::repo::AuxiliarySaveResult;
 use base64::Engine as _;
 use zeroize::Zeroizing;
 
@@ -55,11 +58,15 @@ fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
 /// Результат короткой синхронизации Входящих. `new_messages` считает только
 /// remote ID, которых не было в локальной БД до этого прохода; повторно
 /// полученные EWS Modified-события поэтому не создают уведомления.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `new_message_ids` - локальные id этих же писем (только из папки Входящие),
+/// отсортированные по дате по возрастанию: используются для карточки
+/// уведомления, чтобы показывать именно новое письмо, а не самое свежее в БД.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxSyncResult {
     pub downloaded: usize,
     pub new_messages: usize,
     pub had_baseline: bool,
+    pub new_message_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,6 +91,8 @@ mod sync_registry_tests {
             imap: None,
             smtp: None,
             ews_url: None,
+            caldav_url: None,
+            carddav_url: None,
             jmap_url: None,
             username: None,
             secret_ref: Some("unused-in-test".into()),
@@ -195,6 +204,60 @@ mod sync_registry_tests {
         drop(db);
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
+
+    /// Без secret_ref обе ветки auxiliary_credential падают на первом же шаге,
+    /// ещё до обращения к системному keychain - этого достаточно, чтобы по
+    /// тексту ошибки отличить маршрут OAuth2 (oauth_access_token) от
+    /// Password/Ntlm, не завязываясь на keychain, которого на CI-раннере
+    /// может не быть. Регрессия: раньше create_event/create_contact и
+    /// подобные команды в commands.rs всегда звали oauth_access_token
+    /// напрямую, и Exchange-аккаунт с Password получал невнятную ошибку про
+    /// OAuth-токен вместо честной "нет ссылки на пароль".
+    #[tokio::test]
+    async fn auxiliary_credential_routes_by_auth_kind() {
+        let root = std::env::temp_dir().join(format!(
+            "truemail-auxiliary-credential-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = std::sync::Arc::new(crate::crypto::StorageCrypto::from_key(rand::random()));
+        let database_key = crate::crypto::DatabaseKey::from_key(rand::random());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let manager = AccountManager::new(db.clone());
+
+        let mut oauth_account = gmail_account(1);
+        oauth_account.secret_ref = None;
+        let error = manager
+            .auxiliary_credential(&oauth_account)
+            .await
+            .expect_err("oauth account without secret_ref must fail before keychain access");
+        assert!(
+            matches!(&error, crate::Error::AccountConfig(message) if message.contains("OAuth-токен")),
+            "unexpected error: {error}"
+        );
+
+        for auth_kind in [AuthKind::Password, AuthKind::Ntlm, AuthKind::AppPassword] {
+            let mut password_account = gmail_account(2);
+            password_account.provider = Provider::Exchange;
+            password_account.auth_kind = auth_kind;
+            password_account.secret_ref = None;
+            let error = manager
+                .auxiliary_credential(&password_account)
+                .await
+                .expect_err("password-family account without secret_ref must fail before keychain access");
+            assert!(
+                matches!(&error, crate::Error::AccountConfig(message) if message.contains("пароль")),
+                "unexpected error for {auth_kind:?}: {error}"
+            );
+        }
+
+        db.close().await;
+        drop(db);
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
 }
 
 #[derive(Default)]
@@ -259,6 +322,57 @@ impl AccountManager {
         format!("gmail_api_retry_at:{account_id}")
     }
 
+    /// secret_ref уже подключённого аккаунта с этим email, если он есть -
+    /// снимок состояния ДО апсерта. save_account делает UPSERT по email, так
+    /// что после сохранения старое значение уже не прочитать: смотреть
+    /// нужно заранее, чтобы потом понять, какую запись keychain подчищать.
+    async fn existing_secret_ref(&self, email: &str) -> Option<String> {
+        match self.db.list_accounts().await {
+            Ok(accounts) => accounts
+                .into_iter()
+                .find(|account| account.email.eq_ignore_ascii_case(email))
+                .and_then(|account| account.secret_ref),
+            Err(error) => {
+                tracing::warn!(%error, "не удалось прочитать список аккаунтов перед подключением");
+                None
+            }
+        }
+    }
+
+    /// Если email раньше был подключён другим способом (был пароль IMAP,
+    /// стал OAuth и т.п.), secret_ref в БД сменился на новый, а старая
+    /// запись в системном keychain так и осталась висеть с прежним секретом.
+    /// Подчищаем её здесь. Вызывать строго ПОСЛЕ того, как новый секрет и
+    /// аккаунт уже успешно сохранены: сбой этой очистки не должен ронять
+    /// само подключение, а порядок исключает риск остаться совсем без
+    /// секрета при сбое на середине.
+    fn cleanup_stale_secret(previous: Option<String>, new_secret_ref: &str) {
+        let Some(previous) = previous else {
+            return;
+        };
+        if previous == new_secret_ref {
+            return;
+        }
+        match keyring::Entry::new("truemail", &previous) {
+            Ok(entry) => {
+                if let Err(error) = entry.delete_credential() {
+                    tracing::warn!(
+                        secret_ref = %previous,
+                        %error,
+                        "не удалось удалить осиротевшую запись keychain (возможно, уже отсутствует)"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    secret_ref = %previous,
+                    %error,
+                    "не удалось открыть осиротевшую запись keychain для удаления"
+                );
+            }
+        }
+    }
+
     /// Не выпускать Gmail HTTP-запрос раньше серверного Retry-After даже после
     /// перезапуска приложения. Значение хранится в зашифрованной settings.
     async fn ensure_gmail_mail_allowed(&self, account: &Account) -> Result<()> {
@@ -270,7 +384,7 @@ impl AccountManager {
             return Ok(());
         };
         let Ok(retry_at) = chrono::DateTime::parse_from_rfc3339(&value) else {
-            tracing::warn!(account = %account.email, value, "повреждён сохранённый Gmail Retry-After; значение проигнорировано");
+            tracing::warn!(account = %crate::logging::mask_email(&account.email), value, "повреждён сохранённый Gmail Retry-After; значение проигнорировано");
             return Ok(());
         };
         let retry_at = retry_at.with_timezone(&chrono::Utc);
@@ -305,7 +419,7 @@ impl AccountManager {
         let existing = match self.db.setting(&key).await {
             Ok(value) => value,
             Err(read_error) => {
-                tracing::warn!(account = %account.email, %read_error, "Gmail Retry-After не прочитан перед обновлением");
+                tracing::warn!(account = %crate::logging::mask_email(&account.email), %read_error, "Gmail Retry-After не прочитан перед обновлением");
                 None
             }
         };
@@ -319,16 +433,60 @@ impl AccountManager {
         let value = retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         match self.db.set_setting(&key, &value).await {
             Ok(()) => tracing::info!(
-                account = %account.email,
+                account = %crate::logging::mask_email(&account.email),
                 retry_at = %value,
                 "Gmail Retry-After сохранён и переживёт перезапуск"
             ),
             Err(write_error) => tracing::warn!(
-                account = %account.email,
+                account = %crate::logging::mask_email(&account.email),
                 %write_error,
                 "Gmail Retry-After не удалось сохранить"
             ),
         }
+    }
+
+    /// `parent_folder_id` - локальный id уже существующей папки, внутри
+    /// которой создаётся новая (None - верхний уровень аккаунта). В отличие
+    /// от rename/delete здесь нет защиты системных папок: создать подпапку
+    /// внутри Входящих - обычная операция, ничего не переименовывает и не
+    /// удаляет.
+    pub async fn create_folder(
+        &self,
+        account_id: i64,
+        parent_folder_id: Option<i64>,
+        name: &str,
+    ) -> Result<()> {
+        let account = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| crate::Error::AccountConfig("аккаунт не найден".into()))?;
+        let parent_remote_path = match parent_folder_id {
+            Some(id) => {
+                let parent = self.db.folder(id).await?;
+                if parent.account_id != account_id {
+                    return Err(crate::Error::AccountConfig(
+                        "родительская папка принадлежит другому аккаунту".into(),
+                    ));
+                }
+                Some(parent.remote_path)
+            }
+            None => None,
+        };
+        let token = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
+        backend
+            .create_folder(&account.email, &token, parent_remote_path.as_deref(), name)
+            .await?;
+        // Локально папка заводится обычным циклом синхронизации списка папок
+        // (как в sync_mail_account_inner) - так UI сразу видит новую папку,
+        // а не только remote_path, о котором знает только что созданный backend.
+        if let Ok(folders) = backend.discover_folders(&account.email, &token).await {
+            self.db.save_discovered_folders(account.id, &folders).await?;
+        }
+        Ok(())
     }
 
     pub async fn rename_folder(&self, folder_id: i64, new_name: &str) -> Result<()> {
@@ -424,6 +582,18 @@ impl AccountManager {
 
     async fn mail_credential(&self, account: &Account) -> Result<Zeroizing<String>> {
         self.ensure_gmail_mail_allowed(account).await?;
+        self.auxiliary_credential(account).await
+    }
+
+    /// Секрет для вспомогательных операций (запись события/контакта из
+    /// commands.rs) и для Exchange EWS вне почтового rate-limit'а Gmail:
+    /// для OAuth2 - access token с обновлением по refresh (см.
+    /// oauth_access_token), для Password/Ntlm/AppPassword - обычный пароль
+    /// из системного keychain. Раньше эти команды всегда звали
+    /// oauth_access_token напрямую, из-за чего Exchange-аккаунт с паролем
+    /// падал на serde_json::from_str ещё до выбора провайдера - секрет в
+    /// keychain у него лежит строкой, а не JSON StoredOAuthCredential.
+    pub async fn auxiliary_credential(&self, account: &Account) -> Result<Zeroizing<String>> {
         if account.auth_kind == AuthKind::Oauth2 {
             return self.oauth_access_token(account).await;
         }
@@ -536,7 +706,7 @@ impl AccountManager {
             entry
                 .set_password(&serialized)
                 .map_err(|e| crate::Error::Keyring(e.to_string()))?;
-            tracing::info!(email = %account.email, provider = ?account.provider, scope = ?updated.scope, "OAuth-токен обновлён через refresh");
+            tracing::info!(email = %crate::logging::mask_email(&account.email), provider = ?account.provider, scope = ?updated.scope, "OAuth-токен обновлён через refresh");
             credential = updated;
         }
         Ok(Zeroizing::new(credential.access_token.clone()))
@@ -586,11 +756,10 @@ impl AccountManager {
             .collect::<Vec<_>>();
         remote_ids.sort();
         remote_ids.dedup();
-        let new_messages = self
-            .db
-            .unknown_remote_ids(account.id, &remote_ids)
-            .await?
-            .len();
+        // До этого момента письма ещё не в БД - список остаётся полным набором
+        // действительно новых remote_id, а не тем, что уже успело устареть.
+        let unknown_remote_ids = self.db.unknown_remote_ids(account.id, &remote_ids).await?;
+        let new_messages = unknown_remote_ids.len();
         self.db
             .save_discovered_folders(account.id, &discovery.folders)
             .await?;
@@ -617,6 +786,16 @@ impl AccountManager {
         self.db
             .save_discovered_messages(account.id, &discovery.messages)
             .await?;
+        // Письма к этому моменту уже в БД и получили локальные id - можно
+        // достать их для уведомления. Только Входящие (роль 'inbox'): другие
+        // папки уведомлению не нужны.
+        let new_message_ids = if unknown_remote_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.db
+                .inbox_message_ids_by_remote_ids(account.id, &unknown_remote_ids)
+                .await?
+        };
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
@@ -627,12 +806,14 @@ impl AccountManager {
             downloaded,
             new_messages,
             had_baseline,
+            new_message_ids,
         })
     }
 
-    /// Совместимый интерфейс для IMAP/Gmail: количество загруженных изменений.
-    pub async fn sync_mail_inbox(&self, account: &Account) -> Result<usize> {
-        Ok(self.sync_mail_inbox_delta(account).await?.downloaded)
+    /// Совместимый интерфейс для IMAP/Gmail: полный результат синхронизации
+    /// Входящих, включая новые id для уведомлений.
+    pub async fn sync_mail_inbox(&self, account: &Account) -> Result<InboxSyncResult> {
+        self.sync_mail_inbox_delta(account).await
     }
 
     /// Гарантировать наличие сырого MIME письма локально. Если кэш был вычищен
@@ -668,7 +849,7 @@ impl AccountManager {
             )
             .await?;
         self.db.store_fetched_raw(message_id, &raw).await?;
-        tracing::info!(message_id, account = %account.email, "письмо докачано с сервера (вне кэша)");
+        tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
     }
 
@@ -686,49 +867,98 @@ impl AccountManager {
                 .await
             {
                 Ok(pruned) if pruned > 0 => tracing::info!(
-                    account = %account.email,
+                    account = %crate::logging::mask_email(&account.email),
                     pruned,
                     retention_days = account.retention_days,
                     "кэш очищен по глубине хранения (старт)"
                 ),
                 Ok(_) => {}
                 Err(error) => {
-                    tracing::warn!(account = %account.email, %error, "автоочистка кэша не удалась")
+                    tracing::warn!(account = %crate::logging::mask_email(&account.email), %error, "автоочистка кэша не удалась")
                 }
             }
         }
         Ok(())
     }
 
-    /// Обновить календарь и контакты, не запуская тяжёлую IMAP-синхронизацию.
-    pub async fn sync_yandex_dav_account(
-        &self,
-        account: &Account,
-    ) -> Result<(usize, usize, usize)> {
+    /// Определить базовые адреса CalDAV/CardDAV для аккаунта: уже заданные
+    /// на аккаунте (ручная настройка или прошлое обнаружение), фиксированные
+    /// адреса Яндекса, либо RFC 6764 .well-known/{caldav,carddav} по домену
+    /// почты. Найденные адреса сохраняются на аккаунте, чтобы не искать их
+    /// заново при каждой синхронизации. SRV-записи (_caldavs._tcp) не
+    /// проверяются - см. dav::discover_well_known.
+    async fn resolve_dav_bases(&self, account: &Account) -> Result<(Option<String>, Option<String>)> {
+        if account.provider == Provider::Yandex {
+            let (cal, card) = dav::resolve_yandex_bases(
+                account.caldav_url.as_deref(),
+                account.carddav_url.as_deref(),
+            );
+            return Ok((Some(cal), Some(card)));
+        }
+        let mut caldav_url = account.caldav_url.clone();
+        let mut carddav_url = account.carddav_url.clone();
+        if let Some((_, domain)) = account.email.rsplit_once('@') {
+            let origin = format!("https://{domain}");
+            if caldav_url.is_none() {
+                caldav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CALDAV).await;
+            }
+            if carddav_url.is_none() {
+                carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
+            }
+        }
+        if caldav_url != account.caldav_url || carddav_url != account.carddav_url {
+            self.db
+                .set_dav_urls(account.id, caldav_url.as_deref(), carddav_url.as_deref())
+                .await?;
+        }
+        Ok((caldav_url, carddav_url))
+    }
+
+    /// Обновить календарь и контакты по CalDAV/CardDAV, не запуская тяжёлую
+    /// IMAP-синхронизацию. Работает для любого провайдера с известными или
+    /// обнаруженными DAV-адресами (см. resolve_dav_bases) - раньше это было
+    /// жёстко привязано к Яндексу.
+    pub async fn sync_dav_auxiliary_account(&self, account: &Account) -> Result<AuxiliarySaveResult> {
         self.sync_registry
             .exclusive(
                 account.id,
                 SyncKind::Auxiliary,
-                self.sync_yandex_dav_account_inner(account),
+                self.sync_dav_auxiliary_account_inner(account),
             )
             .await
     }
 
-    async fn sync_yandex_dav_account_inner(
+    async fn sync_dav_auxiliary_account_inner(
         &self,
         account: &Account,
-    ) -> Result<(usize, usize, usize)> {
-        let access_token = self.oauth_access_token(account).await?;
+    ) -> Result<AuxiliarySaveResult> {
+        // auxiliary_credential (не oauth_access_token) - иначе аккаунт с
+        // Password/AppPassword (iCloud, Mail.ru, generic) упадёт на разборе
+        // JSON ещё до диспетчеризации по провайдеру.
+        let secret = self.auxiliary_credential(account).await?;
+        let auth = dav::DavAuth::new(
+            dav::dav_auth_scheme(account.provider, account.auth_kind),
+            account.username.clone().unwrap_or_else(|| account.email.clone()),
+            secret.as_str(),
+        );
+        let (caldav_base, carddav_base) = self.resolve_dav_bases(account).await?;
         let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
-        let dav = sync_yandex_dav(&account.email, &access_token, &cursors).await?;
-        self.db.save_yandex_dav(account.id, &dav).await
+        let dav = dav::sync_dav_account(
+            &account.email,
+            &auth,
+            caldav_base.as_deref(),
+            carddav_base.as_deref(),
+            &cursors,
+        )
+        .await?;
+        self.db.save_dav(account.id, &dav).await
     }
 
     /// Обновить Google Calendar, Contacts и Tasks отдельно от IMAP.
     pub async fn sync_google_auxiliary_account(
         &self,
         account: &Account,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         self.sync_registry
             .exclusive(
                 account.id,
@@ -741,7 +971,7 @@ impl AccountManager {
     async fn sync_google_auxiliary_account_inner(
         &self,
         account: &Account,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         let access_token = self.oauth_access_token(account).await?;
         let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
         let data = sync_google_services(&access_token, &cursors).await?;
@@ -752,7 +982,7 @@ impl AccountManager {
     pub async fn sync_exchange_auxiliary_account(
         &self,
         account: &Account,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         self.sync_registry
             .exclusive(
                 account.id,
@@ -765,7 +995,7 @@ impl AccountManager {
     async fn sync_exchange_auxiliary_account_inner(
         &self,
         account: &Account,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         let credential = self.mail_credential(account).await?;
         let endpoint = account.ews_url.clone().ok_or_else(|| {
             crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
@@ -785,13 +1015,303 @@ impl AccountManager {
     /// Обновить дополнительные сервисы поддерживаемого провайдера.
     /// Почтовый цикл вызывает только почтовую синхронизацию, а этот метод —
     /// единственная точка входа для календарей, контактов и задач.
-    pub async fn sync_auxiliary_account(&self, account: &Account) -> Result<(usize, usize, usize)> {
+    pub async fn sync_auxiliary_account(&self, account: &Account) -> Result<AuxiliarySaveResult> {
+        // JMAP-аккаунт живёт как Provider::Generic (см. add_jmap_password), но
+        // у JMAP нет календаря/контактов через DAV - без этой проверки он
+        // попал бы в общую DAV-ветку и на каждой синхронизации безрезультатно
+        // дёргал бы .well-known на своём домене.
+        if account.backend_kind == BackendKind::Jmap {
+            return Ok(AuxiliarySaveResult::default());
+        }
         match account.provider {
-            Provider::Yandex => self.sync_yandex_dav_account(account).await,
             Provider::Gmail => self.sync_google_auxiliary_account(account).await,
             Provider::Exchange => self.sync_exchange_auxiliary_account(account).await,
-            _ => Ok((0, 0, 0)),
+            Provider::Yandex
+            | Provider::Icloud
+            | Provider::Mailru
+            | Provider::Outlook
+            | Provider::Generic => self.sync_dav_auxiliary_account(account).await,
         }
+    }
+
+    /// Ответить на приглашение (RSVP): единая точка входа, дальше ветвление
+    /// по провайдеру - тот же приём, что у write_event/delete_event в
+    /// auxiliary.rs, только здесь нужен доступ к self (учётные данные,
+    /// SMTP-транспорт), поэтому это метод AccountManager, а не свободная
+    /// функция в auxiliary.rs.
+    /// - Google: events.patch с обновлённым responseStatus (sendUpdates=all) -
+    ///   сервер сам уведомляет организатора.
+    /// - CalDAV (Яндекс и остальные DAV-провайдеры): сервер не рассылает
+    ///   приглашения сам - PUT своей копии события с новым PARTSTAT плюс
+    ///   письмо-ответ организатору в формате iMIP (METHOD:REPLY, RFC 5546).
+    /// - Exchange: штатные SOAP-операции AcceptItem/DeclineItem/
+    ///   TentativelyAcceptItem - сервер сам формирует и рассылает ответ.
+    pub async fn respond_to_event(
+        &self,
+        account: &Account,
+        calendar_source: &str,
+        remote: RemoteObject<'_>,
+        event: &crate::model::Event,
+        response: crate::model::RsvpResponse,
+    ) -> Result<()> {
+        match account.provider {
+            Provider::Gmail => {
+                let token = self.oauth_access_token(account).await?;
+                let attendees = auxiliary::updated_attendees(&event.attendees, &account.email, response);
+                let remote_url = remote.remote_url.ok_or_else(|| {
+                    crate::Error::AccountConfig("у события нет серверного идентификатора".into())
+                })?;
+                auxiliary::respond_to_google_event(calendar_source, remote_url, &attendees, &token)
+                    .await
+            }
+            Provider::Yandex | Provider::Icloud | Provider::Mailru | Provider::Outlook
+            | Provider::Generic => {
+                self.respond_to_dav_event(account, calendar_source, remote, event, response)
+                    .await
+            }
+            Provider::Exchange => {
+                let credential = self.mail_credential(account).await?;
+                let endpoint = account.ews_url.clone().ok_or_else(|| {
+                    crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
+                })?;
+                let username = account
+                    .username
+                    .clone()
+                    .unwrap_or_else(|| account.email.clone());
+                let backend = EwsBackend { endpoint, username };
+                let remote_url = remote.remote_url.ok_or_else(|| {
+                    crate::Error::AccountConfig("у события нет серверного идентификатора".into())
+                })?;
+                let item_id = remote_url.strip_prefix("ews-event:").ok_or_else(|| {
+                    crate::Error::AccountConfig("неизвестный серверный идентификатор события".into())
+                })?;
+                backend
+                    .respond_to_calendar_item(&credential, item_id, response)
+                    .await
+            }
+        }
+    }
+
+    /// Ветка respond_to_event для CalDAV (Яндекс и остальные DAV-провайдеры):
+    /// сервер не знает про iMIP, поэтому отвечающий сам обновляет свою копию
+    /// события (PUT с новым PARTSTAT) и сам же отправляет организатору
+    /// письмо-ответ. Оба шага делаем последовательно; если PUT прошёл, а
+    /// письмо не ушло - вернём ошибку письма (само событие уже несёт
+    /// правильный статус локально после следующей синхронизации, и
+    /// update_own_partstat в commands.rs применит его немедленно только если
+    /// respond_to_event вернул Ok, так что тут именно так: без письма
+    /// организатор не узнает об ответе).
+    /// EwsBackend по данным аккаунта. Вынесено, чтобы шесть операций записи
+    /// не повторяли сборку endpoint/username каждая по-своему.
+    fn ews_backend(&self, account: &Account) -> Result<EwsBackend> {
+        let endpoint = account.ews_url.clone().ok_or_else(|| {
+            crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
+        })?;
+        let username = account
+            .username
+            .clone()
+            .unwrap_or_else(|| account.email.clone());
+        Ok(EwsBackend { endpoint, username })
+    }
+
+    /// Идентификатор элемента EWS из remote_url. Читающая сторона (ews.rs)
+    /// сохраняет их с префиксом ews-event:/ews-contact:, поэтому чужой
+    /// префикс - это признак, что объект пришёл от другого провайдера.
+    fn ews_item_id<'a>(remote_url: &'a str, prefix: &str) -> Result<&'a str> {
+        remote_url.strip_prefix(prefix).ok_or_else(|| {
+            crate::Error::AccountConfig("неизвестный серверный идентификатор объекта".into())
+        })
+    }
+
+    /// Создать или изменить событие. Для Exchange - через EWS, для остальных -
+    /// прежним путём (Google REST или CalDAV).
+    pub async fn write_event(
+        &self,
+        account: &Account,
+        calendar_source: &str,
+        remote: RemoteObject<'_>,
+        input: &EventInput,
+    ) -> Result<()> {
+        let credential = self.auxiliary_credential(account).await?;
+        if account.provider == Provider::Exchange {
+            let backend = self.ews_backend(account)?;
+            return match remote.remote_url {
+                Some(url) => {
+                    backend
+                        .update_calendar_item(&credential, Self::ews_item_id(url, "ews-event:")?, input)
+                        .await
+                }
+                // ItemId созданного элемента намеренно отбрасываем: как и в
+                // DAV-ветке, локальные записи получают серверные идентификаторы
+                // ближайшим refresh_auxiliary, отдельного пути для них нет.
+                None => backend
+                    .create_calendar_item(&credential, input)
+                    .await
+                    .map(|_| ()),
+            };
+        }
+        write_event(
+            account.provider,
+            account.auth_kind,
+            &account.email,
+            &credential,
+            calendar_source,
+            remote,
+            input,
+        )
+        .await
+    }
+
+    /// Удалить событие.
+    pub async fn delete_event(
+        &self,
+        account: &Account,
+        calendar_source: &str,
+        remote_url: &str,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        let credential = self.auxiliary_credential(account).await?;
+        if account.provider == Provider::Exchange {
+            return self
+                .ews_backend(account)?
+                .delete_calendar_item(&credential, Self::ews_item_id(remote_url, "ews-event:")?)
+                .await;
+        }
+        delete_event(
+            account.provider,
+            account.auth_kind,
+            &account.email,
+            &credential,
+            calendar_source,
+            remote_url,
+            etag,
+        )
+        .await
+    }
+
+    /// Создать или изменить контакт.
+    pub async fn write_contact(
+        &self,
+        account: &Account,
+        collection_url: Option<&str>,
+        remote: RemoteObject<'_>,
+        input: &ContactInput,
+    ) -> Result<()> {
+        let credential = self.auxiliary_credential(account).await?;
+        if account.provider == Provider::Exchange {
+            let backend = self.ews_backend(account)?;
+            return match remote.remote_url {
+                Some(url) => {
+                    backend
+                        .update_contact_item(&credential, Self::ews_item_id(url, "ews-contact:")?, input)
+                        .await
+                }
+                None => backend
+                    .create_contact_item(&credential, input)
+                    .await
+                    .map(|_| ()),
+            };
+        }
+        write_contact(
+            account.provider,
+            account.auth_kind,
+            &account.email,
+            &credential,
+            collection_url,
+            remote,
+            input,
+        )
+        .await
+    }
+
+    /// Удалить контакт.
+    pub async fn delete_contact(
+        &self,
+        account: &Account,
+        remote_url: &str,
+        etag: Option<&str>,
+    ) -> Result<()> {
+        let credential = self.auxiliary_credential(account).await?;
+        if account.provider == Provider::Exchange {
+            return self
+                .ews_backend(account)?
+                .delete_contact_item(&credential, Self::ews_item_id(remote_url, "ews-contact:")?)
+                .await;
+        }
+        delete_contact(
+            account.provider,
+            account.auth_kind,
+            &account.email,
+            &credential,
+            remote_url,
+            etag,
+        )
+        .await
+    }
+
+    async fn respond_to_dav_event(
+        &self,
+        account: &Account,
+        calendar_source: &str,
+        remote: RemoteObject<'_>,
+        event: &crate::model::Event,
+        response: crate::model::RsvpResponse,
+    ) -> Result<()> {
+        let organizer = event.organizer.clone().ok_or_else(|| {
+            crate::Error::AccountConfig(
+                "у события не указан организатор - отправить ответ некому".into(),
+            )
+        })?;
+        let uid = event
+            .uid
+            .clone()
+            .or_else(|| remote.uid.map(str::to_owned))
+            .ok_or_else(|| crate::Error::AccountConfig("у события нет UID".into()))?;
+        let attendees = auxiliary::updated_attendees(&event.attendees, &account.email, response);
+        // auxiliary_credential (не oauth_access_token) - Яндекс всегда Oauth2,
+        // но остальные DAV-провайдеры (iCloud, Mail.ru, generic) обычно идут
+        // по паролю/app-password, и oauth_access_token для них упал бы.
+        let credential = self.auxiliary_credential(account).await?;
+        let input = auxiliary::event_to_input(event, attendees.clone());
+        auxiliary::write_event(
+            account.provider,
+            account.auth_kind,
+            &account.email,
+            &credential,
+            calendar_source,
+            remote,
+            &input,
+        )
+        .await?;
+        let own = attendees
+            .iter()
+            .find(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))
+            .ok_or_else(|| {
+                crate::Error::AccountConfig("пользователь не найден среди участников события".into())
+            })?;
+        let ics = auxiliary::imip_reply_body(&uid, &organizer, event.sequence, own);
+        let subject = format!("Re: {}", event.summary);
+        let body_text = match response {
+            crate::model::RsvpResponse::Accepted => "Приглашение принято.",
+            crate::model::RsvpResponse::Declined => "Приглашение отклонено.",
+            crate::model::RsvpResponse::Tentative => "Участие пока под вопросом.",
+        }
+        .to_owned();
+        let message = crate::backend::OutgoingMessage {
+            from: account.email.clone(),
+            to: vec![organizer],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject,
+            body_text,
+            body_html: None,
+            attachments: vec![crate::backend::OutgoingAttachment {
+                filename: "reply.ics".into(),
+                mime_type: "text/calendar; method=REPLY; charset=UTF-8".into(),
+                data: ics.into_bytes(),
+            }],
+        };
+        self.send_outgoing(account.id, message).await
     }
 
     /// Отправить письмо через транспорт выбранного аккаунта; поле From задаёт core.
@@ -819,7 +1339,7 @@ impl AccountManager {
                 .queue_sent_append(account.id, &payload, &error.to_string())
                 .await?;
             tracing::warn!(
-                account = %account.email,
+                account = %crate::logging::mask_email(&account.email),
                 provider,
                 %error,
                 "SMTP доставил письмо; сохранение в Отправленные поставлено в отдельный retry"
@@ -827,7 +1347,7 @@ impl AccountManager {
             return Ok(());
         }
         tracing::info!(
-            account = %account.email,
+            account = %crate::logging::mask_email(&account.email),
             provider,
             "письмо отправлено, серверная копия сохранена"
         );
@@ -885,7 +1405,7 @@ impl AccountManager {
                                         )
                                         .await?;
                                     tracing::warn!(
-                                        account = %account.email,
+                                        account = %crate::logging::mask_email(&account.email),
                                         operation = operation.id,
                                         %error,
                                         "SMTP доставил scheduled-письмо; retry продолжит только IMAP APPEND"
@@ -923,7 +1443,7 @@ impl AccountManager {
                         .fail_outbox_operation(operation.id, &error.to_string())
                         .await?;
                     tracing::warn!(
-                        account = %account.email,
+                        account = %crate::logging::mask_email(&account.email),
                         operation = operation.id,
                         attempts = operation.attempts + 1,
                         %error,
@@ -959,6 +1479,7 @@ impl AccountManager {
         backend.validate(email, password).await?;
 
         let secret_ref = format!("mail-password:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|error| crate::Error::Keyring(error.to_string()))?;
         entry
@@ -975,6 +1496,8 @@ impl AccountManager {
                 imap: Some(imap),
                 smtp: config.smtp.clone(),
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some(username.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -988,6 +1511,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
         Ok(ConnectedAccountSync {
             account,
             mail_folders: 0,
@@ -1023,6 +1547,7 @@ impl AccountManager {
         };
         backend.validate(email, password).await?;
         let secret_ref = format!("exchange-password:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|error| crate::Error::Keyring(error.to_string()))?;
         entry
@@ -1039,6 +1564,8 @@ impl AccountManager {
                 imap: None,
                 smtp: None,
                 ews_url: Some(endpoint),
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some(username.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -1052,6 +1579,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
         Ok(ConnectedAccountSync {
             account,
             mail_folders: 0,
@@ -1080,6 +1608,7 @@ impl AccountManager {
         };
         backend.validate(email, password).await?;
         let secret_ref = format!("jmap-password:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|error| crate::Error::Keyring(error.to_string()))?;
         entry
@@ -1096,6 +1625,8 @@ impl AccountManager {
                 imap: None,
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: Some(session_url.trim().to_owned()),
                 username: Some(username.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -1109,6 +1640,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
         Ok(ConnectedAccountSync {
             account,
             mail_folders: 0,
@@ -1128,6 +1660,7 @@ impl AccountManager {
     ) -> Result<ConnectedAccountSync> {
         let access_token = Zeroizing::new(token.access_token.clone());
         let secret_ref = format!("yandex-oauth:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
         let credential = StoredOAuthCredential::from(token);
@@ -1155,6 +1688,8 @@ impl AccountManager {
                     security: Security::Ssl,
                 }),
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -1168,13 +1703,15 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
 
         // Код уже обменян и одноразовый, поэтому токен сначала надёжно
         // сохраняется. Проверки доступа быстрые; их временный сбой становится
         // предупреждением и не заставляет пользователя получать новый код.
+        let dav_auth = dav::DavAuth::new(dav::DavAuthScheme::BasicToken, email, access_token.as_str());
         let (mail_access, dav_access) = tokio::join!(
             YandexBackend.validate(email, &access_token),
-            validate_yandex_dav(email, &access_token)
+            validate_dav(&dav_auth, YANDEX_CALDAV_BASE, YANDEX_CARDDAV_BASE)
         );
         let mut warnings = Vec::new();
         if let Err(error) = mail_access {
@@ -1201,7 +1738,7 @@ impl AccountManager {
         display_name: &str,
         token: OAuthToken,
     ) -> Result<ConnectedAccountSync> {
-        tracing::info!(email, scope = ?token.scope, "Gmail OAuth: провайдер вернул scope");
+        tracing::info!(email = %crate::logging::mask_email(email), scope = ?token.scope, "Gmail OAuth: провайдер вернул scope");
         if let Some(granted) = token.scope.as_deref() {
             let granted: std::collections::HashSet<_> = granted.split_whitespace().collect();
             let missing: Vec<_> = GOOGLE_SCOPES
@@ -1209,7 +1746,7 @@ impl AccountManager {
                 .filter(|scope| !granted.contains(scope))
                 .collect();
             if !missing.is_empty() {
-                tracing::warn!(email, missing = ?missing, "Gmail OAuth: Google выдал не все запрошенные scope");
+                tracing::warn!(email = %crate::logging::mask_email(email), missing = ?missing, "Gmail OAuth: Google выдал не все запрошенные scope");
                 return Err(crate::Error::AccountConfig(format!(
                     "Google не выдал все разрешения truemail. Повторите подключение и подтвердите доступ к Gmail, Календарю, Контактам и Задачам. Не выданы: {}",
                     missing.join(", ")
@@ -1217,12 +1754,13 @@ impl AccountManager {
             }
         } else {
             tracing::warn!(
-                email,
+                email = %crate::logging::mask_email(email),
                 "Gmail OAuth: провайдер не вернул поле scope, проверку разрешений пропускаем"
             );
         }
         let access_token = Zeroizing::new(token.access_token.clone());
         let secret_ref = format!("google-oauth:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|e| crate::Error::Keyring(e.to_string()))?;
         let credential = StoredOAuthCredential::from(token);
@@ -1250,6 +1788,8 @@ impl AccountManager {
                     security: Security::Ssl,
                 }),
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -1263,6 +1803,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
 
         let mut warnings = Vec::new();
         if let Err(error) = GmailBackend.validate(email, &access_token).await {
@@ -1300,6 +1841,7 @@ impl AccountManager {
         }
         let access_token = Zeroizing::new(token.access_token.clone());
         let secret_ref = format!("microsoft-oauth:{}", email.to_lowercase());
+        let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
             .map_err(|error| crate::Error::Keyring(error.to_string()))?;
         let credential = StoredOAuthCredential::from(token);
@@ -1327,6 +1869,8 @@ impl AccountManager {
                     security: Security::Starttls,
                 }),
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some(email.to_owned()),
                 secret_ref: secret_ref.clone(),
@@ -1340,6 +1884,7 @@ impl AccountManager {
                 return Err(error);
             }
         };
+        Self::cleanup_stale_secret(previous_secret_ref, &secret_ref);
 
         let mut warnings = Vec::new();
         if let Err(error) = OutlookBackend.validate(email, &access_token).await {

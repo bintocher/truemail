@@ -485,6 +485,77 @@ pub(crate) async fn append_password_sent(
     .await
 }
 
+pub(crate) async fn create_oauth_folder(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    parent_path: Option<&str>,
+    name: &str,
+) -> Result<String> {
+    let session = connect_oauth(host, email, access_token).await?;
+    create_folder(session, parent_path, name).await
+}
+
+pub(crate) async fn create_password_folder(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    parent_path: Option<&str>,
+    name: &str,
+) -> Result<String> {
+    let session = connect_password(host, port, security, username, password).await?;
+    create_folder(session, parent_path, name).await
+}
+
+/// `parent_path` задаёт родителя, внутри которого создаётся папка (None -
+/// верхний уровень). Разделитель иерархии специфичен для сервера (у Яндекса
+/// '|', у большинства остальных '/'), поэтому его не угадываем, а спрашиваем
+/// у родителя через LIST - так же, как delete_folder ниже узнаёт его перед
+/// поиском подпапок.
+async fn create_folder(
+    mut session: OAuthSession,
+    parent_path: Option<&str>,
+    name: &str,
+) -> Result<String> {
+    let trimmed = validate_folder_name(name)?;
+    let encoded_name = encode_modified_utf7(trimmed);
+    let target = match parent_path {
+        Some(parent) if !parent.is_empty() => {
+            let entries: Vec<Name> = session
+                .list(Some(""), Some(parent))
+                .await
+                .map_err(|error| Error::Backend {
+                    backend: "imap-create-list".into(),
+                    message: error.to_string(),
+                })?
+                .try_collect()
+                .await
+                .map_err(|error| Error::Backend {
+                    backend: "imap-create-list".into(),
+                    message: error.to_string(),
+                })?;
+            let delimiter = entries
+                .iter()
+                .find_map(|entry| entry.delimiter())
+                .unwrap_or("|")
+                .to_string();
+            format!("{parent}{delimiter}{encoded_name}")
+        }
+        _ => encoded_name,
+    };
+    session
+        .create(&target)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-create".into(),
+            message: error.to_string(),
+        })?;
+    let _ = session.logout().await;
+    Ok(target)
+}
+
 pub(crate) async fn rename_oauth_folder(
     host: &str,
     email: &str,
@@ -509,17 +580,25 @@ pub(crate) async fn rename_password_folder(
     rename_folder(session, remote_path, new_name).await
 }
 
+/// Общая проверка имени папки для rename и create: непустое и без символов
+/// иерархии. Оба разделителя ('/' и '|' у Яндекса) запрещены сразу, поскольку
+/// конкретный разделитель сервера здесь ещё не известен.
+fn validate_folder_name(name: &str) -> Result<&str> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.contains(['/', '|']) {
+        return Err(Error::AccountConfig(
+            "имя папки пустое или содержит разделитель".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
 async fn rename_folder(
     mut session: OAuthSession,
     remote_path: &str,
     new_name: &str,
 ) -> Result<String> {
-    let name = new_name.trim();
-    if name.is_empty() || name.contains(['/', '|']) {
-        return Err(Error::AccountConfig(
-            "имя папки пустое или содержит разделитель".into(),
-        ));
-    }
+    let name = validate_folder_name(new_name)?;
     let prefix_len = remote_path.rfind(['/', '|']).map_or(0, |index| index + 1);
     let target = format!(
         "{}{}",
@@ -709,6 +788,27 @@ pub async fn apply_password_operation(
     apply_operation(session, op_kind, payload).await
 }
 
+/// STORE-команды для операции 'flag': \Seen - всегда, \Flagged - только если
+/// поле явно есть в payload (старые операции, вставленные в outbox до
+/// появления звёздочки, не должны трактоваться как сброс \Flagged). Вынесено
+/// в чистую функцию, чтобы маппинг seen/flagged в IMAP-команды можно было
+/// протестировать без реального IMAP-сеанса.
+fn imap_store_commands(seen: bool, flagged: Option<bool>) -> Vec<&'static str> {
+    let mut commands = vec![if seen {
+        "+FLAGS.SILENT (\\Seen)"
+    } else {
+        "-FLAGS.SILENT (\\Seen)"
+    }];
+    if let Some(flagged) = flagged {
+        commands.push(if flagged {
+            "+FLAGS.SILENT (\\Flagged)"
+        } else {
+            "-FLAGS.SILENT (\\Flagged)"
+        });
+    }
+    commands
+}
+
 async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_str(payload)?;
     let folder = payload["folder_path"]
@@ -729,18 +829,16 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
             let seen = payload["seen"]
                 .as_bool()
                 .ok_or_else(|| Error::AccountConfig("outbox: нет seen".into()))?;
-            let command = if seen {
-                "+FLAGS.SILENT (\\Seen)"
-            } else {
-                "-FLAGS.SILENT (\\Seen)"
-            };
-            session
-                .uid_store(uid.to_string(), command)
-                .await
-                .map_err(imap_outbox_error)?
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(imap_outbox_error)?;
+            let flagged = payload["flagged"].as_bool();
+            for command in imap_store_commands(seen, flagged) {
+                session
+                    .uid_store(uid.to_string(), command)
+                    .await
+                    .map_err(imap_outbox_error)?
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .map_err(imap_outbox_error)?;
+            }
         }
         "move" => {
             let target = payload["target_folder_path"]
@@ -1440,15 +1538,32 @@ async fn discover_session(
                 mut folder_flag_updates,
                 vanished,
             )) => {
-                tracing::info!(
-                    collection = %path,
-                    scope = if full_snapshot { "full-reconcile" } else { "delta" },
-                    messages = folder_messages.len(),
-                    flag_updates = folder_flag_updates.len(),
-                    snapshot_uids = if full_snapshot { uids.len() } else { 0 },
-                    network_ms = folder_started.elapsed().as_millis() as u64,
-                    "IMAP collection delta fetched"
-                );
+                let messages_count = folder_messages.len();
+                let flag_updates_count = folder_flag_updates.len();
+                let snapshot_uids_count = if full_snapshot { uids.len() } else { 0 };
+                let unchanged =
+                    messages_count == 0 && flag_updates_count == 0 && snapshot_uids_count == 0;
+                if unchanged {
+                    tracing::debug!(
+                        collection = %path,
+                        scope = if full_snapshot { "full-reconcile" } else { "delta" },
+                        messages = messages_count,
+                        flag_updates = flag_updates_count,
+                        snapshot_uids = snapshot_uids_count,
+                        network_ms = folder_started.elapsed().as_millis() as u64,
+                        "IMAP collection delta fetched"
+                    );
+                } else {
+                    tracing::info!(
+                        collection = %path,
+                        scope = if full_snapshot { "full-reconcile" } else { "delta" },
+                        messages = messages_count,
+                        flag_updates = flag_updates_count,
+                        snapshot_uids = snapshot_uids_count,
+                        network_ms = folder_started.elapsed().as_millis() as u64,
+                        "IMAP collection delta fetched"
+                    );
+                }
                 messages.append(&mut folder_messages);
                 flag_updates.append(&mut folder_flag_updates);
                 if !vanished.is_empty() {
@@ -1645,8 +1760,8 @@ fn encode_modified_utf7(value: &str) -> String {
 #[cfg(test)]
 mod utf7_tests {
     use super::{
-        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, mime_message_id,
-        sent_mailbox_candidate, uid_set,
+        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, imap_store_commands,
+        mime_message_id, sent_mailbox_candidate, uid_set, validate_folder_name,
     };
 
     #[test]
@@ -1658,6 +1773,27 @@ mod utf7_tests {
     fn message_fetch_never_marks_mail_as_seen() {
         assert!(MESSAGE_FETCH_ITEMS.contains("BODY.PEEK[]"));
         assert!(!MESSAGE_FETCH_ITEMS.contains(" RFC822 "));
+    }
+
+    #[test]
+    fn flag_commands_set_seen_and_flagged_independently() {
+        assert_eq!(imap_store_commands(true, None), vec!["+FLAGS.SILENT (\\Seen)"]);
+        assert_eq!(imap_store_commands(false, None), vec!["-FLAGS.SILENT (\\Seen)"]);
+        assert_eq!(
+            imap_store_commands(true, Some(true)),
+            vec!["+FLAGS.SILENT (\\Seen)", "+FLAGS.SILENT (\\Flagged)"]
+        );
+        assert_eq!(
+            imap_store_commands(false, Some(true)),
+            vec!["-FLAGS.SILENT (\\Seen)", "+FLAGS.SILENT (\\Flagged)"]
+        );
+        assert_eq!(
+            imap_store_commands(true, Some(false)),
+            vec!["+FLAGS.SILENT (\\Seen)", "-FLAGS.SILENT (\\Flagged)"]
+        );
+        // Отсутствие "flagged" в payload (старые операции из outbox) не должно
+        // порождать команду по \Flagged вовсе.
+        assert_eq!(imap_store_commands(true, None).len(), 1);
     }
 
     #[test]
@@ -1677,6 +1813,25 @@ mod utf7_tests {
             decode_modified_utf7(&encoded).as_deref(),
             Some("Архив & old")
         );
+    }
+
+    #[test]
+    fn encodes_cyrillic_folder_name_for_create() {
+        // CREATE отправляет имя в modified UTF-7 (RFC 3501) - проверяем, что
+        // кириллица кодируется в ASCII (сырые байты запрещены в mailbox name)
+        // и обратно декодируется без потерь.
+        let encoded = encode_modified_utf7("Заметки");
+        assert!(encoded.is_ascii());
+        assert_ne!(encoded, "Заметки");
+        assert_eq!(decode_modified_utf7(&encoded).as_deref(), Some("Заметки"));
+    }
+
+    #[test]
+    fn validate_folder_name_rejects_empty_and_separators() {
+        assert!(validate_folder_name("   ").is_err());
+        assert!(validate_folder_name("a/b").is_err());
+        assert!(validate_folder_name("a|b").is_err());
+        assert_eq!(validate_folder_name("  Заметки  ").unwrap(), "Заметки");
     }
 
     #[test]

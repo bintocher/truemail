@@ -9,11 +9,196 @@ pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
 }
 
+/// Результат сохранения календарей/контактов провайдера: счётчики плюс
+/// смысловые изменения встреч (для будущих уведомлений - показ отдельным
+/// этапом, здесь только вычисляем дельту).
+#[derive(Debug, Clone, Default)]
+pub struct AuxiliarySaveResult {
+    pub calendars: usize,
+    pub events: usize,
+    pub contacts: usize,
+    pub changes: Vec<CalendarChange>,
+}
+
+/// Смысловое изменение встречи, вычисленное сравнением со старым состоянием
+/// в БД. При полном снимке (SyncScope::Full, первая синхронизация) не
+/// формируется вовсе - иначе первый sync даст сотни "новых встреч".
+#[derive(Debug, Clone)]
+pub struct CalendarChange {
+    pub kind: CalendarChangeKind,
+    pub calendar_id: i64,
+    pub event_id: i64,
+    pub summary: String,
+    pub start: Option<String>,
+    pub previous_start: Option<String>,
+    pub previous_summary: Option<String>,
+    pub location: Option<String>,
+    pub organizer: Option<String>,
+    pub attendee_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalendarChangeKind {
+    Created,
+    Rescheduled,
+    Cancelled,
+    Renamed,
+    LocationChanged,
+    AttendeesChanged,
+}
+
+/// Контекст события для ответа на приглашение - см. Db::event_for_response.
+#[derive(Debug, Clone)]
+pub struct EventResponseContext {
+    pub account_id: i64,
+    pub calendar_source: String,
+    pub remote_url: Option<String>,
+    pub etag: Option<String>,
+    pub event: Event,
+}
+
+/// Прежнее состояние строки events, нужное для сравнения при upsert.
+/// Ключ в HashMap - (uid, recurrence_id.unwrap_or_default()), совпадает с
+/// уникальным индексом uq_events_calendar_uid (migrations/0011).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PreviousEventRow {
+    id: i64,
+    uid: Option<String>,
+    recurrence_id: Option<String>,
+    summary: String,
+    dtstart: String,
+    dtend: Option<String>,
+    status: Option<String>,
+    location: Option<String>,
+}
+
+fn is_cancelled_status(status: Option<&str>) -> bool {
+    status.is_some_and(|value| value.eq_ignore_ascii_case("CANCELLED"))
+}
+
+/// Классифицировать изменение одной встречи по старому и новому состоянию.
+/// Приоритет строгий для первых трёх видов: Created, затем Rescheduled,
+/// затем Cancelled - они взаимоисключающие и обрывают дальнейшие проверки,
+/// иначе на одну встречу пришло бы сразу несколько разнородных уведомлений.
+/// Место и состав участников проверяются, только если ни один из первых
+/// трёх не сработал, но независимо друг от друга - если поменялось и то,
+/// и другое разом, в changes попадут оба. Изменение только description и
+/// прочих полей изменением не считается.
+#[allow(clippy::too_many_arguments)]
+fn classify_event_change(
+    calendar_id: i64,
+    event_id: i64,
+    new_summary: &str,
+    new_dtstart: &str,
+    new_dtend: Option<&str>,
+    new_status: Option<&str>,
+    new_location: Option<&str>,
+    new_organizer: Option<&str>,
+    new_attendees: &std::collections::HashSet<String>,
+    previous: Option<&PreviousEventRow>,
+    previous_attendees: Option<&std::collections::HashSet<String>>,
+    changes: &mut Vec<CalendarChange>,
+) {
+    let Some(previous) = previous else {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::Created,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: None,
+            previous_summary: None,
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+        return;
+    };
+    let time_changed = previous.dtstart != new_dtstart || previous.dtend.as_deref() != new_dtend;
+    if time_changed && !is_cancelled_status(new_status) {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::Rescheduled,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: Some(previous.dtstart.clone()),
+            previous_summary: None,
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+        return;
+    }
+    if is_cancelled_status(new_status) && !is_cancelled_status(previous.status.as_deref()) {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::Cancelled,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: None,
+            previous_summary: None,
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+        return;
+    }
+    // Переименование сравнивается по значению из RETURNING, а не по тому, что
+    // прислал сервер: у огрызка summary пустое, но COALESCE вернул прежнее -
+    // значит здесь оно совпадёт с previous и ложного "переименована" не будет.
+    if previous.summary != new_summary {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::Renamed,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: None,
+            previous_summary: Some(previous.summary.clone()),
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+    }
+    if previous.location.as_deref() != new_location {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::LocationChanged,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: None,
+            previous_summary: None,
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+    }
+    if let Some(previous_attendees) = previous_attendees
+        && previous_attendees != new_attendees
+    {
+        changes.push(CalendarChange {
+            kind: CalendarChangeKind::AttendeesChanged,
+            calendar_id,
+            event_id,
+            summary: new_summary.to_owned(),
+            start: Some(new_dtstart.to_owned()),
+            previous_start: None,
+            previous_summary: None,
+            location: new_location.map(str::to_owned),
+            organizer: new_organizer.map(str::to_owned),
+            attendee_count: new_attendees.len(),
+        });
+    }
+}
+
 /// Строка локатора письма: account_id, remote_path папки, uid, remote_id, raw_blob_ref.
 type MessageLocatorRow = (i64, String, i64, Option<String>, i64);
 
-/// Строка последнего письма во Входящих: id, from_name, from_addr, subject, preview.
-type LatestInboxRow = (i64, Option<String>, Option<String>, String, Option<String>);
+/// Строка метаданных письма для уведомления: id, from_name, from_addr, subject, preview.
+type NotificationPreviewRow = (i64, Option<String>, Option<String>, String, Option<String>);
 type FolderCursorRow = (
     String,
     Option<i64>,
@@ -160,8 +345,8 @@ impl Db {
             "INSERT INTO accounts(
                 uuid, email, display_name, provider, backend_kind, auth_kind,
                 imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, jmap_url, username, secret_ref, color
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, color
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(email) DO UPDATE SET
                 display_name = excluded.display_name,
                 provider = excluded.provider,
@@ -194,6 +379,11 @@ impl Db {
         .bind(security(input.smtp.as_ref()))
         .bind(input.ews_url.as_deref())
         .bind(input.jmap_url.as_deref())
+        // caldav_url/carddav_url нарочно не входят в ON CONFLICT UPDATE SET
+        // (как и color ниже): переподключение того же email не должно
+        // затирать уже обнаруженные DAV-адреса значением NULL из NewAccount.
+        .bind(input.caldav_url.as_deref())
+        .bind(input.carddav_url.as_deref())
         .bind(input.username.as_deref())
         .bind(&input.secret_ref)
         .bind(input.color.as_deref())
@@ -211,7 +401,7 @@ impl Db {
         let rows = sqlx::query_as::<_, AccountRow>(
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, jmap_url, username, secret_ref, include_in_unified, color, retention_days, enabled
+                ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, include_in_unified, color, retention_days, enabled
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
@@ -382,6 +572,28 @@ impl Db {
         }
         tx.commit().await?;
         Ok(old.len())
+    }
+
+    /// Сохранить обнаруженные (или заданные вручную) базовые адреса
+    /// CalDAV/CardDAV, чтобы не искать их заново при каждой синхронизации.
+    /// None в аргументе означает "не найдено" и пишет NULL - это осознанно:
+    /// вызывающая сторона (AccountManager::resolve_dav_bases) передаёт сюда
+    /// уже смешанный результат "было задано ИЛИ обнаружено".
+    pub async fn set_dav_urls(
+        &self,
+        account_id: i64,
+        caldav_url: Option<&str>,
+        carddav_url: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        )
+        .bind(caldav_url)
+        .bind(carddav_url)
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
     }
 
     /// Задать цвет аккаунта (для аватаров писем и сайдбара).
@@ -988,11 +1200,13 @@ impl Db {
         })
     }
 
-    pub async fn save_yandex_dav(
+    /// Сохранить результат CalDAV/CardDAV-синхронизации - для любого DAV-
+    /// провайдера (Яндекс и все остальные), не только для Яндекса, как раньше.
+    pub async fn save_dav(
         &self,
         account_id: i64,
         data: &crate::account::DavSyncResult,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         self.save_auxiliary_data(account_id, "caldav", data).await
     }
 
@@ -1000,7 +1214,7 @@ impl Db {
         &self,
         account_id: i64,
         data: &crate::account::DavSyncResult,
-    ) -> Result<(usize, usize, usize)> {
+    ) -> Result<AuxiliarySaveResult> {
         self.save_auxiliary_data(account_id, "google", data).await
     }
 
@@ -1010,8 +1224,8 @@ impl Db {
         account_id: i64,
         source_kind: &str,
         data: &crate::account::DavSyncResult,
-    ) -> Result<(usize, usize, usize)> {
-        use std::collections::HashSet;
+    ) -> Result<AuxiliarySaveResult> {
+        use std::collections::{HashMap, HashSet};
 
         // Файловая система не участвует в SQLite-транзакции. Поэтому новые
         // blobs учитываем отдельно: при любой ошибке удаляем их, а старые
@@ -1052,7 +1266,7 @@ impl Db {
             }
         }
 
-        let save_result: Result<(usize, usize, usize)> = async {
+        let save_result: Result<AuxiliarySaveResult> = async {
             let writer_wait_started = std::time::Instant::now();
             let mut tx = self.begin_write().await?;
             let writer_wait = writer_wait_started.elapsed();
@@ -1068,6 +1282,7 @@ impl Db {
             };
             let mut active_calendars = HashSet::new();
             let mut event_count = 0;
+            let mut changes: Vec<CalendarChange> = Vec::new();
             for (calendar, events) in calendar_rows {
                 let (calendar_id,): (i64,) = sqlx::query_as(
                     "INSERT INTO calendars(account_id, uid, name, kind, url, ctag, sync_token)
@@ -1088,31 +1303,134 @@ impl Db {
                 .await?;
                 active_calendars.insert(calendar_id);
 
-                let existing_events: Vec<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM events WHERE calendar_id=?",
+                // Расширенная выборка (не дополнительный запрос - раньше тут
+                // читали только id) даёт прежнее состояние каждой встречи:
+                // нужно для дельты изменений при upsert ниже. Ключ совпадает
+                // с уникальным индексом uq_events_calendar_uid.
+                let existing_event_rows: Vec<PreviousEventRow> = sqlx::query_as(
+                    "SELECT id, uid, recurrence_id, summary, dtstart, dtend, status, location
+                     FROM events WHERE calendar_id=?",
                 )
-                        .bind(calendar_id)
-                        .fetch_all(&mut *tx)
-                        .await?;
+                .bind(calendar_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                let mut previous_by_key: HashMap<(String, String), &PreviousEventRow> =
+                    HashMap::new();
+                for row in &existing_event_rows {
+                    if let Some(uid) = &row.uid {
+                        previous_by_key.insert(
+                            (uid.clone(), row.recurrence_id.clone().unwrap_or_default()),
+                            row,
+                        );
+                    }
+                }
+                let track_changes = calendar.sync_scope != crate::account::SyncScope::Full;
                 for remote_url in &calendar.deleted_event_urls {
+                    let deleted: Option<(i64, String, String, Option<String>, Option<String>, i64)> =
+                        sqlx::query_as(
+                            "SELECT e.id, e.summary, e.dtstart, e.location, e.organizer,
+                                    (SELECT COUNT(*) FROM event_attendees a WHERE a.event_id = e.id)
+                             FROM events e
+                             WHERE e.calendar_id=? AND e.remote_url=?",
+                        )
+                    .bind(calendar_id)
+                    .bind(remote_url)
+                    .fetch_optional(&mut *tx)
+                    .await?;
                     sqlx::query("DELETE FROM events WHERE calendar_id=? AND remote_url=?")
                         .bind(calendar_id)
                         .bind(remote_url)
                         .execute(&mut *tx)
                         .await?;
+                    // Ресурс реально пропал на сервере (не просто помечен
+                    // CANCELLED - см. задачу B, где Google больше так не
+                    // делает). С точки зрения пользователя это та же отмена.
+                    if track_changes
+                        && let Some((
+                            event_id,
+                            summary,
+                            dtstart,
+                            location,
+                            organizer,
+                            attendee_count,
+                        )) = deleted
+                    {
+                        changes.push(CalendarChange {
+                            kind: CalendarChangeKind::Cancelled,
+                            calendar_id,
+                            event_id,
+                            summary,
+                            start: Some(dtstart),
+                            previous_start: None,
+                            previous_summary: None,
+                            location,
+                            organizer,
+                            attendee_count: attendee_count.max(0) as usize,
+                        });
+                    }
                 }
                 let mut active_events = HashSet::new();
                 for (event, blob_ref) in events {
-                    let (event_id,): (i64,) = sqlx::query_as(
+                    // Google в delta-синхронизации присылает отменённые
+                    // события огрызками без summary/dtstart (задача B).
+                    // COALESCE(NULLIF(...)) сохраняет прежнее значение
+                    // колонки, если новое - пустая строка, а не перезаписывает
+                    // встречу пустым названием и датой. all_day пересчитан от
+                    // того же эффективного (после coalesce) dtstart, иначе
+                    // такой огрызок сбросил бы флаг "весь день" на false.
+                    let previous = previous_by_key
+                        .get(&(
+                            event.uid.clone(),
+                            event.recurrence_id.clone().unwrap_or_default(),
+                        ))
+                        .copied();
+                    // У огрызка заполнен только идентификатор и статус. Полный upsert
+                    // затёр бы место, описание, организатора и категории пустыми, а ниже
+                    // снёс бы и всех участников - от отменённой встречи не осталось бы
+                    // ничего, кроме названия. Поэтому такому событию меняем только статус.
+                    let cancel_snippet = event.dtstart.trim().is_empty();
+                    let saved: Option<(
+                        i64,
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                    )> = if cancel_snippet {
+                        sqlx::query_as(
+                            "UPDATE events SET status=?, etag=COALESCE(?, etag)
+                             WHERE calendar_id=? AND uid=?
+                                AND COALESCE(recurrence_id,'') = COALESCE(?,'')
+                             RETURNING id, summary, dtstart, dtend, status, location, organizer",
+                        )
+                        .bind(&event.status)
+                        .bind(&event.etag)
+                        .bind(calendar_id)
+                        .bind(&event.uid)
+                        .bind(&event.recurrence_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    } else {
+                        Some(sqlx::query_as(
                         "INSERT INTO events(calendar_id, uid, summary, description, location,
                                             dtstart, dtend, all_day, rrule, recurrence_id, exdates, rdates,
                                             status, ical_ref, etag, remote_url, timezone, transp, class,
                                             categories, url, organizer, sequence)
                          VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                         ON CONFLICT DO UPDATE SET summary=excluded.summary,
+                         ON CONFLICT DO UPDATE SET
+                            summary=COALESCE(NULLIF(excluded.summary, ''), summary),
                             description=excluded.description, location=excluded.location,
-                            dtstart=excluded.dtstart, dtend=excluded.dtend,
-                            all_day=excluded.all_day,
+                            dtstart=COALESCE(NULLIF(excluded.dtstart, ''), dtstart),
+                            dtend=excluded.dtend,
+                            all_day=CASE
+                                WHEN length(COALESCE(NULLIF(excluded.dtstart, ''), dtstart)) = 8
+                                    THEN 1
+                                WHEN length(COALESCE(NULLIF(excluded.dtstart, ''), dtstart)) = 10
+                                    AND instr(COALESCE(NULLIF(excluded.dtstart, ''), dtstart), '-') > 0
+                                    THEN 1
+                                ELSE 0
+                            END,
                             rrule=excluded.rrule, recurrence_id=excluded.recurrence_id,
                             exdates=excluded.exdates, rdates=excluded.rdates,
                             status=excluded.status,
@@ -1121,7 +1439,7 @@ impl Db {
                             transp=excluded.transp, class=excluded.class,
                             categories=excluded.categories, url=excluded.url,
                             organizer=excluded.organizer, sequence=excluded.sequence
-                         RETURNING id",
+                         RETURNING id, summary, dtstart, dtend, status, location, organizer",
                     )
                     .bind(calendar_id)
                     .bind(&event.uid)
@@ -1150,7 +1468,65 @@ impl Db {
                     .bind(&event.organizer)
                     .bind(event.sequence)
                     .fetch_one(&mut *tx)
-                    .await?;
+                    .await?)
+                    };
+                    // Огрызок про событие, которого у нас нет: отменять нечего.
+                    let Some((
+                        event_id,
+                        new_summary,
+                        new_dtstart,
+                        new_dtend,
+                        new_status,
+                        new_location,
+                        new_organizer,
+                    )) = saved
+                    else {
+                        continue;
+                    };
+                    if track_changes {
+                        let previous_attendees: HashSet<String> = sqlx::query_as::<_, (String,)>(
+                            "SELECT email FROM event_attendees WHERE event_id=?",
+                        )
+                        .bind(event_id)
+                        .fetch_all(&mut *tx)
+                        .await?
+                        .into_iter()
+                        .map(|(email,)| email.to_ascii_lowercase())
+                        .collect();
+                        // У огрызка списка участников нет, и мы его не перезаписываем -
+                        // значит состав не менялся, иначе выдали бы ложное
+                        // "изменился состав участников" на каждой отмене.
+                        let new_attendees: HashSet<String> = if cancel_snippet {
+                            previous_attendees.clone()
+                        } else {
+                            event
+                                .attendees
+                                .iter()
+                                .map(|attendee| attendee.email.to_ascii_lowercase())
+                                .collect()
+                        };
+                        classify_event_change(
+                            calendar_id,
+                            event_id,
+                            &new_summary,
+                            &new_dtstart,
+                            new_dtend.as_deref(),
+                            new_status.as_deref(),
+                            new_location.as_deref(),
+                            new_organizer.as_deref(),
+                            &new_attendees,
+                            previous,
+                            Some(&previous_attendees),
+                            &mut changes,
+                        );
+                    }
+                    // Огрызок не несёт ни участников, ни напоминаний - перезапись
+                    // стёрла бы уже сохранённые. Обновление статуса выше уже выполнено.
+                    if cancel_snippet {
+                        active_events.insert(event_id);
+                        event_count += 1;
+                        continue;
+                    }
                     sqlx::query("DELETE FROM event_attendees WHERE event_id=?")
                         .bind(event_id)
                         .execute(&mut *tx)
@@ -1190,10 +1566,10 @@ impl Db {
                     event_count += 1;
                 }
                 if calendar.sync_scope == crate::account::SyncScope::Full {
-                    for (event_id,) in existing_events {
-                        if !active_events.contains(&event_id) {
+                    for row in &existing_event_rows {
+                        if !active_events.contains(&row.id) {
                             sqlx::query("DELETE FROM events WHERE id=?")
-                                .bind(event_id)
+                                .bind(row.id)
                                 .execute(&mut *tx)
                                 .await?;
                         }
@@ -1330,11 +1706,17 @@ impl Db {
                 calendars = data.calendars.len(),
                 events = event_count,
                 contacts = data.contacts.len(),
+                changes = changes.len(),
                 writer_wait_ms = writer_wait.as_millis() as u64,
                 tx_ms = tx_started.elapsed().as_millis() as u64,
                 "auxiliary delta applied"
             );
-            Ok((data.calendars.len(), event_count, data.contacts.len()))
+            Ok(AuxiliarySaveResult {
+                calendars: data.calendars.len(),
+                events: event_count,
+                contacts: data.contacts.len(),
+                changes,
+            })
         }
         .await;
 
@@ -2250,19 +2632,17 @@ impl Db {
         })
     }
 
-    /// Последнее письмо во Входящих аккаунта: (id, отправитель, тема, превью).
-    /// Для содержательных уведомлений о новой почте.
-    pub async fn latest_inbox_message(
+    /// Метаданные письма по локальному id для карточки уведомления:
+    /// (id, отправитель, тема, превью). Тело и вложения сюда не тянем -
+    /// уведомлению нужен только короткий текст.
+    pub async fn message_notification_preview(
         &self,
-        account_id: i64,
+        message_id: i64,
     ) -> Result<Option<(i64, String, String, String)>> {
-        let row: Option<LatestInboxRow> = sqlx::query_as(
-            "SELECT m.id, m.from_name, m.from_addr, m.subject, m.preview \
-                 FROM messages m JOIN folders f ON f.id = m.folder_id \
-                 WHERE m.account_id = ? AND (f.role = 'inbox' OR f.role IS NULL) \
-                 ORDER BY m.date DESC LIMIT 1",
+        let row: Option<NotificationPreviewRow> = sqlx::query_as(
+            "SELECT id, from_name, from_addr, subject, preview FROM messages WHERE id = ?",
         )
-        .bind(account_id)
+        .bind(message_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id, name, addr, subject, preview)| {
@@ -2272,6 +2652,35 @@ impl Db {
                 .unwrap_or_default();
             (id, from, subject, preview.unwrap_or_default())
         }))
+    }
+
+    /// Локальные id писем аккаунта из Входящих (роль строго 'inbox', без
+    /// "OR role IS NULL" - уведомлению не нужны письма из папок без роли),
+    /// у которых remote_id входит в переданный список. Сортировка по дате
+    /// по возрастанию: последний элемент результата - самое свежее письмо.
+    pub async fn inbox_message_ids_by_remote_ids(
+        &self,
+        account_id: i64,
+        remote_ids: &[String],
+    ) -> Result<Vec<i64>> {
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; remote_ids.len()].join(",");
+        let sql = format!(
+            "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id \
+                 WHERE m.account_id = ? AND f.role = 'inbox' AND m.remote_id IN ({placeholders}) \
+                 ORDER BY m.date ASC"
+        );
+        // Плейсхолдеры формируются только из числа id (не из пользовательских
+        // данных), сами значения передаются через bind - инъекция невозможна.
+        let mut query =
+            sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql)).bind(account_id);
+        for id in remote_ids {
+            query = query.bind(id);
+        }
+        let rows = query.fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Из набора remote_id вернуть те, которых ещё нет в БД (новые письма).
@@ -2370,7 +2779,7 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
-        let calendars = calendar_rows
+        let calendars: Vec<CalendarSummary> = calendar_rows
             .into_iter()
             .map(|row| CalendarSummary {
                 id: row.0,
@@ -2383,7 +2792,7 @@ impl Db {
             .collect();
         let rows: Vec<EventRow> = sqlx::query_as(
             "SELECT id, calendar_id, uid, summary, description, location, dtstart, dtend,
-                    all_day, rrule, recurrence_id, exdates, rdates, timezone, transp, class,
+                    all_day, rrule, recurrence_id, exdates, rdates, timezone, status, transp, class,
                     categories, url, organizer, sequence
              FROM events ORDER BY dtstart",
         )
@@ -2425,7 +2834,133 @@ impl Db {
                 });
             }
         }
+        // Свой статус участия - удобное представление для UI (см. resolve_my_attendance):
+        // сопоставляем участников события с email аккаунта, которому принадлежит
+        // календарь события (через calendar_id -> account_id -> accounts.email).
+        let account_emails: std::collections::HashMap<i64, String> =
+            sqlx::query_as::<_, (i64, String)>("SELECT id, email FROM accounts")
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect();
+        let calendar_accounts: std::collections::HashMap<i64, i64> =
+            calendars.iter().map(|c| (c.id, c.account_id)).collect();
+        for event in events.iter_mut() {
+            if let Some(email) = calendar_accounts
+                .get(&event.calendar_id)
+                .and_then(|account_id| account_emails.get(account_id))
+            {
+                let (my_partstat, needs_response) = crate::model::resolve_my_attendance(
+                    &event.attendees,
+                    event.organizer.as_deref(),
+                    email,
+                );
+                event.my_partstat = my_partstat;
+                event.needs_response = needs_response;
+            }
+        }
         Ok((calendars, events))
+    }
+
+    /// Контекст события для отправки ответа на приглашение: серверные
+    /// идентификаторы календаря/события и модель события с участниками -
+    /// без my_partstat/needs_response, их выше по стеку пересчитывает
+    /// вызывающий код (respond_to_event в commands.rs), уже имея полный
+    /// Account, а не только email.
+    pub async fn event_for_response(&self, event_id: i64) -> Result<Option<EventResponseContext>> {
+        let Some(row): Option<EventRow> = sqlx::query_as(
+            "SELECT id, calendar_id, uid, summary, description, location, dtstart, dtend,
+                    all_day, rrule, recurrence_id, exdates, rdates, timezone, status, transp, class,
+                    categories, url, organizer, sequence
+             FROM events WHERE id=?",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let mut event: Event = row.into();
+        let attendee_rows: Vec<EventAttendeeRow> = sqlx::query_as(
+            "SELECT event_id, email, name, role, partstat, rsvp FROM event_attendees WHERE event_id=?",
+        )
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await?;
+        event.attendees = attendee_rows
+            .into_iter()
+            .map(|row| crate::model::Attendee {
+                email: row.email,
+                name: row.name,
+                role: row.role,
+                partstat: row.partstat,
+                rsvp: row.rsvp != 0,
+            })
+            .collect();
+        let calendar: (i64, String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT c.account_id, c.url, e.remote_url, e.etag
+             FROM events e JOIN calendars c ON c.id=e.calendar_id WHERE e.id=?",
+        )
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Some(EventResponseContext {
+            account_id: calendar.0,
+            calendar_source: calendar.1,
+            remote_url: calendar.2,
+            etag: calendar.3,
+            event,
+        }))
+    }
+
+    /// После успешной отправки ответа обновить свою запись в event_attendees
+    /// локально, не дожидаясь следующей синхронизации - иначе UI показывал бы
+    /// старый PARTSTAT до следующего прохода sync_auxiliary_account.
+    pub async fn update_own_partstat(
+        &self,
+        event_id: i64,
+        account_email: &str,
+        partstat: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE event_attendees SET partstat=? WHERE event_id=? AND lower(email)=lower(?)")
+            .bind(partstat)
+            .bind(event_id)
+            .bind(account_email)
+            .execute(&self.write_pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Нужен ли ответ на приглашение для этого события и адреса аккаунта -
+    /// используется при формировании карточки уведомления об изменении
+    /// календаря (см. notify_calendar_changes в commands.rs), где под рукой
+    /// только event_id, а не полный Event.
+    pub async fn event_needs_response(&self, event_id: i64, account_email: &str) -> Result<bool> {
+        let organizer: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT organizer FROM events WHERE id=?")
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some((organizer,)) = organizer else {
+            return Ok(false);
+        };
+        let attendee_rows: Vec<EventAttendeeRow> = sqlx::query_as(
+            "SELECT event_id, email, name, role, partstat, rsvp FROM event_attendees WHERE event_id=?",
+        )
+        .bind(event_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let attendees: Vec<crate::model::Attendee> = attendee_rows
+            .into_iter()
+            .map(|row| crate::model::Attendee {
+                email: row.email,
+                name: row.name,
+                role: row.role,
+                partstat: row.partstat,
+                rsvp: row.rsvp != 0,
+            })
+            .collect();
+        Ok(crate::model::resolve_my_attendance(&attendees, organizer.as_deref(), account_email).1)
     }
 
     pub async fn set_calendar_visible(&self, calendar_id: i64, visible: bool) -> Result<()> {
@@ -2440,8 +2975,8 @@ impl Db {
     /// Отметить письмо прочитанным (локально; в outbox уйдёт синхронизация флага).
     pub async fn mark_seen(&self, message_id: i64, seen: bool) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        let locator: (i64, i64, String, Option<String>) = sqlx::query_as(
-            "SELECT m.account_id, m.uid, f.remote_path, m.remote_id FROM messages m
+        let locator: (i64, i64, String, Option<String>, i64) = sqlx::query_as(
+            "SELECT m.account_id, m.uid, f.remote_path, m.remote_id, m.flagged FROM messages m
              JOIN folders f ON f.id=m.folder_id WHERE m.id=?",
         )
         .bind(message_id)
@@ -2452,27 +2987,91 @@ impl Db {
             .bind(message_id)
             .execute(&mut *tx)
             .await?;
+        Self::queue_flag_sync(
+            &mut tx,
+            message_id,
+            locator.0,
+            &locator.2,
+            locator.1,
+            locator.3.as_deref(),
+            seen,
+            locator.4 != 0,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Отметить/снять звёздочку (\Flagged; локально, в outbox уйдёт
+    /// синхронизация). Устроено симметрично mark_seen - seen и flagged
+    /// синхронизируются независимо и не затирают друг друга, потому что
+    /// payload каждый раз несёт оба текущих значения, а не только изменённое
+    /// (см. queue_flag_sync).
+    pub async fn mark_flagged(&self, message_id: i64, flagged: bool) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let locator: (i64, i64, String, Option<String>, i64) = sqlx::query_as(
+            "SELECT m.account_id, m.uid, f.remote_path, m.remote_id, m.seen FROM messages m
+             JOIN folders f ON f.id=m.folder_id WHERE m.id=?",
+        )
+        .bind(message_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE messages SET flagged = ? WHERE id = ?")
+            .bind(flagged as i64)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        Self::queue_flag_sync(
+            &mut tx,
+            message_id,
+            locator.0,
+            &locator.2,
+            locator.1,
+            locator.3.as_deref(),
+            locator.4 != 0,
+            flagged,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Общая часть mark_seen/mark_flagged: заменить незавершённую
+    /// 'flag'-операцию в outbox на новую с актуальным состоянием обоих
+    /// флагов сразу. Пересборка целиком (а не только изменённого поля)
+    /// нужна, чтобы более ранняя ещё не отправленная пометка не потерялась,
+    /// когда пользователь быстро меняет seen и flagged подряд.
+    async fn queue_flag_sync(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        message_id: i64,
+        account_id: i64,
+        folder_path: &str,
+        uid: i64,
+        remote_id: Option<&str>,
+        seen: bool,
+        flagged: bool,
+    ) -> Result<()> {
         let payload = serde_json::json!({
             "message_id": message_id,
-            "folder_path": locator.2,
-            "uid": locator.1,
-            "remote_id": locator.3,
+            "folder_path": folder_path,
+            "uid": uid,
+            "remote_id": remote_id,
             "seen": seen,
+            "flagged": flagged,
         });
         sqlx::query("DELETE FROM outbox_ops WHERE message_id=? AND op_kind='flag' AND status IN ('pending','retry')")
             .bind(message_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         sqlx::query(
             "INSERT INTO outbox_ops(account_id, message_id, op_kind, payload, status, next_attempt_at)
              VALUES(?, ?, 'flag', ?, 'pending', datetime('now'))",
         )
-        .bind(locator.0)
+        .bind(account_id)
         .bind(message_id)
         .bind(payload.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -3501,7 +4100,7 @@ impl Db {
     pub async fn list_contacts(&self, query: Option<&str>) -> Result<Vec<Contact>> {
         let like = format!("%{}%", query.unwrap_or(""));
         let rows = sqlx::query_as::<_, ContactRow>(
-            "SELECT id, account_id, uid, display_name, first_name, last_name, organization, is_favorite
+            "SELECT id, account_id, uid, display_name, first_name, last_name, organization, is_favorite, remote_url
              FROM contacts WHERE hidden=0 AND display_name LIKE ? ORDER BY display_name LIMIT 500",
         )
         .bind(like)
@@ -3746,6 +4345,8 @@ struct AccountRow {
     smtp_security: Option<String>,
     ews_url: Option<String>,
     jmap_url: Option<String>,
+    caldav_url: Option<String>,
+    carddav_url: Option<String>,
     username: Option<String>,
     secret_ref: Option<String>,
     include_in_unified: i64,
@@ -3798,6 +4399,8 @@ impl From<AccountRow> for Account {
             smtp,
             ews_url: r.ews_url,
             jmap_url: r.jmap_url,
+            caldav_url: r.caldav_url,
+            carddav_url: r.carddav_url,
             username: r.username,
             secret_ref: r.secret_ref,
             include_in_unified: r.include_in_unified != 0,
@@ -3995,6 +4598,7 @@ struct ContactRow {
     last_name: Option<String>,
     organization: Option<String>,
     is_favorite: i64,
+    remote_url: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -4036,6 +4640,7 @@ struct EventRow {
     exdates: Option<String>,
     rdates: Option<String>,
     timezone: Option<String>,
+    status: Option<String>,
     transp: Option<String>,
     class: Option<String>,
     categories: Option<String>,
@@ -4079,6 +4684,7 @@ impl From<EventRow> for Event {
             exdates: row.exdates,
             rdates: row.rdates,
             timezone: row.timezone,
+            status: row.status.as_deref().and_then(EventStatus::parse),
             transp: match row.transp.as_deref() {
                 Some("TRANSPARENT") => Some(Transp::Transparent),
                 Some(_) => Some(Transp::Opaque),
@@ -4100,6 +4706,10 @@ impl From<EventRow> for Event {
             url: row.url,
             organizer: row.organizer,
             sequence: row.sequence,
+            // Заполняется отдельно, уже с участниками - см.
+            // list_calendars_and_events/event_for_response ниже.
+            my_partstat: None,
+            needs_response: false,
         }
     }
 }
@@ -4116,6 +4726,178 @@ impl From<ContactRow> for Contact {
             emails: Vec::new(),
             phones: Vec::new(),
             is_favorite: r.is_favorite != 0,
+            is_local_only: r.remote_url.is_none(),
         }
+    }
+}
+
+#[cfg(test)]
+mod notification_lookup_tests {
+    use super::*;
+    use crate::crypto::{DatabaseKey, StorageCrypto};
+    use rand::Rng as _;
+    use std::sync::Arc;
+
+    fn random_key() -> [u8; 32] {
+        let mut key = [0_u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        key
+    }
+
+    /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в
+    /// storage::tests (storage/mod.rs).
+    async fn test_db() -> Db {
+        let root =
+            std::env::temp_dir().join(format!("truemail-repo-notify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let database_key = DatabaseKey::from_key(random_key());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+        db
+    }
+
+    /// Заводит аккаунт, возвращает его id.
+    async fn seed_account(db: &Db) -> i64 {
+        let (account_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind) \
+                 VALUES (?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(format!("{}@example.test", uuid::Uuid::new_v4()))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert account");
+        account_id
+    }
+
+    /// Заводит папку заданной роли в аккаунте, возвращает id папки.
+    async fn seed_folder(db: &Db, account_id: i64, remote_path: &str, role: Option<&str>) -> i64 {
+        let (folder_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO folders(account_id, remote_path, display_name, role) \
+                 VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(remote_path)
+        .bind(remote_path)
+        .bind(role)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert folder");
+        folder_id
+    }
+
+    /// Вставляет письмо с заданным remote_id в указанную папку, возвращает id письма.
+    async fn seed_message(
+        db: &Db,
+        account_id: i64,
+        folder_id: i64,
+        uid: i64,
+        remote_id: &str,
+    ) -> i64 {
+        let (message_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO messages(account_id, folder_id, uid, remote_id, subject, date) \
+                 VALUES (?, ?, ?, ?, 'тест', datetime('now')) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(folder_id)
+        .bind(uid)
+        .bind(remote_id)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert message");
+        message_id
+    }
+
+    #[tokio::test]
+    async fn returns_ids_for_inbox_messages_only() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let archive_id = seed_folder(&db, account_id, "Archive", Some("archive")).await;
+
+        let inbox_message_id = seed_message(&db, account_id, inbox_id, 1, "remote-inbox").await;
+        seed_message(&db, account_id, archive_id, 2, "remote-archive").await;
+
+        let ids = db
+            .inbox_message_ids_by_remote_ids(
+                account_id,
+                &["remote-inbox".to_owned(), "remote-archive".to_owned()],
+            )
+            .await
+            .expect("query inbox ids");
+
+        assert_eq!(ids, vec![inbox_message_id], "письмо из архива не должно попасть в выборку");
+    }
+
+    #[tokio::test]
+    async fn empty_input_returns_empty_result_without_querying() {
+        let db = test_db().await;
+        let ids = db
+            .inbox_message_ids_by_remote_ids(1, &[])
+            .await
+            .expect("query with empty input");
+        assert!(ids.is_empty());
+    }
+
+    /// Читает payload единственной pending-операции 'flag' письма из outbox.
+    async fn pending_flag_payload(db: &Db, message_id: i64) -> serde_json::Value {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload FROM outbox_ops WHERE message_id=? AND op_kind='flag' AND status IN ('pending','retry')",
+        )
+        .bind(message_id)
+        .fetch_all(&db.write_pool)
+        .await
+        .expect("query outbox_ops");
+        assert_eq!(rows.len(), 1, "должна остаться ровно одна pending 'flag'-операция");
+        serde_json::from_str(&rows[0].0).expect("payload must be valid JSON")
+    }
+
+    /// seen и flagged синхронизируются независимо: смена одного не должна
+    /// затирать ещё не отправленное значение другого в outbox-payload -
+    /// раньше payload нёс только изменённое поле, и mark_flagged вообще не
+    /// существовал (звёздочка не уходила на сервер).
+    #[tokio::test]
+    async fn mark_seen_and_mark_flagged_do_not_clobber_each_other_in_outbox_payload() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let message_id = seed_message(&db, account_id, folder_id, 1, "remote-1").await;
+
+        db.mark_seen(message_id, true).await.expect("mark_seen");
+        let payload = pending_flag_payload(&db, message_id).await;
+        assert_eq!(payload["seen"], serde_json::json!(true));
+        assert_eq!(payload["flagged"], serde_json::json!(false));
+
+        db.mark_flagged(message_id, true)
+            .await
+            .expect("mark_flagged");
+        let payload = pending_flag_payload(&db, message_id).await;
+        assert_eq!(
+            payload["seen"],
+            serde_json::json!(true),
+            "flagged не должен сбрасывать ранее выставленный seen"
+        );
+        assert_eq!(payload["flagged"], serde_json::json!(true));
+
+        db.mark_seen(message_id, false).await.expect("mark_seen");
+        let payload = pending_flag_payload(&db, message_id).await;
+        assert_eq!(payload["seen"], serde_json::json!(false));
+        assert_eq!(
+            payload["flagged"],
+            serde_json::json!(true),
+            "seen не должен сбрасывать ранее выставленный flagged"
+        );
+
+        let (seen, flagged): (i64, i64) =
+            sqlx::query_as("SELECT seen, flagged FROM messages WHERE id=?")
+                .bind(message_id)
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("query message flags");
+        assert_eq!(seen, 0);
+        assert_eq!(flagged, 1);
     }
 }

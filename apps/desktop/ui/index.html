@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260718-2">
+  <link rel="stylesheet" href="styles.css?v=20260720-2">
 </head>
 <body>
 
@@ -438,6 +438,15 @@
         <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
         <div class="fld"><label data-i18n="calendarOrTaskList">Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
         <div class="fld"><label data-i18n="titleLabel">Название</label><input class="inp" id="eventSummary" required></div>
+        <div class="fld hidden" id="eventRsvpBox">
+          <label data-i18n="eventRsvpLabel">Ваш ответ</label>
+          <div class="event-rsvp-status" id="eventRsvpStatus"></div>
+          <div class="event-rsvp-actions hidden" id="eventRsvpActions">
+            <button type="button" class="btn sm" id="eventRsvpAccept"><span data-i18n="rsvpAccept">Пойду</span></button>
+            <button type="button" class="btn sm" id="eventRsvpTentative"><span data-i18n="rsvpTentative">Возможно</span></button>
+            <button type="button" class="btn sm" id="eventRsvpDecline"><span data-i18n="rsvpDecline">Не пойду</span></button>
+          </div>
+        </div>
         <div class="aux-two"><div class="fld"><label data-i18n="startDue">Начало / срок</label><input class="inp" id="eventStart" type="datetime-local" required></div><div class="fld"><label data-i18n="endLabel">Окончание</label><input class="inp" id="eventEnd" type="datetime-local"></div></div>
         <label class="aux-check"><input type="checkbox" id="eventAllDay"> <span data-i18n="allDay">Весь день</span></label>
         <div class="fld"><label data-i18n="locationLabel">Место</label><input class="inp" id="eventLocation"></div>
@@ -476,6 +485,7 @@
     <form id="contactForm" class="hidden">
       <div class="mb aux-form">
         <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="contactAccount" required></select></div>
+        <div class="fld note-muted hidden" id="contactLocalOnlyNotice" data-i18n="contactLocalOnlyNotice">Этот контакт хранится только на этом устройстве: провайдер аккаунта не поддерживает синхронизацию контактов.</div>
         <div class="fld"><label data-i18n="displayName">Отображаемое имя</label><input class="inp" id="contactDisplayName" required></div>
         <div class="aux-two"><div class="fld"><label data-i18n="firstName">Имя</label><input class="inp" id="contactFirstName"></div><div class="fld"><label data-i18n="lastName">Фамилия</label><input class="inp" id="contactLastName"></div></div>
         <div class="fld"><label data-i18n="organization">Организация</label><input class="inp" id="contactOrganization"></div>
@@ -498,6 +508,7 @@
   <div class="tmi" data-folder-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
   <div class="tmi" data-folder-action="settings"><i data-i="settings"></i><span data-i18n="configureMapping">Настроить сопоставление</span></div>
   <div class="tmsep"></div>
+  <div class="tmi" data-folder-action="create"><i data-i="plus"></i><span data-i18n="createFolder">Создать папку</span></div>
   <div class="tmi" data-folder-action="rename"><i data-i="edit"></i><span data-i18n="rename">Переименовать</span></div>
   <div class="tmi danger-menu-item" data-folder-action="delete"><i data-i="trash"></i><span data-i18n="deleteFolder">Удалить папку</span></div>
 </div>
@@ -610,13 +621,13 @@
 </div>
 
 <script src="modules/shell.js?v=20260718-3"></script>
-<script src="modules/calendar-contacts.js?v=20260718-1"></script>
-<script src="modules/commands-accessibility.js?v=20260717-1"></script>
-<script src="modules/smart-rules.js?v=20260718-3"></script>
-<script src="modules/i18n-onboarding.js?v=20260717-3"></script>
-<script src="modules/mail.js?v=20260718-3"></script>
+<script src="modules/calendar-contacts.js?v=20260720-4"></script>
+<script src="modules/commands-accessibility.js?v=20260720-1"></script>
+<script src="modules/smart-rules.js?v=20260720-3"></script>
+<script src="modules/i18n-onboarding.js?v=20260720-1"></script>
+<script src="modules/mail.js?v=20260720-2"></script>
 <script src="modules/composer.js?v=20260717-1"></script>
-<script src="modules/settings.js?v=20260717-2"></script>
-<script src="bridge.js?v=20260718-3"></script>
+<script src="modules/settings.js?v=20260720-1"></script>
+<script src="bridge.js?v=20260720-3"></script>
 </body>
 </html>

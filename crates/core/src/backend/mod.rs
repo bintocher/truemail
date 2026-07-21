@@ -33,16 +33,36 @@ pub async fn gmail_latest_ids(access_token: &str, limit: u32) -> Result<Vec<Stri
 
 /// Одношаговая отписка (RFC 8058): POST на List-Unsubscribe URL с телом
 /// "List-Unsubscribe=One-Click". Возвращает HTTP-код ответа сервера.
+///
+/// URL приходит прямо из заголовка письма, то есть от произвольного
+/// отправителя, а локальный HTTP API приложения слушает 127.0.0.1:34981 -
+/// без проверок это SSRF: письмо может дёрнуть внутренний эндпоинт или
+/// любую машину в приватной сети получателя.
 pub async fn unsubscribe_one_click(url: &str) -> Result<u16> {
-    let client = reqwest::Client::builder()
+    let parsed = url::Url::parse(url).map_err(|error| crate::Error::Backend {
+        backend: "unsubscribe".into(),
+        message: format!("некорректный URL отписки: {error}"),
+    })?;
+    let checked = ensure_unsubscribe_target_is_public(&parsed).await?;
+    let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|error| crate::Error::Backend {
-            backend: "unsubscribe".into(),
-            message: error.to_string(),
-        })?;
+        // Иначе проверка хоста выше обходится тривиально: сервер письма
+        // отвечает 302 на локальный адрес, и reqwest сам туда сходит.
+        .redirect(reqwest::redirect::Policy::none());
+    // Проверка адреса и установка соединения - два разных резолва, между
+    // которыми DNS успевает ответить иначе (rebinding): проверили публичный
+    // адрес, а подключились к 127.0.0.1. Прибиваем соединение к тому адресу,
+    // который реально прошёл проверку. Для literal IP в URL это не нужно -
+    // там резолва нет и подменять нечего.
+    if let (Some(host), Some(addr)) = (parsed.host_str(), checked) {
+        builder = builder.resolve(host, addr);
+    }
+    let client = builder.build().map_err(|error| crate::Error::Backend {
+        backend: "unsubscribe".into(),
+        message: error.to_string(),
+    })?;
     let response = client
-        .post(url)
+        .post(parsed)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body("List-Unsubscribe=One-Click")
         .send()
@@ -52,6 +72,96 @@ pub async fn unsubscribe_one_click(url: &str) -> Result<u16> {
             message: error.to_string(),
         })?;
     Ok(response.status().as_u16())
+}
+
+/// Схема должна быть веб-ссылкой, а хост - не указывать на loopback,
+/// link-local или приватную сеть. Хост в URL может быть как literal IP, так
+/// и DNS-именем, поэтому имя резолвится и проверяются уже полученные
+/// адреса; резолв идёт через tokio::net::lookup_host, а не через блокирующий
+/// системный резолвер, чтобы не подвесить async runtime.
+/// Возвращает проверенный адрес для DNS-имени (его и надо использовать при
+/// соединении) либо None, если в URL был literal IP.
+async fn ensure_unsubscribe_target_is_public(
+    url: &url::Url,
+) -> Result<Option<std::net::SocketAddr>> {
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: format!("схема \"{}\" недопустима для отписки", url.scheme()),
+        });
+    }
+    let host = url.host_str().ok_or_else(|| crate::Error::Backend {
+        backend: "unsubscribe".into(),
+        message: "URL отписки без хоста".into(),
+    })?;
+    // Порт нужен и для lookup_host, и чтобы вернуть готовый SocketAddr для
+    // привязки соединения.
+    let port = url.port_or_known_default().unwrap_or(80);
+    if let Ok(literal) = host.parse::<std::net::IpAddr>() {
+        reject_if_disallowed(literal)?;
+        return Ok(None);
+    }
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: format!("не удалось разрешить хост отписки: {error}"),
+        })?;
+    // Проверяем все адреса, но соединяться будем строго по первому: если
+    // хоть один из них запрещён, запрос не уходит вовсе.
+    let mut first = None;
+    for addr in resolved {
+        reject_if_disallowed(addr.ip())?;
+        if first.is_none() {
+            first = Some(addr);
+        }
+    }
+    first.ok_or_else(|| crate::Error::Backend {
+        backend: "unsubscribe".into(),
+        message: "хост отписки не резолвится ни в один адрес".into(),
+    })
+    .map(Some)
+}
+
+fn reject_if_disallowed(ip: std::net::IpAddr) -> Result<()> {
+    if is_disallowed_unsubscribe_ip(ip) {
+        return Err(crate::Error::Backend {
+            backend: "unsubscribe".into(),
+            message: format!("URL отписки указывает на недопустимый адрес {ip}"),
+        });
+    }
+    Ok(())
+}
+
+/// Loopback, link-local, приватные диапазоны и unspecified-адрес запрещены
+/// и для IPv4, и для IPv6 - в эти сети как раз и попадает локальный API
+/// приложения и внутренняя сеть пользователя.
+fn is_disallowed_unsubscribe_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:a.b.c.d) - проверяем как обычный IPv4.
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_disallowed_unsubscribe_ip(IpAddr::V4(mapped));
+            }
+            // fc00::/7 - Unique Local Address, IPv6-аналог приватных сетей;
+            // is_unique_local() в std пока нестабилен, поэтому маска вручную.
+            let unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || unique_local
+        }
+    }
 }
 
 use crate::Result;
@@ -90,6 +200,15 @@ pub trait MailBackend: Send + Sync {
         operation: &str,
         payload: &str,
     ) -> Result<()>;
+    /// Создать папку. `parent_path` - remote_path родительской папки (None -
+    /// создание на верхнем уровне). Возвращает remote_path новой папки.
+    async fn create_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String>;
     async fn rename_folder(
         &self,
         email: &str,
@@ -182,6 +301,16 @@ impl MailBackend for YandexBackend {
 
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()> {
         wait_for_yandex_change(email, credential).await
+    }
+
+    async fn create_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        imap::create_oauth_folder("imap.yandex.ru", email, credential, parent_path, name).await
     }
 
     async fn rename_folder(
@@ -281,6 +410,17 @@ impl MailBackend for GmailBackend {
         Ok(())
     }
 
+    async fn create_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        let _ = email;
+        gmail_api::create_label(credential, parent_path, name).await
+    }
+
     async fn rename_folder(
         &self,
         email: &str,
@@ -378,6 +518,17 @@ impl MailBackend for OutlookBackend {
             payload,
         )
         .await
+    }
+
+    async fn create_folder(
+        &self,
+        email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        imap::create_oauth_folder("outlook.office365.com", email, credential, parent_path, name)
+            .await
     }
 
     async fn rename_folder(
@@ -521,6 +672,25 @@ impl MailBackend for GenericImapBackend {
         .await
     }
 
+    async fn create_folder(
+        &self,
+        _email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        imap::create_password_folder(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            parent_path,
+            name,
+        )
+        .await
+    }
+
     async fn rename_folder(
         &self,
         _email: &str,
@@ -609,5 +779,69 @@ impl MailBackend for GenericImapBackend {
             uid,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod unsubscribe_ssrf_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_ipv4_loopback_and_private_ranges() {
+        for ip in ["127.0.0.1", "10.0.0.1", "172.16.0.5", "192.168.1.1", "169.254.1.1", "0.0.0.0"] {
+            assert!(
+                is_disallowed_unsubscribe_ip(ip.parse().unwrap()),
+                "{ip} должен быть запрещён"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_ipv6_loopback_link_local_and_unique_local() {
+        for ip in ["::1", "::", "fe80::1", "fc00::1", "fd12:3456::1"] {
+            assert!(
+                is_disallowed_unsubscribe_ip(ip.parse().unwrap()),
+                "{ip} должен быть запрещён"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_private_address() {
+        // ::ffff:127.0.0.1 - тот же loopback, только в IPv6-обёртке.
+        assert!(is_disallowed_unsubscribe_ip("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn allows_ordinary_public_addresses() {
+        assert!(!is_disallowed_unsubscribe_ip("93.184.216.34".parse().unwrap()));
+        assert!(!is_disallowed_unsubscribe_ip("2606:2800:220:1:248:1893:25c8:1946".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_http_scheme() {
+        let url = url::Url::parse("file:///etc/passwd").unwrap();
+        let error = ensure_unsubscribe_target_is_public(&url).await.unwrap_err();
+        assert!(error.to_string().contains("схема"));
+    }
+
+    #[tokio::test]
+    async fn rejects_literal_loopback_host() {
+        let url = url::Url::parse("http://127.0.0.1:34981/unsubscribe").unwrap();
+        assert!(ensure_unsubscribe_target_is_public(&url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rejects_literal_private_host() {
+        let url = url::Url::parse("https://192.168.0.1/unsubscribe").unwrap();
+        assert!(ensure_unsubscribe_target_is_public(&url).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn allows_ordinary_https_host() {
+        // example.com зарезервирован IANA специально для документации и
+        // тестов - не резолвится в приватный адрес и не бьёт по живому сервису.
+        let url = url::Url::parse("https://example.com/unsubscribe").unwrap();
+        assert!(ensure_unsubscribe_target_is_public(&url).await.is_ok());
     }
 }

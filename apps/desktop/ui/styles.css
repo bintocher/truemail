@@ -260,7 +260,7 @@
   .cal-account-label,.cal-source-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .cal-sidebar-empty{padding:16px 10px;color:var(--text-3);font-size:12px;line-height:1.45;}
   .calgrid{flex:1;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:1fr;overflow:hidden;}
-  .calcell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 9px;min-width:0;min-height:140px;}
+  .calcell{border-right:1px solid var(--border);border-bottom:1px solid var(--border);padding:7px 9px;min-width:0;}
   .calcell .d{font-size:12px;color:var(--text-3);font-variant-numeric:tabular-nums;}
   .calcell.today .d{color:#fff;background:var(--accent);width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-weight:600;}
   .ev{font-size:11.5px;padding:2px 6px;border-radius:5px;margin-top:4px;background:var(--accent-weak);color:var(--accent-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
@@ -396,7 +396,7 @@
   .snooze-presets{display:grid;gap:8px;margin-bottom:14px}.snooze-presets .btn{justify-content:flex-start}
   .template-field{display:grid;gap:6px;color:var(--text-2);font-size:12px}
   .template-list{display:grid;gap:8px}.template-row{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid var(--border);border-radius:9px}.template-row .t{font-weight:600}.template-row .d{font-size:12px;color:var(--text-3)}.template-empty{color:var(--text-3);text-align:center;padding:20px}
-  .aux-form .fld{margin-bottom:13px}.aux-form .fld>label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px}.aux-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.aux-check{display:flex;align-items:center;gap:8px;font-size:13px;margin:-2px 0 13px}.aux-check input{accent-color:var(--accent)}.ccard{cursor:pointer}.ccard:hover{background:var(--hover)}
+  .aux-form .fld{margin-bottom:13px}.aux-form .fld>label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px}.aux-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.aux-check{display:flex;align-items:center;gap:8px;font-size:13px;margin:-2px 0 13px}.aux-check input{accent-color:var(--accent)}.event-rsvp-status{font-size:12.5px;color:var(--text-2);margin-bottom:6px}.event-rsvp-actions{display:flex;gap:6px;flex-wrap:wrap}.ccard{cursor:pointer}.ccard:hover{background:var(--hover)}
   .event-advanced{border-top:1px solid var(--border);padding-top:11px;margin-top:3px}.event-advanced>summary{cursor:pointer;color:var(--accent-text);font-size:13px;font-weight:600}.event-advanced-body{padding-top:13px}.event-lines{min-height:62px}.event-advanced .sel{width:100%}
   .fld{margin-bottom:18px;} .fld>label{display:block;font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:7px;}
   .name-row{display:flex;gap:10px;align-items:center;} .name-row .inp{flex:1;}
@@ -415,7 +415,9 @@
 
   /* calendar week/day */
   .cal{--wk-hour:48px;}
-  .cal .calmonth{flex:1;min-height:0;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:auto;align-content:start;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;}
+  /* 6 строк сетки всегда делят высоту области поровну (minmax..1fr) - без пустого хвоста снизу;
+     92px - минимум для читаемости числа и пары событий, дальше срабатывает overflow-y:auto. */
+  .cal .calmonth{flex:1;min-height:0;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:minmax(92px,1fr);align-content:start;overflow-x:hidden;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;}
   .cal .calweek,.cal .calday{flex:1;display:none;flex-direction:column;overflow:hidden;min-height:0;}
   .cal[data-cv="week"] .calmonth{display:none;} .cal[data-cv="week"] .calweek{display:flex;}
   .cal[data-cv="day"] .calmonth{display:none;} .cal[data-cv="day"] .calday{display:flex;}

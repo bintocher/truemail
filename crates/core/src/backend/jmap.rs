@@ -658,6 +658,12 @@ impl MailBackend for JmapBackend {
                         .map(Value::Bool)
                         .unwrap_or(Value::Null),
                 );
+                // Ключ "flagged" опционален - его нет в операциях, поставленных в
+                // outbox до появления звёздочки, и тогда патч $flagged не шлём вовсе,
+                // чтобы не сбросить состояние на сервере.
+                if let Some(flagged) = payload["flagged"].as_bool() {
+                    patch.insert("keywords/$flagged".into(), Value::Bool(flagged));
+                }
             }
             "move" => {
                 let source = payload["folder_path"]
@@ -702,6 +708,32 @@ impl MailBackend for JmapBackend {
         }
         self.email_set(credential, json!({id: Value::Object(patch)}), Vec::new())
             .await
+    }
+
+    async fn create_folder(
+        &self,
+        _email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        let session = self.session(credential).await?;
+        let account_id = self.mail_account(&session)?;
+        // "new-folder" - произвольный creation id из запроса: сервер вернёт
+        // под этим же ключом реальный id новой Mailbox в "created".
+        let response = self
+            .api(
+                &session,
+                credential,
+                vec![json!(["Mailbox/set", {
+                    "accountId": account_id,
+                    "create": {"new-folder": {"name": name.trim(), "parentId": parent_path}}
+                }, "set"])],
+            )
+            .await?;
+        let args = method_args(&response, "set")?;
+        ensure_set_succeeded(args, "Mailbox/set")?;
+        required_string(&args["created"]["new-folder"], "id")
     }
 
     async fn rename_folder(
@@ -1188,6 +1220,8 @@ mod tests {
                 imap: None,
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: Some(format!("{base}/.well-known/jmap")),
                 username: Some("user@example.test".into()),
                 secret_ref: "test-keychain-ref".into(),

@@ -66,6 +66,12 @@ pub struct Contact {
     #[serde(default)]
     pub phones: Vec<ContactPhone>,
     pub is_favorite: bool,
+    /// true, если контакт существует только в локальной БД - провайдер
+    /// аккаунта не поддерживает запись контактов (см. auxiliary::write_contact),
+    /// поэтому carddav/API-копии на сервере нет. Вычисляется из remote_url:
+    /// пока его нет, контакт не отправлен ни на один сервер.
+    #[serde(default)]
+    pub is_local_only: bool,
 }
 
 pub fn clean_contact_name(value: &str) -> String {

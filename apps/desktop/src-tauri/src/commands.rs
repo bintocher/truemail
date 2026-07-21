@@ -23,11 +23,11 @@ use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
 };
 use truemail_core::model::{
-    Account, AuthKind, BackendKind, Contact, Event, Folder, Keybinding, MailRule, MailRuleInput,
-    MessageFull, MessageMeta, MessageTemplate, Provider, Security, ServerConfig, Signature,
-    SmartFolder,
+    Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, Keybinding, MailRule,
+    MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
+    ServerConfig, Signature, SmartFolder, resolve_my_attendance,
 };
-use truemail_core::storage::repo::CalendarSummary;
+use truemail_core::storage::repo::{CalendarChange, CalendarChangeKind, CalendarSummary};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
@@ -50,6 +50,17 @@ pub struct AppState {
     // Куда прижимать окно уведомлений; кэш настройки notify_position,
     // чтобы позиционирование не лезло в БД (оно синхронное).
     pub notify_anchor: Arc<std::sync::Mutex<NotifyAnchor>>,
+    // Локальные id писем, о которых уже показано уведомление о новой почте.
+    // Три независимых пути (gmail-realtime, exchange-mail-sync, mail-watch)
+    // могут увидеть одно и то же новое письмо - множество не даёт показать
+    // по нему карточку дважды.
+    pub notified_messages: Arc<tokio::sync::Mutex<HashSet<i64>>>,
+    // Изменения календаря, о которых уже показано уведомление. Ключ -
+    // "event_id:kind" (см. calendar_change_key), а не просто event_id: одно
+    // и то же событие может дать несколько разнородных уведомлений подряд
+    // (сначала перенесли, потом отменили) - ключ по одному event_id стёр бы
+    // второе уведомление как "уже показанное".
+    pub notified_calendar_changes: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 pub fn default_keybindings() -> Vec<Keybinding> {
@@ -361,8 +372,19 @@ async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
 
 /// Показать собственное уведомление (кросс-платформенное окно в стиле софта).
 /// Данные уходят в webview-окно "notify", которое рисует карточку с кнопками.
-fn push_notification(app: &AppHandle, payload: serde_json::Value) {
+fn push_notification(app: &AppHandle, payload: serde_json::Value, source: &'static str) {
     position_notify_window(app);
+    // Источник и содержимое карточки логируем до отправки: уведомление могут
+    // независимо породить несколько путей (watch/IDLE, периодический sync,
+    // gmail-поллинг), и без source в логе невозможно понять, кто из них
+    // показал карточку и почему их оказалось две на одно письмо.
+    let kind = payload
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let message_id = payload.get("message_id").and_then(|value| value.as_i64());
+    let count = payload.get("count").and_then(|value| value.as_u64());
     let emitted = app.emit_to("notify", "notify-push", payload).is_ok();
     let mut shown = false;
     if let Some(window) = app.get_webview_window("notify") {
@@ -370,7 +392,15 @@ fn push_notification(app: &AppHandle, payload: serde_json::Value) {
         let _ = window.set_ignore_cursor_events(false);
         shown = window.show().is_ok();
     }
-    tracing::info!(emitted, shown, "desktop notification dispatched");
+    tracing::info!(
+        source,
+        kind,
+        message_id,
+        count,
+        emitted,
+        shown,
+        "уведомление показано пользователю"
+    );
 }
 
 /// Прижать окно уведомлений к выбранному пользователем углу основного монитора.
@@ -454,19 +484,84 @@ pub async fn set_notify_position(
     Ok(())
 }
 
-/// Уведомление о новых письмах: отправитель, тема и превью последнего письма.
+/// Оставляет из `ids` только те, о которых ещё не уведомляли, и запоминает их
+/// как уведомлённые. Чистая функция над `HashSet` - синхронный дедуп-хелпер,
+/// вызывающая сторона сама держит блокировку `Mutex`.
+///
+/// Три независимых пути (gmail-realtime, exchange-mail-sync, mail-watch) могут
+/// увидеть одно и то же новое письмо в одном и том же проходе - без дедупа
+/// пользователь получил бы две карточки на одно письмо.
+fn dedupe_notified(notified: &mut HashSet<i64>, ids: &[i64]) -> Vec<i64> {
+    dedupe_notified_keys(notified, ids)
+}
+
+/// Обобщённая версия dedupe_notified: ключ дедупа не обязан быть i64.
+/// Для изменений календаря ключ составной ("event_id:kind" строкой, см.
+/// calendar_change_key) - HashSet<i64> тут не подходит, а переписывать
+/// dedupe_notified под другой тип нельзя, не сломав её текущих вызывающих
+/// и тесты.
+fn dedupe_notified_keys<T: Eq + std::hash::Hash + Clone>(
+    notified: &mut HashSet<T>,
+    ids: &[T],
+) -> Vec<T> {
+    let fresh: Vec<T> = ids
+        .iter()
+        .cloned()
+        .filter(|id| !notified.contains(id))
+        .collect();
+    notified.extend(fresh.iter().cloned());
+    // Не даём множеству бесконечно расти в течение сессии (тот же приём, что
+    // и для напоминаний о встречах в reminders_loop).
+    if notified.len() > 1000 {
+        notified.clear();
+    }
+    fresh
+}
+
+/// Уведомление о новых письмах: отправитель, тема и превью самого свежего
+/// из реально новых писем Входящих. `new_message_ids` отсортированы по дате
+/// по возрастанию (см. `InboxSyncResult::new_message_ids`) - последний элемент
+/// самый свежий. Пустой список - уведомление не показывается вовсе: это либо
+/// первый проход без базовой линии, либо новых писем действительно нет.
 async fn notify_new_mail(
     app: &AppHandle,
     core: &Arc<Core>,
     account: &truemail_core::model::Account,
-    count: usize,
+    new_message_ids: &[i64],
+    source: &'static str,
+    notified: &Arc<tokio::sync::Mutex<HashSet<i64>>>,
 ) {
+    if new_message_ids.is_empty() {
+        return;
+    }
+    let fresh = {
+        let mut guard = notified.lock().await;
+        dedupe_notified(&mut guard, new_message_ids)
+    };
+    let Some(&message_id) = fresh.last() else {
+        tracing::debug!(
+            source,
+            account = %truemail_core::logging::mask_email(&account.email),
+            candidates = new_message_ids.len(),
+            "уведомление подавлено: письма уже показаны другим путём"
+        );
+        return;
+    };
+    let count = fresh.len();
     let meta = core
         .db
-        .latest_inbox_message(account.id)
+        .message_notification_preview(message_id)
         .await
         .ok()
         .flatten();
+    tracing::info!(
+        source,
+        account = %truemail_core::logging::mask_email(&account.email),
+        candidates = new_message_ids.len(),
+        after_dedup = count,
+        message_id,
+        "готовим уведомление о новых письмах"
+    );
     let payload = match meta {
         Some((id, from, subject, preview)) => serde_json::json!({
             "kind": "mail",
@@ -484,17 +579,342 @@ async fn notify_new_mail(
             "preview": "",
             "count": count,
             "account_id": account.id,
-            "message_id": serde_json::Value::Null,
+            "message_id": message_id,
         }),
     };
-    push_notification(app, payload);
+    push_notification(app, payload, source);
 }
 
-/// Первый EWS-снимок создаёт локальную базовую линию и не должен вываливать
-/// пользователю историю ящика. После появления SyncState уведомляем только о
-/// remote ID, которых до прохода не было в БД.
-fn exchange_notification_count(result: InboxSyncResult) -> Option<usize> {
-    (result.had_baseline && result.new_messages > 0).then_some(result.new_messages)
+/// Первый проход синхронизации создаёт локальную базовую линию и не должен
+/// вываливать пользователю историю ящика: до появления baseline id новых
+/// писем в уведомление не передаются вовсе. Общий принцип для Exchange и
+/// IMAP/Gmail-путей (раньше применялся только к Exchange).
+fn notification_ids(result: &InboxSyncResult) -> &[i64] {
+    if result.had_baseline {
+        &result.new_message_ids
+    } else {
+        &[]
+    }
+}
+
+/// Порог, начиная с которого пачка изменений календаря за один проход
+/// синхронизации схлопывается в одну сводную карточку "Изменения в
+/// календаре: N" вместо потока карточек по каждому изменению - иначе
+/// синхронизация после долгого простоя (отпуск, переустановка) завалила бы
+/// пользователя лавиной уведомлений разом.
+const CALENDAR_CHANGE_BUNDLE_THRESHOLD: usize = 3;
+
+/// Изменение показывается, только если сама встреча ещё не наступила:
+/// уведомление о переносе или отмене встречи, которая была вчера,
+/// пользователю уже не нужно. Сравниваем с текущим моментом без запаса -
+/// как только встреча началась, дальнейшие уведомления о ней бессмысленны.
+fn is_future_calendar_change(change: &CalendarChange, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match change.start.as_deref().and_then(parse_event_start) {
+        Some(start) => start >= now,
+        // Время начала не распозналось - лучше показать карточку, чем молча
+        // проглотить реальное изменение из-за особенностей формата даты.
+        None => true,
+    }
+}
+
+/// Ключ дедупа одного изменения: событие + вид изменения. Простого event_id
+/// недостаточно - перенос и последующая отмена одной и той же встречи это
+/// два разных уведомления, оба должны быть показаны.
+fn calendar_change_key(change: &CalendarChange) -> String {
+    format!("{}:{:?}", change.event_id, change.kind)
+}
+
+/// Короткое человекочитаемое "было/стало"-время: дата и время в локальном
+/// поясе пользователя, без секунд и без суффикса таймзоны - секунды и
+/// смещение только загромождают карточку, а календарь в UI тоже показывает
+/// локальное время.
+fn format_event_local(value: chrono::DateTime<chrono::Utc>) -> String {
+    value
+        .with_timezone(&chrono::Local)
+        .format("%d.%m.%Y %H:%M")
+        .to_string()
+}
+
+fn calendar_change_tag(kind: CalendarChangeKind) -> &'static str {
+    match kind {
+        CalendarChangeKind::Created => "created",
+        CalendarChangeKind::Rescheduled => "rescheduled",
+        CalendarChangeKind::Cancelled => "cancelled",
+        CalendarChangeKind::Renamed => "renamed",
+        CalendarChangeKind::LocationChanged => "location",
+        CalendarChangeKind::AttendeesChanged => "attendees",
+    }
+}
+
+/// Полезная нагрузка карточки одного изменения встречи. Статичные части
+/// текста (заголовки, слова "было"/"стало") берутся из общего каталога
+/// локализации (truemail_core::i18n - тот же источник, что и у остального
+/// UI). Плейсхолдеров в каталоге нет ни у одного ключа проекта, поэтому
+/// переменные значения (даты, место) просто подставляются рядом в Rust.
+/// Вторая строка карточки: организатор и число участников. Обе части
+/// необязательны - у встречи без организатора (создана самим пользователем в
+/// локальном календаре) остаётся только счётчик, а у встречи без участников
+/// строки не будет вовсе, вместо пустой "Участников: 0".
+fn calendar_change_details(
+    change: &CalendarChange,
+    catalog: &truemail_core::i18n::I18n,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(organizer) = change
+        .organizer
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!("{} {organizer}", catalog.t("notifyEventOrganizer")));
+    }
+    if change.attendee_count > 0 {
+        parts.push(format!(
+            "{} {}",
+            catalog.t("notifyEventAttendeeCount"),
+            change.attendee_count
+        ));
+    }
+    parts.join(", ")
+}
+
+fn calendar_change_payload(
+    account_id: i64,
+    change: &CalendarChange,
+    catalog: &truemail_core::i18n::I18n,
+) -> serde_json::Value {
+    let title = match change.kind {
+        CalendarChangeKind::Created => catalog.t("notifyEventCreatedTitle"),
+        CalendarChangeKind::Rescheduled => catalog.t("notifyEventRescheduledTitle"),
+        CalendarChangeKind::Cancelled => catalog.t("notifyEventCancelledTitle"),
+        CalendarChangeKind::Renamed => catalog.t("notifyEventRenamedTitle"),
+        CalendarChangeKind::LocationChanged => catalog.t("notifyEventLocationTitle"),
+        CalendarChangeKind::AttendeesChanged => catalog.t("notifyEventAttendeesTitle"),
+    };
+    let preview = match change.kind {
+        CalendarChangeKind::Rescheduled => {
+            let was_label = catalog.t("notifyEventWas");
+            let became_label = catalog.t("notifyEventBecame");
+            let was_time = change
+                .previous_start
+                .as_deref()
+                .and_then(parse_event_start)
+                .map(format_event_local)
+                .unwrap_or_default();
+            let became_time = change
+                .start
+                .as_deref()
+                .and_then(parse_event_start)
+                .map(format_event_local)
+                .unwrap_or_default();
+            format!("{was_label} {was_time}, {became_label} {became_time}")
+        }
+        CalendarChangeKind::LocationChanged => match change
+            .location
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(location) => format!("{} {location}", catalog.t("notifyEventNewLocation")),
+            None => catalog.t("notifyEventLocationRemoved"),
+        },
+        CalendarChangeKind::Cancelled => {
+            let scheduled_label = catalog.t("notifyEventWasScheduledFor");
+            let when = change
+                .start
+                .as_deref()
+                .and_then(parse_event_start)
+                .map(format_event_local)
+                .unwrap_or_default();
+            format!("{scheduled_label} {when}")
+        }
+        CalendarChangeKind::AttendeesChanged => catalog.t("notifyEventAttendeesPreview"),
+        CalendarChangeKind::Renamed => {
+            let was_label = catalog.t("notifyEventWasNamed");
+            let previous = change.previous_summary.clone().unwrap_or_default();
+            format!("{was_label} {previous}")
+        }
+        // У новой встречи менять нечего - вместо "было/стало" показываем то,
+        // ради чего карточку вообще открывают: когда она и где.
+        CalendarChangeKind::Created => {
+            let when = change
+                .start
+                .as_deref()
+                .and_then(parse_event_start)
+                .map(format_event_local)
+                .unwrap_or_default();
+            match change
+                .location
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(location) if !when.is_empty() => format!("{when}, {location}"),
+                Some(location) => location.to_owned(),
+                None => when,
+            }
+        }
+    };
+    serde_json::json!({
+        "kind": "event-change",
+        "change": calendar_change_tag(change.kind),
+        "brand": catalog.t("notifyEventChangeBrand"),
+        "title": title,
+        "subject": change.summary,
+        "preview": preview,
+        "details": calendar_change_details(change, catalog),
+        "count": 1,
+        "event_id": change.event_id,
+        "account_id": account_id,
+        "start": change.start,
+    })
+}
+
+/// Полезная нагрузка сводной карточки - когда изменений в одном проходе
+/// больше CALENDAR_CHANGE_BUNDLE_THRESHOLD.
+fn calendar_change_bundle_payload(
+    account_id: i64,
+    count: usize,
+    catalog: &truemail_core::i18n::I18n,
+) -> serde_json::Value {
+    let bundle_title = catalog.t("notifyEventBundleTitle");
+    serde_json::json!({
+        "kind": "event-change",
+        "change": "bundle",
+        "brand": catalog.t("notifyEventChangeBrand"),
+        "title": format!("{bundle_title}: {count}"),
+        "subject": bundle_title,
+        "preview": "",
+        "count": count,
+        "event_id": serde_json::Value::Null,
+        "account_id": account_id,
+        "start": serde_json::Value::Null,
+    })
+}
+
+/// Решить, какие карточки показать для набора уже отфильтрованных и
+/// отдедуплированных изменений: по одной на изменение, либо одна сводная,
+/// если изменений больше CALENDAR_CHANGE_BUNDLE_THRESHOLD. Вынесено отдельно
+/// от notify_calendar_changes, чтобы протестировать порог схлопывания без
+/// Tauri AppHandle и БД.
+fn calendar_change_cards(
+    account_id: i64,
+    changes: &[&CalendarChange],
+    catalog: &truemail_core::i18n::I18n,
+) -> Vec<serde_json::Value> {
+    if changes.len() > CALENDAR_CHANGE_BUNDLE_THRESHOLD {
+        vec![calendar_change_bundle_payload(
+            account_id,
+            changes.len(),
+            catalog,
+        )]
+    } else {
+        changes
+            .iter()
+            .map(|change| calendar_change_payload(account_id, change, catalog))
+            .collect()
+    }
+}
+
+/// Показать уведомления об изменениях календаря: по карточке на изменение,
+/// либо одну сводную при лавине (порог - CALENDAR_CHANGE_BUNDLE_THRESHOLD).
+/// Дедуп по (event_id, kind) - одно и то же изменение может прийти повторно
+/// из другого пути синхронизации того же аккаунта (общий mail-sync и
+/// периодический aux-sync).
+async fn notify_calendar_changes(
+    app: &AppHandle,
+    core: &Arc<Core>,
+    account: &truemail_core::model::Account,
+    changes: &[CalendarChange],
+    source: &'static str,
+    notified: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+) {
+    if changes.is_empty() {
+        return;
+    }
+    let now = chrono::Utc::now();
+    let future: Vec<&CalendarChange> = changes
+        .iter()
+        .filter(|change| is_future_calendar_change(change, now))
+        .collect();
+    let keys: Vec<String> = future
+        .iter()
+        .map(|change| calendar_change_key(change))
+        .collect();
+    let fresh_keys: HashSet<String> = {
+        let mut guard = notified.lock().await;
+        dedupe_notified_keys(&mut guard, &keys).into_iter().collect()
+    };
+    let fresh: Vec<&CalendarChange> = future
+        .into_iter()
+        .zip(keys.iter())
+        .filter(|(_, key)| fresh_keys.contains(*key))
+        .map(|(change, _)| change)
+        .collect();
+    if fresh.is_empty() {
+        tracing::debug!(
+            source,
+            account = %truemail_core::logging::mask_email(&account.email),
+            candidates = changes.len(),
+            "уведомление об изменениях календаря подавлено: события прошли или уже показаны"
+        );
+        return;
+    }
+    let locale = core
+        .db
+        .setting("locale")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let catalog = truemail_core::i18n::I18n::new(&locale);
+    let count = fresh.len();
+    let bundled = count > CALENDAR_CHANGE_BUNDLE_THRESHOLD;
+    // Кнопки "Пойду/Не пойду/Возможно" в самой карточке - только когда ответ
+    // на приглашение реально нужен (см. resolve_my_attendance) и карточки не
+    // схлопнуты в сводную: у сводной карточки нет одного event_id, на который
+    // отвечать. Отменённую встречу тоже не предлагаем принять/отклонить.
+    let mut needs_response_by_event: HashMap<i64, bool> = HashMap::new();
+    if !bundled {
+        for change in &fresh {
+            if change.kind == CalendarChangeKind::Cancelled {
+                continue;
+            }
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                needs_response_by_event.entry(change.event_id)
+            {
+                let needs = core
+                    .db
+                    .event_needs_response(change.event_id, &account.email)
+                    .await
+                    .unwrap_or(false);
+                entry.insert(needs);
+            }
+        }
+    }
+    let rsvp_labels = serde_json::json!({
+        "accepted": catalog.t("notifyEventRsvpAccept"),
+        "declined": catalog.t("notifyEventRsvpDecline"),
+        "tentative": catalog.t("notifyEventRsvpTentative"),
+    });
+    for mut payload in calendar_change_cards(account.id, &fresh, &catalog) {
+        let needs_response = payload["event_id"]
+            .as_i64()
+            .is_some_and(|id| needs_response_by_event.get(&id).copied().unwrap_or(false));
+        payload["needs_response"] = serde_json::json!(needs_response);
+        if needs_response {
+            payload["rsvp_labels"] = rsvp_labels.clone();
+        }
+        push_notification(app, payload, source);
+    }
+    tracing::info!(
+        source,
+        account = %truemail_core::logging::mask_email(&account.email),
+        candidates = changes.len(),
+        shown = count,
+        bundled,
+        "показаны уведомления об изменениях календаря"
+    );
 }
 
 /// Почти реалтайм-поллинг новых писем Gmail: лёгкая проверка ID Входящих,
@@ -528,6 +948,7 @@ async fn gmail_realtime_loop(
     core: Arc<Core>,
     app: AppHandle,
     syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
+    notified: Arc<tokio::sync::Mutex<HashSet<i64>>>,
 ) {
     let mut observed: HashMap<i64, HashSet<String>> = HashMap::new();
     let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
@@ -551,7 +972,7 @@ async fn gmail_realtime_loop(
             // отсутствие его в ещё заполняющейся локальной БД не делает письмо новым.
             let Some(fresh) = observe_gmail_message_ids(&mut observed, account.id, latest_ids)
             else {
-                tracing::debug!(account = %account.email, "Gmail realtime: исходный снимок сохранён");
+                tracing::debug!(account = %truemail_core::logging::mask_email(&account.email), "Gmail realtime: исходный снимок сохранён");
                 continue;
             };
             if !fresh.is_empty() {
@@ -573,13 +994,21 @@ async fn gmail_realtime_loop(
             let synced = core.accounts.sync_mail_inbox(&account).await;
             syncing.lock().await.remove(&account.id);
             match synced {
-                Ok(_) => {
+                Ok(result) => {
                     pending.remove(&account.id);
                     let _ = app.emit("truemail-data-changed", account.id);
-                    notify_new_mail(&app, &core, &account, pending_count).await;
+                    notify_new_mail(
+                        &app,
+                        &core,
+                        &account,
+                        notification_ids(&result),
+                        "gmail-realtime",
+                        &notified,
+                    )
+                    .await;
                 }
                 Err(error) => {
-                    tracing::warn!(account = %account.email, %error, "Gmail realtime: не удалось загрузить новые письма");
+                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
             }
         }
@@ -673,7 +1102,12 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
         let now = chrono::Utc::now();
         for event in events {
             // Напоминания только если они заданы в самой встрече (alarms).
-            if event.all_day || event.alarms.is_empty() {
+            // Отменённая встреча в календаре остаётся (не удаляется), но
+            // напоминать о ней уже не нужно.
+            if event.all_day
+                || event.alarms.is_empty()
+                || event.status == Some(EventStatus::Cancelled)
+            {
                 continue;
             }
             let Some(start) = parse_event_start(&event.dtstart) else {
@@ -716,6 +1150,7 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
                         "account_id": serde_json::Value::Null,
                         "message_id": serde_json::Value::Null,
                     }),
+                    "event-reminder",
                 );
             }
         }
@@ -1033,6 +1468,20 @@ pub async fn set_folder_role(
 }
 
 #[tauri::command]
+pub async fn create_folder(
+    state: State<'_, AppState>,
+    account_id: i64,
+    parent_folder_id: Option<i64>,
+    name: String,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .create_folder(account_id, parent_folder_id, &name)
+        .await?)
+}
+
+#[tauri::command]
 pub async fn rename_folder(
     state: State<'_, AppState>,
     folder_id: i64,
@@ -1133,9 +1582,15 @@ pub async fn unsubscribe_one_click(url: String) -> CmdResult<u16> {
         })
 }
 
-/// Кнопка "Открыть" в уведомлении: показать главное окно и открыть письмо.
+/// Кнопка "Открыть" в уведомлении: показать главное окно и открыть письмо
+/// или (для карточки изменения встречи) поставить календарь на нужную дату.
 #[tauri::command]
-pub fn notify_open(app: AppHandle, message_id: Option<i64>) -> CmdResult<()> {
+pub async fn notify_open(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    message_id: Option<i64>,
+    event_id: Option<i64>,
+) -> CmdResult<()> {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -1144,7 +1599,32 @@ pub fn notify_open(app: AppHandle, message_id: Option<i64>) -> CmdResult<()> {
     if let Some(id) = message_id {
         let _ = app.emit("truemail-open-message", id);
     }
+    if let Some(id) = event_id {
+        // Пока карточка висела на экране, встреча могла ещё раз измениться -
+        // берём актуальное время начала из БД, а не то, что было в пейлоаде
+        // самого уведомления.
+        let start = match core(&state).await {
+            Ok(core) => event_start_from_db(&core, id).await,
+            Err(_) => None,
+        };
+        let _ = app.emit(
+            "truemail-open-event",
+            serde_json::json!({"event_id": id, "start": start}),
+        );
+    }
     Ok(())
+}
+
+/// Текущее dtstart события по локальному id - для перехода календаря на
+/// нужную дату по кнопке "Открыть" в уведомлении об изменении встречи.
+async fn event_start_from_db(core: &Core, event_id: i64) -> Option<String> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT dtstart FROM events WHERE id=?")
+        .bind(event_id)
+        .fetch_optional(&core.db.pool)
+        .await
+        .ok()
+        .flatten();
+    row.map(|(value,)| value)
 }
 
 /// Кнопка "Закрыть"/пустая очередь: спрятать окно уведомлений.
@@ -1210,6 +1690,11 @@ pub async fn attachment_content(
 }
 
 /// Сохранить одно вложение по абсолютному пути (путь выбирает пользователь в диалоге).
+///
+/// dest_path приходит не из письма, а из системного диалога "Сохранить как":
+/// пользователь сам выбирает полный путь и подтверждает перезапись, поэтому
+/// санитизация имени здесь не нужна - в отличие от save_all_attachments, где
+/// имя файла берётся из недоверенного письма.
 #[tauri::command]
 pub async fn save_attachment(
     state: State<'_, AppState>,
@@ -1228,6 +1713,75 @@ pub async fn save_attachment(
     Ok(())
 }
 
+/// Обезвредить имя вложения перед записью на диск. Имя приходит из письма
+/// (repo.rs берёт его как есть из MIME-заголовка part.attachment_name()), а
+/// значит недоверенное: Path::join с абсолютным путём заменит базу целиком,
+/// ".." выведет запись за пределы папки, а на Windows добавляются свои
+/// ловушки - разделитель '\', префикс диска "C:", зарезервированные имена
+/// устройств (CON, PRN, NUL, COM1-9, LPT1-9) и запрещённые в именах символы.
+fn safe_attachment_name(filename: &str) -> String {
+    const FALLBACK: &str = "attachment";
+    // Берём только последний компонент пути - откидываем и '/', и '\', так
+    // что вложенные и родительские каталоги в имени не имеют силы.
+    let last = filename.rsplit(['/', '\\']).next().unwrap_or(filename).trim();
+    let mut name = if last.is_empty() || last == "." || last == ".." {
+        FALLBACK.to_owned()
+    } else {
+        last.to_owned()
+    };
+    // Символы, запрещённые в именах файлов Windows (и управляющие байты),
+    // заменяем на подчёркивание - на Unix они легальны, но лучше не плодить
+    // разное поведение между платформами для одного и того же письма.
+    name = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20 {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Windows сам отбрасывает хвостовые точки и пробелы в именах файлов;
+    // делаем это явно, иначе "evil.." и "..\\evil" схлопнутся в одно и то же
+    // после ОС-уровневой нормализации.
+    let trimmed = name.trim_end_matches([' ', '.']);
+    name = if trimmed.is_empty() {
+        FALLBACK.to_owned()
+    } else {
+        trimmed.to_owned()
+    };
+    // Зарезервированные имена устройств Windows недоступны с любым
+    // расширением (CON.txt тоже нельзя создать), поэтому сравниваем именно
+    // основу имени, не всё имя целиком.
+    let stem = name.split('.').next().unwrap_or(&name);
+    let reserved = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+    if reserved { format!("_{name}") } else { name }
+}
+
 /// Сохранить все вложения письма в выбранную папку. Возвращает список записанных имён.
 #[tauri::command]
 pub async fn save_all_attachments(
@@ -1237,24 +1791,38 @@ pub async fn save_all_attachments(
 ) -> CmdResult<Vec<String>> {
     let core = core(&state).await?;
     let full = core.db.get_message(message_id).await?;
+    // Канонизируем базу один раз и дальше сверяем с ней родителя каждой
+    // цели - это последняя линия обороны, если санитизация имени всё же
+    // где-то пропустит выход за пределы папки.
+    let dest_root = std::path::Path::new(&dest_dir)
+        .canonicalize()
+        .map_err(|error| ApiError {
+            message: format!("не удалось открыть папку назначения: {error}"),
+        })?;
     let mut saved = Vec::new();
     for attachment in &full.attachments {
         let (filename, _, bytes) = core.db.attachment_bytes(message_id, attachment.id).await?;
+        let safe_name = safe_attachment_name(&filename);
         // Защита от коллизий имён: при повторе добавляем индекс.
-        let mut target = std::path::Path::new(&dest_dir).join(&filename);
+        let mut target = dest_root.join(&safe_name);
         let mut counter = 1;
         while target.exists() {
-            let stem = std::path::Path::new(&filename)
+            let stem = std::path::Path::new(&safe_name)
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or("attachment");
-            let ext = std::path::Path::new(&filename)
+            let ext = std::path::Path::new(&safe_name)
                 .extension()
                 .and_then(|value| value.to_str())
                 .map(|value| format!(".{value}"))
                 .unwrap_or_default();
-            target = std::path::Path::new(&dest_dir).join(format!("{stem} ({counter}){ext}"));
+            target = dest_root.join(format!("{stem} ({counter}){ext}"));
             counter += 1;
+        }
+        if target.parent() != Some(dest_root.as_path()) {
+            return Err(ApiError {
+                message: format!("недопустимое имя вложения: {filename}"),
+            });
         }
         std::fs::write(&target, bytes).map_err(|error| ApiError {
             message: format!("не удалось сохранить {filename}: {error}"),
@@ -1263,7 +1831,7 @@ pub async fn save_all_attachments(
             target
                 .file_name()
                 .and_then(|v| v.to_str())
-                .unwrap_or(&filename)
+                .unwrap_or(&safe_name)
                 .to_owned(),
         );
     }
@@ -1473,11 +2041,24 @@ async fn account_by_id(core: &Core, account_id: i64) -> CmdResult<Account> {
         })
 }
 
+/// Провайдеры, у которых календарь/контакты читаются и пишутся через общий
+/// CalDAV/CardDAV-путь (см. truemail_core::account::sync_dav_account).
+/// JMAP-аккаунт исключён отдельно: он живёт как Provider::Generic, но DAV
+/// у него нет (см. sync_auxiliary_account в core - там та же проверка).
+fn is_dav_capable(account: &Account) -> bool {
+    account.backend_kind != BackendKind::Jmap
+        && matches!(
+            account.provider,
+            Provider::Yandex
+                | Provider::Icloud
+                | Provider::Mailru
+                | Provider::Outlook
+                | Provider::Generic
+        )
+}
+
 async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
     match account.provider {
-        truemail_core::model::Provider::Yandex => {
-            core.accounts.sync_yandex_dav_account(account).await?;
-        }
         truemail_core::model::Provider::Gmail => {
             core.accounts.sync_google_auxiliary_account(account).await?;
         }
@@ -1485,6 +2066,9 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
             core.accounts
                 .sync_exchange_auxiliary_account(account)
                 .await?;
+        }
+        _ if is_dav_capable(account) => {
+            core.accounts.sync_dav_auxiliary_account(account).await?;
         }
         _ => {
             return Err(ApiError {
@@ -1516,19 +2100,19 @@ pub async fn create_event(
             message: "Календарь принадлежит другому аккаунту".into(),
         });
     }
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::write_event(
-        account.provider,
-        &account.email,
-        &token,
-        &calendar.1,
-        RemoteObject {
-            uid: None,
-            remote_url: None,
-            etag: None,
-        },
-        &input,
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .write_event(
+            &account,
+            &calendar.1,
+            RemoteObject {
+                uid: None,
+                remote_url: None,
+                etag: None,
+            },
+            &input,
+        )
     .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account_id);
@@ -1552,19 +2136,19 @@ pub async fn update_event(
     .await
     .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::write_event(
-        account.provider,
-        &account.email,
-        &token,
-        &row.1,
-        RemoteObject {
-            uid: row.2.as_deref(),
-            remote_url: row.3.as_deref(),
-            etag: row.4.as_deref(),
-        },
-        &input,
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .write_event(
+            &account,
+            &row.1,
+            RemoteObject {
+                uid: row.2.as_deref(),
+                remote_url: row.3.as_deref(),
+                etag: row.4.as_deref(),
+            },
+            &input,
+        )
     .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
@@ -1590,17 +2174,68 @@ pub async fn delete_event(
     let remote_url = row.2.as_deref().ok_or_else(|| ApiError {
         message: "У события нет серверного идентификатора".into(),
     })?;
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::delete_event(
-        account.provider,
-        &account.email,
-        &token,
-        &row.1,
-        remote_url,
-        row.3.as_deref(),
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .delete_event(&account, &row.1, remote_url, row.3.as_deref())
     .await?;
     refresh_auxiliary(&core, &account).await?;
+    let _ = app.emit("truemail-data-changed", account.id);
+    Ok(())
+}
+
+/// Ответить на приглашение: "accepted" | "declined" | "tentative". Точка
+/// входа, которую вызывает и карточка своего уведомления (notify.js), и
+/// кнопки в деталях события в календаре (smart-rules.js) - вся логика
+/// ветвления по провайдеру уже в core.accounts.respond_to_event (см.
+/// crates/core/src/account/mod.rs), здесь только поднимаем контекст из БД
+/// и сразу же локально обновляем PARTSTAT, чтобы UI не ждал следующей
+/// синхронизации.
+#[tauri::command]
+pub async fn respond_to_event(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    event_id: i64,
+    response: String,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let response = RsvpResponse::parse(&response).ok_or_else(|| ApiError {
+        message: "неизвестный вариант ответа на приглашение".into(),
+    })?;
+    let context = core
+        .db
+        .event_for_response(event_id)
+        .await?
+        .ok_or_else(|| ApiError {
+            message: "Событие не найдено".into(),
+        })?;
+    let account = account_by_id(&core, context.account_id).await?;
+    let (_, needs_response) = resolve_my_attendance(
+        &context.event.attendees,
+        context.event.organizer.as_deref(),
+        &account.email,
+    );
+    if !needs_response {
+        return Err(ApiError {
+            message: "Ответ на это событие не требуется".into(),
+        });
+    }
+    core.accounts
+        .respond_to_event(
+            &account,
+            &context.calendar_source,
+            RemoteObject {
+                uid: context.event.uid.as_deref(),
+                remote_url: context.remote_url.as_deref(),
+                etag: context.etag.as_deref(),
+            },
+            &context.event,
+            response,
+        )
+        .await?;
+    core.db
+        .update_own_partstat(event_id, &account.email, response.partstat())
+        .await?;
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(())
 }
@@ -1614,7 +2249,7 @@ pub async fn create_contact(
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
-    if !matches!(account.provider, Provider::Gmail | Provider::Yandex) {
+    if !(account.provider == Provider::Gmail || is_dav_capable(&account)) {
         core.db.save_local_contact(account_id, None, &input).await?;
         let _ = app.emit("truemail-data-changed", account_id);
         return Ok(());
@@ -1643,19 +2278,19 @@ pub async fn create_contact(
             .and_then(|url| url.join(".").ok())
             .map(String::from)
     };
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::write_contact(
-        account.provider,
-        &account.email,
-        &token,
-        collection.as_deref(),
-        RemoteObject {
-            uid: None,
-            remote_url: None,
-            etag: None,
-        },
-        &input,
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .write_contact(
+            &account,
+            collection.as_deref(),
+            RemoteObject {
+                uid: None,
+                remote_url: None,
+                etag: None,
+            },
+            &input,
+        )
     .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account_id);
@@ -1684,19 +2319,19 @@ pub async fn update_contact(
         let _ = app.emit("truemail-data-changed", account.id);
         return Ok(());
     }
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::write_contact(
-        account.provider,
-        &account.email,
-        &token,
-        None,
-        RemoteObject {
-            uid: row.1.as_deref(),
-            remote_url: row.2.as_deref(),
-            etag: row.3.as_deref(),
-        },
-        &input,
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .write_contact(
+            &account,
+            None,
+            RemoteObject {
+                uid: row.1.as_deref(),
+                remote_url: row.2.as_deref(),
+                etag: row.3.as_deref(),
+            },
+            &input,
+        )
     .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
@@ -1722,14 +2357,10 @@ pub async fn delete_contact(
         let _ = app.emit("truemail-data-changed", account.id);
         return Ok(());
     };
-    let token = core.accounts.oauth_access_token(&account).await?;
-    truemail_core::account::delete_contact(
-        account.provider,
-        &account.email,
-        &token,
-        remote_url,
-        row.2.as_deref(),
-    )
+    // Через AccountManager, а не свободной функцией: для Exchange нужны
+    // ews_url и username из аккаунта, которых у свободной функции нет.
+    core.accounts
+        .delete_contact(&account, remote_url, row.2.as_deref())
     .await?;
     refresh_auxiliary(&core, &account).await?;
     let _ = app.emit("truemail-data-changed", account.id);
@@ -1989,28 +2620,36 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
         let sync_core = core.clone();
         let sync_set = state.syncing.clone();
         let sync_app = app.clone();
+        let sync_notified = state.notified_messages.clone();
+        let sync_calendar_notified = state.notified_calendar_changes.clone();
         let _ = app.emit(
             "truemail-sync-state",
             serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
         );
         tokio::spawn(async move {
-            tracing::info!(account = %account.email, provider = ?account.provider, "mail-sync начат");
+            tracing::info!(account = %truemail_core::logging::mask_email(&account.email), provider = ?account.provider, "mail-sync начат");
             if account.provider == truemail_core::model::Provider::Exchange {
                 match sync_core.accounts.sync_mail_inbox_delta(&account).await {
                     Ok(result) => {
                         tracing::info!(
-                            account = %account.email,
+                            account = %truemail_core::logging::mask_email(&account.email),
                             messages = result.downloaded,
                             new_messages = result.new_messages,
                             "Exchange: свежие входящие загружены"
                         );
                         let _ = sync_app.emit("truemail-data-changed", account.id);
-                        if let Some(count) = exchange_notification_count(result) {
-                            notify_new_mail(&sync_app, &sync_core, &account, count).await;
-                        }
+                        notify_new_mail(
+                            &sync_app,
+                            &sync_core,
+                            &account,
+                            notification_ids(&result),
+                            "exchange-mail-sync",
+                            &sync_notified,
+                        )
+                        .await;
                     }
                     Err(error) => {
-                        tracing::warn!(account = %account.email, %error, "Exchange: быстрые входящие не загрузились");
+                        tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Exchange: быстрые входящие не загрузились");
                     }
                 }
             }
@@ -2026,30 +2665,53 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             let auxiliary = if supports_auxiliary {
                 sync_core.accounts.sync_auxiliary_account(&account).await
             } else {
-                Ok((0, 0, 0))
+                Ok(truemail_core::storage::repo::AuxiliarySaveResult::default())
             };
             let state = match (mail, auxiliary) {
-                (Ok(result), Ok((calendars, events, contacts))) => {
-                    tracing::info!(account = %account.email, calendars, events, contacts, "инкрементальный sync завершён");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings, "calendars": calendars, "events": events, "contacts": contacts})
+                (Ok(result), Ok(aux)) => {
+                    if !aux.changes.is_empty() {
+                        tracing::debug!(account = %truemail_core::logging::mask_email(&account.email), changes = aux.changes.len(), "обнаружены изменения календаря");
+                        notify_calendar_changes(
+                            &sync_app,
+                            &sync_core,
+                            &account,
+                            &aux.changes,
+                            "mail-sync",
+                            &sync_calendar_notified,
+                        )
+                        .await;
+                    }
+                    tracing::info!(account = %truemail_core::logging::mask_email(&account.email), calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "инкрементальный sync завершён");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Ok(mut result), Err(error)) => {
-                    tracing::warn!(account = %account.email, %error, "почта обновлена, вспомогательный sync будет повторён");
+                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "почта обновлена, вспомогательный sync будет повторён");
                     result.warnings.push(error.to_string());
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
-                (Err(mail_error), Ok((calendars, events, contacts))) if supports_auxiliary => {
-                    tracing::warn!(account = %account.email, %mail_error, calendars, events, contacts, "почта отложена, вспомогательный sync завершён");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": calendars, "events": events, "contacts": contacts})
+                (Err(mail_error), Ok(aux)) if supports_auxiliary => {
+                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "почта отложена, вспомогательный sync завершён");
+                    if !aux.changes.is_empty() {
+                        notify_calendar_changes(
+                            &sync_app,
+                            &sync_core,
+                            &account,
+                            &aux.changes,
+                            "mail-sync",
+                            &sync_calendar_notified,
+                        )
+                        .await;
+                    }
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
                     let error =
                         format!("почта: {mail_error}; календарь/контакты: {auxiliary_error}");
-                    tracing::error!(account = %account.email, %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error})
                 }
                 (Err(error), Ok(_)) => {
-                    tracing::error!(account = %account.email, %error, "фоновая синхронизация не удалась");
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая синхронизация не удалась");
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.to_string()})
                 }
             };
@@ -2083,20 +2745,33 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         let sync_core = core.clone();
         let sync_set = state.syncing_aux.clone();
         let sync_app = app.clone();
+        let sync_calendar_notified = state.notified_calendar_changes.clone();
         let _ = app.emit(
             "truemail-sync-state",
             serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "syncing"}),
         );
         tokio::spawn(async move {
-            tracing::info!(account = %account.email, provider = ?account.provider, "aux-sync начат");
+            tracing::info!(account = %truemail_core::logging::mask_email(&account.email), provider = ?account.provider, "aux-sync начат");
             let sync_result = sync_core.accounts.sync_auxiliary_account(&account).await;
             let state = match sync_result {
-                Ok((calendars, events, contacts)) => {
-                    tracing::info!(account = %account.email, calendars, events, contacts, "календари, задачи и контакты обновлены");
-                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready", "calendars": calendars, "events": events, "contacts": contacts})
+                Ok(aux) => {
+                    if !aux.changes.is_empty() {
+                        tracing::debug!(account = %truemail_core::logging::mask_email(&account.email), changes = aux.changes.len(), "обнаружены изменения календаря");
+                        notify_calendar_changes(
+                            &sync_app,
+                            &sync_core,
+                            &account,
+                            &aux.changes,
+                            "aux-sync",
+                            &sync_calendar_notified,
+                        )
+                        .await;
+                    }
+                    tracing::info!(account = %truemail_core::logging::mask_email(&account.email), calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "календари, задачи и контакты обновлены");
+                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready", "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 Err(error) => {
-                    tracing::error!(account = %account.email, %error, "синхронизация календаря, задач и контактов не удалась");
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "синхронизация календаря, задач и контактов не удалась");
                     serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "error", "error": error.to_string()})
                 }
             };
@@ -2130,9 +2805,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         let gmail_core = core.clone();
         let gmail_app = app.clone();
         let gmail_syncing = state.syncing.clone();
-        tokio::spawn(
-            async move { gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing).await },
-        );
+        let gmail_notified = state.notified_messages.clone();
+        tokio::spawn(async move {
+            gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing, gmail_notified).await
+        });
     }
     for account in core.db.list_accounts().await? {
         if !account.enabled {
@@ -2153,6 +2829,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
             let watch_app = app.clone();
             let watch_account = account.clone();
             let watch_generation = state.generation.clone();
+            let watch_notified = state.notified_messages.clone();
             let generation = watch_generation.load(std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut retry_delay = std::time::Duration::from_secs(2);
@@ -2176,49 +2853,52 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 drop(syncing);
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                             }
+                            // Exchange идёт через delta-путь напрямую, остальные транспорты -
+                            // через sync_mail_inbox (тонкая обёртка над тем же delta-путём).
+                            // Оба возвращают InboxSyncResult - решение об уведомлении
+                            // принимается единообразно, downloaded используется только
+                            // для лога, а не как признак "есть новое письмо".
                             let inbox_sync = if watch_account.provider
                                 == truemail_core::model::Provider::Exchange
                             {
-                                watch_core
-                                    .accounts
-                                    .sync_mail_inbox_delta(&watch_account)
-                                    .await
-                                    .map(|result| {
-                                        (result.downloaded, exchange_notification_count(result))
-                                    })
+                                watch_core.accounts.sync_mail_inbox_delta(&watch_account).await
                             } else {
-                                watch_core
-                                    .accounts
-                                    .sync_mail_inbox(&watch_account)
-                                    .await
-                                    .map(|messages| (messages, (messages > 0).then_some(messages)))
+                                watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
                             match inbox_sync {
-                                // Плановая переустановка IDLE без новых писем (messages=0)
-                                // происходит каждые ~90с - это debug, чтобы не шуметь.
-                                // Реальные новые письма логируем на info.
-                                Ok((messages, Some(new_messages))) => {
-                                    tracing::info!(
-                                        account = %watch_account.email,
-                                        messages,
-                                        new_messages,
-                                        "почтовый транспорт: входящие обновлены"
-                                    );
-                                    notify_new_mail(
-                                        &watch_app,
-                                        &watch_core,
-                                        &watch_account,
-                                        new_messages,
-                                    )
-                                    .await;
+                                Ok(result) => {
+                                    let ids = notification_ids(&result);
+                                    if !ids.is_empty() {
+                                        // Реальные новые письма логируем на info.
+                                        tracing::info!(
+                                            account = %truemail_core::logging::mask_email(&watch_account.email),
+                                            messages = result.downloaded,
+                                            new_messages = ids.len(),
+                                            "почтовый транспорт: входящие обновлены"
+                                        );
+                                        notify_new_mail(
+                                            &watch_app,
+                                            &watch_core,
+                                            &watch_account,
+                                            ids,
+                                            "mail-watch",
+                                            &watch_notified,
+                                        )
+                                        .await;
+                                    } else {
+                                        // Плановая переустановка IDLE без новых писем происходит
+                                        // каждые ~90с, и первый проход без базовой линии тоже
+                                        // не должен шуметь - оба случая на debug.
+                                        tracing::debug!(
+                                            account = %truemail_core::logging::mask_email(&watch_account.email),
+                                            messages = result.downloaded,
+                                            had_baseline = result.had_baseline,
+                                            "наблюдение переустановлено, новых писем нет"
+                                        );
+                                    }
                                 }
-                                Ok((messages, None)) => tracing::debug!(
-                                    account = %watch_account.email,
-                                    messages,
-                                    "наблюдение переустановлено, новых писем нет"
-                                ),
                                 Err(error) => tracing::error!(
-                                    account = %watch_account.email,
+                                    account = %truemail_core::logging::mask_email(&watch_account.email),
                                     %error,
                                     "не удалось дозагрузить входящие"
                                 ),
@@ -2239,9 +2919,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
                             if routine {
-                                tracing::debug!(account = %watch_account.email, %error, "наблюдение за почтой переустанавливается");
+                                tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой переустанавливается");
                             } else {
-                                tracing::warn!(account = %watch_account.email, %error, "наблюдение за почтой будет восстановлено");
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой будет восстановлено");
                             }
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
                             tokio::time::sleep(retry_delay).await;
@@ -2272,7 +2952,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     }
                     Ok(_) => {}
                     Err(error) => tracing::warn!(
-                        account = %outbox_account.email,
+                        account = %truemail_core::logging::mask_email(&outbox_account.email),
                         %error,
                         "outbox временно недоступен"
                     ),
@@ -2372,6 +3052,21 @@ pub async fn schedule_message(
 #[tauri::command]
 pub async fn mark_seen(state: State<'_, AppState>, message_id: i64, seen: bool) -> CmdResult<()> {
     Ok(core(&state).await?.db.mark_seen(message_id, seen).await?)
+}
+
+/// Отметить/снять звёздочку (\Flagged). Симметрична mark_seen - ставит
+/// операцию 'flag' в outbox, дальше её применяет выбранный бэкенд.
+#[tauri::command]
+pub async fn mark_flagged(
+    state: State<'_, AppState>,
+    message_id: i64,
+    flagged: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .mark_flagged(message_id, flagged)
+        .await?)
 }
 
 #[tauri::command]
@@ -2757,33 +3452,34 @@ async fn spawn_initial_mail_sync(
     tokio::spawn(async move {
         match core.accounts.sync_mail_account(&account).await {
             Ok(result) => {
-                tracing::info!(account = %account.email, folders = result.mail_folders, "первая синхронизация почты завершена")
+                tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена")
             }
             Err(error) => {
-                tracing::error!(account = %account.email, %error, "первая синхронизация почты не удалась")
+                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "первая синхронизация почты не удалась")
             }
         }
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
-        if matches!(
-            account.provider,
-            Provider::Yandex | Provider::Gmail | Provider::Exchange
-        ) {
+        if matches!(account.provider, Provider::Gmail | Provider::Exchange)
+            || is_dav_capable(&account)
+        {
             let mut syncing_aux = aux_sync_set.lock().await;
             if !syncing_aux.insert(account.id) {
                 return;
             }
             drop(syncing_aux);
             match core.accounts.sync_auxiliary_account(&account).await {
-                Ok((calendars, events, contacts)) => tracing::info!(
-                    account = %account.email,
-                    calendars,
-                    events,
-                    contacts,
+                // Первая синхронизация - полный снимок (SyncScope::Full),
+                // changes для него намеренно пуст (см. задачу A в repo.rs).
+                Ok(aux) => tracing::info!(
+                    account = %truemail_core::logging::mask_email(&account.email),
+                    calendars = aux.calendars,
+                    events = aux.events,
+                    contacts = aux.contacts,
                     "первая синхронизация календарей и контактов завершена"
                 ),
                 Err(error) => tracing::error!(
-                    account = %account.email,
+                    account = %truemail_core::logging::mask_email(&account.email),
                     %error,
                     "первая синхронизация календарей и контактов не удалась"
                 ),
@@ -3372,30 +4068,65 @@ mod update_tests {
     }
 
     #[test]
-    fn exchange_notifies_only_new_mail_after_baseline() {
-        assert_eq!(
-            exchange_notification_count(InboxSyncResult {
+    fn notifies_only_new_mail_after_baseline() {
+        assert!(
+            notification_ids(&InboxSyncResult {
                 downloaded: 50,
                 new_messages: 50,
                 had_baseline: false,
-            }),
-            None
+                new_message_ids: vec![1, 2, 3],
+            })
+            .is_empty(),
+            "первый проход без базовой линии не должен вываливать историю"
         );
         assert_eq!(
-            exchange_notification_count(InboxSyncResult {
+            notification_ids(&InboxSyncResult {
                 downloaded: 2,
                 new_messages: 1,
                 had_baseline: true,
-            }),
-            Some(1)
+                new_message_ids: vec![42],
+            })
+            .to_vec(),
+            vec![42_i64]
         );
-        assert_eq!(
-            exchange_notification_count(InboxSyncResult {
+        assert!(
+            notification_ids(&InboxSyncResult {
                 downloaded: 1,
                 new_messages: 0,
                 had_baseline: true,
-            }),
-            None
+                new_message_ids: vec![],
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn dedupe_notified_drops_ids_already_shown() {
+        let mut notified = HashSet::new();
+        assert_eq!(
+            dedupe_notified(&mut notified, &[1, 2, 3]),
+            vec![1, 2, 3],
+            "первый проход - все id новые"
+        );
+        assert_eq!(
+            dedupe_notified(&mut notified, &[2, 3, 4]),
+            vec![4],
+            "2 и 3 уже показывались другим путём"
+        );
+        assert!(
+            dedupe_notified(&mut notified, &[]).is_empty(),
+            "пустой вход - пустой результат"
+        );
+    }
+
+    #[test]
+    fn dedupe_notified_clears_set_when_it_grows_too_large() {
+        let mut notified: HashSet<i64> = (0..1000).collect();
+        let fresh = dedupe_notified(&mut notified, &[1000]);
+        assert_eq!(fresh, vec![1000]);
+        assert!(
+            notified.is_empty(),
+            "множество должно быть очищено после превышения предела"
         );
     }
 
@@ -3405,5 +4136,261 @@ mod update_tests {
         assert_eq!(endpoint.scheme(), "https");
         assert_eq!(endpoint.host_str(), Some("chernov.gitverse.site"));
         assert!(endpoint.path().ends_with("/latest.json"));
+    }
+}
+
+#[cfg(test)]
+mod calendar_change_notify_tests {
+    use super::*;
+
+    fn change(
+        kind: CalendarChangeKind,
+        start: Option<&str>,
+        previous_start: Option<&str>,
+        location: Option<&str>,
+    ) -> CalendarChange {
+        CalendarChange {
+            kind,
+            calendar_id: 1,
+            event_id: 42,
+            summary: "Обсуждение релиза".to_owned(),
+            start: start.map(str::to_owned),
+            previous_start: previous_start.map(str::to_owned),
+            previous_summary: Some("Планёрка".to_owned()),
+            location: location.map(str::to_owned),
+            organizer: Some("lead@example.com".to_owned()),
+            attendee_count: 3,
+        }
+    }
+
+    #[test]
+    fn is_future_calendar_change_drops_past_events() {
+        let now = chrono::Utc::now();
+        let yesterday = (now - chrono::Duration::days(1)).to_rfc3339();
+        let in_an_hour = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let past = change(CalendarChangeKind::Rescheduled, Some(&yesterday), None, None);
+        let future = change(CalendarChangeKind::Rescheduled, Some(&in_an_hour), None, None);
+        let unparsable = change(CalendarChangeKind::Created, Some("не дата"), None, None);
+        assert!(
+            !is_future_calendar_change(&past, now),
+            "встреча, которая уже была вчера, не должна уведомляться"
+        );
+        assert!(is_future_calendar_change(&future, now));
+        assert!(
+            is_future_calendar_change(&unparsable, now),
+            "нераспознанная дата не должна молча скрывать изменение"
+        );
+    }
+
+    #[test]
+    fn calendar_change_key_distinguishes_kind_on_same_event() {
+        let rescheduled = change(CalendarChangeKind::Rescheduled, Some("2026-07-21T10:00:00Z"), None, None);
+        let cancelled = change(CalendarChangeKind::Cancelled, Some("2026-07-21T10:00:00Z"), None, None);
+        assert_ne!(
+            calendar_change_key(&rescheduled),
+            calendar_change_key(&cancelled),
+            "перенос и последующая отмена одной встречи - разные ключи дедупа"
+        );
+    }
+
+    #[test]
+    fn format_event_local_has_no_seconds_or_timezone_suffix() {
+        use chrono::TimeZone;
+        let value = chrono::Utc.with_ymd_and_hms(2026, 7, 20, 10, 30, 0).unwrap();
+        let text = format_event_local(value);
+        assert_eq!(text.matches(':').count(), 1, "часы:минуты без секунд");
+        assert!(
+            !text.contains('Z') && !text.contains('+'),
+            "без суффикса таймзоны: {text}"
+        );
+    }
+
+    #[test]
+    fn calendar_change_payload_texts_match_kind_ru() {
+        let catalog = truemail_core::i18n::I18n::new("ru");
+        let rescheduled = change(
+            CalendarChangeKind::Rescheduled,
+            Some("2026-07-21T11:30:00Z"),
+            Some("2026-07-20T10:00:00Z"),
+            None,
+        );
+        let payload = calendar_change_payload(1, &rescheduled, &catalog);
+        assert_eq!(payload["change"], "rescheduled");
+        assert_eq!(payload["subject"], "Обсуждение релиза");
+        let preview = payload["preview"].as_str().unwrap().to_owned();
+        assert!(preview.contains("было") && preview.contains("стало"), "{preview}");
+
+        let cancelled = change(CalendarChangeKind::Cancelled, Some("2026-07-21T11:30:00Z"), None, None);
+        let payload = calendar_change_payload(1, &cancelled, &catalog);
+        assert_eq!(payload["change"], "cancelled");
+        assert!(payload["preview"].as_str().unwrap().contains("Была назначена"));
+
+        let location = change(
+            CalendarChangeKind::LocationChanged,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            Some(" Переговорка 3 "),
+        );
+        let payload = calendar_change_payload(1, &location, &catalog);
+        assert_eq!(payload["change"], "location");
+        assert_eq!(payload["preview"], "Новое место: Переговорка 3");
+
+        let location_removed = change(CalendarChangeKind::LocationChanged, Some("2026-07-21T11:30:00Z"), None, None);
+        let payload = calendar_change_payload(1, &location_removed, &catalog);
+        assert_eq!(payload["preview"], "Место встречи убрано");
+
+        let attendees = change(CalendarChangeKind::AttendeesChanged, Some("2026-07-21T11:30:00Z"), None, None);
+        let payload = calendar_change_payload(1, &attendees, &catalog);
+        assert_eq!(payload["change"], "attendees");
+        assert_eq!(payload["preview"], "Изменился список участников");
+
+        let created = change(
+            CalendarChangeKind::Created,
+            Some("2026-07-21T11:30:00Z"),
+            None,
+            Some("Zoom"),
+        );
+        let payload = calendar_change_payload(1, &created, &catalog);
+        assert_eq!(payload["change"], "created");
+        // Дата форматируется в локальном поясе, поэтому час зависит от машины -
+        // проверяем сам факт "когда и где", а не конкретное время.
+        let preview = payload["preview"].as_str().unwrap().to_owned();
+        assert!(
+            preview.contains("2026") && preview.contains("Zoom"),
+            "у новой встречи в карточке должны быть дата и место: {preview}"
+        );
+        assert_eq!(payload["brand"], "Календарь");
+
+        let renamed = change(CalendarChangeKind::Renamed, Some("2026-07-21T11:30:00Z"), None, None);
+        let payload = calendar_change_payload(1, &renamed, &catalog);
+        assert_eq!(payload["change"], "renamed");
+        assert_eq!(payload["preview"], "Прежнее название: Планёрка");
+    }
+
+    #[test]
+    fn calendar_change_details_lists_organizer_and_attendee_count() {
+        let catalog = truemail_core::i18n::I18n::new("ru");
+        let created = change(CalendarChangeKind::Created, Some("2026-07-21T11:30:00Z"), None, None);
+        assert_eq!(
+            calendar_change_details(&created, &catalog),
+            "Организатор: lead@example.com, участников: 3"
+        );
+
+        let mut lonely = created.clone();
+        lonely.organizer = None;
+        lonely.attendee_count = 0;
+        assert!(
+            calendar_change_details(&lonely, &catalog).is_empty(),
+            "без организатора и участников строка не выводится, а не показывает \"участников: 0\""
+        );
+    }
+
+    #[test]
+    fn calendar_change_payload_texts_use_english_catalog() {
+        let catalog = truemail_core::i18n::I18n::new("en");
+        let rescheduled = change(
+            CalendarChangeKind::Rescheduled,
+            Some("2026-07-21T11:30:00Z"),
+            Some("2026-07-20T10:00:00Z"),
+            None,
+        );
+        let payload = calendar_change_payload(1, &rescheduled, &catalog);
+        let preview = payload["preview"].as_str().unwrap().to_owned();
+        assert!(preview.contains("was") && preview.contains("became"), "{preview}");
+        assert_eq!(payload["brand"], "Calendar");
+        assert_eq!(payload["title"], "Event rescheduled");
+    }
+
+    #[test]
+    fn calendar_change_cards_bundles_when_many() {
+        let catalog = truemail_core::i18n::I18n::new("ru");
+        let changes: Vec<CalendarChange> = (0..4)
+            .map(|i| {
+                let mut item = change(CalendarChangeKind::Created, Some("2026-07-21T10:00:00Z"), None, None);
+                item.event_id = i;
+                item
+            })
+            .collect();
+        let refs: Vec<&CalendarChange> = changes.iter().collect();
+
+        let bundled = calendar_change_cards(99, &refs, &catalog);
+        assert_eq!(
+            bundled.len(),
+            1,
+            "больше порога - одна сводная карточка вместо потока"
+        );
+        assert_eq!(bundled[0]["change"], "bundle");
+        assert_eq!(bundled[0]["count"], 4);
+
+        let few = &refs[..3];
+        let individual = calendar_change_cards(99, few, &catalog);
+        assert_eq!(
+            individual.len(),
+            3,
+            "не больше порога - карточка на каждое изменение"
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_name_tests {
+    use super::*;
+
+    #[test]
+    fn keeps_plain_name_as_is() {
+        assert_eq!(safe_attachment_name("report.pdf"), "report.pdf");
+    }
+
+    #[test]
+    fn strips_unix_absolute_path_to_last_component() {
+        assert_eq!(safe_attachment_name("/etc/passwd"), "passwd");
+    }
+
+    #[test]
+    fn strips_windows_absolute_path_to_last_component() {
+        assert_eq!(
+            safe_attachment_name("C:\\Windows\\System32\\evil.exe"),
+            "evil.exe"
+        );
+    }
+
+    #[test]
+    fn strips_parent_directory_traversal() {
+        assert_eq!(safe_attachment_name("../../secrets.txt"), "secrets.txt");
+        assert_eq!(
+            safe_attachment_name("..\\..\\..\\secrets.txt"),
+            "secrets.txt"
+        );
+    }
+
+    #[test]
+    fn replaces_bare_dot_and_dotdot_with_fallback() {
+        assert_eq!(safe_attachment_name("."), "attachment");
+        assert_eq!(safe_attachment_name(".."), "attachment");
+        assert_eq!(safe_attachment_name(""), "attachment");
+        assert_eq!(safe_attachment_name("   "), "attachment");
+    }
+
+    #[test]
+    fn neutralizes_windows_reserved_device_names() {
+        assert_eq!(safe_attachment_name("CON"), "_CON");
+        assert_eq!(safe_attachment_name("con.txt"), "_con.txt");
+        assert_eq!(safe_attachment_name("LPT1"), "_LPT1");
+        assert_eq!(safe_attachment_name("COM9.log"), "_COM9.log");
+        // Не зарезервированное имя не должно затрагиваться.
+        assert_eq!(safe_attachment_name("CONTRACT.pdf"), "CONTRACT.pdf");
+    }
+
+    #[test]
+    fn replaces_forbidden_windows_characters() {
+        assert_eq!(
+            safe_attachment_name("a<b>c:d\"e|f?g*h.txt"),
+            "a_b_c_d_e_f_g_h.txt"
+        );
+    }
+
+    #[test]
+    fn trims_trailing_dots_and_spaces() {
+        assert_eq!(safe_attachment_name("evil.. "), "evil");
     }
 }

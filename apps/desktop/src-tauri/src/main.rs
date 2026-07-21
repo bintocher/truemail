@@ -88,19 +88,48 @@ fn run() -> anyhow::Result<()> {
 
     // Логи пишем и в stdout (виден при запуске из терминала), и в файл в
     // data_dir/logs/ - у GUI-сборки на Windows stdout не отображается, поэтому
-    // файл единственный способ увидеть диагностику. По умолчанию включаем debug
-    // для ядра, чтобы IMAP-операции (удаление папок и т.п.) логировались из коробки.
+    // файл единственный способ увидеть диагностику. В отладочной сборке
+    // по умолчанию включаем debug для ядра, чтобы IMAP-операции (удаление
+    // папок и т.п.) логировались из коробки. В релизе дефолт - info: debug
+    // для всего ядра в проде слишком шумный и может писать лишние детали.
+    // RUST_LOG пользователя в любом случае имеет приоритет над этим дефолтом.
+    use tracing_appender::rolling::{Builder, Rotation};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let log_dir = data_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "truemail.log");
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,truemail_core=debug"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(std::io::stdout.and(file_appender))
-        .init();
+    // Ротация суточная, но без ограничения файлы копились бесконечно (у
+    // пользователя за 6 дней набежало 4+ МБ). Храним последнюю неделю.
+    let file_appender = Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("truemail.log")
+        .max_log_files(7)
+        .build(&log_dir);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            tracing_subscriber::EnvFilter::new("info,truemail_core=debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
+    match file_appender {
+        Ok(file_appender) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(std::io::stdout.and(file_appender))
+                .init();
+        }
+        Err(error) => {
+            // Логирование не критично для работы приложения: если файловый
+            // appender не поднялся (например, нет прав на директорию),
+            // не роняем запуск, а продолжаем писать хотя бы в stdout.
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .init();
+            eprintln!("не удалось создать файловый логгер в {}: {error}; логи будут только в stdout", log_dir.display());
+        }
+    }
     tracing::info!(log_dir = %log_dir.display(), "логирование инициализировано");
 
     // На новой установке ядро создаст визард после сбора пользовательской
@@ -137,6 +166,8 @@ fn run() -> anyhow::Result<()> {
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         api_server: Arc::new(tokio::sync::Mutex::new(None)),
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -305,6 +336,7 @@ fn run() -> anyhow::Result<()> {
             commands::message_label_ids,
             commands::list_folders,
             commands::set_folder_role,
+            commands::create_folder,
             commands::rename_folder,
             commands::delete_folder,
             commands::list_messages,
@@ -332,6 +364,7 @@ fn run() -> anyhow::Result<()> {
             commands::create_event,
             commands::update_event,
             commands::delete_event,
+            commands::respond_to_event,
             commands::create_contact,
             commands::update_contact,
             commands::delete_contact,
@@ -345,6 +378,7 @@ fn run() -> anyhow::Result<()> {
             commands::send_message,
             commands::schedule_message,
             commands::mark_seen,
+            commands::mark_flagged,
             commands::snooze_messages,
             commands::unsnooze_messages,
             commands::release_due_snoozes,
@@ -406,6 +440,7 @@ mod command_contract_tests {
             "create_event",
             "update_event",
             "delete_event",
+            "respond_to_event",
             "create_contact",
             "update_contact",
             "delete_contact",

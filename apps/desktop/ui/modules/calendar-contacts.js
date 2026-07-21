@@ -15,6 +15,9 @@ function expandCalendarEvents(events,rangeStart,rangeEnd){
   overrides.forEach(event=>{const date=parseDavDate(event.dtstart);if(date&&!output.some(item=>item.id===event.id))add(event,date);});return output;
 }
 function localeName(date,options){return new Intl.DateTimeFormat(wizardLocale||'ru',options).format(date);}
+// Заголовок календаря зависит от вида: день - "срд, 20 июля", месяц/неделя - "июль 2026".
+// Общая функция, чтобы заголовок совпадал и при клике по кнопке вида, и при восстановлении вида на старте.
+function calendarTitleText(view){if(view==='day'){const wd=localeName(calendarCursor,{weekday:'short'}).replace('.','');return `${wizardLocale==='ru'?wd.slice(0,2):wd.slice(0,3)}, ${localeName(calendarCursor,{day:'numeric',month:'long'})}`;}return localeName(calendarCursor,{month:'long',year:'numeric'});}
 function calendarDateKey(date){const pad=value=>String(value).padStart(2,'0');return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}`;}
 function visibleCalendarEvents(data=coreCalendarData){const calendars=data?.calendars||[],events=data?.events||[];if(!calendars.length)return events;const visibleIds=new Set(calendars.filter(calendar=>calendar.visible!==false).map(calendar=>calendar.id));return events.filter(event=>visibleIds.has(event.calendar_id));}
 const calSidebar=document.getElementById('calendarSidebar'),calSidebarList=document.getElementById('calendarSidebarList'),calSidebarToggle=document.getElementById('calSidebarToggle');
@@ -27,7 +30,8 @@ document.getElementById('calSidebarClose').onclick=()=>setCalendarSidebarOpen(fa
 setCalendarSidebarOpen(localStorage.getItem('calendar_sidebar_open')==='1');
 function renderCalendarData(data=coreCalendarData){
   coreCalendarData=data||{calendars:[],events:[]};renderCalendarSidebar();const allEvents=coreCalendarData.events||[],events=visibleCalendarEvents(coreCalendarData),visibleCalendars=(coreCalendarData.calendars||[]).filter(calendar=>calendar.visible!==false);
-  const year=calendarCursor.getFullYear(),month=calendarCursor.getMonth(),displayEvents=expandCalendarEvents(events,new Date(year,month-1,20),new Date(year,month+2,10));document.getElementById('calTitle').textContent=localeName(calendarCursor,{month:'long',year:'numeric'});
+  const year=calendarCursor.getFullYear(),month=calendarCursor.getMonth(),displayEvents=expandCalendarEvents(events,new Date(year,month-1,20),new Date(year,month+2,10));
+  document.getElementById('calTitle').textContent=calendarTitleText(document.getElementById('calSection')?.dataset.cv||'month');
   cg.innerHTML='';const start=(new Date(year,month,1).getDay()+6)%7,days=new Date(year,month+1,0).getDate(),prevDays=new Date(year,month,0).getDate();
   let visibleEvents=0;for(let i=0;i<42;i++){const day=i-start+1,current=i>=start&&day<=days,date=new Date(year,month,current?day:day<1?day:day);const number=current?day:day<1?prevDays+day:day-days;
     const cell=document.createElement('div');cell.className='calcell'+(!current?' other':'')+(new Date().toDateString()===date.toDateString()?' today':'');cell.innerHTML=`<div class="d${current?'':' d-dim'}">${number}</div>`;
@@ -36,10 +40,22 @@ function renderCalendarData(data=coreCalendarData){
   renderWeekDay(events);
   const count=document.querySelector('[data-nav="calendar"] .count');if(count)count.textContent=allEvents.length||'';
 }
-const WK_HOUR=48; // высота одного часа в пикселях (совпадает с --wk-hour в CSS)
+const WK_HOUR_MIN=32; // минимальная высота часа в px - меньше получасовые события становятся нечитаемыми, дальше включаем прокрутку
+let WK_HOUR=48; // высота одного часа в пикселях, пересчитывается под высоту области показа и число рабочих часов (зеркалится в --wk-hour в CSS)
 let calendarHourStartMinutes=8*60,calendarHourEndMinutes=20*60;
 function parseCalendarClock(value,fallback){const match=String(value||'').match(/^(\d{2}):(\d{2})$/);if(!match)return fallback;const minutes=Number(match[1])*60+Number(match[2]);return Number.isFinite(minutes)&&minutes>=0&&minutes<24*60?minutes:fallback;}
 function calendarRangeHeight(){return (calendarHourEndMinutes-calendarHourStartMinutes)/60*WK_HOUR;}
+// Высота часа = доступная высота вида (неделя/день) / число отображаемых часов, чтобы сетка
+// заполняла всю область без пустого хвоста и без лишней прокрутки. Меряем контейнер активного
+// вида (у недели и дня одна и та же область), при недоступности/скрытости - оставляем текущее значение.
+function computeWkHour(){
+  const view=document.getElementById('calSection')?.dataset.cv,hours=(calendarHourEndMinutes-calendarHourStartMinutes)/60;
+  const container=document.querySelector(view==='day'?'#calday .wk-scroll':'#calweek .wk-scroll');
+  if(!container||!(hours>0))return;
+  const available=container.clientHeight;
+  if(available>0)WK_HOUR=Math.max(WK_HOUR_MIN,Math.floor(available/hours));
+  document.getElementById('calSection')?.style.setProperty('--wk-hour',`${WK_HOUR}px`);
+}
 window.applyCalendarHourRange=function(startValue='08:00',endValue='20:00',persist=false){const startInput=document.getElementById('calendarHourStart'),endInput=document.getElementById('calendarHourEnd'),status=document.getElementById('calendarHoursStatus'),start=parseCalendarClock(startValue,8*60),end=parseCalendarClock(endValue,20*60);if(startInput)startInput.value=startValue;if(endInput)endInput.value=endValue;if(startInput&&endInput){startInput.max=endInput.value;endInput.min=startInput.value;}if(start>=end){if(status){status.textContent=L('Время «с» должно быть раньше времени «по».','Start time must be earlier than end time.');status.dataset.kind='error';}return false;}calendarHourStartMinutes=start;calendarHourEndMinutes=end;if(status){status.textContent='';status.dataset.kind='';}if(persist){window.tm?.setSetting('calendar_hour_start',startValue).catch(console.error);window.tm?.setSetting('calendar_hour_end',endValue).catch(console.error);renderWeekDay(visibleCalendarEvents());}return true;};
 const calendarHourStartInput=document.getElementById('calendarHourStart'),calendarHourEndInput=document.getElementById('calendarHourEnd');
 if(calendarHourStartInput&&calendarHourEndInput){const applyHours=()=>window.applyCalendarHourRange(calendarHourStartInput.value,calendarHourEndInput.value,true);calendarHourStartInput.onchange=applyHours;calendarHourEndInput.onchange=applyHours;}
@@ -72,6 +88,7 @@ function renderDayColumn(dayStart,items){
 }
 function timesColumn(){let out=`<div class="wk-times" style="min-height:${calendarRangeHeight()}px">`;for(let minute=calendarHourStartMinutes;minute<calendarHourEndMinutes;minute+=60){const hour=Math.floor(minute/60),mins=minute%60,top=(minute-calendarHourStartMinutes)/60*WK_HOUR;out+=`<div class="wk-tlabel" style="top:${top}px">${String(hour).padStart(2,'0')}:${String(mins).padStart(2,'0')}</div>`;}return out+'</div>';}
 function renderWeekDay(events){
+  computeWkHour();
   const base=new Date(calendarCursor),monday=new Date(base);monday.setDate(base.getDate()-((base.getDay()+6)%7));
   const expanded=expandCalendarEvents(events,new Date(monday.getFullYear(),monday.getMonth(),monday.getDate()-1),new Date(monday.getFullYear(),monday.getMonth(),monday.getDate()+9));
   const intervals=expanded.map(eventInterval).filter(Boolean);
@@ -84,6 +101,14 @@ function renderWeekDay(events){
   const dayD=new Date(base.getFullYear(),base.getMonth(),base.getDate()),dToday=new Date().toDateString()===base.toDateString(),dwd=localeName(base,{weekday:'short'}).replace('.','');
   document.getElementById('calday').innerHTML=`<div class="wk-head wk-head-day"><div class="wk-corner"></div><div class="wk-dayhd${dToday?' today':''}">${wizardLocale==='ru'?dwd.slice(0,2):dwd.slice(0,3)}<b>${base.getDate()}</b></div></div><div class="wk-scroll">${timesColumn()}<div class="wk-cols wk-cols-day"><div class="wk-daycol" data-date="${calendarDateKey(dayD)}" style="min-height:${calendarRangeHeight()}px">${renderDayColumn(dayD,dayItems(dayD))}</div></div></div>`;
 }
+// Один обработчик на весь модуль (не внутри renderWeekDay - иначе слушатели копились бы
+// при каждой перерисовке): пересчитываем высоту часа при ресайзе окна, только если сейчас
+// показан вид неделя/день (в месяце сетка адаптивна чисто через CSS grid, JS не нужен).
+let calResizeTimer=null;
+window.addEventListener('resize',()=>{
+  clearTimeout(calResizeTimer);
+  calResizeTimer=setTimeout(()=>{if(document.getElementById('calSection')?.dataset.cv!=='month')renderWeekDay(visibleCalendarEvents());},150);
+});
 function escapeHtml(value){return String(value||'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
 // Цвет события = цвет его аккаунта (через календарь), как у писем в списке.
 function eventAccountColor(event){const cal=(coreCalendarData.calendars||[]).find(item=>item.id===event.calendar_id);return cal?accountColorById(cal.account_id):null;}
@@ -94,6 +119,19 @@ calendarSection.addEventListener('dragend',event=>{event.target.closest('.ev,.wk
 calendarSection.addEventListener('dragover',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(!target)return;event.preventDefault();event.dataTransfer.dropEffect='move';calendarSection.querySelectorAll('.drop-hi').forEach(item=>item.classList.toggle('drop-hi',item===target));});
 calendarSection.addEventListener('dragleave',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(target&&!target.contains(event.relatedTarget))target.classList.remove('drop-hi');});
 calendarSection.addEventListener('drop',event=>{const target=event.target.closest('.calcell[data-date],.wk-daycol[data-date]');if(!target)return;event.preventDefault();target.classList.remove('drop-hi');let payload;try{payload=JSON.parse(event.dataTransfer.getData('application/x-truemail-event'));}catch(_){return;}let destination=target.dataset.date;if(target.classList.contains('wk-daycol')){const match=destination.match(/^(\d{4})-(\d{2})-(\d{2})$/),date=new Date(+match[1],+match[2]-1,+match[3]),minutes=Math.max(calendarHourStartMinutes,Math.min(calendarHourEndMinutes-15,calendarHourStartMinutes+Math.round(((event.clientY-target.getBoundingClientRect().top)/WK_HOUR*60)/15)*15));date.setMinutes(minutes);destination=date.toISOString();}window.calendarDropJustHappened=true;setTimeout(()=>{window.calendarDropJustHappened=false;},100);window.prepareCalendarEventMove?.(payload.id,payload.start,destination);});
+// Перейти в раздел календаря на дату события (вызывается из своего уведомления
+// об изменении встречи через bridge). startIso уже пришла свежей из БД на
+// момент клика (см. notify_open в Rust) - искать событие в coreCalendarData
+// не нужно, достаточно просто встать курсором на присланную дату.
+window.openCalendarEventById=function(eventId,startIso){
+  goCal();
+  const date=startIso?parseDavDate(startIso):null;
+  if(!date)return;
+  calendarCursor=new Date(date);
+  const view=document.getElementById('calSection')?.dataset.cv||'month';
+  if(view==='month')renderCalendarData();
+  else{renderWeekDay(visibleCalendarEvents());document.getElementById('calTitle').textContent=calendarTitleText(view);}
+};
 
 /* contacts */
 const cts=[];
@@ -104,7 +142,11 @@ cts.forEach(([n,e,c])=>{const ini=n.split(' ').map(x=>x[0]).join('');const card=
 /* nav sections (mail/calendar/contacts) */
 document.querySelectorAll('.navitem[data-nav]').forEach(n=>n.onclick=()=>{
   document.querySelectorAll('.navitem').forEach(x=>x.classList.remove('active'));n.classList.add('active');
-  const app=document.getElementById('app');app.classList.toggle('calmode',n.dataset.nav==='calendar');app.classList.toggle('contactsmode',n.dataset.nav==='contacts');});
+  const app=document.getElementById('app'),enteringCalendar=n.dataset.nav==='calendar'&&!app.classList.contains('calmode');
+  app.classList.toggle('calmode',n.dataset.nav==='calendar');app.classList.toggle('contactsmode',n.dataset.nav==='contacts');
+  // При первом входе в раздел календаря сетка недели/дня могла быть отрисована ещё скрытой
+  // (высота области = 0), поэтому пересчитываем высоту часа теперь, когда область уже видна.
+  if(enteringCalendar&&document.getElementById('calSection')?.dataset.cv!=='month')renderWeekDay(visibleCalendarEvents());});
 /* account collapse */
 // Делегирование: работает и для аккаунтов, отрисованных динамически после загрузки.
 function accountNavIsOpen(accountId){try{const saved=JSON.parse(localStorage.getItem('account_nav_open')||'{}');return saved[String(accountId)]!==false;}catch(_){return true;}}
@@ -185,6 +227,7 @@ ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
   executeToolbarAction(action);
 });
-ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='rename'){const name=prompt(L('Новое имя папки','New folder name'),contextFolder.display_name);if(!name||name.trim()===contextFolder.display_name)return;try{await window.tm.renameFolder(contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка переименована на сервере','Folder renamed on the server'));}catch(error){showToast(error.message||String(error));}return;}if(action==='delete'){if(!confirm(L(`Удалить папку «${contextFolder.display_name}» на сервере? Письма внутри также будут удалены.`,`Delete the folder "${contextFolder.display_name}" on the server? Messages inside will also be deleted.`)))return;try{await window.tm.deleteFolder(contextFolder.id);await window.reloadCoreData();showToast(L('Папка удалена на сервере','Folder deleted on the server'));}catch(error){showToast(error.message||String(error));}}}));
+ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='create'){const name=prompt(L(`Имя новой папки внутри «${contextFolder.display_name}»`,`New folder name inside "${contextFolder.display_name}"`),'');if(!name||!name.trim())return;try{await window.tm.createFolder(contextFolder.account_id,contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка создана на сервере','Folder created on the server'));}catch(error){showToast(error.message||String(error));}return;}
+  if(action==='rename'){const name=prompt(L('Новое имя папки','New folder name'),contextFolder.display_name);if(!name||name.trim()===contextFolder.display_name)return;try{await window.tm.renameFolder(contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка переименована на сервере','Folder renamed on the server'));}catch(error){showToast(error.message||String(error));}return;}if(action==='delete'){if(!confirm(L(`Удалить папку «${contextFolder.display_name}» на сервере? Письма внутри также будут удалены.`,`Delete the folder "${contextFolder.display_name}" on the server? Messages inside will also be deleted.`)))return;try{await window.tm.deleteFolder(contextFolder.id);await window.reloadCoreData();showToast(L('Папка удалена на сервере','Folder deleted on the server'));}catch(error){showToast(error.message||String(error));}}}));
 ctxcontact.querySelectorAll('[data-contact-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextContact)return;const action=item.dataset.contactAction,email=contextContact.emails?.[0]?.email;if(action==='edit'){openContactEditor(contextContact);return;}if(action==='compose'){resetComposer();setRecipients('compTo',[{name:contextContact.display_name||'',email}]);document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');await applyComposerSignature('new');return;}if(action==='copy'){try{await navigator.clipboard.writeText(email);showToast(L('Email скопирован','Email copied'));}catch(error){showToast(error.message||String(error));}return;}if(action==='delete'){if(!confirm(L(`Удалить контакт «${contextContact.display_name||email||''}»?`,`Delete contact "${contextContact.display_name||email||''}"?`)))return;try{await window.tm.deleteContact(contextContact.id);await window.reloadCoreData();showToast(L('Контакт удалён','Contact deleted'));}catch(error){showToast(error.message||String(error));}}}));
 

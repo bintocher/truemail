@@ -116,7 +116,12 @@ async function openGallery(full,att,messageId){
 function folderTitle(folder){const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};return names[folder?.role]||folder?.display_name||folder?.remote_path||'';}
 function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
 function contactPhoneLabel(phone){return phone?`${phone.number||''}${phone.extension?` ${L('доб.','ext.')} ${phone.extension}`:''}`:'';}
-function renderContacts(contacts=coreContacts){const query=(document.querySelector('.ct-search input')?.value||'').trim(),filtered=contacts.filter(contact=>matchQ(`${contact.display_name||''} ${(contact.emails||[]).map(item=>item.email).join(' ')} ${(contact.phones||[]).map(contactPhoneLabel).join(' ')}`,query)),grid=document.getElementById('cgrid');grid.innerHTML='';filtered.forEach((contact,index)=>{const primary=contact.emails?.[0]?.email||contactPhoneLabel(contact.phones?.[0]),card=document.createElement('button');card.type='button';card.className='ccard';card.dataset.contactId=contact.id;card.innerHTML=`<span class="ava ava-c${index%8}"></span><div><div class="cn"></div><div class="ce"></div></div>`;card.querySelector('.ava').textContent=(contact.display_name||primary||'?').split(/\s+/).map(word=>word[0]).join('').slice(0,2).toUpperCase();card.querySelector('.cn').textContent=contact.display_name||primary||'';card.querySelector('.ce').textContent=primary||'';card.onclick=()=>openContactEditor(contact);grid.appendChild(card);});const count=document.querySelector('.ct-count');if(count)count.textContent=`${filtered.length}${query?` / ${contacts.length}`:''} ${wizardLocale==='en'?'contacts':'контактов'}`;}
+function renderContacts(contacts=coreContacts){const query=(document.querySelector('.ct-search input')?.value||'').trim(),filtered=contacts.filter(contact=>matchQ(`${contact.display_name||''} ${(contact.emails||[]).map(item=>item.email).join(' ')} ${(contact.phones||[]).map(contactPhoneLabel).join(' ')}`,query)),grid=document.getElementById('cgrid');grid.innerHTML='';filtered.forEach((contact,index)=>{const primary=contact.emails?.[0]?.email||contactPhoneLabel(contact.phones?.[0]),card=document.createElement('button');card.type='button';card.className='ccard';card.dataset.contactId=contact.id;card.innerHTML=`<span class="ava ava-c${index%8}"></span><div><div class="cn"></div><div class="ce"></div></div>`;card.querySelector('.ava').textContent=(contact.display_name||primary||'?').split(/\s+/).map(word=>word[0]).join('').slice(0,2).toUpperCase();card.querySelector('.cn').textContent=contact.display_name||primary||'';card.querySelector('.ce').textContent=primary||'';
+  // Провайдер аккаунта может не поддерживать запись контактов на сервер (см.
+  // is_local_only в ядре) - тогда контакт живёт только в локальной БД, и это
+  // не должно выглядеть как обычная синхронизированная запись.
+  if(contact.is_local_only){const badge=document.createElement('div');badge.className='note-muted';badge.textContent=L('Только на этом устройстве','This device only');card.querySelector('div').appendChild(badge);card.title=L('Провайдер этого аккаунта не поддерживает синхронизацию контактов - запись хранится только локально','This account provider does not support contact sync - the record is stored locally only');}
+  card.onclick=()=>openContactEditor(contact);grid.appendChild(card);});const count=document.querySelector('.ct-count');if(count)count.textContent=`${filtered.length}${query?` / ${contacts.length}`:''} ${wizardLocale==='en'?'contacts':'контактов'}`;}
 document.querySelector('.ct-search input')?.addEventListener('input',()=>renderContacts());
 const contactViewSwitch=document.getElementById('contactViewSwitch');
 if(contactViewSwitch){contactViewSwitch.querySelectorAll('button').forEach(button=>button.onclick=()=>{contactViewSwitch.querySelectorAll('button').forEach(other=>other.classList.toggle('on',other===button));const view=button.dataset.cview;document.getElementById('cgrid')?.classList.toggle('table-view',view==='table');window.tm?.setSetting('contacts_view',view).catch(console.error);});}
@@ -134,6 +139,34 @@ function bindExternalLinks(scope){
   });
 }
 
+/* Проверка href/src/xlink:href на опасность (замена дырявой регулярки, которая ловила только
+   "data:text/html:" с двоеточием после mime, хотя реальные data-URI используют ";" или ",").
+   Перед проверкой нормализуем значение: декодируем HTML-entity (числовые "&#106;" и именованные
+   "&amp;"), убираем управляющие символы и пробелы по всей строке (не только в начале) - иначе
+   "java\tscript:" и "&#106;avascript:" браузер схлопнет и выполнит, а наша проверка их пропустит.
+   data: разрешаем только для картиночных mime-типов: repo.rs инлайнит вложения как
+   data:<mime>;base64,... прямо из письма без белого списка, и вредоносное вложение может прийти
+   с mime "text/html" - это должно быть отловлено именно здесь. */
+function isDangerousUrl(value){
+  let s=String(value||'');
+  s=s.replace(/&#x([0-9a-f]+);?/gi,(_,hex)=>String.fromCodePoint(parseInt(hex,16)))
+     .replace(/&#(\d+);?/g,(_,dec)=>String.fromCodePoint(parseInt(dec,10)))
+     .replace(/&amp;/gi,'&');
+  s=s.replace(/[\x00-\x20\x7f]+/g,'').toLowerCase();
+  const schemeMatch=s.match(/^([a-z][a-z0-9+.-]*):/);
+  if(!schemeMatch)return false;
+  const scheme=schemeMatch[1];
+  if(['javascript','vbscript','file','blob'].includes(scheme))return true;
+  if(scheme==='data'){
+    // Белый список, а не черный: единственный легитимный data: в письме - инлайн-вложение
+    // картинки (repo.rs собирает data:<mime>;base64). Все остальное (text/html, svg с скриптами,
+    // xml с XSLT, pdf) браузер может трактовать как активный документ, поэтому отсекаем по умолчанию.
+    const rest=s.slice(scheme.length+1);
+    const mime=rest.split(',')[0].split(';')[0];
+    return !['image/png','image/jpeg','image/jpg','image/gif','image/webp','image/bmp','image/x-icon','image/vnd.microsoft.icon','image/avif','image/tiff'].includes(mime);
+  }
+  return false;
+}
 async function renderHtmlMessage(container,html,sender){
   const normalizedSender=String(sender||'').trim().toLocaleLowerCase();
   const allowRemote=Boolean(normalizedSender)&&await window.tm?.imageSenderTrusted(normalizedSender).catch(()=>false);
@@ -141,7 +174,7 @@ async function renderHtmlMessage(container,html,sender){
   parsed.querySelectorAll('script,iframe,object,embed,form,input,button,textarea,select,base,link,meta,audio,video').forEach(node=>node.remove());
   let blocked=false;
   parsed.querySelectorAll('style').forEach(node=>{node.textContent=node.textContent.replace(/url\(\s*(['"]?)https?:[^)]*\)/gi,'none');});
-  parsed.querySelectorAll('*').forEach(node=>{[...node.attributes].forEach(attr=>{const name=attr.name.toLowerCase(),value=attr.value.trim();if(name.startsWith('on')||['srcdoc','formaction','integrity','nonce'].includes(name)||((name==='href'||name==='src'||name==='xlink:href')&&/^\s*(?:javascript|file|data:text\/html):/i.test(value)))node.removeAttribute(attr.name);else if(name==='style')node.setAttribute('style',value.replace(/url\(\s*(['"]?)https?:[^)]*\)/gi,'none'));});});
+  parsed.querySelectorAll('*').forEach(node=>{[...node.attributes].forEach(attr=>{const name=attr.name.toLowerCase(),value=attr.value.trim();if(name.startsWith('on')||['srcdoc','formaction','integrity','nonce'].includes(name)||((name==='href'||name==='src'||name==='xlink:href')&&isDangerousUrl(value)))node.removeAttribute(attr.name);else if(name==='style')node.setAttribute('style',value.replace(/url\(\s*(['"]?)https?:[^)]*\)/gi,'none'));});});
   parsed.querySelectorAll('a').forEach(link=>{link.target='_blank';link.rel='noopener noreferrer';try{const url=new URL(link.href);[...url.searchParams.keys()].filter(key=>key.toLowerCase().startsWith('utm_')||['fbclid','gclid'].includes(key.toLowerCase())).forEach(key=>url.searchParams.delete(key));link.href=url.toString();}catch(_){}});
   parsed.querySelectorAll('img,source').forEach(image=>{const src=image.getAttribute('src')||image.getAttribute('srcset')||'';if(/^https?:/i.test(src)&&!allowRemote){blocked=true;image.removeAttribute('src');image.removeAttribute('srcset');image.setAttribute('alt',image.getAttribute('alt')||L('Удалённое изображение заблокировано','Remote image blocked'));}image.setAttribute('loading','lazy');image.setAttribute('referrerpolicy','no-referrer');image.style.maxWidth='100%';image.style.height='auto';});
   container.classList.add('html');

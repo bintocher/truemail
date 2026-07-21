@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260717-3`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260720-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}

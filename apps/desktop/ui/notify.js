@@ -40,19 +40,24 @@
 
   function addCard(data) {
     const isEvent = data.kind === "event";
+    const isChange = data.kind === "event-change";
     const card = document.createElement("div");
-    card.className = "card";
-    const brandName = isEvent ? "Напоминание" : "truemail";
-    const icon = isEvent ? "◷" : "✉";
+    // Отмену встречи выделяем тревожным акцентом - в отличие от переноса
+    // или смены места, её лучше явно отличить визуально от прочих карточек.
+    card.className = "card" + (isChange && data.change === "cancelled" ? " cancel" : "");
+    const brandName = isEvent ? "Напоминание" : isChange ? (data.brand || "Календарь") : "truemail";
+    const icon = isEvent ? "◷" : isChange ? (data.change === "cancelled" ? "✕" : "▤") : "✉";
     card.innerHTML =
       `<div class="head"><div class="brand"><span class="dot">${icon}</span><span>${escapeHtml(brandName)}</span></div>` +
       `<button class="close-x" title="Закрыть">×</button></div>` +
       `<div class="title"></div><div class="subject"></div>` +
       (data.preview ? `<div class="preview"></div>` : "") +
+      (data.details ? `<div class="details"></div>` : "") +
       `<div class="actions"></div>`;
     card.querySelector(".title").textContent = data.title || "";
     card.querySelector(".subject").textContent = data.subject || "";
     if (data.preview) card.querySelector(".preview").textContent = data.preview;
+    if (data.details) card.querySelector(".details").textContent = data.details;
 
     const actions = card.querySelector(".actions");
     if (isEvent) {
@@ -63,10 +68,40 @@
         b.title = url;
         actions.appendChild(b);
       });
-      const open = mkBtn("Открыть", urls.length === 0, () => { invoke("notify_open", { messageId: null }).catch(() => {}); dismiss(card); });
+      const open = mkBtn("Открыть", urls.length === 0, () => { invoke("notify_open", { messageId: null, eventId: null }).catch(() => {}); dismiss(card); });
+      actions.appendChild(open);
+    } else if (isChange) {
+      // Кнопки ответа на приглашение - только когда организатор реально ждёт
+      // ответа (см. resolve_my_attendance в ядре) и карточка не про отмену:
+      // отвечать на отменённую встречу нечем. Подписи уже локализованы на
+      // стороне Rust (тот же каталог, что и title/subject этой карточки).
+      if (data.needs_response && data.change !== "cancelled") {
+        const labels = data.rsvp_labels || {};
+        const respond = (value) => {
+          actions.querySelectorAll("button").forEach(b => { b.disabled = true; });
+          invoke("respond_to_event", { eventId: data.event_id, response: value })
+            .then(() => dismiss(card))
+            .catch(error => {
+              actions.querySelectorAll("button").forEach(b => { b.disabled = false; });
+              let err = card.querySelector(".rsvp-error");
+              if (!err) {
+                err = document.createElement("div");
+                err.className = "rsvp-error";
+                card.insertBefore(err, actions);
+              }
+              err.textContent = error?.message || String(error);
+            });
+        };
+        actions.appendChild(mkBtn(labels.accepted || "Пойду", true, () => respond("accepted")));
+        actions.appendChild(mkBtn(labels.tentative || "Возможно", false, () => respond("tentative")));
+        actions.appendChild(mkBtn(labels.declined || "Не пойду", false, () => respond("declined")));
+      }
+      // "Прочитано" тут не применима (она про письма) - только переход в
+      // календарь на дату встречи и закрытие карточки.
+      const open = mkBtn("Открыть", !data.needs_response, () => { invoke("notify_open", { messageId: null, eventId: data.event_id ?? null }).catch(() => {}); dismiss(card); });
       actions.appendChild(open);
     } else {
-      const open = mkBtn("Открыть", true, () => { invoke("notify_open", { messageId: data.message_id ?? null }).catch(() => {}); dismiss(card); });
+      const open = mkBtn("Открыть", true, () => { invoke("notify_open", { messageId: data.message_id ?? null, eventId: null }).catch(() => {}); dismiss(card); });
       const read = mkBtn("Прочитано", false, () => {
         if (data.message_id != null) invoke("mark_seen", { messageId: data.message_id, seen: true }).catch(() => {});
         dismiss(card);

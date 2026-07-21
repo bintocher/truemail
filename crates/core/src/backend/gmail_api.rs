@@ -972,11 +972,24 @@ pub async fn apply_operation(access_token: &str, op_kind: &str, payload: &str) -
     match op_kind {
         "flag" => {
             let seen = payload["seen"].as_bool().unwrap_or(true);
-            let body = if seen {
-                json!({"removeLabelIds":["UNREAD"]})
+            let mut add_label_ids: Vec<&str> = Vec::new();
+            let mut remove_label_ids: Vec<&str> = Vec::new();
+            if seen {
+                remove_label_ids.push("UNREAD");
             } else {
-                json!({"addLabelIds":["UNREAD"]})
-            };
+                add_label_ids.push("UNREAD");
+            }
+            // Отсутствие "flagged" в payload (старые операции из outbox, вставленные
+            // до появления звёздочки) не должно сбрасывать метку STARRED - трогаем
+            // её только когда поле явно есть.
+            if let Some(flagged) = payload["flagged"].as_bool() {
+                if flagged {
+                    add_label_ids.push("STARRED");
+                } else {
+                    remove_label_ids.push("STARRED");
+                }
+            }
+            let body = json!({"addLabelIds": add_label_ids, "removeLabelIds": remove_label_ids});
             request(
                 &client,
                 Method::POST,
@@ -1036,6 +1049,59 @@ pub async fn apply_operation(access_token: &str, op_kind: &str, payload: &str) -
         }
     }
     Ok(())
+}
+
+/// Gmail не различает папки и метки, а вложенность у меток задаётся не
+/// отдельным parentId, а самим именем через "/" (например "Родитель/Дочка").
+/// Поэтому для вложенной папки сперва читаем имя родителя по его label id
+/// (parent_label_id пришёл как remote_path родительской папки), а затем
+/// создаём метку с составным именем.
+pub async fn create_label(
+    access_token: &str,
+    parent_label_id: Option<&str>,
+    name: &str,
+) -> Result<String> {
+    let trimmed = name.trim();
+    let client = client()?;
+    let full_name = match parent_label_id {
+        Some(parent_id) => {
+            let parent: Label = request(
+                &client,
+                Method::GET,
+                url(&["labels", parent_id])?,
+                access_token,
+                None,
+            )
+            .await?
+            .json()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "gmail-labels".into(),
+                message: error.to_string(),
+            })?;
+            format!("{}/{trimmed}", parent.name)
+        }
+        None => trimmed.to_owned(),
+    };
+    let created: Label = request(
+        &client,
+        Method::POST,
+        url(&["labels"])?,
+        access_token,
+        Some(json!({
+            "name": full_name,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show"
+        })),
+    )
+    .await?
+    .json()
+    .await
+    .map_err(|error| Error::Backend {
+        backend: "gmail-labels".into(),
+        message: error.to_string(),
+    })?;
+    Ok(created.id)
 }
 
 pub async fn rename_label(access_token: &str, label_id: &str, new_name: &str) -> Result<String> {

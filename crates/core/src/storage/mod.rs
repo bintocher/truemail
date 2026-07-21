@@ -666,6 +666,8 @@ mod tests {
                 }),
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some("repo@example.test".into()),
                 secret_ref: "test-keychain-ref".into(),
@@ -1257,6 +1259,8 @@ mod tests {
                 imap: None,
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: None,
                 secret_ref: "delta-test".into(),
@@ -1410,6 +1414,469 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 
+    /// Дельта изменений (Этап 1, задача A в crates/core/src/storage/repo.rs):
+    /// создание, перенос времени, отмена, смена места, смена состава
+    /// участников классифицируются по-разному, а правка только description -
+    /// не меняющая ничего из перечисленного - изменением не считается вовсе.
+    #[tokio::test]
+    async fn auxiliary_delta_classifies_calendar_changes() {
+        use crate::account::{DavCalendar, DavEvent, DavSyncResult, SyncScope};
+        use crate::model::{Attendee, AuthKind, BackendKind, NewAccount, Provider};
+        use crate::storage::repo::CalendarChangeKind;
+
+        fn basic_event(
+            id: &str,
+            summary: &str,
+            dtstart: &str,
+            location: Option<&str>,
+            status: Option<&str>,
+            attendees: Vec<Attendee>,
+        ) -> DavEvent {
+            DavEvent {
+                remote_url: Some(format!("google-event:{id}")),
+                uid: id.into(),
+                summary: summary.into(),
+                description: Some("описание встречи".into()),
+                location: location.map(str::to_owned),
+                dtstart: dtstart.into(),
+                dtend: None,
+                rrule: None,
+                recurrence_id: None,
+                exdates: None,
+                rdates: None,
+                status: status.map(str::to_owned),
+                attendees,
+                alarms: Vec::new(),
+                timezone: None,
+                transp: None,
+                class: None,
+                categories: Vec::new(),
+                url: None,
+                organizer: None,
+                sequence: 0,
+                raw: format!("event:{id}:{summary}"),
+                etag: None,
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("truemail-aux-changes-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "changes@example.test".into(),
+                display_name: "Changes test".into(),
+                provider: Provider::Gmail,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
+                jmap_url: None,
+                username: None,
+                secret_ref: "changes-test".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+
+        let guest_a = Attendee {
+            email: "a@example.test".into(),
+            name: None,
+            role: Some("REQ-PARTICIPANT".into()),
+            partstat: None,
+            rsvp: false,
+        };
+        let guest_b = Attendee {
+            email: "b@example.test".into(),
+            name: None,
+            role: Some("REQ-PARTICIPANT".into()),
+            partstat: None,
+            rsvp: false,
+        };
+
+        let full = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("token-1".into()),
+                sync_scope: SyncScope::Full,
+                deleted_event_urls: Vec::new(),
+                events: vec![
+                    basic_event(
+                        "reschedule-me",
+                        "Rescheduled meeting",
+                        "2026-07-20T10:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "cancel-me",
+                        "Cancelled meeting",
+                        "2026-07-20T11:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "relocate-me",
+                        "Location meeting",
+                        "2026-07-20T12:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "reinvite-me",
+                        "Attendee meeting",
+                        "2026-07-20T13:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "quiet-me",
+                        "Quiet meeting",
+                        "2026-07-20T14:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                ],
+            }],
+            calendars_available: true,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        let full_result = db
+            .save_google_services(account.id, &full)
+            .await
+            .expect("save full snapshot");
+        assert!(
+            full_result.changes.is_empty(),
+            "полный снимок (первая синхронизация) не должен порождать changes"
+        );
+
+        let mut quiet_only_description = basic_event(
+            "quiet-me",
+            "Quiet meeting",
+            "2026-07-20T14:00:00Z",
+            Some("Room A"),
+            None,
+            vec![guest_a.clone()],
+        );
+        quiet_only_description.description = Some("другое описание, без смысловых изменений".into());
+
+        let delta = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("token-2".into()),
+                sync_scope: SyncScope::Delta,
+                deleted_event_urls: Vec::new(),
+                events: vec![
+                    basic_event(
+                        "reschedule-me",
+                        "Rescheduled meeting",
+                        "2026-07-20T15:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "cancel-me",
+                        "Cancelled meeting",
+                        "2026-07-20T11:00:00Z",
+                        Some("Room A"),
+                        Some("CANCELLED"),
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "relocate-me",
+                        "Location meeting",
+                        "2026-07-20T12:00:00Z",
+                        Some("Room B"),
+                        None,
+                        vec![guest_a.clone()],
+                    ),
+                    basic_event(
+                        "reinvite-me",
+                        "Attendee meeting",
+                        "2026-07-20T13:00:00Z",
+                        Some("Room A"),
+                        None,
+                        vec![guest_b.clone()],
+                    ),
+                    quiet_only_description,
+                    basic_event(
+                        "brand-new",
+                        "New meeting",
+                        "2026-07-20T16:00:00Z",
+                        Some("Room C"),
+                        None,
+                        Vec::new(),
+                    ),
+                ],
+            }],
+            calendars_available: true,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        let delta_result = db
+            .save_google_services(account.id, &delta)
+            .await
+            .expect("save delta");
+
+        let kind_for = |summary: &str| {
+            delta_result
+                .changes
+                .iter()
+                .find(|change| change.summary == summary)
+                .map(|change| change.kind)
+        };
+        assert_eq!(
+            kind_for("Rescheduled meeting"),
+            Some(CalendarChangeKind::Rescheduled)
+        );
+        assert_eq!(
+            kind_for("Cancelled meeting"),
+            Some(CalendarChangeKind::Cancelled)
+        );
+        assert_eq!(
+            kind_for("Location meeting"),
+            Some(CalendarChangeKind::LocationChanged)
+        );
+        assert_eq!(
+            kind_for("Attendee meeting"),
+            Some(CalendarChangeKind::AttendeesChanged)
+        );
+        assert_eq!(kind_for("New meeting"), Some(CalendarChangeKind::Created));
+        assert!(
+            kind_for("Quiet meeting").is_none(),
+            "изменение только description не должно попадать в changes"
+        );
+        assert_eq!(
+            delta_result.changes.len(),
+            5,
+            "ровно пять из шести событий дали смысловое изменение"
+        );
+
+        let rescheduled = delta_result
+            .changes
+            .iter()
+            .find(|change| change.summary == "Rescheduled meeting")
+            .expect("запись о переносе");
+        assert_eq!(
+            rescheduled.previous_start.as_deref(),
+            Some("2026-07-20T10:00:00Z")
+        );
+        assert_eq!(rescheduled.start.as_deref(), Some("2026-07-20T15:00:00Z"));
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    /// Задача B: Google в delta-синхронизации присылает отменённое событие
+    /// огрызком (заполнены только remote-идентификатор и статус, summary и
+    /// dtstart - пустые строки). Задача A должна подставить прежние значения
+    /// из БД, а не затереть встречу пустым названием и пустой датой.
+    #[tokio::test]
+    async fn cancelled_event_snippet_preserves_summary_and_dtstart() {
+        use crate::account::{DavCalendar, DavEvent, DavSyncResult, SyncScope};
+        use crate::model::{AuthKind, BackendKind, NewAccount, Provider};
+        use crate::storage::repo::CalendarChangeKind;
+
+        fn full_event(id: &str, summary: &str, dtstart: &str, location: Option<&str>) -> DavEvent {
+            DavEvent {
+                remote_url: Some(format!("google-event:{id}")),
+                uid: id.into(),
+                summary: summary.into(),
+                description: None,
+                location: location.map(str::to_owned),
+                dtstart: dtstart.into(),
+                dtend: None,
+                rrule: None,
+                recurrence_id: None,
+                exdates: None,
+                rdates: None,
+                status: Some("confirmed".into()),
+                attendees: Vec::new(),
+                alarms: Vec::new(),
+                timezone: None,
+                transp: None,
+                class: None,
+                categories: Vec::new(),
+                url: None,
+                organizer: None,
+                sequence: 0,
+                raw: format!("event:{id}:{summary}"),
+                etag: None,
+            }
+        }
+
+        // Та же форма, что отдаёт cancelled_google_event() в
+        // crates/core/src/account/google_services.rs для delta-огрызка.
+        fn cancelled_snippet(id: &str) -> DavEvent {
+            DavEvent {
+                remote_url: Some(format!("google-event:{id}")),
+                uid: id.into(),
+                summary: String::new(),
+                description: None,
+                location: None,
+                dtstart: String::new(),
+                dtend: None,
+                rrule: None,
+                recurrence_id: None,
+                exdates: None,
+                rdates: None,
+                status: Some("CANCELLED".into()),
+                attendees: Vec::new(),
+                alarms: Vec::new(),
+                timezone: None,
+                transp: None,
+                class: None,
+                categories: Vec::new(),
+                url: None,
+                organizer: None,
+                sequence: 0,
+                raw: format!("event:{id}:cancelled"),
+                etag: None,
+            }
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("truemail-aux-snippet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("migrate database");
+        let account = db
+            .save_account(&NewAccount {
+                email: "snippet@example.test".into(),
+                display_name: "Snippet test".into(),
+                provider: Provider::Gmail,
+                backend_kind: BackendKind::Imap,
+                auth_kind: AuthKind::Oauth2,
+                imap: None,
+                smtp: None,
+                ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
+                jmap_url: None,
+                username: None,
+                secret_ref: "snippet-test".into(),
+                color: None,
+            })
+            .await
+            .expect("save account");
+
+        let full = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("token-1".into()),
+                sync_scope: SyncScope::Full,
+                deleted_event_urls: Vec::new(),
+                events: vec![full_event(
+                    "meeting-1",
+                    "Ежедневный созвон",
+                    "2026-07-21T09:00:00Z",
+                    Some("Zoom"),
+                )],
+            }],
+            calendars_available: true,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        db.save_google_services(account.id, &full)
+            .await
+            .expect("save full snapshot");
+
+        let delta = DavSyncResult {
+            calendars: vec![DavCalendar {
+                url: "google-calendar:primary".into(),
+                name: "Primary".into(),
+                ctag: None,
+                sync_token: Some("token-2".into()),
+                sync_scope: SyncScope::Delta,
+                deleted_event_urls: Vec::new(),
+                events: vec![cancelled_snippet("meeting-1")],
+            }],
+            calendars_available: true,
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            contacts_sync_token: None,
+            deleted_contact_urls: Vec::new(),
+        };
+        let delta_result = db
+            .save_google_services(account.id, &delta)
+            .await
+            .expect("save cancelled snippet");
+
+        let (summary, dtstart, status, all_day): (String, String, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT summary, dtstart, status, all_day FROM events
+                 WHERE calendar_id IN (SELECT id FROM calendars WHERE account_id=?)",
+            )
+            .bind(account.id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read event after cancellation");
+        assert_eq!(
+            summary, "Ежедневный созвон",
+            "огрызок не должен затирать summary прежним пустым значением"
+        );
+        assert_eq!(
+            dtstart, "2026-07-21T09:00:00Z",
+            "огрызок не должен затирать dtstart"
+        );
+        assert_eq!(status.as_deref(), Some("CANCELLED"));
+        assert_eq!(
+            all_day, 0,
+            "флаг \"весь день\" не должен сброситься из-за пустого dtstart в огрызке"
+        );
+
+        assert_eq!(delta_result.changes.len(), 1);
+        assert_eq!(delta_result.changes[0].kind, CalendarChangeKind::Cancelled);
+        assert_eq!(delta_result.changes[0].summary, "Ежедневный созвон");
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
     #[tokio::test]
     async fn mail_rules_queue_each_matching_message_once() {
         use crate::model::{
@@ -1440,6 +1907,8 @@ mod tests {
                 }),
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some("rules@example.test".into()),
                 secret_ref: "test-keychain-ref".into(),
@@ -1549,6 +2018,8 @@ mod tests {
                 }),
                 smtp: None,
                 ews_url: None,
+                caldav_url: None,
+                carddav_url: None,
                 jmap_url: None,
                 username: Some("outbox@example.test".into()),
                 secret_ref: "test-keychain-ref".into(),

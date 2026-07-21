@@ -30,7 +30,39 @@ function goCal(){document.querySelectorAll('.navitem').forEach(x=>x.classList.re
 function goContacts(){document.querySelectorAll('.navitem').forEach(x=>x.classList.remove('active'));const a=document.getElementById('app');a.classList.remove('calmode');a.classList.add('contactsmode');showView('mailView');}
 function goMail(){const a=document.getElementById('app');a.classList.remove('calmode','contactsmode');showView('mailView');}
 // Открыть письмо по id (вызывается из своего уведомления через bridge).
-window.openMessageById=function(id){const message=messages.find(item=>item.id===id);if(!message)return;goMail();showMessage(message);};
+// Письмо может лежать в любой папке, в том числе вложенной и не входящей в умную папку,
+// поэтому переключаем список на папку письма, а не полагаемся на текущий вид.
+window.openMessageById=async function(id){
+  goMail();
+  let message=messages.find(item=>item.id===id);
+  if(!message){
+    // В messages лежит лишь по странице писем на папку - недостающее письмо берём с бэкенда.
+    try{const full=await window.tm?.getMessage(id);if(full?.meta)message={...full.meta};}catch(error){console.error('openMessageById',error);}
+    if(!message){showToast(L('Письмо не найдено','Message not found'));return;}
+    messages=[...messages,message];
+  }
+  const folder=coreFolders.find(item=>item.id===message.folder_id);
+  if(folder){
+    currentFolderId=folder.id;currentSmartIndex=null;
+    document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));
+    const row=document.querySelector(`.folder-row[data-folder-id="${folder.id}"]`);
+    if(row){
+      row.classList.add('active');
+      const sub=row.closest('.acc-sub'),header=sub?.previousElementSibling;
+      if(sub&&!sub.classList.contains('open')){sub.classList.add('open');header?.classList.add('open');if(header?.dataset.accountId)saveAccountNavOpen(header.dataset.accountId,true);}
+      row.scrollIntoView({block:'nearest'});
+    }
+    applyListOptions(true,folderTitle(folder));
+    // Активные фильтры списка могут скрыть только что пришедшее письмо - тогда снимаем их.
+    if(!currentMessageRows.some(item=>item.id===id)){
+      filterMenu.querySelectorAll('input[type="checkbox"]:checked').forEach(input=>{input.checked=false;});
+      const filterText=document.getElementById('filterText');if(filterText)filterText.value='';
+      applyListOptions(true,folderTitle(folder));
+    }
+  }
+  const index=currentMessageRows.findIndex(item=>item.id===id);
+  if(index>=0)focusMessageAt(index);else await showMessage(message);
+};
 const S2=(id)=>()=>{showView('settingsView');setSection(id);};
 function getStaticCmds(){const en=smartIsEnglish(),gAct=en?'Actions':'Действия',gGo=en?'Go to':'Переход',gSet=en?'Settings':'Настройки';return [
   {g:gAct,i:'compose',t:en?'Compose new message':'Написать новое письмо',k:['C'],a:()=>document.getElementById('composeBtn').click()},

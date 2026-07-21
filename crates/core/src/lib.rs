@@ -10,6 +10,7 @@ pub mod backend;
 pub mod crypto;
 pub mod error;
 pub mod i18n;
+pub mod logging;
 pub mod model;
 pub mod search;
 pub mod storage;

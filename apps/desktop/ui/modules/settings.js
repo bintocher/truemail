@@ -162,6 +162,10 @@ window.applyCoreSettings=function(settings){
   root.setAttribute('data-mode',expert?'expert':'simple');
   if(settings.preview_lines){document.documentElement.style.setProperty('--preview-lines',settings.preview_lines);const sel=document.getElementById('previewLines');if(sel)sel.value=settings.preview_lines;}
   window.applyCalendarHourRange?.(settings.calendar_hour_start||'08:00',settings.calendar_hour_end||'20:00',false);
+  // Вид календаря (месяц/неделя/день): восстанавливаем до первой отрисовки данных, чтобы не мигало дефолтом.
+  const calendarView=['month','week','day'].includes(settings.calendar_view)?settings.calendar_view:'month';
+  document.getElementById('calSection').dataset.cv=calendarView;
+  document.querySelectorAll('#calViews button').forEach(b=>b.classList.toggle('on',b.dataset.cv===calendarView));
   if(settings.contacts_view==='table'){document.getElementById('cgrid')?.classList.add('table-view');const sw=document.getElementById('contactViewSwitch');if(sw)sw.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.cview==='table'));}
   conversationsEnabled=settings.show_conversations==='1';const convToggle=document.getElementById('conversationsToggle');if(convToggle)convToggle.classList.toggle('on',conversationsEnabled);
   if(settings.sidebar_width)setSidebarWidth(settings.sidebar_width,false);

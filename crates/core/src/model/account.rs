@@ -59,6 +59,11 @@ pub struct Account {
     pub smtp: Option<ServerConfig>,
     pub ews_url: Option<String>,
     pub jmap_url: Option<String>,
+    /// Базовый адрес CalDAV: задан вручную или обнаружен по RFC 6764
+    /// (.well-known/caldav) и закэширован здесь, чтобы не искать заново.
+    pub caldav_url: Option<String>,
+    /// Базовый адрес CardDAV; см. caldav_url.
+    pub carddav_url: Option<String>,
     pub username: Option<String>,
     /// Имя записи в системном keychain; сам секрет в SQLite не хранится.
     #[serde(skip_serializing)]
@@ -83,6 +88,10 @@ pub struct NewAccount {
     pub smtp: Option<ServerConfig>,
     pub ews_url: Option<String>,
     pub jmap_url: Option<String>,
+    /// См. Account::caldav_url. При создании аккаунта обычно None -
+    /// обнаруживается позже, при первой синхронизации календаря/контактов.
+    pub caldav_url: Option<String>,
+    pub carddav_url: Option<String>,
     pub username: Option<String>,
     pub secret_ref: String,
     pub color: Option<String>,

@@ -5,10 +5,10 @@ use super::{
     OutgoingMessage,
 };
 use crate::account::{
-    AuxiliarySyncCursors, DavCalendar, DavCollection, DavContact, DavEvent, DavSyncResult,
-    SyncScope,
+    AuxiliarySyncCursors, ContactInput, DavCalendar, DavCollection, DavContact, DavEvent,
+    DavSyncResult, EventInput, SyncScope,
 };
-use crate::model::{ContactPhone, FolderRole, infer_folder_role};
+use crate::model::{Attendee, ContactPhone, FolderRole, infer_folder_role};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -89,6 +89,41 @@ fn escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// XML-фрагмент t:Updates для UpdateItem операции 'flag': message:IsRead
+/// шлём всегда, message:Flag (комплексное свойство с FlagStatus
+/// Flagged/NotFlagged) - только если "flagged" явно есть в payload. Flag
+/// доступен в EWS начиная с Exchange 2010 - тот же минимум, что и
+/// RequestServerVersion=Exchange2010_SP2 в конверте envelope() выше, поэтому
+/// используем его напрямую вместо обходных путей вроде Importance. Вынесено
+/// в чистую функцию, чтобы протестировать маппинг без реального EWS-запроса.
+fn flag_update_fields(seen: bool, flagged: Option<bool>) -> String {
+    let mut updates = format!(
+        r#"<t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>{seen}</t:IsRead></t:Message></t:SetItemField>"#
+    );
+    if let Some(flagged) = flagged {
+        let flag_status = if flagged { "Flagged" } else { "NotFlagged" };
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:FieldURI FieldURI="message:Flag"/><t:Message><t:Flag><t:FlagStatus>{flag_status}</t:FlagStatus></t:Flag></t:Message></t:SetItemField>"#
+        ));
+    }
+    updates
+}
+
+/// Тело CreateFolder: ParentFolderId ссылается либо на конкретную папку по
+/// Id, либо (без родителя) на distinguished-папку msgfolderroot - корень
+/// пользовательских папок почты в Exchange. Вынесено в чистую функцию, чтобы
+/// протестировать сборку XML без реального EWS-запроса.
+fn create_folder_body(parent_path: Option<&str>, name: &str) -> String {
+    let parent = match parent_path {
+        Some(id) => format!(r#"<t:FolderId Id="{}"/>"#, escape(id)),
+        None => r#"<t:DistinguishedFolderId Id="msgfolderroot"/>"#.to_owned(),
+    };
+    format!(
+        r#"<m:CreateFolder><m:ParentFolderId>{parent}</m:ParentFolderId><m:Folders><t:Folder><t:DisplayName>{}</t:DisplayName></t:Folder></m:Folders></m:CreateFolder>"#,
+        escape(name)
+    )
 }
 
 fn envelope(body: &str) -> String {
@@ -638,16 +673,34 @@ impl EwsBackend {
                 self.messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
                     .await?
             };
-            tracing::info!(
-                provider = "exchange-ews",
-                collection = %folder.display_name,
-                scope = if sync.initial { "full-reconcile" } else { "delta" },
-                changed_ids = sync.changed_ids.len(),
-                deleted_ids = sync.deleted_ids.len(),
-                downloaded = found.len(),
-                network_ms = folder_started.elapsed().as_millis() as u64,
-                "EWS collection delta fetched"
-            );
+            let changed_ids_count = sync.changed_ids.len();
+            let deleted_ids_count = sync.deleted_ids.len();
+            let downloaded_count = found.len();
+            let unchanged =
+                changed_ids_count == 0 && deleted_ids_count == 0 && downloaded_count == 0;
+            if unchanged {
+                tracing::debug!(
+                    provider = "exchange-ews",
+                    collection = %folder.display_name,
+                    scope = if sync.initial { "full-reconcile" } else { "delta" },
+                    changed_ids = changed_ids_count,
+                    deleted_ids = deleted_ids_count,
+                    downloaded = downloaded_count,
+                    network_ms = folder_started.elapsed().as_millis() as u64,
+                    "EWS collection delta fetched"
+                );
+            } else {
+                tracing::info!(
+                    provider = "exchange-ews",
+                    collection = %folder.display_name,
+                    scope = if sync.initial { "full-reconcile" } else { "delta" },
+                    changed_ids = changed_ids_count,
+                    deleted_ids = deleted_ids_count,
+                    downloaded = downloaded_count,
+                    network_ms = folder_started.elapsed().as_millis() as u64,
+                    "EWS collection delta fetched"
+                );
+            }
             changed_remote_ids.extend(found.iter().filter_map(|message| message.remote_id.clone()));
             messages.append(&mut found);
             if sync.initial {
@@ -779,6 +832,99 @@ impl EwsBackend {
             .and_then(|node| node.attribute("ChangeKey"))
             .map(str::to_owned)
             .ok_or_else(|| backend_error("item", "Exchange не вернул ChangeKey письма"))
+    }
+
+    /// Ответить на приглашение штатным способом EWS: AcceptItem/DeclineItem/
+    /// TentativelyAcceptItem внутри CreateItem с MessageDisposition=
+    /// SendAndSaveCopy - сервер сам формирует и рассылает ответ организатору
+    /// (как для обычного письма в send(), только тип элемента другой), и
+    /// сохраняет копию в Отправленных. ChangeKey нужен свежий - берём его тем
+    /// же способом, что и для операции "flag" в apply_operation.
+    pub async fn respond_to_calendar_item(
+        &self,
+        password: &str,
+        item_id: &str,
+        response: crate::model::RsvpResponse,
+    ) -> Result<()> {
+        let change_key = self.item_change_key(password, item_id).await?;
+        let element = match response {
+            crate::model::RsvpResponse::Accepted => "AcceptItem",
+            crate::model::RsvpResponse::Declined => "DeclineItem",
+            crate::model::RsvpResponse::Tentative => "TentativelyAcceptItem",
+        };
+        let body = format!(
+            r#"<m:CreateItem MessageDisposition="SendAndSaveCopy"><m:Items><t:{element}><t:ReferenceItemId Id="{}" ChangeKey="{}"/></t:{element}></m:Items></m:CreateItem>"#,
+            escape(item_id),
+            escape(&change_key)
+        );
+        self.soap(password, "CreateItem", &body).await.map(|_| ())
+    }
+
+    /// Создать событие в календаре Exchange. SendMeetingInvitations решает,
+    /// рассылать ли приглашения участникам: если их нет - SendToNone (обычная
+    /// запись в календаре без встречи), если есть - SendToAllAndSaveCopy.
+    /// Повторяемость (RRULE) не поддержана: EWS описывает её отдельным типом
+    /// Recurrence с десятком вариантов паттерна (Daily/Weekly/.../Yearly, у
+    /// каждого свой набор полей), адекватный маппинг из RFC5545 RRULE не влез
+    /// в объём этой задачи - событие создаётся одиночным, без повторения.
+    pub async fn create_calendar_item(&self, password: &str, input: &EventInput) -> Result<String> {
+        let body = create_calendar_item_body(input)?;
+        let response = self.soap(password, "CreateItem", &body).await?;
+        parse_created_item_id(&response)
+    }
+
+    /// Изменить событие: ChangeKey - свежий (та же оптимистичная блокировка,
+    /// что и у respond_to_calendar_item/apply_operation), каждое поле - в
+    /// своём SetItemField, поэтому порядок между ними не важен (важен только
+    /// порядок полей внутри одного CalendarItem, а тут в каждом ровно одно).
+    pub async fn update_calendar_item(
+        &self,
+        password: &str,
+        item_id: &str,
+        input: &EventInput,
+    ) -> Result<()> {
+        let change_key = self.item_change_key(password, item_id).await?;
+        let body = update_calendar_item_body(item_id, &change_key, input)?;
+        self.soap(password, "UpdateItem", &body).await.map(|_| ())
+    }
+
+    /// Удалить событие. SendMeetingCancellations обязателен для CalendarItem
+    /// (в отличие от обычного письма) - без него Exchange не разошлёт отмену
+    /// участникам встречи.
+    pub async fn delete_calendar_item(&self, password: &str, item_id: &str) -> Result<()> {
+        let body = delete_calendar_item_body(item_id);
+        self.soap(password, "DeleteItem", &body).await.map(|_| ())
+    }
+
+    /// Создать контакт в адресной книге Exchange.
+    pub async fn create_contact_item(&self, password: &str, input: &ContactInput) -> Result<String> {
+        let body = create_contact_item_body(input);
+        let response = self.soap(password, "CreateItem", &body).await?;
+        parse_created_item_id(&response)
+    }
+
+    /// Изменить контакт. EmailAddresses/PhoneNumbers - словарные свойства
+    /// EWS, для них плоский FieldURI не годится, нужен IndexedFieldURI на
+    /// конкретную запись (contacts:EmailAddress/EmailAddress1..3,
+    /// contacts:PhoneNumber/MobilePhone|BusinessPhone|...) - см.
+    /// contact_item_updates. Убранные из формы адрес/телефон эти
+    /// SetItemField не удаляют - для этого нужен отдельный DeleteItemField
+    /// по индексу, который здесь не реализован.
+    pub async fn update_contact_item(
+        &self,
+        password: &str,
+        item_id: &str,
+        input: &ContactInput,
+    ) -> Result<()> {
+        let change_key = self.item_change_key(password, item_id).await?;
+        let body = update_contact_item_body(item_id, &change_key, input);
+        self.soap(password, "UpdateItem", &body).await.map(|_| ())
+    }
+
+    /// Удалить контакт.
+    pub async fn delete_contact_item(&self, password: &str, item_id: &str) -> Result<()> {
+        let body = delete_contact_item_body(item_id);
+        self.soap(password, "DeleteItem", &body).await.map(|_| ())
     }
 
     /// Календарь и адресная книга Exchange для aux-синхронизации.
@@ -1147,6 +1293,14 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
             .find(|node| node.is_element() && node.tag_name().name() == "Organizer")
             .and_then(|node| node_text(node, "EmailAddress"))
             .map(str::to_owned);
+        // IsCancelled - штатное поле CalendarItem, приходит уже при
+        // BaseShape=AllProperties (см. calendar_events/calendar_events_by_ids
+        // выше), доп. свойств запрашивать не нужно.
+        let status = if node_text(item, "IsCancelled") == Some("true") {
+            Some("CANCELLED".to_owned())
+        } else {
+            None
+        };
         let raw = build_vevent(
             id,
             &summary,
@@ -1166,7 +1320,7 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
             recurrence_id: None,
             exdates: None,
             rdates: None,
-            status: None,
+            status,
             attendees: Vec::new(),
             alarms: Vec::new(),
             timezone: None,
@@ -1351,6 +1505,367 @@ fn build_vcard(
     lines.join("\r\n")
 }
 
+/// SendMeetingInvitations/SendMeetingInvitationsOrCancellations: рассылаем
+/// приглашения только если у события реально есть участники - иначе это
+/// просто личная запись в календаре, а не встреча.
+fn calendar_send_disposition(input: &EventInput) -> &'static str {
+    if input.attendees.is_empty() {
+        "SendToNone"
+    } else {
+        "SendToAllAndSaveCopy"
+    }
+}
+
+/// EventInput.dtstart/dtend - RFC3339 (тот же формат, что понимают
+/// write_dav_event и google_event_body в account/auxiliary.rs). Для
+/// всесуточного события EWS хочет начало суток UTC; для обычного - точное
+/// время, приведённое к UTC в формате "2026-07-16T17:00:00Z" (том же, что
+/// разбирает to_ical_datetime при чтении).
+fn ews_event_datetime(value: &str, all_day: bool) -> Result<String> {
+    if all_day {
+        let date = value.get(..10).filter(|date| date.len() == 10);
+        return date.map(|date| format!("{date}T00:00:00Z")).ok_or_else(|| {
+            backend_error("event-datetime", "некорректная дата всесуточного события")
+        });
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .map_err(|error| backend_error("event-datetime", format!("некорректная дата события: {error}")))
+}
+
+fn attendees_xml(attendees: &[&Attendee]) -> String {
+    attendees
+        .iter()
+        .map(|attendee| {
+            let name = attendee
+                .name
+                .as_deref()
+                .map(|name| format!("<t:Name>{}</t:Name>", escape(name)))
+                .unwrap_or_default();
+            format!(
+                "<t:Attendee><t:Mailbox>{name}<t:EmailAddress>{}</t:EmailAddress></t:Mailbox></t:Attendee>",
+                escape(&attendee.email)
+            )
+        })
+        .collect()
+}
+
+/// Поля CalendarItem в порядке, требуемом схемой EWS (CalendarItemType
+/// наследует ItemType): Subject/Body/ReminderIsSet/ReminderMinutesBeforeStart
+/// - из общей части ItemType, дальше Start/End/IsAllDayEvent/Location/
+/// RequiredAttendees/OptionalAttendees - уже из calendar-специфичной части.
+/// Для CreateItem все поля идут одним блоком <t:CalendarItem> и порядок
+/// критичен (нарушение схемы = ErrorSchemaValidation); для UpdateItem тот же
+/// список оборачивается по одному полю на SetItemField, там порядок между
+/// полями уже не важен.
+fn calendar_item_fields(input: &EventInput) -> Result<Vec<(&'static str, String)>> {
+    let mut fields = vec![
+        (
+            "item:Subject",
+            format!("<t:Subject>{}</t:Subject>", escape(&input.summary)),
+        ),
+        (
+            "item:Body",
+            format!(
+                r#"<t:Body BodyType="Text">{}</t:Body>"#,
+                escape(input.description.as_deref().unwrap_or(""))
+            ),
+        ),
+    ];
+    match input.alarms.first() {
+        Some(alarm) => {
+            fields.push((
+                "item:ReminderIsSet",
+                "<t:ReminderIsSet>true</t:ReminderIsSet>".to_owned(),
+            ));
+            fields.push((
+                "item:ReminderMinutesBeforeStart",
+                format!(
+                    "<t:ReminderMinutesBeforeStart>{}</t:ReminderMinutesBeforeStart>",
+                    alarm.trigger_minutes.max(0)
+                ),
+            ));
+        }
+        None => fields.push((
+            "item:ReminderIsSet",
+            "<t:ReminderIsSet>false</t:ReminderIsSet>".to_owned(),
+        )),
+    }
+    fields.push((
+        "calendar:Start",
+        format!(
+            "<t:Start>{}</t:Start>",
+            ews_event_datetime(&input.dtstart, input.all_day)?
+        ),
+    ));
+    let end = input.dtend.as_deref().unwrap_or(&input.dtstart);
+    fields.push((
+        "calendar:End",
+        format!("<t:End>{}</t:End>", ews_event_datetime(end, input.all_day)?),
+    ));
+    fields.push((
+        "calendar:IsAllDayEvent",
+        format!("<t:IsAllDayEvent>{}</t:IsAllDayEvent>", input.all_day),
+    ));
+    if let Some(location) = input.location.as_deref().filter(|value| !value.is_empty()) {
+        fields.push((
+            "calendar:Location",
+            format!("<t:Location>{}</t:Location>", escape(location)),
+        ));
+    }
+    let (optional, required): (Vec<_>, Vec<_>) = input
+        .attendees
+        .iter()
+        .partition(|attendee| attendee.role.as_deref() == Some("OPT-PARTICIPANT"));
+    if !required.is_empty() {
+        fields.push((
+            "calendar:RequiredAttendees",
+            format!(
+                "<t:RequiredAttendees>{}</t:RequiredAttendees>",
+                attendees_xml(&required)
+            ),
+        ));
+    }
+    if !optional.is_empty() {
+        fields.push((
+            "calendar:OptionalAttendees",
+            format!(
+                "<t:OptionalAttendees>{}</t:OptionalAttendees>",
+                attendees_xml(&optional)
+            ),
+        ));
+    }
+    Ok(fields)
+}
+
+fn calendar_item_xml(input: &EventInput) -> Result<String> {
+    let body = calendar_item_fields(input)?
+        .into_iter()
+        .map(|(_, xml)| xml)
+        .collect::<String>();
+    Ok(format!("<t:CalendarItem>{body}</t:CalendarItem>"))
+}
+
+fn create_calendar_item_body(input: &EventInput) -> Result<String> {
+    let disposition = calendar_send_disposition(input);
+    let item = calendar_item_xml(input)?;
+    Ok(format!(
+        r#"<m:CreateItem SendMeetingInvitations="{disposition}"><m:SavedItemFolderId><t:DistinguishedFolderId Id="calendar"/></m:SavedItemFolderId><m:Items>{item}</m:Items></m:CreateItem>"#
+    ))
+}
+
+fn update_calendar_item_body(item_id: &str, change_key: &str, input: &EventInput) -> Result<String> {
+    let disposition = calendar_send_disposition(input);
+    let updates = calendar_item_fields(input)?
+        .into_iter()
+        .map(|(field_uri, xml)| {
+            format!(
+                r#"<t:SetItemField><t:FieldURI FieldURI="{field_uri}"/><t:CalendarItem>{xml}</t:CalendarItem></t:SetItemField>"#
+            )
+        })
+        .collect::<String>();
+    Ok(format!(
+        r#"<m:UpdateItem ConflictResolution="AutoResolve" SendMeetingInvitationsOrCancellations="{disposition}"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{updates}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
+        escape(item_id),
+        escape(change_key)
+    ))
+}
+
+/// SendMeetingCancellations обязателен для CalendarItem - без него Exchange
+/// не разошлёт отмену участникам встречи (в отличие от удаления обычного
+/// письма, см. "delete" в apply_operation выше).
+fn delete_calendar_item_body(item_id: &str) -> String {
+    format!(
+        r#"<m:DeleteItem DeleteType="MoveToDeletedItems" SendMeetingCancellations="SendToAllAndSaveCopy"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
+        escape(item_id)
+    )
+}
+
+fn parse_created_item_id(xml: &str) -> Result<String> {
+    let document = Document::parse(xml).map_err(|error| backend_error("xml", error))?;
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+        .and_then(|node| node.attribute("Id"))
+        .map(str::to_owned)
+        .ok_or_else(|| backend_error("item", "Exchange не вернул идентификатор нового элемента"))
+}
+
+fn parse_created_folder_id(xml: &str) -> Result<String> {
+    let document = Document::parse(xml).map_err(|error| backend_error("xml", error))?;
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "FolderId")
+        .and_then(|node| node.attribute("Id"))
+        .map(str::to_owned)
+        .ok_or_else(|| backend_error("folder", "Exchange не вернул идентификатор новой папки"))
+}
+
+fn contact_emails_xml(emails: &[String]) -> String {
+    emails
+        .iter()
+        .filter(|email| !email.trim().is_empty())
+        .take(3)
+        .enumerate()
+        .map(|(index, email)| {
+            format!(
+                r#"<t:Entry Key="EmailAddress{}">{}</t:Entry>"#,
+                index + 1,
+                escape(email.trim())
+            )
+        })
+        .collect()
+}
+
+/// EWS хранит телефоны контакта как словарь с фиксированным набором ключей
+/// (MobilePhone, BusinessPhone/BusinessPhone2, HomePhone/HomePhone2,
+/// BusinessFax, OtherTelephone) - произвольный "kind" сюда не положить.
+/// Второй телефон того же вида (work/home) уходит под "2"-вариант ключа -
+/// его же понимает phone_kind() при чтении; третий и далее телефон того же
+/// вида на сервер не попадает (used не находит свободного ключа).
+fn ews_phone_key<'a>(kind: Option<&str>, used: &mut HashSet<&'a str>) -> Option<&'a str> {
+    let candidates: &[&'a str] = match kind {
+        Some("mobile") => &["MobilePhone"],
+        Some("work") => &["BusinessPhone", "BusinessPhone2"],
+        Some("home") => &["HomePhone", "HomePhone2"],
+        Some("fax") => &["BusinessFax"],
+        _ => &["OtherTelephone"],
+    };
+    candidates.iter().copied().find(|key| used.insert(key))
+}
+
+fn contact_phones_xml(phones: &[ContactPhone]) -> String {
+    let mut used = HashSet::new();
+    phones
+        .iter()
+        .filter(|phone| !phone.number.trim().is_empty())
+        .filter_map(|phone| {
+            let key = ews_phone_key(phone.kind.as_deref(), &mut used)?;
+            Some(format!(
+                r#"<t:Entry Key="{key}">{}</t:Entry>"#,
+                escape(&phone.remote_value())
+            ))
+        })
+        .collect()
+}
+
+/// Поля Contact в порядке схемы EWS (ContactItemType): DisplayName/GivenName/
+/// CompanyName идут в начале, EmailAddresses/PhoneNumbers - следом, а
+/// Surname в самой схеме стоит куда дальше (после SpouseName) - неочевидно,
+/// но так задокументировано у Microsoft, и здесь сохранено намеренно, а не
+/// по интуитивному "имя, фамилия".
+fn contact_item_xml(input: &ContactInput) -> String {
+    let mut body = format!(
+        "<t:DisplayName>{}</t:DisplayName>",
+        escape(&input.display_name)
+    );
+    if let Some(first) = input.first_name.as_deref().filter(|value| !value.is_empty()) {
+        body.push_str(&format!("<t:GivenName>{}</t:GivenName>", escape(first)));
+    }
+    if let Some(company) = input
+        .organization
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        body.push_str(&format!("<t:CompanyName>{}</t:CompanyName>", escape(company)));
+    }
+    if !input.emails.is_empty() {
+        body.push_str(&format!(
+            "<t:EmailAddresses>{}</t:EmailAddresses>",
+            contact_emails_xml(&input.emails)
+        ));
+    }
+    if !input.phones.is_empty() {
+        body.push_str(&format!(
+            "<t:PhoneNumbers>{}</t:PhoneNumbers>",
+            contact_phones_xml(&input.phones)
+        ));
+    }
+    if let Some(last) = input.last_name.as_deref().filter(|value| !value.is_empty()) {
+        body.push_str(&format!("<t:Surname>{}</t:Surname>", escape(last)));
+    }
+    format!("<t:Contact>{body}</t:Contact>")
+}
+
+fn create_contact_item_body(input: &ContactInput) -> String {
+    let item = contact_item_xml(input);
+    format!(
+        r#"<m:CreateItem><m:SavedItemFolderId><t:DistinguishedFolderId Id="contacts"/></m:SavedItemFolderId><m:Items>{item}</m:Items></m:CreateItem>"#
+    )
+}
+
+fn update_contact_item_body(item_id: &str, change_key: &str, input: &ContactInput) -> String {
+    let updates = contact_item_updates(input);
+    format!(
+        r#"<m:UpdateItem ConflictResolution="AutoResolve"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{updates}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
+        escape(item_id),
+        escape(change_key)
+    )
+}
+
+fn delete_contact_item_body(item_id: &str) -> String {
+    format!(
+        r#"<m:DeleteItem DeleteType="MoveToDeletedItems"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
+        escape(item_id)
+    )
+}
+
+/// SetItemField по каждому простому полю; EmailAddresses/PhoneNumbers -
+/// словарные свойства, для них нужен IndexedFieldURI на конкретную запись
+/// (см. документацию EWS "Setting an indexed property"), а не общий FieldURI.
+fn contact_item_updates(input: &ContactInput) -> String {
+    let mut updates = format!(
+        r#"<t:SetItemField><t:FieldURI FieldURI="contacts:DisplayName"/><t:Contact><t:DisplayName>{}</t:DisplayName></t:Contact></t:SetItemField>"#,
+        escape(&input.display_name)
+    );
+    if let Some(first) = input.first_name.as_deref().filter(|value| !value.is_empty()) {
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:FieldURI FieldURI="contacts:GivenName"/><t:Contact><t:GivenName>{}</t:GivenName></t:Contact></t:SetItemField>"#,
+            escape(first)
+        ));
+    }
+    if let Some(last) = input.last_name.as_deref().filter(|value| !value.is_empty()) {
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:FieldURI FieldURI="contacts:Surname"/><t:Contact><t:Surname>{}</t:Surname></t:Contact></t:SetItemField>"#,
+            escape(last)
+        ));
+    }
+    if let Some(company) = input
+        .organization
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:FieldURI FieldURI="contacts:CompanyName"/><t:Contact><t:CompanyName>{}</t:CompanyName></t:Contact></t:SetItemField>"#,
+            escape(company)
+        ));
+    }
+    for (index, email) in input
+        .emails
+        .iter()
+        .filter(|value| !value.trim().is_empty())
+        .take(3)
+        .enumerate()
+    {
+        let key = format!("EmailAddress{}", index + 1);
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:IndexedFieldURI FieldURI="contacts:EmailAddress" FieldIndex="{key}"/><t:Contact><t:EmailAddresses><t:Entry Key="{key}">{}</t:Entry></t:EmailAddresses></t:Contact></t:SetItemField>"#,
+            escape(email.trim())
+        ));
+    }
+    let mut used = HashSet::new();
+    for phone in input.phones.iter().filter(|phone| !phone.number.trim().is_empty()) {
+        let Some(key) = ews_phone_key(phone.kind.as_deref(), &mut used) else {
+            continue;
+        };
+        updates.push_str(&format!(
+            r#"<t:SetItemField><t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="{key}"/><t:Contact><t:PhoneNumbers><t:Entry Key="{key}">{}</t:Entry></t:PhoneNumbers></t:Contact></t:SetItemField>"#,
+            escape(&phone.remote_value())
+        ));
+    }
+    updates
+}
+
 #[async_trait]
 impl MailBackend for EwsBackend {
     fn provider_id(&self) -> &'static str {
@@ -1407,13 +1922,19 @@ impl MailBackend for EwsBackend {
             None
         };
         let (action, body) = match operation {
+            // message:IsRead всегда шлём. message:Flag (FlagStatus Flagged/NotFlagged)
+            // - комплексное свойство, доступное EWS начиная с Exchange 2010 (тот же
+            // минимум, что и RequestServerVersion=Exchange2010_SP2 в конверте soap()
+            // ниже), поэтому используем его напрямую вместо обходных путей вроде
+            // Importance. Ключ "flagged" опционален - его нет в операциях, вставленных
+            // в outbox до появления звёздочки, тогда update по Flag не шлём вовсе.
             "flag" => (
                 "UpdateItem",
                 format!(
-                    r#"<m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates><t:SetItemField><t:FieldURI FieldURI="message:IsRead"/><t:Message><t:IsRead>{}</t:IsRead></t:Message></t:SetItemField></t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
+                    r#"<m:UpdateItem ConflictResolution="AutoResolve" MessageDisposition="SaveOnly"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
                     escape(item_id),
                     escape(change_key.as_deref().unwrap_or_default()),
-                    payload["seen"].as_bool().unwrap_or(false)
+                    flag_update_fields(payload["seen"].as_bool().unwrap_or(false), payload["flagged"].as_bool())
                 ),
             ),
             "move" => (
@@ -1440,6 +1961,18 @@ impl MailBackend for EwsBackend {
             }
         };
         self.soap(credential, action, &body).await.map(|_| ())
+    }
+
+    async fn create_folder(
+        &self,
+        _email: &str,
+        credential: &str,
+        parent_path: Option<&str>,
+        name: &str,
+    ) -> Result<String> {
+        let body = create_folder_body(parent_path, name.trim());
+        let response = self.soap(credential, "CreateFolder", &body).await?;
+        parse_created_folder_id(&response)
     }
 
     async fn rename_folder(
@@ -1515,6 +2048,27 @@ mod tests {
             .find(|node| node.tag_name().name() == "EwsUrl")
             .and_then(|node| node.text());
         assert_eq!(value, Some("https://mail.example.test/EWS/Exchange.asmx"));
+    }
+
+    #[test]
+    fn create_folder_body_targets_parent_by_id_when_given() {
+        let body = create_folder_body(Some("parent-folder-id"), "Заметки");
+        assert!(body.contains(r#"<t:FolderId Id="parent-folder-id"/>"#));
+        assert!(body.contains("<t:DisplayName>Заметки</t:DisplayName>"));
+        assert!(!body.contains("msgfolderroot"));
+    }
+
+    #[test]
+    fn create_folder_body_falls_back_to_msgfolderroot_without_parent() {
+        let body = create_folder_body(None, "Top level");
+        assert!(body.contains(r#"<t:DistinguishedFolderId Id="msgfolderroot"/>"#));
+        assert!(body.contains("<t:DisplayName>Top level</t:DisplayName>"));
+    }
+
+    #[test]
+    fn create_folder_body_escapes_special_characters_in_name() {
+        let body = create_folder_body(None, "A & B <test>");
+        assert!(body.contains("<t:DisplayName>A &amp; B &lt;test&gt;</t:DisplayName>"));
     }
 
     #[test]
@@ -1620,5 +2174,182 @@ mod tests {
         let error = response_error(xml).expect("response error");
         assert!(error.contains("ErrorInvalidSyncStateData"));
         assert!(error.contains("synchronization state data is invalid"));
+    }
+
+    fn sample_event_input() -> EventInput {
+        EventInput {
+            summary: "Планёрка <team>".into(),
+            description: Some("Обсудить & согласовать".into()),
+            location: Some("Переговорная \"Б\"".into()),
+            dtstart: "2026-07-20T10:00:00+03:00".into(),
+            dtend: Some("2026-07-20T11:00:00+03:00".into()),
+            all_day: false,
+            attendees: Vec::new(),
+            alarms: Vec::new(),
+            ..EventInput::default()
+        }
+    }
+
+    #[test]
+    fn ews_event_datetime_converts_offset_to_utc() {
+        assert_eq!(
+            ews_event_datetime("2026-07-20T10:00:00+03:00", false).unwrap(),
+            "2026-07-20T07:00:00Z"
+        );
+        assert_eq!(
+            ews_event_datetime("2026-07-20T00:00:00Z", true).unwrap(),
+            "2026-07-20T00:00:00Z"
+        );
+        assert!(ews_event_datetime("not-a-date", false).is_err());
+    }
+
+    #[test]
+    fn create_calendar_item_body_escapes_fields_and_sends_to_none_without_attendees() {
+        let body = create_calendar_item_body(&sample_event_input()).expect("build body");
+        assert!(body.contains(r#"SendMeetingInvitations="SendToNone""#));
+        assert!(body.contains("<t:Subject>Планёрка &lt;team&gt;</t:Subject>"));
+        assert!(body.contains("Обсудить &amp; согласовать"));
+        assert!(body.contains("Переговорная &quot;Б&quot;"));
+        assert!(body.contains(r#"<t:DistinguishedFolderId Id="calendar"/>"#));
+        assert!(body.contains("<t:Start>2026-07-20T07:00:00Z</t:Start>"));
+        assert!(body.contains("<t:End>2026-07-20T08:00:00Z</t:End>"));
+        assert!(!body.contains("RequiredAttendees"));
+    }
+
+    #[test]
+    fn create_calendar_item_body_splits_required_and_optional_attendees() {
+        let mut input = sample_event_input();
+        input.attendees = vec![
+            Attendee {
+                email: "req@example.test".into(),
+                name: Some("Обязательный".into()),
+                role: Some("REQ-PARTICIPANT".into()),
+                partstat: None,
+                rsvp: true,
+            },
+            Attendee {
+                email: "opt@example.test".into(),
+                name: None,
+                role: Some("OPT-PARTICIPANT".into()),
+                partstat: None,
+                rsvp: true,
+            },
+        ];
+        let body = create_calendar_item_body(&input).expect("build body");
+        assert!(body.contains(r#"SendMeetingInvitations="SendToAllAndSaveCopy""#));
+        assert!(body.contains("<t:RequiredAttendees>"));
+        assert!(body.contains("req@example.test"));
+        assert!(body.contains("<t:OptionalAttendees>"));
+        assert!(body.contains("opt@example.test"));
+        // Обязательный участник не должен попасть в OptionalAttendees и наоборот.
+        let required_start = body.find("<t:RequiredAttendees>").unwrap();
+        let required_end = body.find("</t:RequiredAttendees>").unwrap();
+        assert!(!body[required_start..required_end].contains("opt@example.test"));
+    }
+
+    #[test]
+    fn update_calendar_item_body_carries_change_key_and_disposition() {
+        let body =
+            update_calendar_item_body("item-1", "change-1", &sample_event_input()).expect("build body");
+        assert!(body.contains(r#"<t:ItemId Id="item-1" ChangeKey="change-1"/>"#));
+        assert!(body.contains(r#"SendMeetingInvitationsOrCancellations="SendToNone""#));
+        assert!(body.contains(r#"<t:FieldURI FieldURI="item:Subject"/>"#));
+        assert!(body.contains(r#"<t:FieldURI FieldURI="calendar:Start"/>"#));
+    }
+
+    #[test]
+    fn delete_calendar_item_body_always_sends_meeting_cancellations() {
+        let body = delete_calendar_item_body("item \"1\"");
+        assert!(body.contains(r#"SendMeetingCancellations="SendToAllAndSaveCopy""#));
+        assert!(body.contains(r#"DeleteType="MoveToDeletedItems""#));
+        assert!(body.contains("item &quot;1&quot;"));
+    }
+
+    fn sample_contact_input() -> ContactInput {
+        ContactInput {
+            display_name: "Иванов & Ко".into(),
+            first_name: Some("Иван".into()),
+            last_name: Some("Иванов".into()),
+            organization: Some("ООО \"Пример\"".into()),
+            emails: vec![
+                "a@example.test".into(),
+                "b@example.test".into(),
+                "c@example.test".into(),
+                "d@example.test".into(),
+            ],
+            phones: vec![
+                ContactPhone {
+                    number: "+79990000001".into(),
+                    kind: Some("work".into()),
+                    extension: None,
+                },
+                ContactPhone {
+                    number: "+79990000002".into(),
+                    kind: Some("work".into()),
+                    extension: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn contact_item_xml_orders_fields_and_limits_emails_to_three() {
+        let xml = contact_item_xml(&sample_contact_input());
+        assert!(xml.contains("<t:DisplayName>Иванов &amp; Ко</t:DisplayName>"));
+        assert!(xml.contains("<t:CompanyName>ООО &quot;Пример&quot;</t:CompanyName>"));
+        assert!(xml.contains(r#"<t:Entry Key="EmailAddress1">a@example.test</t:Entry>"#));
+        assert!(xml.contains(r#"<t:Entry Key="EmailAddress3">c@example.test</t:Entry>"#));
+        assert!(!xml.contains("d@example.test"));
+        // DisplayName должен идти раньше EmailAddresses, а Surname - позже него
+        // (порядок ContactItemType в схеме EWS, см. contact_item_xml).
+        let display_at = xml.find("DisplayName").unwrap();
+        let emails_at = xml.find("EmailAddresses").unwrap();
+        let surname_at = xml.find("Surname").unwrap();
+        assert!(display_at < emails_at);
+        assert!(emails_at < surname_at);
+    }
+
+    #[test]
+    fn contact_phones_xml_uses_second_key_for_repeated_kind() {
+        let xml = contact_phones_xml(&sample_contact_input().phones);
+        assert!(xml.contains(r#"<t:Entry Key="BusinessPhone">+79990000001</t:Entry>"#));
+        assert!(xml.contains(r#"<t:Entry Key="BusinessPhone2">+79990000002</t:Entry>"#));
+    }
+
+    #[test]
+    fn create_contact_item_body_targets_contacts_folder() {
+        let body = create_contact_item_body(&sample_contact_input());
+        assert!(body.contains(r#"<t:DistinguishedFolderId Id="contacts"/>"#));
+        assert!(body.contains("<t:Contact>"));
+    }
+
+    #[test]
+    fn update_contact_item_body_uses_indexed_field_uri_for_emails_and_phones() {
+        let body = update_contact_item_body("contact-1", "change-1", &sample_contact_input());
+        assert!(body.contains(r#"<t:ItemId Id="contact-1" ChangeKey="change-1"/>"#));
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:EmailAddress" FieldIndex="EmailAddress1"/>"#
+        ));
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="BusinessPhone"/>"#
+        ));
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="BusinessPhone2"/>"#
+        ));
+    }
+
+    #[test]
+    fn delete_contact_item_body_has_no_meeting_attributes() {
+        let body = delete_contact_item_body("contact\"1");
+        assert!(!body.contains("SendMeetingCancellations"));
+        assert!(body.contains("contact&quot;1"));
+    }
+
+    #[test]
+    fn parses_created_item_and_folder_ids() {
+        let item_xml = r#"<CreateItemResponse><Items><CalendarItem><ItemId Id="new-item" ChangeKey="ck"/></CalendarItem></Items></CreateItemResponse>"#;
+        assert_eq!(parse_created_item_id(item_xml).unwrap(), "new-item");
+        let folder_xml = r#"<CreateFolderResponse><Folders><Folder><FolderId Id="new-folder"/></Folder></Folders></CreateFolderResponse>"#;
+        assert_eq!(parse_created_folder_id(folder_xml).unwrap(), "new-folder");
     }
 }

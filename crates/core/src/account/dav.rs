@@ -1,12 +1,107 @@
-//! Полная и инкрементальная синхронизация календарей и контактов Яндекса
-//! по CalDAV/CardDAV и WebDAV Sync (RFC 6578).
-
-use crate::model::{Alarm, Attendee, ContactPhone, clean_contact_name};
+//! Полная и инкрементальная синхронизация календарей и контактов по
+//! CalDAV/CardDAV и WebDAV Sync (RFC 6578). Работает с любым сервером,
+//! реализующим эти RFC, а не только с Яндексом: адреса серверов приходят
+//! параметром (заданы вручную или найдены через RFC 6764, см.
+//! discover_well_known), а схема авторизации выбирается через DavAuth.
+use crate::model::{Alarm, Attendee, AuthKind, ContactPhone, Provider, clean_contact_name};
 use crate::{Error, Result};
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
 use std::collections::{HashMap, HashSet};
 use url::Url;
+
+/// Базовые адреса Яндекса по умолчанию - используются, если на аккаунте не
+/// задан свой caldav_url/carddav_url. Для Яндекса RFC 6764-обнаружение не
+/// запускается: эти адреса и так известны и стабильны, а лишний сетевой
+/// запрос перед каждой синхронизацией не нужен.
+pub const YANDEX_CALDAV_BASE: &str = "https://caldav.yandex.ru/";
+pub const YANDEX_CARDDAV_BASE: &str = "https://carddav.yandex.ru/";
+
+/// RFC 6764: стандартные пути обнаружения адреса CalDAV/CardDAV на домене.
+pub const WELL_KNOWN_CALDAV: &str = "/.well-known/caldav";
+pub const WELL_KNOWN_CARDDAV: &str = "/.well-known/carddav";
+
+/// Подставить известные адреса Яндекса там, где на аккаунте своих ещё нет.
+/// Вынесено в чистую функцию, чтобы не тянуть Account/AccountManager ради
+/// теста "Яндекс продолжает использовать прежние адреса после обнаружения
+/// DAV для остальных провайдеров".
+pub fn resolve_yandex_bases(
+    caldav_url: Option<&str>,
+    carddav_url: Option<&str>,
+) -> (String, String) {
+    (
+        caldav_url.map(str::to_owned).unwrap_or_else(|| YANDEX_CALDAV_BASE.to_owned()),
+        carddav_url
+            .map(str::to_owned)
+            .unwrap_or_else(|| YANDEX_CARDDAV_BASE.to_owned()),
+    )
+}
+
+/// Схема авторизации DAV-запроса. Явный enum вместо цепочки if по
+/// провайдеру внутри каждого запроса - выбор делается один раз в
+/// dav_auth_scheme, а исполнение (какой заголовок поставить) - в одном
+/// месте (apply_dav_auth).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DavAuthScheme {
+    /// Basic с логином и OAuth-токеном вместо пароля. Так работает Яндекс:
+    /// его DAV-серверы принимают OAuth access token через обычный Basic.
+    BasicToken,
+    /// Basic с обычным логином и паролем/app-specific password. Так
+    /// работают iCloud, Mail.ru и подавляющее большинство generic-серверов.
+    BasicPassword,
+    /// Authorization: Bearer <token> - RFC 6750, стандартный способ отдать
+    /// OAuth2-токен CalDAV/CardDAV-серверу, если он не завязан на Basic,
+    /// как Яндекс.
+    Bearer,
+}
+
+/// Данные для авторизации DAV-запроса. identity - логин для Basic
+/// (игнорируется для Bearer); secret - пароль/app-password/OAuth-токен.
+#[derive(Debug, Clone)]
+pub struct DavAuth {
+    pub scheme: DavAuthScheme,
+    pub identity: String,
+    pub secret: String,
+}
+
+impl DavAuth {
+    pub fn new(scheme: DavAuthScheme, identity: impl Into<String>, secret: impl Into<String>) -> Self {
+        Self {
+            scheme,
+            identity: identity.into(),
+            secret: secret.into(),
+        }
+    }
+}
+
+/// Выбрать схему авторизации DAV по провайдеру и способу аутентификации
+/// аккаунта. Яндекс - особый случай независимо от auth_kind (у него всегда
+/// Oauth2, но токен идёт через Basic, а не Bearer). Остальные провайдеры с
+/// Oauth2 (например Outlook) получают стандартный Bearer; Password/
+/// AppPassword/Ntlm - обычный Basic с логином и секретом из keychain.
+pub fn dav_auth_scheme(provider: Provider, auth_kind: AuthKind) -> DavAuthScheme {
+    match (provider, auth_kind) {
+        (Provider::Yandex, _) => DavAuthScheme::BasicToken,
+        (_, AuthKind::Oauth2) => DavAuthScheme::Bearer,
+        _ => DavAuthScheme::BasicPassword,
+    }
+}
+
+/// pub(crate), а не private: используется и здесь (все PROPFIND/REPORT), и в
+/// auxiliary.rs (PUT/DELETE события и контакта) - одна точка применения
+/// схемы авторизации к запросу вместо двух похожих матчей по DavAuthScheme.
+pub(crate) fn apply_dav_auth(
+    request: reqwest::RequestBuilder,
+    scheme: DavAuthScheme,
+    auth: &DavAuth,
+) -> reqwest::RequestBuilder {
+    match scheme {
+        DavAuthScheme::Bearer => request.bearer_auth(&auth.secret),
+        DavAuthScheme::BasicToken | DavAuthScheme::BasicPassword => {
+            request.basic_auth(&auth.identity, Some(&auth.secret))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AuxiliarySyncCursors {
@@ -122,32 +217,45 @@ struct DavHttpResponse {
     body: String,
 }
 
+async fn dav_send(
+    client: &Client,
+    method: &Method,
+    url: &str,
+    depth: &str,
+    body: &str,
+    scheme: DavAuthScheme,
+    auth: &DavAuth,
+) -> Result<DavHttpResponse> {
+    let request = apply_dav_auth(client.request(method.clone(), url), scheme, auth)
+        .header("Depth", depth)
+        .header("Content-Type", "application/xml; charset=utf-8")
+        .body(body.to_owned());
+    let response = request.send().await.map_err(|e| Error::Backend {
+        backend: "dav".into(),
+        message: e.to_string(),
+    })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Ok(DavHttpResponse { status, body })
+}
+
 async fn dav_request_response(
     client: &Client,
     method: &str,
     url: &str,
     depth: &str,
     body: &str,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<DavHttpResponse> {
     let method = Method::from_bytes(method.as_bytes()).map_err(|e| Error::Other(e.to_string()))?;
-    let response = client
-        .request(method, url)
-        // Яндекс принимает OAuth-токен в DAV через Basic (логин + токен).
-        .basic_auth(email, Some(token))
-        .header("Depth", depth)
-        .header("Content-Type", "application/xml; charset=utf-8")
-        .body(body.to_owned())
-        .send()
-        .await
-        .map_err(|e| Error::Backend {
-            backend: "dav".into(),
-            message: e.to_string(),
-        })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Ok(DavHttpResponse { status, body })
+    let response = dav_send(client, &method, url, depth, body, auth.scheme, auth).await?;
+    // Bearer поддерживают не все серверы, объявляющие OAuth2 (некоторые
+    // CalDAV-реализации, как Яндекс, ждут тот же токен через Basic). Один
+    // молчаливый фолбэк на 401 - не перебор схем на каждый запрос.
+    if response.status == StatusCode::UNAUTHORIZED && auth.scheme == DavAuthScheme::Bearer {
+        return dav_send(client, &method, url, depth, body, DavAuthScheme::BasicToken, auth).await;
+    }
+    Ok(response)
 }
 
 async fn dav_request(
@@ -156,10 +264,9 @@ async fn dav_request(
     url: &str,
     depth: &str,
     body: &str,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<String> {
-    dav_request_optional(client, method, url, depth, body, email, token)
+    dav_request_optional(client, method, url, depth, body, auth)
         .await?
         .ok_or_else(|| Error::Backend {
             backend: "dav".into(),
@@ -168,19 +275,18 @@ async fn dav_request(
 }
 
 /// Выполняет DAV-запрос, но позволяет вызывающему отличить отсутствующую
-/// коллекцию от ошибки транспорта. Яндекс создаёт CardDAV-книгу лениво, поэтому
-/// объявленный addressbook-home-set может законно отвечать 404 до появления
-/// первой синхронизируемой адресной книги.
+/// коллекцию от ошибки транспорта. Часть серверов (например, Яндекс) создаёт
+/// CardDAV-книгу лениво, поэтому объявленный addressbook-home-set может
+/// законно отвечать 404 до появления первой синхронизируемой адресной книги.
 async fn dav_request_optional(
     client: &Client,
     method: &str,
     url: &str,
     depth: &str,
     body: &str,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<Option<String>> {
-    let response = dav_request_response(client, method, url, depth, body, email, token).await?;
+    let response = dav_request_response(client, method, url, depth, body, auth).await?;
     if response.status == StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -210,11 +316,10 @@ async fn discover_home(
     client: &Client,
     base: &str,
     home_tag: &str,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<String> {
     let principal_xml =
-        dav_request(client, "PROPFIND", base, "0", PRINCIPAL_BODY, email, token).await?;
+        dav_request(client, "PROPFIND", base, "0", PRINCIPAL_BODY, auth).await?;
     let principal_doc = Document::parse(&principal_xml).map_err(|e| Error::Backend {
         backend: "dav-xml".into(),
         message: e.to_string(),
@@ -236,7 +341,7 @@ async fn discover_home(
         })?;
     let principal_url = resolve(base, &principal)?;
     let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="urn:ietf:params:xml:ns:carddav"><d:prop><c:calendar-home-set/><a:addressbook-home-set/></d:prop></d:propfind>"#;
-    let xml = dav_request(client, "PROPFIND", &principal_url, "0", body, email, token).await?;
+    let xml = dav_request(client, "PROPFIND", &principal_url, "0", body, auth).await?;
     let doc = Document::parse(&xml).map_err(|e| Error::Backend {
         backend: "dav-xml".into(),
         message: e.to_string(),
@@ -257,7 +362,7 @@ async fn discover_home(
 }
 
 /// Проверить доступ к CalDAV и CardDAV без скачивания коллекций.
-pub async fn validate_yandex_dav(email: &str, access_token: &str) -> Result<()> {
+pub async fn validate_dav(auth: &DavAuth, caldav_base: &str, carddav_base: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -265,23 +370,48 @@ pub async fn validate_yandex_dav(email: &str, access_token: &str) -> Result<()> 
             backend: "dav".into(),
             message: e.to_string(),
         })?;
-    discover_home(
-        &client,
-        "https://caldav.yandex.ru/",
-        "calendar-home-set",
-        email,
-        access_token,
-    )
-    .await?;
-    discover_home(
-        &client,
-        "https://carddav.yandex.ru/",
-        "addressbook-home-set",
-        email,
-        access_token,
-    )
-    .await?;
+    discover_home(&client, caldav_base, "calendar-home-set", auth).await?;
+    discover_home(&client, carddav_base, "addressbook-home-set", auth).await?;
     Ok(())
+}
+
+/// RFC 6764: обнаружение адреса CalDAV/CardDAV по well-known пути на
+/// домене - сервер отвечает HTTP-редиректом (301/302/303/307/308) на
+/// настоящий базовый URL коллекций; редиректы (до 5 переходов) допускаются,
+/// т.к. некоторые серверы редиректят well-known на промежуточный путь.
+/// `origin` - это схема+хост(+порт), например "https://icloud.com"; вынесен
+/// отдельным параметром (а не захардкожен как https://) для тестируемости
+/// на локальном mock-сервере по http.
+///
+/// SRV-записи (_caldavs._tcp/_carddavs._tcp, тоже часть RFC 6764) НЕ
+/// проверяются: для них нужен отдельный DNS-резолвер с поддержкой SRV,
+/// которого нет среди зависимостей (обычный резолвер ОС SRV не отдаёт), а
+/// well-known-редирект уже покрывает iCloud, Mail.ru, Fastmail и
+/// подавляющее большинство self-hosted серверов (Radicale, Baïkal, Nextcloud
+/// и т.п.). Если в будущем понадобится - это отдельная точка расширения.
+pub async fn discover_well_known(origin: &str, path: &str) -> Option<String> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let mut current = format!("{origin}{path}");
+    for _ in 0..5 {
+        let response = client.get(&current).send().await.ok()?;
+        let status = response.status();
+        if status.is_redirection() {
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)?
+                .to_str()
+                .ok()?
+                .to_owned();
+            current = resolve(&current, &location).ok()?;
+            continue;
+        }
+        return status.is_success().then_some(current);
+    }
+    None
 }
 
 fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<(String, Option<String>, String)>> {
@@ -502,12 +632,11 @@ async fn request_sync_collection(
     client: &Client,
     collection_url: &str,
     sync_token: Option<&str>,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<SyncReportOutcome> {
     let body = sync_collection_body(sync_token);
     let response =
-        dav_request_response(client, "REPORT", collection_url, "0", &body, email, token).await?;
+        dav_request_response(client, "REPORT", collection_url, "0", &body, auth).await?;
     if response.status == StatusCode::MULTI_STATUS || response.status.is_success() {
         return parse_sync_collection(&response.body, collection_url)
             .map(SyncReportOutcome::Success);
@@ -616,8 +745,7 @@ async fn etag_fallback(
     client: &Client,
     collection: &DiscoveredCollection,
     cursor: Option<&CollectionCursor>,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<CollectionSync> {
     let xml = dav_request(
         client,
@@ -625,8 +753,7 @@ async fn etag_fallback(
         &collection.url,
         "1",
         ETAG_LIST_BODY,
-        email,
-        token,
+        auth,
     )
     .await?;
     let resources = parse_etag_listing(&xml, &collection.url)?;
@@ -647,8 +774,7 @@ async fn sync_collection_resources(
     client: &Client,
     collection: &DiscoveredCollection,
     cursor: Option<&CollectionCursor>,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<CollectionSync> {
     if let Some(cursor) = cursor {
         let token_unchanged = cursor.sync_token.is_some()
@@ -670,14 +796,8 @@ async fn sync_collection_resources(
 
     if collection.supports_sync_collection {
         if let Some(previous_token) = cursor.and_then(|cursor| cursor.sync_token.as_deref()) {
-            match request_sync_collection(
-                client,
-                &collection.url,
-                Some(previous_token),
-                email,
-                token,
-            )
-            .await?
+            match request_sync_collection(client, &collection.url, Some(previous_token), auth)
+                .await?
             {
                 SyncReportOutcome::Success(delta) => {
                     return Ok(CollectionSync {
@@ -693,12 +813,12 @@ async fn sync_collection_resources(
                     // неизменившихся calendar-data/address-data.
                 }
                 SyncReportOutcome::Unsupported => {
-                    return etag_fallback(client, collection, cursor, email, token).await;
+                    return etag_fallback(client, collection, cursor, auth).await;
                 }
             }
         }
 
-        match request_sync_collection(client, &collection.url, None, email, token).await? {
+        match request_sync_collection(client, &collection.url, None, auth).await? {
             SyncReportOutcome::Success(snapshot) => {
                 let known = cursor
                     .map(|cursor| &cursor.resource_etags)
@@ -718,7 +838,7 @@ async fn sync_collection_resources(
             SyncReportOutcome::Unsupported => {}
         }
     }
-    etag_fallback(client, collection, cursor, email, token).await
+    etag_fallback(client, collection, cursor, auth).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -756,8 +876,7 @@ async fn multiget_changed(
     collection_url: &str,
     resources: &[ResourceRef],
     kind: MultigetKind,
-    email: &str,
-    token: &str,
+    auth: &DavAuth,
 ) -> Result<Vec<(String, Option<String>, String)>> {
     let data_tag = match kind {
         MultigetKind::Calendar => "calendar-data",
@@ -767,7 +886,7 @@ async fn multiget_changed(
     // Ограничиваем размер XML и число возвращаемых тяжёлых тел в одном REPORT.
     for chunk in resources.chunks(100) {
         let body = multiget_body(kind, chunk);
-        let xml = dav_request(client, "REPORT", collection_url, "0", &body, email, token).await?;
+        let xml = dav_request(client, "REPORT", collection_url, "0", &body, auth).await?;
         parts.extend(response_parts(&xml, data_tag)?);
     }
     Ok(parts)
@@ -1056,54 +1175,27 @@ fn collections_unchanged(
         })
 }
 
-pub async fn sync_yandex_dav(
+async fn sync_calendars(
+    client: &Client,
     email: &str,
-    access_token: &str,
+    auth: &DavAuth,
+    cal_base: &str,
     cursors: &AuxiliarySyncCursors,
-) -> Result<DavSyncResult> {
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .build()
-        .map_err(|e| Error::Backend {
-            backend: "dav".into(),
-            message: e.to_string(),
-        })?;
-    let cal_base = "https://caldav.yandex.ru/";
-    let card_base = "https://carddav.yandex.ru/";
-    let cal_home =
-        discover_home(&client, cal_base, "calendar-home-set", email, access_token).await?;
-    let card_home = discover_home(
-        &client,
-        card_base,
-        "addressbook-home-set",
-        email,
-        access_token,
-    )
-    .await?;
-    let cal_xml = dav_request(
-        &client,
-        "PROPFIND",
-        &cal_home,
-        "1",
-        COLLECTIONS_BODY,
-        email,
-        access_token,
-    )
-    .await?;
+) -> Result<Vec<DavCalendar>> {
+    let cal_home = discover_home(client, cal_base, "calendar-home-set", auth).await?;
+    let cal_xml = dav_request(client, "PROPFIND", &cal_home, "1", COLLECTIONS_BODY, auth).await?;
     let discovered_calendars = parse_collections(&cal_xml, cal_base, "calendar", "Календарь")?;
     let mut calendars = Vec::new();
     for collection in discovered_calendars {
         let collection_started = std::time::Instant::now();
         let cursor = cursors.calendars.get(&collection.url);
-        let sync =
-            sync_collection_resources(&client, &collection, cursor, email, access_token).await?;
+        let sync = sync_collection_resources(client, &collection, cursor, auth).await?;
         let events: Vec<_> = multiget_changed(
-            &client,
+            client,
             &collection.url,
             &sync.changed,
             MultigetKind::Calendar,
-            email,
-            access_token,
+            auth,
         )
         .await?
         .into_iter()
@@ -1112,16 +1204,32 @@ pub async fn sync_yandex_dav(
             parse_events(raw, etag, remote_url)
         })
         .collect();
-        tracing::info!(
-            provider = "yandex-caldav",
-            account = %email,
-            collection = %collection.url,
-            scope = ?sync.scope,
-            changed = events.len(),
-            deleted = sync.deleted_urls.len(),
-            network_ms = collection_started.elapsed().as_millis() as u64,
-            "DAV collection delta fetched"
-        );
+        let changed = events.len();
+        let deleted = sync.deleted_urls.len();
+        let unchanged = changed == 0 && deleted == 0;
+        if unchanged {
+            tracing::debug!(
+                provider = "caldav",
+                account = %crate::logging::mask_email(email),
+                collection = %collection.url,
+                scope = ?sync.scope,
+                changed,
+                deleted,
+                network_ms = collection_started.elapsed().as_millis() as u64,
+                "DAV collection delta fetched"
+            );
+        } else {
+            tracing::info!(
+                provider = "caldav",
+                account = %crate::logging::mask_email(email),
+                collection = %collection.url,
+                scope = ?sync.scope,
+                changed,
+                deleted,
+                network_ms = collection_started.elapsed().as_millis() as u64,
+                "DAV collection delta fetched"
+            );
+        }
         calendars.push(DavCalendar {
             url: collection.url,
             name: collection.name,
@@ -1132,25 +1240,37 @@ pub async fn sync_yandex_dav(
             events,
         });
     }
-    let Some(card_xml) = dav_request_optional(
-        &client,
-        "PROPFIND",
-        &card_home,
-        "1",
-        COLLECTIONS_BODY,
-        email,
-        access_token,
-    )
-    .await?
+    Ok(calendars)
+}
+
+/// Промежуточный результат sync_contacts - отдельная структура, а не
+/// напрямую DavSyncResult, потому что в нём нет полей календаря.
+struct ContactsSyncOutcome {
+    contacts: Vec<DavContact>,
+    contact_collections: Vec<DavCollection>,
+    contacts_available: bool,
+    contacts_scope: SyncScope,
+    deleted_contact_urls: Vec<String>,
+}
+
+async fn sync_contacts(
+    client: &Client,
+    email: &str,
+    auth: &DavAuth,
+    card_base: &str,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<ContactsSyncOutcome> {
+    let card_home = discover_home(client, card_base, "addressbook-home-set", auth).await?;
+    let Some(card_xml) =
+        dav_request_optional(client, "PROPFIND", &card_home, "1", COLLECTIONS_BODY, auth).await?
     else {
-        return Ok(DavSyncResult {
-            calendars,
-            calendars_available: true,
+        // Часть серверов (например, Яндекс) создаёт CardDAV-книгу лениво -
+        // 404 здесь означает "адресной книги ещё нет", а не ошибку.
+        return Ok(ContactsSyncOutcome {
             contacts: Vec::new(),
             contact_collections: Vec::new(),
             contacts_available: false,
             contacts_scope: SyncScope::Unchanged,
-            contacts_sync_token: None,
             deleted_contact_urls: Vec::new(),
         });
     };
@@ -1181,18 +1301,16 @@ pub async fn sync_yandex_dav(
     for collection in discovered_addressbooks {
         let collection_started = std::time::Instant::now();
         let cursor = cursors.contact_collections.get(&collection.url);
-        let sync =
-            sync_collection_resources(&client, &collection, cursor, email, access_token).await?;
+        let sync = sync_collection_resources(client, &collection, cursor, auth).await?;
         collection_scopes.push(sync.scope);
         let deleted_count = sync.deleted_urls.len();
         deleted_contact_urls.extend(sync.deleted_urls);
         let changed_contacts: Vec<_> = multiget_changed(
-            &client,
+            client,
             &collection.url,
             &sync.changed,
             MultigetKind::AddressBook,
-            email,
-            access_token,
+            auth,
         )
         .await?
         .into_iter()
@@ -1201,16 +1319,32 @@ pub async fn sync_yandex_dav(
             parse_contact(raw, etag, remote_url)
         })
         .collect();
-        tracing::info!(
-            provider = "yandex-carddav",
-            account = %email,
-            collection = %collection.url,
-            scope = ?sync.scope,
-            changed = changed_contacts.len(),
-            deleted = deleted_count,
-            network_ms = collection_started.elapsed().as_millis() as u64,
-            "DAV collection delta fetched"
-        );
+        let changed = changed_contacts.len();
+        let deleted = deleted_count;
+        let unchanged = changed == 0 && deleted == 0;
+        if unchanged {
+            tracing::debug!(
+                provider = "carddav",
+                account = %crate::logging::mask_email(email),
+                collection = %collection.url,
+                scope = ?sync.scope,
+                changed,
+                deleted,
+                network_ms = collection_started.elapsed().as_millis() as u64,
+                "DAV collection delta fetched"
+            );
+        } else {
+            tracing::info!(
+                provider = "carddav",
+                account = %crate::logging::mask_email(email),
+                collection = %collection.url,
+                scope = ?sync.scope,
+                changed,
+                deleted,
+                network_ms = collection_started.elapsed().as_millis() as u64,
+                "DAV collection delta fetched"
+            );
+        }
         contacts.extend(changed_contacts);
         addressbooks.push(DavCollection {
             url: collection.url,
@@ -1236,21 +1370,76 @@ pub async fn sync_yandex_dav(
         // удалит контакты из другой, не изменившейся CardDAV-коллекции.
         SyncScope::Delta
     };
-    Ok(DavSyncResult {
-        calendars,
-        calendars_available: true,
+    Ok(ContactsSyncOutcome {
         contacts,
         contact_collections: addressbooks,
         contacts_available: true,
         contacts_scope,
-        contacts_sync_token: None,
         deleted_contact_urls,
+    })
+}
+
+/// Полная и инкрементальная синхронизация календарей и контактов по
+/// CalDAV/CardDAV для любого сервера, реализующего эти RFC (раньше эта
+/// функция называлась sync_yandex_dav и была жёстко привязана к адресам
+/// Яндекса). caldav_base/carddav_base опциональны: не у каждого сервера
+/// есть оба протокола (например, CardDAV может не поддерживаться), и в этом
+/// случае соответствующая часть просто не синхронизируется
+/// (calendars_available/contacts_available = false), а не считается
+/// ошибкой. Если не задан и не обнаружен ни один из адресов - синхронизация
+/// невозможна в принципе, это единственный настоящий сбой.
+pub async fn sync_dav_account(
+    email: &str,
+    auth: &DavAuth,
+    caldav_base: Option<&str>,
+    carddav_base: Option<&str>,
+    cursors: &AuxiliarySyncCursors,
+) -> Result<DavSyncResult> {
+    if caldav_base.is_none() && carddav_base.is_none() {
+        return Err(Error::AccountConfig(
+            "календарь для этого аккаунта не найден: адрес CalDAV/CardDAV не задан и не обнаружен автоматически".into(),
+        ));
+    }
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .map_err(|e| Error::Backend {
+            backend: "dav".into(),
+            message: e.to_string(),
+        })?;
+
+    let calendars = match caldav_base {
+        Some(cal_base) => sync_calendars(&client, email, auth, cal_base, cursors).await?,
+        None => Vec::new(),
+    };
+
+    let contacts = match carddav_base {
+        Some(card_base) => sync_contacts(&client, email, auth, card_base, cursors).await?,
+        None => ContactsSyncOutcome {
+            contacts: Vec::new(),
+            contact_collections: Vec::new(),
+            contacts_available: false,
+            contacts_scope: SyncScope::Unchanged,
+            deleted_contact_urls: Vec::new(),
+        },
+    };
+
+    Ok(DavSyncResult {
+        calendars,
+        calendars_available: caldav_base.is_some(),
+        contacts: contacts.contacts,
+        contact_collections: contacts.contact_collections,
+        contacts_available: contacts.contacts_available,
+        contacts_scope: contacts.contacts_scope,
+        contacts_sync_token: None,
+        deleted_contact_urls: contacts.deleted_contact_urls,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, response::Redirect, routing::get};
 
     #[test]
     fn parses_every_vevent_and_recurrence_override() {
@@ -1440,5 +1629,105 @@ mod tests {
         let xml = r#"<d:error xmlns:d="DAV:"><d:valid-sync-token/></d:error>"#;
         assert!(response_has_element(xml, "valid-sync-token"));
         assert!(!response_has_element(xml, "supported-report"));
+    }
+
+    #[test]
+    fn picks_dav_auth_scheme_by_provider_and_auth_kind() {
+        // Яндекс - особый случай независимо от auth_kind: токен всегда через
+        // Basic, никогда через Bearer, т.к. его DAV-серверы Bearer не понимают.
+        assert_eq!(
+            dav_auth_scheme(Provider::Yandex, AuthKind::Oauth2),
+            DavAuthScheme::BasicToken
+        );
+        // Остальные OAuth2-провайдеры (например, Outlook) - стандартный Bearer.
+        assert_eq!(
+            dav_auth_scheme(Provider::Outlook, AuthKind::Oauth2),
+            DavAuthScheme::Bearer
+        );
+        // Password/AppPassword у любого не-Яндекс провайдера - обычный Basic
+        // с логином и секретом из keychain (iCloud, Mail.ru, generic-серверы).
+        assert_eq!(
+            dav_auth_scheme(Provider::Icloud, AuthKind::AppPassword),
+            DavAuthScheme::BasicPassword
+        );
+        assert_eq!(
+            dav_auth_scheme(Provider::Mailru, AuthKind::AppPassword),
+            DavAuthScheme::BasicPassword
+        );
+        assert_eq!(
+            dav_auth_scheme(Provider::Generic, AuthKind::Password),
+            DavAuthScheme::BasicPassword
+        );
+    }
+
+    #[test]
+    fn yandex_keeps_default_bases_when_account_has_none_configured() {
+        // Без обнаружения и без ручной настройки - те же адреса, что были
+        // жёстко зашиты раньше. Обобщение DAV на остальных провайдеров не
+        // должно ничего сломать для Яндекса.
+        let (cal, card) = resolve_yandex_bases(None, None);
+        assert_eq!(cal, YANDEX_CALDAV_BASE);
+        assert_eq!(card, YANDEX_CARDDAV_BASE);
+
+        // Если на аккаунте уже сохранён свой адрес (например, задан вручную) -
+        // используется именно он, дефолт не перетирает явную настройку.
+        let (cal, card) = resolve_yandex_bases(Some("https://custom.test/dav/"), None);
+        assert_eq!(cal, "https://custom.test/dav/");
+        assert_eq!(card, YANDEX_CARDDAV_BASE);
+    }
+
+    #[tokio::test]
+    async fn sync_dav_account_without_any_base_fails_clearly_instead_of_panicking() {
+        let auth = DavAuth::new(DavAuthScheme::BasicPassword, "user@example.test", "secret");
+        let error = sync_dav_account(
+            "user@example.test",
+            &auth,
+            None,
+            None,
+            &AuxiliarySyncCursors::default(),
+        )
+        .await
+        .expect_err("both bases missing must be a clear config error, not a panic or silent no-op");
+        assert!(
+            matches!(&error, Error::AccountConfig(message) if message.contains("не найден")),
+            "unexpected error: {error}"
+        );
+    }
+
+    async fn well_known_redirect() -> Redirect {
+        Redirect::permanent("/dav/principal/")
+    }
+
+    #[tokio::test]
+    async fn resolves_well_known_redirect_to_the_real_dav_base() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(WELL_KNOWN_CALDAV, get(well_known_redirect));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let discovered = discover_well_known(&origin, WELL_KNOWN_CALDAV).await;
+
+        server.abort();
+        assert_eq!(discovered.as_deref(), Some(format!("{origin}/dav/principal/").as_str()));
+    }
+
+    #[tokio::test]
+    async fn well_known_without_redirect_or_success_yields_no_discovery() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        // Ни одного маршрута не зарегистрировано - сервер отвечает 404, что не
+        // является ни редиректом, ни успехом; discover_well_known должен
+        // вернуть None, а не запаниковать или зациклиться.
+        let app = Router::new();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let discovered = discover_well_known(&origin, WELL_KNOWN_CALDAV).await;
+
+        server.abort();
+        assert!(discovered.is_none());
     }
 }

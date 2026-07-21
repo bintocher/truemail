@@ -347,6 +347,55 @@ fn google_partstat(value: &str) -> String {
     .into()
 }
 
+/// Минимальное представление отменённой встречи Google. При delta-синхронизации
+/// Google присылает такое событие огрызком - заполнен только id (иногда ещё
+/// recurringEventId/originalStartTime), а summary и start отсутствуют. Пустые
+/// summary/dtstart - намеренный сигнал для save_auxiliary_data: оно подставит
+/// прежние значения из БД вместо того, чтобы затереть их пустотой (см. задачу A
+/// в crates/core/src/storage/repo.rs).
+fn cancelled_google_event(event: GoogleEvent) -> DavEvent {
+    let uid = event
+        .recurring_event_id
+        .clone()
+        .unwrap_or_else(|| event.id.clone());
+    let dtstart = event
+        .start
+        .as_ref()
+        .and_then(GoogleDateTime::value)
+        .unwrap_or_default();
+    let recurrence_id = event
+        .original_start_time
+        .as_ref()
+        .and_then(GoogleDateTime::value);
+    let sequence = event.sequence.unwrap_or(0);
+    let raw = serde_json::to_string(&event).unwrap_or_default();
+    DavEvent {
+        remote_url: Some(format!("google-event:{}", event.id)),
+        uid,
+        summary: event.summary.unwrap_or_default(),
+        description: event.description,
+        location: event.location,
+        dtstart,
+        dtend: event.end.and_then(|value| value.value()),
+        rrule: None,
+        recurrence_id,
+        exdates: None,
+        rdates: None,
+        status: Some("CANCELLED".into()),
+        attendees: Vec::new(),
+        alarms: Vec::new(),
+        timezone: None,
+        transp: None,
+        class: None,
+        categories: Vec::new(),
+        url: None,
+        organizer: None,
+        sequence,
+        raw,
+        etag: event.etag,
+    }
+}
+
 fn event_from_google(event: GoogleEvent, default_reminders: &[GoogleReminder]) -> Option<DavEvent> {
     let start = event.start.as_ref().and_then(GoogleDateTime::value)?;
     let uid = event
@@ -478,7 +527,13 @@ async fn fetch_calendars(
             let mut rebaseline_after_expired = false;
             let (events, deleted_event_urls, sync_token, sync_scope) = 'retry: loop {
                 let mut events = Vec::new();
-                let mut deleted_event_urls = Vec::new();
+                // Google больше не шлёт отменённые события через deleted_event_urls
+                // (см. классификацию status == "cancelled" ниже) - но переменная
+                // остаётся: провайдер физически удалённых событий не отличает от
+                // отменённых, поэтому showDeleted=true формально может прислать и
+                // настоящее удаление resourceId без событий. На практике Google
+                // Calendar API отдаёт такие случаи тем же cancelled-огрызком.
+                let deleted_event_urls: Vec<String> = Vec::new();
                 let mut event_page_token: Option<String> = None;
                 loop {
                     let mut events_url =
@@ -528,7 +583,14 @@ async fn fetch_calendars(
                         match serde_json::from_value::<GoogleEvent>(raw_event) {
                             Ok(event) => {
                                 if event.status.as_deref() == Some("cancelled") {
-                                    deleted_event_urls.push(format!("google-event:{}", event.id));
+                                    // Отменённая встреча остаётся в календаре
+                                    // со статусом cancelled, а не удаляется
+                                    // (продуктовое решение). Google отдаёт
+                                    // такое событие огрызком без start/summary,
+                                    // поэтому обычный event_from_google для
+                                    // него не годится - у него dtstart
+                                    // обязателен.
+                                    events.push(cancelled_google_event(event));
                                 } else if let Some(event) =
                                     event_from_google(event, &calendar.default_reminders)
                                 {
@@ -570,14 +632,27 @@ async fn fetch_calendars(
                     }
                 }
             };
-            tracing::info!(
-                provider = "google-calendar",
-                collection = %source_url,
-                scope = ?sync_scope,
-                changed = events.len(),
-                deleted = deleted_event_urls.len(),
-                "Google Calendar collection delta fetched"
-            );
+            let changed = events.len();
+            let deleted = deleted_event_urls.len();
+            if changed == 0 && deleted == 0 {
+                tracing::debug!(
+                    provider = "google-calendar",
+                    collection = %source_url,
+                    scope = ?sync_scope,
+                    changed,
+                    deleted,
+                    "Google Calendar collection delta fetched"
+                );
+            } else {
+                tracing::info!(
+                    provider = "google-calendar",
+                    collection = %source_url,
+                    scope = ?sync_scope,
+                    changed,
+                    deleted,
+                    "Google Calendar collection delta fetched"
+                );
+            }
             calendars.push(DavCalendar {
                 url: source_url,
                 name: calendar.summary,
@@ -854,14 +929,27 @@ async fn fetch_task_calendars(
                         .unwrap_or_else(|| next_updated_min.clone())
                 },
             };
-            tracing::info!(
-                provider = "google-tasks",
-                collection = %source_url,
-                scope = if full_reconciliation { "full" } else { "delta" },
-                changed = events_by_url.len(),
-                deleted = deleted_event_urls.len(),
-                "Google Tasks collection delta fetched"
-            );
+            let changed = events_by_url.len();
+            let deleted = deleted_event_urls.len();
+            if changed == 0 && deleted == 0 {
+                tracing::debug!(
+                    provider = "google-tasks",
+                    collection = %source_url,
+                    scope = if full_reconciliation { "full" } else { "delta" },
+                    changed,
+                    deleted,
+                    "Google Tasks collection delta fetched"
+                );
+            } else {
+                tracing::info!(
+                    provider = "google-tasks",
+                    collection = %source_url,
+                    scope = if full_reconciliation { "full" } else { "delta" },
+                    changed,
+                    deleted,
+                    "Google Tasks collection delta fetched"
+                );
+            }
             calendars.push(DavCalendar {
                 url: source_url,
                 name: format!("Google Tasks · {}", list.title),
