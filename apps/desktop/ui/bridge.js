@@ -114,8 +114,16 @@
     checkForUpdate: () => invoke("check_for_update"),
     installUpdate: () => invoke("install_update"),
   };
+  // Проверка обновлений идёт по кругу каждые 6 часов, и без этой памяти одно
+  // и то же предложение всплывало бы снова и снова, пока пользователь не
+  // обновится. Помним версию, а не факт показа: на следующую версию тост
+  // появится опять. Память живёт в сессии - после перезапуска напомнить один
+  // раз уместно.
+  let offeredVersion = null;
   const offerUpdate = info => {
     if (!info?.available_version) return;
+    if (offeredVersion === info.available_version) return;
+    offeredVersion = info.available_version;
     const message = wizardLocale === "en" ? `truemail ${info.available_version} is available` : `Доступен truemail ${info.available_version}`;
     showToast(message, L("Обновить", "Update"), async () => {
       const status = document.getElementById("updateStatus");
