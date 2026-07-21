@@ -410,6 +410,7 @@ pub async fn discover_well_known(origin: &str, path: &str) -> Option<String> {
         .build()
         .ok()?;
     let mut current = format!("{origin}{path}");
+    let mut redirected = false;
     for _ in 0..5 {
         let response = client.get(&current).send().await.ok()?;
         let status = response.status();
@@ -421,9 +422,21 @@ pub async fn discover_well_known(origin: &str, path: &str) -> Option<String> {
                 .ok()?
                 .to_owned();
             current = resolve(&current, &location).ok()?;
+            redirected = true;
             continue;
         }
-        return status.is_success().then_some(current);
+        // Редирект с .well-known и есть ответ сервера на вопрос "где твой DAV"
+        // (RFC 6764, раздел 5) - дальше идёт PROPFIND с авторизацией, а GET
+        // сюда никто не обещал обслуживать. Требовать от цели успешного GET
+        // нельзя: iCloud и Fastmail отвечают на неавторизованный запрос 401,
+        // Radicale - 405, и discovery ломался бы ровно там, где нужен.
+        // Если же редиректа не было вовсе, .well-known должен отдать сам себя
+        // осмысленно - иначе это сервер без поддержки discovery.
+        return (redirected
+            || status.is_success()
+            || status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::METHOD_NOT_ALLOWED)
+            .then_some(current);
     }
     None
 }
@@ -1745,5 +1758,29 @@ mod tests {
 
         server.abort();
         assert!(discovered.is_none());
+    }
+
+    #[tokio::test]
+    async fn well_known_answering_unauthorized_still_counts_as_discovery() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        // Так отвечают iCloud и Fastmail на GET без авторизации. Ресурс есть,
+        // просто он закрыт - discovery обязано его принять, иначе подключение
+        // к этим провайдерам не состоится вовсе.
+        let app = Router::new().route(
+            WELL_KNOWN_CALDAV,
+            get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let discovered = discover_well_known(&origin, WELL_KNOWN_CALDAV).await;
+
+        server.abort();
+        assert_eq!(
+            discovered.as_deref(),
+            Some(format!("{origin}{WELL_KNOWN_CALDAV}").as_str())
+        );
     }
 }
