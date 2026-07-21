@@ -7,6 +7,34 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-21
+
+### Added
+
+- Postal addresses for contacts: model, storage, card and edit form,
+  synchronization with CardDAV (`ADR`), Exchange
+  (`contacts:PhysicalAddress:*`) and Google People.
+- Recurring Exchange events are read and written: daily, weekly, monthly and
+  yearly rules (including relative ones such as "second Tuesday"), with
+  `UNTIL` and `COUNT` bounds. Dropping the recurrence clears it on the server
+  through `DeleteItemField`.
+- CalDAV/CardDAV discovery through DNS SRV records (RFC 6764), including the
+  `path=` hint from TXT.
+- The Windows build now runs on PowerShell 7.
+
+### Fixed
+
+- The address book stopped at 500 contacts: the hard `LIMIT 500` is gone and
+  emails, phones and addresses are read with four queries instead of `1 + 3N`.
+- Phones and addresses removed from a contact stayed on the Exchange server;
+  they are now deleted through `DeleteItemField`.
+- The update prompt repeated every 6 hours for the same version.
+
+### Security
+
+- An SRV target is accepted only inside the mail domain: DNS without DNSSEC
+  can be spoofed in transit, and the password is sent to that address next.
+
 ## [0.1.4] - 2026-07-21
 
 ### Added
