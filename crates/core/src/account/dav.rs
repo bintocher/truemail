@@ -1,10 +1,12 @@
 //! Полная и инкрементальная синхронизация календарей и контактов по
 //! CalDAV/CardDAV и WebDAV Sync (RFC 6578). Работает с любым сервером,
 //! реализующим эти RFC, а не только с Яндексом: адреса серверов приходят
-//! параметром (заданы вручную или найдены через RFC 6764, см.
-//! discover_well_known), а схема авторизации выбирается через DavAuth.
+//! параметром (заданы вручную или найдены через RFC 6764 - SRV-записи в
+//! discover_srv, .well-known-редирект в discover_well_known), а схема
+//! авторизации выбирается через DavAuth.
 use crate::model::{Alarm, Attendee, AuthKind, ContactPhone, Provider, clean_contact_name};
 use crate::{Error, Result};
+use hickory_resolver::proto::rr::RData;
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
 use std::collections::{HashMap, HashSet};
@@ -20,6 +22,19 @@ pub const YANDEX_CARDDAV_BASE: &str = "https://carddav.yandex.ru/";
 /// RFC 6764: стандартные пути обнаружения адреса CalDAV/CardDAV на домене.
 pub const WELL_KNOWN_CALDAV: &str = "/.well-known/caldav";
 pub const WELL_KNOWN_CARDDAV: &str = "/.well-known/carddav";
+
+/// RFC 6764, раздел 3: имена SRV-сервисов для обнаружения DAV по DNS.
+/// Берём только TLS-варианты: незашифрованные _caldav._tcp/_carddav._tcp
+/// увели бы нас на http, а по http мы не ходим вовсе - там уходит
+/// Authorization с паролем или OAuth-токеном.
+pub const SRV_CALDAVS: &str = "_caldavs._tcp";
+pub const SRV_CARDDAVS: &str = "_carddavs._tcp";
+
+/// Потолок ожидания одного DNS-запроса. Обнаружение через SRV - механизм
+/// опциональный и стоит в цепочке перед остальными источниками, поэтому
+/// зависший или молчащий резолвер не должен задерживать подключение больше
+/// чем на несколько секунд: лучше пойти дальше по цепочке, чем ждать.
+const DNS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Подставить известные адреса Яндекса там, где на аккаунте своих ещё нет.
 /// Вынесено в чистую функцию, чтобы не тянуть Account/AccountManager ради
@@ -397,12 +412,10 @@ pub async fn validate_dav(auth: &DavAuth, caldav_base: &str, carddav_base: &str)
 /// отдельным параметром (а не захардкожен как https://) для тестируемости
 /// на локальном mock-сервере по http.
 ///
-/// SRV-записи (_caldavs._tcp/_carddavs._tcp, тоже часть RFC 6764) НЕ
-/// проверяются: для них нужен отдельный DNS-резолвер с поддержкой SRV,
-/// которого нет среди зависимостей (обычный резолвер ОС SRV не отдаёт), а
-/// well-known-редирект уже покрывает iCloud, Mail.ru, Fastmail и
-/// подавляющее большинство self-hosted серверов (Radicale, Baïkal, Nextcloud
-/// и т.п.). Если в будущем понадобится - это отдельная точка расширения.
+/// Дополняется обнаружением через SRV-записи (см. discover_srv), которое
+/// идёт раньше: well-known работает только если DAV живёт на том же хосте,
+/// что и веб-сайт домена, а SRV позволяет владельцу домена явно указать
+/// чужой хост и нестандартный порт.
 pub async fn discover_well_known(origin: &str, path: &str) -> Option<String> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -439,6 +452,212 @@ pub async fn discover_well_known(origin: &str, path: &str) -> Option<String> {
             .then_some(current);
     }
     None
+}
+
+/// Кандидат из SRV-записи, приведённый к тому, что нам реально нужно:
+/// хост без завершающей точки, порт и поля выбора. Отдельный тип, а не
+/// hickory-шный SRV, чтобы выбор записи и сборка URL были чистыми функциями
+/// и тестировались без DNS и без сети.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SrvTarget {
+    host: String,
+    port: u16,
+    priority: u16,
+    weight: u16,
+}
+
+/// Какой .well-known путь спрашивать у хоста, найденного через SRV, если у
+/// него нет TXT-записи с путём. Пара service -> path зафиксирована RFC 6764
+/// и не выводится алгоритмически, поэтому это явный матч; неизвестный
+/// сервис (в т.ч. нешифрованные _caldav/_carddav) осознанно не
+/// поддерживается.
+fn well_known_for_service(service: &str) -> Option<&'static str> {
+    match service {
+        SRV_CALDAVS => Some(WELL_KNOWN_CALDAV),
+        SRV_CARDDAVS => Some(WELL_KNOWN_CARDDAV),
+        _ => None,
+    }
+}
+
+/// Выбрать одну запись из набора SRV. RFC 2782 требует случайного выбора
+/// внутри одного приоритета пропорционально весу; здесь выбор сделан
+/// детерминированным (наименьший priority, при равенстве - наибольший
+/// weight, при полном равенстве - лексикографически меньший host:port).
+/// Причина: балансировка нагрузки нам не нужна - к DAV ходит один клиент,
+/// и стабильный выбор важнее, потому что найденный базовый URL сохраняется
+/// на аккаунте, а прыгающий между синхронизациями адрес означал бы
+/// бессмысленную перезапись настроек и разъезжающиеся sync-token/ctag.
+/// Записи с target "." (RFC 2782: сервис на домене не предоставляется) и с
+/// нулевым портом отбрасываются.
+fn pick_srv_target(records: &[SrvTarget]) -> Option<SrvTarget> {
+    records
+        .iter()
+        .filter(|record| !record.host.is_empty() && record.host != "." && record.port != 0)
+        .min_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then(right.weight.cmp(&left.weight))
+                .then(left.host.cmp(&right.host))
+                .then(left.port.cmp(&right.port))
+        })
+        .cloned()
+}
+
+/// Разобрать TXT-запись имени сервиса (RFC 6764, раздел 6): её содержимое -
+/// key=value пары в формате RFC 6763, из которых нас интересует только
+/// "path=/dav/" - путь контекста DAV на найденном хосте. TXT-запись может
+/// приходить несколькими character-string, поэтому на вход идёт срез строк,
+/// а не одна строка. Регистр ключа игнорируется, значение без ведущего
+/// слэша нормализуется - серверы пишут и "path=/dav/", и "path=dav/".
+fn parse_srv_txt_path(chunks: &[String]) -> Option<String> {
+    chunks
+        .iter()
+        .flat_map(|chunk| chunk.split_whitespace())
+        .find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            key.trim().eq_ignore_ascii_case("path").then_some(())?;
+            let value = value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            Some(if value.starts_with('/') {
+                value.to_owned()
+            } else {
+                format!("/{value}")
+            })
+        })
+}
+
+/// Схема+хост(+порт) найденного через SRV сервера. Порт 443 в URL не
+/// указываем: для https он подразумевается, а лишний ":443" сделал бы
+/// сохранённый на аккаунте адрес отличным от того же адреса, полученного
+/// через .well-known, и разные ветки обнаружения давали бы разные строки на
+/// один и тот же сервер.
+fn srv_origin(host: &str, port: u16) -> String {
+    if port == 443 {
+        format!("https://{host}")
+    } else {
+        format!("https://{host}:{port}")
+    }
+}
+
+/// Принадлежит ли цель SRV тому же домену, что и адрес почты.
+///
+/// Проверка обязательна, потому что дальше по этому адресу уходит пароль
+/// пользователя (DavAuthScheme::BasicPassword - это логин и пароль в
+/// заголовке). SRV читается из обычного DNS без DNSSEC, то есть его может
+/// подменить кто угодно на пути: провайдер, чужая точка доступа, отравленный
+/// кэш. Без этой проверки одна подделанная запись увела бы учётные данные на
+/// сервер злоумышленника, причём молча - подключение выглядело бы удачным.
+/// У .well-known такой проблемы нет: там адрес и есть домен из почты.
+///
+/// Плата за это - домены, у которых DAV вынесен к стороннему хостеру
+/// (mail.example.com -> dav.provider.net), через SRV не определятся. Такие
+/// случаи закрываются ручным вводом адреса в настройках аккаунта, и это
+/// честный размен: потерянное удобство против утечки пароля.
+fn srv_target_is_trusted(host: &str, domain: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let domain = domain.trim_matches('.').to_ascii_lowercase();
+    if host.is_empty() || domain.is_empty() {
+        return false;
+    }
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// Базовый URL DAV из хоста, порта и пути контекста, взятого из TXT.
+fn srv_base_url(host: &str, port: u16, path: &str) -> String {
+    let origin = srv_origin(host, port);
+    format!("{origin}{path}")
+}
+
+/// RFC 6764: обнаружение базового адреса CalDAV/CardDAV через DNS.
+/// `service` - это SRV_CALDAVS или SRV_CARDDAVS, `domain` - домен из адреса
+/// почты. Порядок действий по разделу 6 стандарта: SRV даёт хост и порт,
+/// затем TXT того же имени может дать путь контекста ("path=/dav/"). Если
+/// TXT нет - путь спрашиваем у самого найденного хоста через .well-known,
+/// потому что SRV сообщает только транспорт, но не место коллекций.
+///
+/// Никогда не возвращает ошибку: DNS может быть недоступен, перехвачен
+/// провайдером или просто не содержать записей - это нормальное состояние,
+/// а не сбой подключения.
+pub async fn discover_srv(domain: &str, service: &str) -> Option<String> {
+    let well_known = well_known_for_service(service)?;
+    let domain = domain.trim().trim_matches('.');
+    if domain.is_empty() {
+        return None;
+    }
+    // Завершающая точка делает имя полностью квалифицированным: без неё
+    // резолвер перебирал бы ещё и search-домены системы, что и медленнее, и
+    // может подсунуть чужой DAV из корпоративного search-суффикса.
+    let name = format!("{service}.{domain}.");
+
+    // Любая неудача ниже (нет резолвера, NXDOMAIN, таймаут, мусор в ответе)
+    // гасится в None: SRV-обнаружение опционально и обязано просто передать
+    // ход следующему источнику в цепочке, а не сорвать подключение.
+    let resolver = hickory_resolver::Resolver::builder_tokio()
+        .ok()?
+        .build()
+        .ok()?;
+
+    let srv_answers = tokio::time::timeout(DNS_TIMEOUT, resolver.srv_lookup(name.clone()))
+        .await
+        .ok()?
+        .ok()?;
+    let targets = srv_answers
+        .answers()
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::SRV(srv) => Some(SrvTarget {
+                host: srv.target.to_utf8().trim_end_matches('.').to_owned(),
+                port: srv.port,
+                priority: srv.priority,
+                weight: srv.weight,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let target = pick_srv_target(&targets)?;
+    if !srv_target_is_trusted(&target.host, domain) {
+        // Отказ логируем: молчаливое игнорирование выглядело бы как "SRV не
+        // настроен", и владелец домена искал бы ошибку не там.
+        tracing::warn!(
+            service,
+            domain,
+            target = %target.host,
+            "SRV указывает на хост вне домена почты - пропускаем, чтобы не отправить учётные данные чужому серверу"
+        );
+        return None;
+    }
+
+    // Отсутствие TXT - штатный случай (RFC 6764 делает её необязательной),
+    // поэтому здесь ошибка резолва не прерывает обнаружение, а превращается
+    // в пустой список и уводит в ветку с .well-known.
+    let chunks = match tokio::time::timeout(DNS_TIMEOUT, resolver.txt_lookup(name)).await {
+        Ok(Ok(txt_answers)) => txt_answers
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::TXT(txt) => Some(txt),
+                _ => None,
+            })
+            .flat_map(|txt| {
+                txt.txt_data
+                    .iter()
+                    .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
+    let base = match parse_srv_txt_path(&chunks) {
+        Some(path) => srv_base_url(&target.host, target.port, &path),
+        // TXT нет - у найденного хоста ещё есть шанс ответить редиректом на
+        // свой .well-known. Спрашиваем именно найденный хост, а не домен
+        // почты: SRV для того и существует, что DAV живёт не там, где сайт.
+        None => discover_well_known(&srv_origin(&target.host, target.port), well_known).await?,
+    };
+    tracing::debug!(service, domain, %base, "DAV обнаружен через SRV");
+    Some(base)
 }
 
 fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<(String, Option<String>, String)>> {
@@ -1718,6 +1937,129 @@ mod tests {
             matches!(&error, Error::AccountConfig(message) if message.contains("не найден")),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn reads_context_path_from_srv_txt_record() {
+        // Каноническая форма из RFC 6764, раздел 6.
+        assert_eq!(
+            parse_srv_txt_path(&["path=/dav/".to_owned()]).as_deref(),
+            Some("/dav/")
+        );
+        // Несколько key=value в одной записи: берём только path, остальное
+        // (RFC 6763 разрешает произвольные ключи) игнорируем.
+        assert_eq!(
+            parse_srv_txt_path(&["ttl=3600 path=/caldav/user/".to_owned()]).as_deref(),
+            Some("/caldav/user/")
+        );
+        // TXT приходит несколькими character-string - path может быть в любой.
+        assert_eq!(
+            parse_srv_txt_path(&["v=1".to_owned(), "PATH=dav".to_owned()]).as_deref(),
+            Some("/dav")
+        );
+        // Ни пустое значение, ни отсутствие ключа не должны давать путь -
+        // иначе получился бы URL вида "https://host" без пути контекста,
+        // который сервер не обязан обслуживать.
+        assert!(parse_srv_txt_path(&["path=".to_owned()]).is_none());
+        assert!(parse_srv_txt_path(&["v=spf1 -all".to_owned()]).is_none());
+        assert!(parse_srv_txt_path(&[]).is_none());
+    }
+
+    #[test]
+    fn picks_lowest_priority_then_highest_weight_srv_record() {
+        let record = |host: &str, port, priority, weight| SrvTarget {
+            host: host.to_owned(),
+            port,
+            priority,
+            weight,
+        };
+        let records = [
+            record("backup.dav.test", 443, 20, 100),
+            record("light.dav.test", 443, 10, 1),
+            record("main.dav.test", 8443, 10, 50),
+        ];
+        let picked = pick_srv_target(&records).expect("есть пригодная запись");
+        assert_eq!(picked.host, "main.dav.test");
+        assert_eq!(picked.port, 8443);
+
+        // RFC 2782: target "." означает, что сервис на домене не
+        // предоставляется; нулевой порт бессмыслен. Обе записи должны быть
+        // отброшены, а не превращены в неработающий URL.
+        assert!(pick_srv_target(&[record(".", 443, 0, 0)]).is_none());
+        assert!(pick_srv_target(&[record("dav.test", 0, 0, 0)]).is_none());
+        assert!(pick_srv_target(&[]).is_none());
+
+        // При полном равенстве priority и weight выбор обязан быть
+        // детерминированным: найденный адрес сохраняется на аккаунте, и
+        // прыгающий между синхронизациями хост означал бы бессмысленную
+        // перезапись настроек.
+        let tie = [
+            record("b.dav.test", 443, 0, 0),
+            record("a.dav.test", 443, 0, 0),
+        ];
+        assert_eq!(
+            pick_srv_target(&tie).map(|target| target.host),
+            Some("a.dav.test".to_owned())
+        );
+    }
+
+    #[test]
+    fn builds_https_base_url_omitting_the_implied_port_443() {
+        assert_eq!(
+            srv_base_url("dav.example.test", 443, "/dav/"),
+            "https://dav.example.test/dav/"
+        );
+        assert_eq!(
+            srv_base_url("dav.example.test", 8443, "/dav/"),
+            "https://dav.example.test:8443/dav/"
+        );
+        // Origin без пути нужен для ветки "TXT нет, спрашиваем .well-known
+        // у найденного хоста" - там тоже нельзя приписывать :443.
+        assert_eq!(
+            srv_origin("dav.example.test", 443),
+            "https://dav.example.test"
+        );
+        assert_eq!(
+            srv_origin("dav.example.test", 8443),
+            "https://dav.example.test:8443"
+        );
+    }
+
+    #[test]
+    fn maps_only_tls_srv_services_to_well_known_paths() {
+        assert_eq!(well_known_for_service(SRV_CALDAVS), Some(WELL_KNOWN_CALDAV));
+        assert_eq!(
+            well_known_for_service(SRV_CARDDAVS),
+            Some(WELL_KNOWN_CARDDAV)
+        );
+        // Нешифрованные варианты не поддерживаются осознанно: по http ушли бы
+        // Authorization с паролем или OAuth-токеном.
+        assert!(well_known_for_service("_caldav._tcp").is_none());
+    }
+
+    #[tokio::test]
+    async fn srv_discovery_rejects_useless_input_before_touching_dns() {
+        // Пустой домен и неподдерживаемый сервис отсекаются до создания
+        // резолвера, поэтому тест не ходит в сеть. Результат - None, а не
+        // ошибка: обнаружение через SRV опционально и обязано передавать ход
+        // дальше по цепочке источников.
+        assert!(discover_srv("", SRV_CALDAVS).await.is_none());
+        assert!(discover_srv("   ", SRV_CALDAVS).await.is_none());
+        assert!(discover_srv("example.test", "_caldav._tcp").await.is_none());
+    }
+
+    #[test]
+    fn srv_target_outside_the_mail_domain_is_not_trusted() {
+        assert!(srv_target_is_trusted("example.test", "example.test"));
+        assert!(srv_target_is_trusted("dav.example.test.", "example.test"));
+        assert!(srv_target_is_trusted("DAV.Example.Test", "example.test"));
+        // Подделанная запись уводит на чужой сервер, куда ушёл бы пароль.
+        assert!(!srv_target_is_trusted("evil.test", "example.test"));
+        // Классическая уловка: чужой домен, оканчивающийся на наш как на суффикс
+        // без разделяющей точки.
+        assert!(!srv_target_is_trusted("notexample.test", "example.test"));
+        assert!(!srv_target_is_trusted("", "example.test"));
+        assert!(!srv_target_is_trusted("example.test", ""));
     }
 
     async fn well_known_redirect() -> Redirect {

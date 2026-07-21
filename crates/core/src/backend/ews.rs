@@ -863,10 +863,12 @@ impl EwsBackend {
     /// Создать событие в календаре Exchange. SendMeetingInvitations решает,
     /// рассылать ли приглашения участникам: если их нет - SendToNone (обычная
     /// запись в календаре без встречи), если есть - SendToAllAndSaveCopy.
-    /// Повторяемость (RRULE) не поддержана: EWS описывает её отдельным типом
-    /// Recurrence с десятком вариантов паттерна (Daily/Weekly/.../Yearly, у
-    /// каждого свой набор полей), адекватный маппинг из RFC5545 RRULE не влез
-    /// в объём этой задачи - событие создаётся одиночным, без повторения.
+    /// Повторяемость (RRULE) переносится в элемент Recurrence: поддержаны
+    /// паттерны Daily/Weekly/AbsoluteMonthly/RelativeMonthly/AbsoluteYearly/
+    /// RelativeYearly и все три вида диапазона (бесконечный, до даты, по числу
+    /// повторений). Правило, которое схема EWS выразить не может, не отправляем
+    /// вовсе: событие создаётся одиночным с предупреждением в лог, зато
+    /// сохранение не падает - подробнее в recurrence_xml.
     pub async fn create_calendar_item(&self, password: &str, input: &EventInput) -> Result<String> {
         let body = create_calendar_item_body(input)?;
         let response = self.soap(password, "CreateItem", &body).await?;
@@ -877,15 +879,50 @@ impl EwsBackend {
     /// что и у respond_to_calendar_item/apply_operation), каждое поле - в
     /// своём SetItemField, поэтому порядок между ними не важен (важен только
     /// порядок полей внутри одного CalendarItem, а тут в каждом ровно одно).
+    ///
+    /// Заодно спрашиваем, повторяется ли событие сейчас на сервере. Это нужно
+    /// для случая "пользователь снял повторение": отсутствие поля в Updates
+    /// означает "не менять", то есть серия уцелела бы, а человек видел бы у
+    /// себя одиночную встречу - расхождение, которое обнаружится только на
+    /// следующей синхронизации. Стирание в EWS - отдельный DeleteItemField, и
+    /// слать его вслепую нельзя: на неповторяющемся событии Exchange отвечает
+    /// ошибкой. Поэтому сначала IsRecurring, и удаление уходит, только если
+    /// повторение там действительно есть.
     pub async fn update_calendar_item(
         &self,
         password: &str,
         item_id: &str,
         input: &EventInput,
     ) -> Result<()> {
-        let change_key = self.item_change_key(password, item_id).await?;
-        let body = update_calendar_item_body(item_id, &change_key, input)?;
+        let (change_key, was_recurring) = self.calendar_item_state(password, item_id).await?;
+        let body = update_calendar_item_body(item_id, &change_key, input, was_recurring)?;
         self.soap(password, "UpdateItem", &body).await.map(|_| ())
+    }
+
+    /// ChangeKey события и признак того, что на сервере это серия. Один GetItem
+    /// вместо прежнего item_change_key - лишнего обращения не появилось.
+    async fn calendar_item_state(&self, password: &str, item_id: &str) -> Result<(String, bool)> {
+        let body = format!(
+            r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="calendar:IsRecurring"/></t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:GetItem>"#,
+            escape(item_id)
+        );
+        let response = self.soap(password, "GetItem", &body).await?;
+        let document = Document::parse(&response).map_err(|error| backend_error("xml", error))?;
+        let change_key = document
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+            .and_then(|node| node.attribute("ChangeKey"))
+            .map(str::to_owned)
+            .ok_or_else(|| backend_error("item", "Exchange не вернул ChangeKey события"))?;
+        // Свойства нет у события, созданного не как встреча - считаем такое
+        // одиночным: лишний DeleteItemField хуже пропущенного, он сорвал бы
+        // сохранение целиком.
+        let was_recurring = document
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "IsRecurring")
+            .and_then(|node| node.text())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+        Ok((change_key, was_recurring))
     }
 
     /// Удалить событие. SendMeetingCancellations обязателен для CalendarItem
@@ -911,18 +948,49 @@ impl EwsBackend {
     /// EWS, для них плоский FieldURI не годится, нужен IndexedFieldURI на
     /// конкретную запись (contacts:EmailAddress/EmailAddress1..3,
     /// contacts:PhoneNumber/MobilePhone|BusinessPhone|...) - см.
-    /// contact_item_updates. Убранные из формы адрес/телефон эти
-    /// SetItemField не удаляют - для этого нужен отдельный DeleteItemField
-    /// по индексу, который здесь не реализован.
+    /// contact_item_updates.
+    ///
+    /// SetItemField задаёт значение, но убранную запись не стирает: если
+    /// пользователь удалил телефон, соответствующий ключ просто не попадает в
+    /// Updates, и на сервере остаётся прежнее значение. Стирание в EWS - это
+    /// отдельный DeleteItemField с тем же IndexedFieldURI, а чтобы понять,
+    /// какие ключи стирать, нужен прежний набор заполненных индексов. Он
+    /// берётся из contact_remote_state: одним GetItem, который заодно отдаёт
+    /// свежий ChangeKey (то есть лишнего обращения к серверу против прежней
+    /// схемы с item_change_key не появилось).
     pub async fn update_contact_item(
         &self,
         password: &str,
         item_id: &str,
         input: &ContactInput,
     ) -> Result<()> {
-        let change_key = self.item_change_key(password, item_id).await?;
-        let body = update_contact_item_body(item_id, &change_key, input);
+        let previous = self.contact_remote_state(password, item_id).await?;
+        let body = update_contact_item_body(item_id, &previous, input);
         self.soap(password, "UpdateItem", &body).await.map(|_| ())
+    }
+
+    /// Прежнее состояние контакта на сервере: ChangeKey плюс ключи уже
+    /// заполненных индексированных свойств.
+    ///
+    /// Запрашиваем словари целиком плоскими FieldURI (contacts:EmailAddresses,
+    /// contacts:PhoneNumbers), а не по одному IndexedFieldURI на каждый
+    /// возможный ключ: во-первых, это один запрос вместо полутора десятков,
+    /// во-вторых, запрос индексированного свойства, которого у элемента нет,
+    /// Exchange считает ошибкой, так что перебор ключей пришлось бы ещё и
+    /// обкладывать разбором частичных отказов. AllProperties тоже подошёл бы,
+    /// но тянет тело письма и вложения контакта - лишний трафик на каждое
+    /// сохранение.
+    async fn contact_remote_state(
+        &self,
+        password: &str,
+        item_id: &str,
+    ) -> Result<ContactRemoteState> {
+        let body = format!(
+            r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="contacts:EmailAddresses"/><t:FieldURI FieldURI="contacts:PhoneNumbers"/></t:AdditionalProperties></m:ItemShape><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:GetItem>"#,
+            escape(item_id)
+        );
+        let response = self.soap(password, "GetItem", &body).await?;
+        parse_contact_remote_state(&response)
     }
 
     /// Удалить контакт.
@@ -1305,12 +1373,24 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
         } else {
             None
         };
+        // Recurrence есть только у мастер-элемента серии
+        // (CalendarItemType=RecurringMaster). CalendarView в calendar_events
+        // разворачивает серию в отдельные Occurrence/Exception - у них
+        // Recurrence не приходит, и правило останется None: каждое вхождение
+        // уже самостоятельное событие со своим ItemId. recurrence_id при этом
+        // намеренно не заполняем - мастера серии в базе нет, а непустой
+        // recurrence_id пометил бы вхождение исключением несуществующей серии.
+        let rrule = item
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == "Recurrence")
+            .and_then(recurrence_to_rrule);
         let raw = build_vevent(
             id,
             &summary,
             &dtstart,
             dtend.as_deref(),
             location.as_deref(),
+            rrule.as_deref(),
         );
         events.push(DavEvent {
             remote_url: Some(format!("ews-event:{id}")),
@@ -1320,7 +1400,7 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
             location,
             dtstart,
             dtend,
-            rrule: None,
+            rrule,
             recurrence_id: None,
             exdates: None,
             rdates: None,
@@ -1347,6 +1427,7 @@ fn build_vevent(
     dtstart: &str,
     dtend: Option<&str>,
     location: Option<&str>,
+    rrule: Option<&str>,
 ) -> String {
     let mut lines = vec![
         "BEGIN:VCALENDAR".to_owned(),
@@ -1362,6 +1443,11 @@ fn build_vevent(
     }
     if let Some(location) = location {
         lines.push(format!("LOCATION:{}", ical_escape(location)));
+    }
+    // RRULE в теле VEVENT не экранируем: это структурированное значение, а не
+    // текст, запятые и точки с запятой в нём значимы.
+    if let Some(rrule) = rrule {
+        lines.push(format!("RRULE:{rrule}"));
     }
     lines.push("END:VEVENT".to_owned());
     lines.push("END:VCALENDAR".to_owned());
@@ -1546,6 +1632,499 @@ fn ews_event_datetime(value: &str, all_day: bool) -> Result<String> {
         })
 }
 
+/// Дни недели: слева значение EWS (DayOfWeekType), справа код BYDAY из
+/// RFC5545. Порядок - от воскресенья, как в обоих стандартах.
+const RECURRENCE_WEEKDAYS: [(&str, &str); 7] = [
+    ("Sunday", "SU"),
+    ("Monday", "MO"),
+    ("Tuesday", "TU"),
+    ("Wednesday", "WE"),
+    ("Thursday", "TH"),
+    ("Friday", "FR"),
+    ("Saturday", "SA"),
+];
+
+/// Месяцы EWS (MonthNamesType) по номеру: индекс 0 - январь.
+const RECURRENCE_MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// DayOfWeekIndexType в относительных паттернах и его эквивалент в числовом
+/// префиксе BYDAY: Last - это -1 ("последний в месяце"), а не 5.
+const RECURRENCE_WEEK_INDEXES: [(&str, i32); 5] = [
+    ("First", 1),
+    ("Second", 2),
+    ("Third", 3),
+    ("Fourth", 4),
+    ("Last", -1),
+];
+
+/// Интервал повторения: EWS всегда присылает Interval у Daily/Weekly/Monthly,
+/// но подстраховываемся значением 1, чтобы кривой ответ не терял всё правило.
+fn recurrence_interval<'a>(pattern: Node<'a, 'a>) -> u32 {
+    node_text(pattern, "Interval")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1)
+}
+
+/// INTERVAL=1 - значение по умолчанию в RFC5545, в строку его не пишем: так
+/// правило совпадает с тем, что присылают CalDAV/Google, и не сбивает
+/// разворачивание серии в UI.
+fn interval_part(interval: u32) -> String {
+    if interval > 1 {
+        format!(";INTERVAL={interval}")
+    } else {
+        String::new()
+    }
+}
+
+/// DaysOfWeek в EWS - список через пробел, где кроме конкретных дней бывают
+/// групповые значения Day/Weekday/WeekendDay. В RFC5545 групп нет, поэтому
+/// раскрываем их в перечисление дней.
+fn ews_days_to_ical(value: &str) -> Option<Vec<&'static str>> {
+    let mut days: Vec<&'static str> = Vec::new();
+    for token in value.split_whitespace() {
+        let expanded: &[&'static str] = match token {
+            "Day" => &["SU", "MO", "TU", "WE", "TH", "FR", "SA"],
+            "Weekday" => &["MO", "TU", "WE", "TH", "FR"],
+            "WeekendDay" => &["SA", "SU"],
+            _ => {
+                days.push(ews_single_day_to_ical(token)?);
+                continue;
+            }
+        };
+        days.extend_from_slice(expanded);
+    }
+    let mut unique: Vec<&'static str> = Vec::new();
+    for day in days {
+        if !unique.contains(&day) {
+            unique.push(day);
+        }
+    }
+    (!unique.is_empty()).then_some(unique)
+}
+
+/// Относительные паттерны (BYDAY вида "2MO") описывают ровно один день недели:
+/// групповые значения и списки в такую запись не укладываются.
+fn ews_single_day_to_ical(value: &str) -> Option<&'static str> {
+    RECURRENCE_WEEKDAYS
+        .iter()
+        .find(|(ews, _)| *ews == value)
+        .map(|(_, ical)| *ical)
+}
+
+fn ical_day_to_ews(value: &str) -> Option<&'static str> {
+    RECURRENCE_WEEKDAYS
+        .iter()
+        .find(|(_, ical)| *ical == value)
+        .map(|(ews, _)| *ews)
+}
+
+fn ews_month_to_number(value: &str) -> Option<u32> {
+    RECURRENCE_MONTHS
+        .iter()
+        .position(|month| *month == value)
+        .and_then(|index| u32::try_from(index + 1).ok())
+}
+
+fn month_number_to_ews(value: u32) -> Option<&'static str> {
+    usize::try_from(value)
+        .ok()
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|index| RECURRENCE_MONTHS.get(index))
+        .copied()
+}
+
+fn ews_week_index_to_position(value: &str) -> Option<i32> {
+    RECURRENCE_WEEK_INDEXES
+        .iter()
+        .find(|(ews, _)| *ews == value)
+        .map(|(_, position)| *position)
+}
+
+fn position_to_ews_week_index(value: i32) -> Option<&'static str> {
+    RECURRENCE_WEEK_INDEXES
+        .iter()
+        .find(|(_, position)| *position == value)
+        .map(|(ews, _)| *ews)
+}
+
+/// EndDate в EWS - дата без времени ("2026-12-31" либо со смещением
+/// "2026-12-31+03:00"). В RFC5545 UNTIL должен быть того же типа, что DTSTART,
+/// а DTSTART мы отдаём как момент в UTC (см. to_ical_datetime), поэтому берём
+/// конец указанных суток.
+fn ical_until_from_ews_date(value: &str) -> Option<String> {
+    let date = ews_date_prefix(value)?;
+    Some(format!("UNTIL={}T235959Z", date.replace('-', "")))
+}
+
+/// Первые 10 символов значения, если это дата вида YYYY-MM-DD.
+fn ews_date_prefix(value: &str) -> Option<String> {
+    let date = value.trim().get(..10)?;
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+/// Обратное преобразование: UNTIL=20261231T235959Z (или просто 20261231) в
+/// дату EWS. Время из UNTIL отбрасываем - EndDate его не хранит, серия
+/// заканчивается указанным днём включительно в обоих представлениях.
+fn ews_date_from_ical_until(value: &str) -> Option<String> {
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|symbol| *symbol != 'T' && *symbol != 't')
+        .filter(|symbol| symbol.is_ascii_digit())
+        .collect();
+    chrono::NaiveDate::parse_from_str(digits.get(..8)?, "%Y%m%d")
+        .ok()
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+/// Собрать RRULE из элемента t:Recurrence ответа EWS.
+///
+/// Recurrence приходит только у мастер-элемента серии
+/// (CalendarItemType=RecurringMaster). Если паттерн распознать не удалось,
+/// возвращаем None: событие останется одиночным, но не потеряется целиком.
+fn recurrence_to_rrule<'a>(recurrence: Node<'a, 'a>) -> Option<String> {
+    let mut pattern: Option<String> = None;
+    let mut bound: Option<String> = None;
+    for child in recurrence.children().filter(|node| node.is_element()) {
+        let name = child.tag_name().name();
+        match name {
+            "DailyRecurrence"
+            | "WeeklyRecurrence"
+            | "AbsoluteMonthlyRecurrence"
+            | "RelativeMonthlyRecurrence"
+            | "AbsoluteYearlyRecurrence"
+            | "RelativeYearlyRecurrence" => {
+                pattern = recurrence_pattern_to_rrule(child, name);
+                if pattern.is_none() {
+                    tracing::warn!(
+                        pattern = name,
+                        "EWS: паттерн повторения не разобран, событие показано одиночным"
+                    );
+                    return None;
+                }
+            }
+            // NoEndRecurrence - бесконечная серия, в RRULE это просто
+            // отсутствие UNTIL/COUNT.
+            "NoEndRecurrence" => {}
+            "EndDateRecurrence" => {
+                bound = node_text(child, "EndDate").and_then(ical_until_from_ews_date);
+            }
+            "NumberedRecurrence" => {
+                bound = node_text(child, "NumberOfOccurrences")
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+                    .map(|value| format!("COUNT={value}"));
+            }
+            // Прочие дочерние элементы (например DailyRegeneration у задач)
+            // игнорируем: паттерн так и останется None и правило не появится.
+            _ => {}
+        }
+    }
+    let pattern = pattern?;
+    Some(match bound {
+        Some(bound) => format!("{pattern};{bound}"),
+        None => pattern,
+    })
+}
+
+fn recurrence_pattern_to_rrule<'a>(pattern: Node<'a, 'a>, name: &str) -> Option<String> {
+    let interval = interval_part(recurrence_interval(pattern));
+    match name {
+        "DailyRecurrence" => Some(format!("FREQ=DAILY{interval}")),
+        "WeeklyRecurrence" => {
+            let days = ews_days_to_ical(node_text(pattern, "DaysOfWeek")?)?;
+            // FirstDayOfWeek в RRULE соответствует WKST, но в строку его не
+            // пишем: значение по умолчанию (понедельник) на результат не
+            // влияет, а лишний параметр ломает простые разворачиватели серий.
+            Some(format!("FREQ=WEEKLY{interval};BYDAY={}", days.join(",")))
+        }
+        "AbsoluteMonthlyRecurrence" => {
+            let day = node_text(pattern, "DayOfMonth")?
+                .trim()
+                .parse::<u32>()
+                .ok()?;
+            Some(format!("FREQ=MONTHLY{interval};BYMONTHDAY={day}"))
+        }
+        "RelativeMonthlyRecurrence" => {
+            let day = ews_single_day_to_ical(node_text(pattern, "DaysOfWeek")?.trim())?;
+            let position =
+                ews_week_index_to_position(node_text(pattern, "DayOfWeekIndex")?.trim())?;
+            Some(format!("FREQ=MONTHLY{interval};BYDAY={position}{day}"))
+        }
+        "AbsoluteYearlyRecurrence" => {
+            // У годовых паттернов схема EWS не предусматривает Interval -
+            // серия всегда ежегодная, поэтому INTERVAL не выводим.
+            let day = node_text(pattern, "DayOfMonth")?
+                .trim()
+                .parse::<u32>()
+                .ok()?;
+            let month = ews_month_to_number(node_text(pattern, "Month")?.trim())?;
+            Some(format!("FREQ=YEARLY;BYMONTHDAY={day};BYMONTH={month}"))
+        }
+        "RelativeYearlyRecurrence" => {
+            let day = ews_single_day_to_ical(node_text(pattern, "DaysOfWeek")?.trim())?;
+            let position =
+                ews_week_index_to_position(node_text(pattern, "DayOfWeekIndex")?.trim())?;
+            let month = ews_month_to_number(node_text(pattern, "Month")?.trim())?;
+            Some(format!("FREQ=YEARLY;BYDAY={position}{day};BYMONTH={month}"))
+        }
+        _ => None,
+    }
+}
+
+/// XML t:Recurrence для CalendarItem по RRULE события.
+///
+/// Если правило нельзя выразить схемой EWS (BYSETPOS, FREQ=HOURLY и прочее),
+/// возвращаем None и пишем предупреждение: событие уедет на сервер одиночным.
+/// Отказывать в сохранении здесь нельзя - пользователь потеряет всю правку
+/// из-за одной непереносимой детали правила, а отправлять приблизительный
+/// паттерн ещё хуже: серия молча начнёт повторяться не тогда, когда задумано.
+fn recurrence_xml(input: &EventInput) -> Option<String> {
+    let rrule = input.rrule.as_deref()?.trim();
+    if rrule.is_empty() {
+        return None;
+    }
+    match build_recurrence_xml(rrule, &input.dtstart) {
+        Some(xml) => Some(xml),
+        None => {
+            tracing::warn!(
+                rrule = %rrule,
+                "EWS: правило повторения не выражается схемой Recurrence, событие сохранено одиночным"
+            );
+            None
+        }
+    }
+}
+
+/// Пары ключ-значение RRULE. Ключи приводим к верхнему регистру: RFC5545
+/// разрешает любой, а сравнивать удобнее с одним.
+fn parse_rrule_parts(rrule: &str) -> Option<Vec<(String, String)>> {
+    let value = rrule.trim();
+    let value = value.strip_prefix("RRULE:").unwrap_or(value);
+    let mut parts = Vec::new();
+    for chunk in value.split(';').filter(|chunk| !chunk.trim().is_empty()) {
+        let (key, raw) = chunk.split_once('=')?;
+        parts.push((
+            key.trim().to_uppercase(),
+            raw.trim().to_uppercase().replace(' ', ""),
+        ));
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Дата начала серии для RecurrenceRange: берём её из dtstart события.
+/// StartDate обязателен во всех трёх вариантах диапазона.
+fn recurrence_start_date(dtstart: &str) -> Option<String> {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(dtstart) {
+        return Some(
+            parsed
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d")
+                .to_string(),
+        );
+    }
+    ews_date_prefix(dtstart)
+}
+
+fn recurrence_start_naive_date(dtstart: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(&recurrence_start_date(dtstart)?, "%Y-%m-%d").ok()
+}
+
+/// BYDAY без числового префикса: "MO,WE" в "Monday Wednesday".
+fn ical_days_to_ews(value: &str) -> Option<Vec<&'static str>> {
+    let mut days = Vec::new();
+    for token in value.split(',').filter(|token| !token.trim().is_empty()) {
+        let day = ical_day_to_ews(token.trim())?;
+        if !days.contains(&day) {
+            days.push(day);
+        }
+    }
+    (!days.is_empty()).then_some(days)
+}
+
+/// BYDAY с числовым префиксом и ровно одним днём: "2MO" в (Second, Monday).
+/// Список дней с позицией (например "1MO,1TU") схема EWS не выражает.
+fn ical_positional_day_to_ews(value: &str) -> Option<(&'static str, &'static str)> {
+    let token = value.trim();
+    // Только ASCII: иначе split_at ниже может разрезать многобайтовый символ.
+    if token.contains(',') || !token.is_ascii() {
+        return None;
+    }
+    let split = token.len().checked_sub(2)?;
+    let (prefix, day) = token.split_at(split);
+    let day = ical_day_to_ews(day)?;
+    let position = prefix.parse::<i32>().ok()?;
+    Some((position_to_ews_week_index(position)?, day))
+}
+
+fn build_recurrence_xml(rrule: &str, dtstart: &str) -> Option<String> {
+    let parts = parse_rrule_parts(rrule)?;
+    let start_date = recurrence_start_date(dtstart)?;
+    let start = recurrence_start_naive_date(dtstart)?;
+    let mut freq: Option<String> = None;
+    let mut interval = 1u32;
+    let mut by_day: Option<String> = None;
+    let mut by_month_day: Option<String> = None;
+    let mut by_month: Option<String> = None;
+    let mut count: Option<u32> = None;
+    let mut until: Option<String> = None;
+    let mut week_start: Option<String> = None;
+    for (key, value) in parts {
+        match key.as_str() {
+            "FREQ" => freq = Some(value),
+            "INTERVAL" => interval = value.parse::<u32>().ok().filter(|value| *value > 0)?,
+            "BYDAY" => by_day = Some(value),
+            "BYMONTHDAY" => by_month_day = Some(value),
+            "BYMONTH" => by_month = Some(value),
+            "COUNT" => count = Some(value.parse::<u32>().ok().filter(|value| *value > 0)?),
+            "UNTIL" => until = Some(value),
+            "WKST" => week_start = Some(value),
+            // BYSETPOS, BYWEEKNO, BYYEARDAY, BYHOUR и прочее схема EWS не
+            // выражает вовсе - отказываемся от всего правила целиком.
+            _ => return None,
+        }
+    }
+    // COUNT и UNTIL по RFC5545 взаимоисключающи, а в EWS это вообще разные
+    // типы диапазона - такое правило считаем непереносимым.
+    if count.is_some() && until.is_some() {
+        return None;
+    }
+    let pattern = match freq.as_deref()? {
+        "DAILY" => {
+            if by_day.is_some() || by_month_day.is_some() || by_month.is_some() {
+                return None;
+            }
+            format!("<t:DailyRecurrence><t:Interval>{interval}</t:Interval></t:DailyRecurrence>")
+        }
+        "WEEKLY" => {
+            if by_month_day.is_some() || by_month.is_some() {
+                return None;
+            }
+            let days = match by_day.as_deref() {
+                Some(value) => ical_days_to_ews(value)?,
+                // BYDAY в еженедельном правиле необязателен - тогда день
+                // берётся из DTSTART. EWS же требует DaysOfWeek явно.
+                None => vec![weekday_to_ews(start)],
+            };
+            let first = match week_start.as_deref() {
+                Some(value) => ical_day_to_ews(value)?,
+                None => "Monday",
+            };
+            format!(
+                "<t:WeeklyRecurrence><t:Interval>{interval}</t:Interval><t:DaysOfWeek>{}</t:DaysOfWeek><t:FirstDayOfWeek>{first}</t:FirstDayOfWeek></t:WeeklyRecurrence>",
+                days.join(" ")
+            )
+        }
+        "MONTHLY" => {
+            if by_month.is_some() {
+                return None;
+            }
+            match (by_day.as_deref(), by_month_day.as_deref()) {
+                (Some(_), Some(_)) => return None,
+                (Some(day), None) => {
+                    let (index, day) = ical_positional_day_to_ews(day)?;
+                    format!(
+                        "<t:RelativeMonthlyRecurrence><t:Interval>{interval}</t:Interval><t:DaysOfWeek>{day}</t:DaysOfWeek><t:DayOfWeekIndex>{index}</t:DayOfWeekIndex></t:RelativeMonthlyRecurrence>"
+                    )
+                }
+                (None, day) => {
+                    let day = match day {
+                        Some(day) => parse_month_day(day)?,
+                        None => chrono::Datelike::day(&start),
+                    };
+                    format!(
+                        "<t:AbsoluteMonthlyRecurrence><t:Interval>{interval}</t:Interval><t:DayOfMonth>{day}</t:DayOfMonth></t:AbsoluteMonthlyRecurrence>"
+                    )
+                }
+            }
+        }
+        "YEARLY" => {
+            // AbsoluteYearlyRecurrencePatternType/RelativeYearlyRecurrencePatternType
+            // не имеют Interval: "раз в N лет" схемой не выражается, и отправить
+            // такое правило как ежегодное было бы искажением.
+            if interval != 1 {
+                return None;
+            }
+            let month = match by_month.as_deref() {
+                Some(value) => month_number_to_ews(value.parse::<u32>().ok()?)?,
+                None => month_number_to_ews(chrono::Datelike::month(&start))?,
+            };
+            match (by_day.as_deref(), by_month_day.as_deref()) {
+                (Some(_), Some(_)) => return None,
+                (Some(day), None) => {
+                    let (index, day) = ical_positional_day_to_ews(day)?;
+                    format!(
+                        "<t:RelativeYearlyRecurrence><t:DaysOfWeek>{day}</t:DaysOfWeek><t:DayOfWeekIndex>{index}</t:DayOfWeekIndex><t:Month>{month}</t:Month></t:RelativeYearlyRecurrence>"
+                    )
+                }
+                (None, day) => {
+                    let day = match day {
+                        Some(day) => parse_month_day(day)?,
+                        None => chrono::Datelike::day(&start),
+                    };
+                    format!(
+                        "<t:AbsoluteYearlyRecurrence><t:DayOfMonth>{day}</t:DayOfMonth><t:Month>{month}</t:Month></t:AbsoluteYearlyRecurrence>"
+                    )
+                }
+            }
+        }
+        // FREQ=SECONDLY/MINUTELY/HOURLY у EWS аналога нет.
+        _ => return None,
+    };
+    let range = match (count, until) {
+        (Some(count), _) => format!(
+            "<t:NumberedRecurrence><t:StartDate>{start_date}</t:StartDate><t:NumberOfOccurrences>{count}</t:NumberOfOccurrences></t:NumberedRecurrence>"
+        ),
+        (None, Some(until)) => {
+            let end = ews_date_from_ical_until(&until)?;
+            format!(
+                "<t:EndDateRecurrence><t:StartDate>{start_date}</t:StartDate><t:EndDate>{end}</t:EndDate></t:EndDateRecurrence>"
+            )
+        }
+        (None, None) => format!(
+            "<t:NoEndRecurrence><t:StartDate>{start_date}</t:StartDate></t:NoEndRecurrence>"
+        ),
+    };
+    Some(format!("<t:Recurrence>{pattern}{range}</t:Recurrence>"))
+}
+
+/// BYMONTHDAY: EWS хранит номер дня 1..31 и отрицательных значений ("-1" -
+/// последний день месяца) не поддерживает.
+fn parse_month_day(value: &str) -> Option<u32> {
+    if value.contains(',') {
+        return None;
+    }
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|day| (1..=31).contains(day))
+}
+
+fn weekday_to_ews(date: chrono::NaiveDate) -> &'static str {
+    usize::try_from(chrono::Datelike::weekday(&date).num_days_from_sunday())
+        .ok()
+        .and_then(|index| RECURRENCE_WEEKDAYS.get(index))
+        .map(|(ews, _)| *ews)
+        .unwrap_or("Monday")
+}
+
 fn attendees_xml(attendees: &[&Attendee]) -> String {
     attendees
         .iter()
@@ -1648,6 +2227,18 @@ fn calendar_item_fields(input: &EventInput) -> Result<Vec<(&'static str, String)
             ),
         ));
     }
+    // В схеме CalendarItemType Recurrence идёт после списков участников (перед
+    // FirstOccurrence/ModifiedOccurrences, которые мы не отправляем), поэтому
+    // поле добавляется последним. Если правило не выразимо в EWS, поля просто
+    // не будет и Exchange создаст одиночное событие - см. recurrence_xml.
+    //
+    // Обратная сторона для UpdateItem: снятое пользователем повторение здесь
+    // превращается в отсутствие поля, то есть серия на сервере уцелеет. Стереть
+    // её - это отдельный DeleteItemField, который на неповторяющемся событии
+    // Exchange может отклонить, поэтому такой запрос не шлём.
+    if let Some(recurrence) = recurrence_xml(input) {
+        fields.push(("calendar:Recurrence", recurrence));
+    }
     Ok(fields)
 }
 
@@ -1671,9 +2262,20 @@ fn update_calendar_item_body(
     item_id: &str,
     change_key: &str,
     input: &EventInput,
+    was_recurring: bool,
 ) -> Result<String> {
     let disposition = calendar_send_disposition(input);
-    let updates = calendar_item_fields(input)?
+    let fields = calendar_item_fields(input)?;
+    // Именно пустое правило, а не отсутствие поля в Updates: поля не будет и
+    // тогда, когда правило есть, но схема EWS его не выражает (BYSETPOS и
+    // прочее из recurrence_xml). Спутать эти случаи - значит стереть на сервере
+    // серию, которую пользователь не трогал.
+    let dropped_by_user = input
+        .rrule
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    let mut updates = fields
         .into_iter()
         .map(|(field_uri, xml)| {
             format!(
@@ -1681,6 +2283,15 @@ fn update_calendar_item_body(
             )
         })
         .collect::<String>();
+    // Повторение было, а нового правила нет - значит его сняли, и серию надо
+    // стереть явно. Условие про was_recurring обязательно: DeleteItemField по
+    // calendar:Recurrence на одиночном событии Exchange считает ошибкой и
+    // отклоняет весь UpdateItem, то есть обычное редактирование встречи
+    // перестало бы сохраняться.
+    if was_recurring && dropped_by_user {
+        updates
+            .push_str(r#"<t:DeleteItemField><t:FieldURI FieldURI="calendar:Recurrence"/></t:DeleteItemField>"#);
+    }
     Ok(format!(
         r#"<m:UpdateItem ConflictResolution="AutoResolve" SendMeetingInvitationsOrCancellations="{disposition}"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{updates}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
         escape(item_id),
@@ -1818,12 +2429,61 @@ fn create_contact_item_body(input: &ContactInput) -> String {
     )
 }
 
-fn update_contact_item_body(item_id: &str, change_key: &str, input: &ContactInput) -> String {
-    let updates = contact_item_updates(input);
+/// Снимок индексированных свойств контакта на сервере перед обновлением:
+/// ChangeKey для оптимистичной блокировки и ключи (Entry Key) уже заполненных
+/// записей словарей. Нужен ровно для одного - вычислить, какие ключи исчезли
+/// в новых данных и должны уйти в DeleteItemField.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ContactRemoteState {
+    change_key: String,
+    email_keys: Vec<String>,
+    phone_keys: Vec<String>,
+}
+
+/// Ключи словарной записи EWS отдаёт атрибутом Key у t:Entry. Пустые Entry
+/// (сервер иногда возвращает их для очищенных полей) считаем незаполненными -
+/// иначе на них выписался бы бессмысленный DeleteItemField.
+fn contact_entry_keys(item: Node<'_, '_>, dictionary: &str) -> Vec<String> {
+    item.descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Entry")
+        .filter(|node| {
+            node.parent()
+                .is_some_and(|parent| parent.tag_name().name() == dictionary)
+        })
+        .filter(|node| node.text().is_some_and(|value| !value.trim().is_empty()))
+        .filter_map(|node| node.attribute("Key").map(str::to_owned))
+        .collect()
+}
+
+fn parse_contact_remote_state(xml: &str) -> Result<ContactRemoteState> {
+    let document = Document::parse(xml).map_err(|error| backend_error("contacts-xml", error))?;
+    let item = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Contact")
+        .ok_or_else(|| backend_error("contact", "Exchange не вернул контакт по идентификатору"))?;
+    let change_key = item
+        .children()
+        .find(|node| node.is_element() && node.tag_name().name() == "ItemId")
+        .and_then(|node| node.attribute("ChangeKey"))
+        .ok_or_else(|| backend_error("contact", "Exchange не вернул ChangeKey контакта"))?
+        .to_owned();
+    Ok(ContactRemoteState {
+        change_key,
+        email_keys: contact_entry_keys(item, "EmailAddresses"),
+        phone_keys: contact_entry_keys(item, "PhoneNumbers"),
+    })
+}
+
+fn update_contact_item_body(
+    item_id: &str,
+    previous: &ContactRemoteState,
+    input: &ContactInput,
+) -> String {
+    let updates = contact_item_updates(input, previous);
     format!(
         r#"<m:UpdateItem ConflictResolution="AutoResolve"><m:ItemChanges><t:ItemChange><t:ItemId Id="{}" ChangeKey="{}"/><t:Updates>{updates}</t:Updates></t:ItemChange></m:ItemChanges></m:UpdateItem>"#,
         escape(item_id),
-        escape(change_key)
+        escape(&previous.change_key)
     )
 }
 
@@ -1837,7 +2497,20 @@ fn delete_contact_item_body(item_id: &str) -> String {
 /// SetItemField по каждому простому полю; EmailAddresses/PhoneNumbers -
 /// словарные свойства, для них нужен IndexedFieldURI на конкретную запись
 /// (см. документацию EWS "Setting an indexed property"), а не общий FieldURI.
-fn contact_item_updates(input: &ContactInput) -> String {
+///
+/// Хвостом идут DeleteItemField по тем ключам, которые были заполнены на
+/// сервере (previous) и не попали в новый набор - именно они стирают убранные
+/// телефоны и адреса электронной почты. Почтовые адреса (PhysicalAddresses)
+/// здесь не трогаются: ContactInput их не несёт, то есть "новых данных" для
+/// них нет, и любой DeleteItemField по ним стирал бы адрес, заведённый в OWA.
+/// Схема EWS (NonEmptyArrayOfItemChangeDescriptionsType)
+/// это choice с unbounded, порядок между Set и Delete ей безразличен, важен
+/// лишь порядок полей внутри одного t:Contact - а тут в каждом SetItemField
+/// ровно одно поле, ровно как в update_calendar_item. Delete держим в конце
+/// осознанно: так Exchange сначала запишет новые значения ключей, а потом
+/// уберёт лишние, и промежуточного состояния "всё стёрли, ничего не записали"
+/// не возникает даже при частичном применении.
+fn contact_item_updates(input: &ContactInput, previous: &ContactRemoteState) -> String {
     let mut updates = format!(
         r#"<t:SetItemField><t:FieldURI FieldURI="contacts:DisplayName"/><t:Contact><t:DisplayName>{}</t:DisplayName></t:Contact></t:SetItemField>"#,
         escape(&input.display_name)
@@ -1868,6 +2541,7 @@ fn contact_item_updates(input: &ContactInput) -> String {
             escape(company)
         ));
     }
+    let mut email_keys = Vec::new();
     for (index, email) in input
         .emails
         .iter()
@@ -1880,8 +2554,10 @@ fn contact_item_updates(input: &ContactInput) -> String {
             r#"<t:SetItemField><t:IndexedFieldURI FieldURI="contacts:EmailAddress" FieldIndex="{key}"/><t:Contact><t:EmailAddresses><t:Entry Key="{key}">{}</t:Entry></t:EmailAddresses></t:Contact></t:SetItemField>"#,
             escape(email.trim())
         ));
+        email_keys.push(key);
     }
     let mut used = HashSet::new();
+    let mut phone_keys = Vec::new();
     for phone in input
         .phones
         .iter()
@@ -1894,8 +2570,48 @@ fn contact_item_updates(input: &ContactInput) -> String {
             r#"<t:SetItemField><t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="{key}"/><t:Contact><t:PhoneNumbers><t:Entry Key="{key}">{}</t:Entry></t:PhoneNumbers></t:Contact></t:SetItemField>"#,
             escape(&phone.remote_value())
         ));
+        phone_keys.push(key.to_owned());
     }
+    updates.push_str(&contact_deleted_index_fields(
+        "contacts:EmailAddress",
+        &previous.email_keys,
+        &email_keys,
+    ));
+    // Ключи телефонов сравниваем как есть, включая те, что наш редактор
+    // выставить не умеет (AssistantPhone, Callback, CarPhone и прочие из
+    // словаря EWS): читаются они в UI как обычные телефоны (см. phone_kind),
+    // значит пользователь их видит, и убранная им запись должна исчезнуть, а
+    // не остаться на сервере под ключом, которого нет в ews_phone_key.
+    updates.push_str(&contact_deleted_index_fields(
+        "contacts:PhoneNumber",
+        &previous.phone_keys,
+        &phone_keys,
+    ));
     updates
+}
+
+/// DeleteItemField по каждому ключу, который был на сервере, но пропал из
+/// новых данных. Дубликаты в previous (сервер такого не присылает, но парсер
+/// их не запрещает) схлопываем: два DeleteItemField на один индекс Exchange
+/// отвергает как ErrorIncorrectUpdatePropertyCount.
+fn contact_deleted_index_fields(
+    field_uri: &str,
+    previous: &[String],
+    current: &[String],
+) -> String {
+    let current: HashSet<&str> = current.iter().map(String::as_str).collect();
+    let mut emitted = HashSet::new();
+    previous
+        .iter()
+        .filter(|key| !current.contains(key.as_str()))
+        .filter(|key| emitted.insert(key.as_str()))
+        .map(|key| {
+            format!(
+                r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="{field_uri}" FieldIndex="{}"/></t:DeleteItemField>"#,
+                escape(key)
+            )
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -2284,12 +3000,249 @@ mod tests {
 
     #[test]
     fn update_calendar_item_body_carries_change_key_and_disposition() {
-        let body = update_calendar_item_body("item-1", "change-1", &sample_event_input())
+        let body = update_calendar_item_body("item-1", "change-1", &sample_event_input(), false)
             .expect("build body");
         assert!(body.contains(r#"<t:ItemId Id="item-1" ChangeKey="change-1"/>"#));
         assert!(body.contains(r#"SendMeetingInvitationsOrCancellations="SendToNone""#));
         assert!(body.contains(r#"<t:FieldURI FieldURI="item:Subject"/>"#));
         assert!(body.contains(r#"<t:FieldURI FieldURI="calendar:Start"/>"#));
+    }
+
+    /// Разобрать фрагмент t:Recurrence в RRULE. Префикс t: в тестовом XML не
+    /// объявлен, поэтому оборачиваем фрагмент в корень с namespace.
+    fn rrule_from_recurrence(fragment: &str) -> Option<String> {
+        let xml = format!(r#"<root xmlns:t="ews-types">{fragment}</root>"#);
+        let document = Document::parse(&xml).expect("parse recurrence xml");
+        let node = document
+            .descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == "Recurrence")
+            .expect("recurrence node");
+        recurrence_to_rrule(node)
+    }
+
+    fn recurrence_of(rrule: &str) -> String {
+        build_recurrence_xml(rrule, "2026-07-20T10:00:00+03:00").expect("build recurrence xml")
+    }
+
+    #[test]
+    fn parses_every_supported_recurrence_pattern_into_rrule() {
+        let cases = [
+            (
+                "<t:DailyRecurrence><t:Interval>3</t:Interval></t:DailyRecurrence>",
+                "FREQ=DAILY;INTERVAL=3",
+            ),
+            (
+                "<t:WeeklyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Monday Tuesday</t:DaysOfWeek><t:FirstDayOfWeek>Monday</t:FirstDayOfWeek></t:WeeklyRecurrence>",
+                "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TU",
+            ),
+            (
+                "<t:AbsoluteMonthlyRecurrence><t:Interval>1</t:Interval><t:DayOfMonth>15</t:DayOfMonth></t:AbsoluteMonthlyRecurrence>",
+                "FREQ=MONTHLY;BYMONTHDAY=15",
+            ),
+            (
+                "<t:RelativeMonthlyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Monday</t:DaysOfWeek><t:DayOfWeekIndex>Second</t:DayOfWeekIndex></t:RelativeMonthlyRecurrence>",
+                "FREQ=MONTHLY;INTERVAL=2;BYDAY=2MO",
+            ),
+            (
+                "<t:AbsoluteYearlyRecurrence><t:DayOfMonth>9</t:DayOfMonth><t:Month>May</t:Month></t:AbsoluteYearlyRecurrence>",
+                "FREQ=YEARLY;BYMONTHDAY=9;BYMONTH=5",
+            ),
+            (
+                "<t:RelativeYearlyRecurrence><t:DaysOfWeek>Friday</t:DaysOfWeek><t:DayOfWeekIndex>Last</t:DayOfWeekIndex><t:Month>November</t:Month></t:RelativeYearlyRecurrence>",
+                "FREQ=YEARLY;BYDAY=-1FR;BYMONTH=11",
+            ),
+        ];
+        for (pattern, expected) in cases {
+            let fragment = format!(
+                "<t:Recurrence>{pattern}<t:NoEndRecurrence><t:StartDate>2026-07-20</t:StartDate></t:NoEndRecurrence></t:Recurrence>"
+            );
+            assert_eq!(rrule_from_recurrence(&fragment).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn parses_recurrence_bounds_into_until_and_count() {
+        let until = rrule_from_recurrence(
+            "<t:Recurrence><t:DailyRecurrence><t:Interval>1</t:Interval></t:DailyRecurrence><t:EndDateRecurrence><t:StartDate>2026-07-20</t:StartDate><t:EndDate>2026-12-31+03:00</t:EndDate></t:EndDateRecurrence></t:Recurrence>",
+        );
+        assert_eq!(until.as_deref(), Some("FREQ=DAILY;UNTIL=20261231T235959Z"));
+        let count = rrule_from_recurrence(
+            "<t:Recurrence><t:DailyRecurrence><t:Interval>1</t:Interval></t:DailyRecurrence><t:NumberedRecurrence><t:StartDate>2026-07-20</t:StartDate><t:NumberOfOccurrences>5</t:NumberOfOccurrences></t:NumberedRecurrence></t:Recurrence>",
+        );
+        assert_eq!(count.as_deref(), Some("FREQ=DAILY;COUNT=5"));
+    }
+
+    #[test]
+    fn unknown_recurrence_pattern_yields_no_rrule() {
+        // Паттерн задач (Regeneration) календарным событием не выражается -
+        // правило не появится, но и разбор элемента не сломается.
+        let rrule = rrule_from_recurrence(
+            "<t:Recurrence><t:DailyRegeneration><t:Interval>1</t:Interval></t:DailyRegeneration><t:NoEndRecurrence><t:StartDate>2026-07-20</t:StartDate></t:NoEndRecurrence></t:Recurrence>",
+        );
+        assert_eq!(rrule, None);
+    }
+
+    #[test]
+    fn calendar_item_carries_recurring_master_rule_into_vevent() {
+        let xml = r#"<Envelope><CalendarItem><ItemId Id="series-1"/><Subject>Планёрка</Subject><Start>2026-07-20T07:00:00Z</Start><End>2026-07-20T08:00:00Z</End><IsAllDayEvent>false</IsAllDayEvent><CalendarItemType>RecurringMaster</CalendarItemType><Recurrence><WeeklyRecurrence><Interval>1</Interval><DaysOfWeek>Monday</DaysOfWeek><FirstDayOfWeek>Monday</FirstDayOfWeek></WeeklyRecurrence><NoEndRecurrence><StartDate>2026-07-20</StartDate></NoEndRecurrence></Recurrence></CalendarItem></Envelope>"#;
+        let events = parse_calendar_items(xml).expect("calendar response");
+        assert_eq!(events[0].rrule.as_deref(), Some("FREQ=WEEKLY;BYDAY=MO"));
+        assert!(events[0].raw.contains("RRULE:FREQ=WEEKLY;BYDAY=MO"));
+        // Отдельное вхождение серии повторения не несёт и исключением серии не
+        // становится - у него собственный ItemId и собственная дата.
+        let occurrence = r#"<Envelope><CalendarItem><ItemId Id="occurrence-1"/><Subject>Планёрка</Subject><Start>2026-07-27T07:00:00Z</Start><End>2026-07-27T08:00:00Z</End><IsAllDayEvent>false</IsAllDayEvent><CalendarItemType>Occurrence</CalendarItemType></CalendarItem></Envelope>"#;
+        let events = parse_calendar_items(occurrence).expect("calendar response");
+        assert_eq!(events[0].rrule, None);
+        assert_eq!(events[0].recurrence_id, None);
+    }
+
+    #[test]
+    fn builds_every_supported_recurrence_pattern_from_rrule() {
+        assert!(
+            recurrence_of("FREQ=DAILY;INTERVAL=3")
+                .contains("<t:DailyRecurrence><t:Interval>3</t:Interval></t:DailyRecurrence>")
+        );
+        assert!(recurrence_of("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TU").contains(
+            "<t:WeeklyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Monday Tuesday</t:DaysOfWeek><t:FirstDayOfWeek>Monday</t:FirstDayOfWeek></t:WeeklyRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=MONTHLY;BYMONTHDAY=15").contains(
+            "<t:AbsoluteMonthlyRecurrence><t:Interval>1</t:Interval><t:DayOfMonth>15</t:DayOfMonth></t:AbsoluteMonthlyRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=MONTHLY;INTERVAL=2;BYDAY=2MO").contains(
+            "<t:RelativeMonthlyRecurrence><t:Interval>2</t:Interval><t:DaysOfWeek>Monday</t:DaysOfWeek><t:DayOfWeekIndex>Second</t:DayOfWeekIndex></t:RelativeMonthlyRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=YEARLY;BYMONTHDAY=9;BYMONTH=5").contains(
+            "<t:AbsoluteYearlyRecurrence><t:DayOfMonth>9</t:DayOfMonth><t:Month>May</t:Month></t:AbsoluteYearlyRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=YEARLY;BYDAY=-1FR;BYMONTH=11").contains(
+            "<t:RelativeYearlyRecurrence><t:DaysOfWeek>Friday</t:DaysOfWeek><t:DayOfWeekIndex>Last</t:DayOfWeekIndex><t:Month>November</t:Month></t:RelativeYearlyRecurrence>"
+        ));
+        // Диапазон всегда идёт после паттерна и всегда несёт StartDate.
+        assert!(recurrence_of("FREQ=DAILY").contains(
+            "</t:DailyRecurrence><t:NoEndRecurrence><t:StartDate>2026-07-20</t:StartDate></t:NoEndRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=DAILY;UNTIL=20261231T235959Z").contains(
+            "<t:EndDateRecurrence><t:StartDate>2026-07-20</t:StartDate><t:EndDate>2026-12-31</t:EndDate></t:EndDateRecurrence>"
+        ));
+        assert!(recurrence_of("FREQ=DAILY;COUNT=5").contains(
+            "<t:NumberedRecurrence><t:StartDate>2026-07-20</t:StartDate><t:NumberOfOccurrences>5</t:NumberOfOccurrences></t:NumberedRecurrence>"
+        ));
+    }
+
+    #[test]
+    fn recurrence_survives_round_trip_through_ews_xml() {
+        let rules = [
+            "FREQ=DAILY;INTERVAL=3",
+            "FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TU",
+            "FREQ=WEEKLY;BYDAY=MO",
+            "FREQ=MONTHLY;BYMONTHDAY=15",
+            "FREQ=MONTHLY;INTERVAL=2;BYDAY=2MO",
+            "FREQ=YEARLY;BYMONTHDAY=9;BYMONTH=5",
+            "FREQ=YEARLY;BYDAY=-1FR;BYMONTH=11",
+            "FREQ=DAILY;UNTIL=20261231T235959Z",
+            "FREQ=DAILY;COUNT=5",
+        ];
+        for rule in rules {
+            assert_eq!(
+                rrule_from_recurrence(&recurrence_of(rule)).as_deref(),
+                Some(rule),
+                "round-trip {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn weekly_rule_without_byday_takes_weekday_from_dtstart() {
+        // 2026-07-20 - понедельник; DaysOfWeek в EWS обязателен, поэтому день
+        // недели выводим из даты начала.
+        assert!(recurrence_of("FREQ=WEEKLY").contains("<t:DaysOfWeek>Monday</t:DaysOfWeek>"));
+    }
+
+    #[test]
+    fn create_calendar_item_body_places_recurrence_after_attendees() {
+        let mut input = sample_event_input();
+        input.rrule = Some("FREQ=WEEKLY;BYDAY=MO".into());
+        input.attendees = vec![Attendee {
+            email: "req@example.test".into(),
+            name: None,
+            role: Some("REQ-PARTICIPANT".into()),
+            partstat: None,
+            rsvp: true,
+        }];
+        let body = create_calendar_item_body(&input).expect("build body");
+        let attendees = body.find("</t:RequiredAttendees>").expect("attendees");
+        let recurrence = body.find("<t:Recurrence>").expect("recurrence");
+        assert!(attendees < recurrence);
+        assert!(body.contains("<t:DaysOfWeek>Monday</t:DaysOfWeek>"));
+        // Recurrence - последнее поле CalendarItem перед закрывающим тегом.
+        assert!(body.contains("</t:Recurrence></t:CalendarItem>"));
+    }
+
+    #[test]
+    fn update_calendar_item_body_sends_recurrence_as_its_own_field() {
+        let mut input = sample_event_input();
+        input.rrule = Some("FREQ=DAILY;COUNT=5".into());
+        let body = update_calendar_item_body("item-1", "change-1", &input, false)
+            .expect("build update body");
+        assert!(body.contains(r#"<t:FieldURI FieldURI="calendar:Recurrence"/>"#));
+        assert!(body.contains("<t:NumberOfOccurrences>5</t:NumberOfOccurrences>"));
+        assert!(
+            !body.contains("DeleteItemField"),
+            "правило есть - стирать нечего"
+        );
+    }
+
+    #[test]
+    fn update_calendar_item_body_clears_recurrence_when_user_dropped_it() {
+        let mut input = sample_event_input();
+        input.rrule = None;
+        // На сервере серия, в правке повторения нет - значит его сняли.
+        let body = update_calendar_item_body("item-1", "change-1", &input, true)
+            .expect("build update body");
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:FieldURI FieldURI="calendar:Recurrence"/></t:DeleteItemField>"#
+        ));
+
+        // То же событие, но на сервере оно и так одиночное: DeleteItemField по
+        // calendar:Recurrence Exchange отклонил бы вместе со всем UpdateItem.
+        let body = update_calendar_item_body("item-1", "change-1", &input, false)
+            .expect("build update body");
+        assert!(!body.contains("DeleteItemField"));
+    }
+
+    #[test]
+    fn update_calendar_item_body_keeps_series_when_rule_is_not_expressible() {
+        let mut input = sample_event_input();
+        // BYSETPOS схема EWS не выражает: правило не уедет, но и стирать
+        // существующую на сервере серию нельзя - пользователь её не снимал.
+        input.rrule = Some("FREQ=MONTHLY;BYDAY=MO;BYSETPOS=-1".into());
+        let body = update_calendar_item_body("item-1", "change-1", &input, true)
+            .expect("build update body");
+        assert!(!body.contains("DeleteItemField"));
+    }
+
+    #[test]
+    fn unsupported_rrule_creates_single_event_without_recurrence() {
+        // BYSETPOS, почасовые правила, COUNT вместе с UNTIL, "раз в N лет" и
+        // BYDAY без позиции в месячном правиле схема EWS не выражает: событие
+        // должно уехать одиночным, а не сорвать сохранение.
+        let unsupported = [
+            "FREQ=MONTHLY;BYDAY=MO;BYSETPOS=2",
+            "FREQ=HOURLY;INTERVAL=6",
+            "FREQ=DAILY;COUNT=5;UNTIL=20261231T235959Z",
+            "FREQ=YEARLY;INTERVAL=2;BYMONTHDAY=9;BYMONTH=5",
+            "FREQ=MONTHLY;BYDAY=MO",
+            "FREQ=MONTHLY;BYMONTHDAY=-1",
+            "FREQ=WEEKLY;BYDAY=1MO",
+            "не-правило",
+        ];
+        for rule in unsupported {
+            let mut input = sample_event_input();
+            input.rrule = Some(rule.to_owned());
+            let body = create_calendar_item_body(&input).expect("build body");
+            assert!(!body.contains("<t:Recurrence>"), "правило {rule}");
+            assert!(body.contains("<t:Subject>"), "правило {rule}");
+        }
     }
 
     #[test]
@@ -2358,9 +3311,27 @@ mod tests {
         assert!(body.contains("<t:Contact>"));
     }
 
+    /// Прежнее состояние контакта на сервере под сегодняшний sample_contact_input:
+    /// те же три почтовых адреса и два телефона, что построит contact_item_updates.
+    fn sample_contact_state() -> ContactRemoteState {
+        ContactRemoteState {
+            change_key: "change-1".into(),
+            email_keys: vec![
+                "EmailAddress1".into(),
+                "EmailAddress2".into(),
+                "EmailAddress3".into(),
+            ],
+            phone_keys: vec!["BusinessPhone".into(), "BusinessPhone2".into()],
+        }
+    }
+
     #[test]
     fn update_contact_item_body_uses_indexed_field_uri_for_emails_and_phones() {
-        let body = update_contact_item_body("contact-1", "change-1", &sample_contact_input());
+        let body = update_contact_item_body(
+            "contact-1",
+            &sample_contact_state(),
+            &sample_contact_input(),
+        );
         assert!(body.contains(r#"<t:ItemId Id="contact-1" ChangeKey="change-1"/>"#));
         assert!(body.contains(
             r#"<t:IndexedFieldURI FieldURI="contacts:EmailAddress" FieldIndex="EmailAddress1"/>"#
@@ -2371,6 +3342,105 @@ mod tests {
         assert!(body.contains(
             r#"<t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="BusinessPhone2"/>"#
         ));
+    }
+
+    #[test]
+    fn update_contact_item_body_deletes_indexes_dropped_from_input() {
+        // На сервере было три телефона (мобильный и два рабочих) и два адреса,
+        // в новых данных остался один мобильный и один адрес.
+        let previous = ContactRemoteState {
+            change_key: "change-1".into(),
+            email_keys: vec!["EmailAddress1".into(), "EmailAddress2".into()],
+            phone_keys: vec![
+                "MobilePhone".into(),
+                "BusinessPhone".into(),
+                "BusinessPhone2".into(),
+            ],
+        };
+        let input = ContactInput {
+            display_name: "Иванов".into(),
+            first_name: None,
+            last_name: None,
+            organization: None,
+            emails: vec!["a@example.test".into()],
+            phones: vec![ContactPhone {
+                number: "+79990000000".into(),
+                kind: Some("mobile".into()),
+                extension: None,
+            }],
+        };
+        let body = update_contact_item_body("contact-1", &previous, &input);
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="BusinessPhone"/></t:DeleteItemField>"#
+        ));
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="BusinessPhone2"/></t:DeleteItemField>"#
+        ));
+        assert!(body.contains(
+            r#"<t:DeleteItemField><t:IndexedFieldURI FieldURI="contacts:EmailAddress" FieldIndex="EmailAddress2"/></t:DeleteItemField>"#
+        ));
+        // Оставшиеся индексы по-прежнему записываются, а не стираются.
+        assert!(body.contains(
+            r#"<t:IndexedFieldURI FieldURI="contacts:PhoneNumber" FieldIndex="MobilePhone"/>"#
+        ));
+        assert!(!body.contains(r#"FieldIndex="MobilePhone"/></t:DeleteItemField>"#));
+        assert!(!body.contains(r#"FieldIndex="EmailAddress1"/></t:DeleteItemField>"#));
+        // Delete идут после Set - см. contact_item_updates.
+        assert!(body.find("<t:SetItemField>").unwrap() < body.find("<t:DeleteItemField>").unwrap());
+    }
+
+    #[test]
+    fn update_contact_item_body_without_changes_has_no_delete_fields() {
+        let body = update_contact_item_body(
+            "contact-1",
+            &sample_contact_state(),
+            &sample_contact_input(),
+        );
+        assert!(!body.contains("DeleteItemField"));
+    }
+
+    #[test]
+    fn update_contact_item_body_deletes_server_only_phone_keys() {
+        // Ключи, которые наш редактор не выставляет (AssistantPhone), тоже
+        // должны стираться: в UI они видны как обычные телефоны.
+        let previous = ContactRemoteState {
+            change_key: "change-1".into(),
+            email_keys: Vec::new(),
+            phone_keys: vec!["AssistantPhone".into(), "AssistantPhone".into()],
+        };
+        let input = ContactInput {
+            display_name: "Иванов".into(),
+            first_name: None,
+            last_name: None,
+            organization: None,
+            emails: Vec::new(),
+            phones: Vec::new(),
+        };
+        let body = update_contact_item_body("contact-1", &previous, &input);
+        assert_eq!(body.matches("<t:DeleteItemField>").count(), 1);
+        assert!(body.contains(r#"FieldIndex="AssistantPhone"/></t:DeleteItemField>"#));
+    }
+
+    #[test]
+    fn parses_contact_remote_state_keys_and_change_key() {
+        let xml = r#"<Envelope><Contact><ItemId Id="contact-1" ChangeKey="ck-7"/><EmailAddresses><Entry Key="EmailAddress1">a@example.test</Entry><Entry Key="EmailAddress2"></Entry></EmailAddresses><PhoneNumbers><Entry Key="MobilePhone">+79990000000</Entry><Entry Key="BusinessPhone">  </Entry></PhoneNumbers></Contact></Envelope>"#;
+        let state = parse_contact_remote_state(xml).expect("contact state");
+        assert_eq!(state.change_key, "ck-7");
+        // Пустые Entry не считаем заполненными - стирать там нечего.
+        assert_eq!(state.email_keys, ["EmailAddress1"]);
+        assert_eq!(state.phone_keys, ["MobilePhone"]);
+    }
+
+    #[test]
+    fn contact_remote_state_requires_contact_and_change_key() {
+        assert!(parse_contact_remote_state("<Envelope/>").is_err());
+        assert!(
+            parse_contact_remote_state(
+                r#"<Envelope><Contact><ItemId Id="c"/></Contact></Envelope>"#
+            )
+            .is_err()
+        );
+        assert!(parse_contact_remote_state("<broken").is_err());
     }
 
     #[test]

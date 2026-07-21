@@ -4106,43 +4106,74 @@ impl Db {
         Ok(())
     }
 
+    /// Все контакты (по умолчанию) или подходящие под подстроку поиска.
+    ///
+    /// Раньше здесь стоял LIMIT 500, и адресная книга просто обрывалась на
+    /// пятисотом контакте по алфавиту - остальных в программе не было видно
+    /// вообще. Лимит был вынужденным: почта и телефоны читались отдельными
+    /// запросами на каждый контакт, то есть 1 + 2N обращений к зашифрованной
+    /// базе, и на большой книге это заметно подвисало. Теперь всё читается
+    /// тремя запросами независимо от числа контактов, и ограничивать выдачу
+    /// больше незачем.
     pub async fn list_contacts(&self, query: Option<&str>) -> Result<Vec<Contact>> {
+        use std::collections::HashMap;
+
         let like = format!("%{}%", query.unwrap_or(""));
         let rows = sqlx::query_as::<_, ContactRow>(
             "SELECT id, account_id, uid, display_name, first_name, last_name, organization, is_favorite, remote_url
-             FROM contacts WHERE hidden=0 AND display_name LIKE ? ORDER BY display_name LIMIT 500",
+             FROM contacts WHERE hidden=0 AND display_name LIKE ? ORDER BY display_name",
         )
-        .bind(like)
+        .bind(&like)
         .fetch_all(&self.pool)
         .await?;
         let mut contacts: Vec<Contact> = rows.into_iter().map(Into::into).collect();
-        for contact in &mut contacts {
-            if let Some(id) = contact.id {
-                contact.emails = sqlx::query_as::<_, ContactEmailRow>(
-                    "SELECT email, kind FROM contact_emails WHERE contact_id = ? ORDER BY id",
-                )
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| ContactEmail {
+        // Позиция контакта по его id: раскладывать почты и телефоны по владельцам
+        // приходится в памяти, зато вместо запроса на каждый контакт остаётся
+        // один на всю таблицу.
+        let positions: HashMap<i64, usize> = contacts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, contact)| contact.id.map(|id| (id, index)))
+            .collect();
+        if positions.is_empty() {
+            return Ok(contacts);
+        }
+        // Условие по hidden повторяет выборку выше: без него в выдачу попали бы
+        // адреса скрытых контактов, а с JOIN по contacts это дешевле, чем
+        // перечислять сотни id в IN (...).
+        let email_rows = sqlx::query_as::<_, ContactEmailRow>(
+            "SELECT e.contact_id, e.email, e.kind
+             FROM contact_emails e JOIN contacts c ON c.id = e.contact_id
+             WHERE c.hidden=0 AND c.display_name LIKE ?
+             ORDER BY e.id",
+        )
+        .bind(&like)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in email_rows {
+            if let Some(index) = positions.get(&row.contact_id) {
+                contacts[*index].emails.push(ContactEmail {
                     email: row.email,
                     kind: row.kind,
-                })
-                .collect();
-                contact.phones = sqlx::query_as::<_, ContactPhoneRow>(
-                    "SELECT number, kind, extension FROM contact_phones WHERE contact_id = ? ORDER BY id",
-                )
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .map(|row| ContactPhone {
+                });
+            }
+        }
+        let phone_rows = sqlx::query_as::<_, ContactPhoneRow>(
+            "SELECT p.contact_id, p.number, p.kind, p.extension
+             FROM contact_phones p JOIN contacts c ON c.id = p.contact_id
+             WHERE c.hidden=0 AND c.display_name LIKE ?
+             ORDER BY p.id",
+        )
+        .bind(&like)
+        .fetch_all(&self.pool)
+        .await?;
+        for row in phone_rows {
+            if let Some(index) = positions.get(&row.contact_id) {
+                contacts[*index].phones.push(ContactPhone {
                     number: row.number,
                     kind: row.kind,
                     extension: row.extension,
-                })
-                .collect();
+                });
             }
         }
         Ok(contacts)
@@ -4610,14 +4641,18 @@ struct ContactRow {
     remote_url: Option<String>,
 }
 
+/// Почта контакта вместе с владельцем: адреса всей книги читаются одним
+/// запросом и раскладываются по контактам в памяти (см. list_contacts).
 #[derive(sqlx::FromRow)]
 struct ContactEmailRow {
+    contact_id: i64,
     email: String,
     kind: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
 struct ContactPhoneRow {
+    contact_id: i64,
     number: String,
     kind: Option<String>,
     extension: Option<String>,

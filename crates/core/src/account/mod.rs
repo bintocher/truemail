@@ -12,9 +12,9 @@ pub use auxiliary::{
 };
 pub use dav::{
     AuxiliarySyncCursors, CollectionCursor, DavAuth, DavAuthScheme, DavCalendar, DavCollection,
-    DavContact, DavEvent, DavSyncResult, SyncScope, WELL_KNOWN_CALDAV, WELL_KNOWN_CARDDAV,
-    YANDEX_CALDAV_BASE, YANDEX_CARDDAV_BASE, dav_auth_scheme, discover_well_known,
-    resolve_yandex_bases, sync_dav_account, validate_dav,
+    DavContact, DavEvent, DavSyncResult, SRV_CALDAVS, SRV_CARDDAVS, SyncScope, WELL_KNOWN_CALDAV,
+    WELL_KNOWN_CARDDAV, YANDEX_CALDAV_BASE, YANDEX_CARDDAV_BASE, dav_auth_scheme, discover_srv,
+    discover_well_known, resolve_yandex_bases, sync_dav_account, validate_dav,
 };
 pub use google_services::sync_google_services;
 pub use oauth::{
@@ -885,12 +885,26 @@ impl AccountManager {
         Ok(())
     }
 
-    /// Определить базовые адреса CalDAV/CardDAV для аккаунта: уже заданные
-    /// на аккаунте (ручная настройка или прошлое обнаружение), фиксированные
-    /// адреса Яндекса, либо RFC 6764 .well-known/{caldav,carddav} по домену
-    /// почты. Найденные адреса сохраняются на аккаунте, чтобы не искать их
-    /// заново при каждой синхронизации. SRV-записи (_caldavs._tcp) не
-    /// проверяются - см. dav::discover_well_known.
+    /// Определить базовые адреса CalDAV/CardDAV для аккаунта. Источники
+    /// перебираются в порядке убывания достоверности, первый давший ответ
+    /// выигрывает:
+    /// 1) адрес, уже сохранённый на аккаунте (ручная настройка или прошлое
+    ///    обнаружение) - явное решение пользователя и результат прошлого
+    ///    поиска не имеет смысла перепроверять на каждой синхронизации;
+    /// 2) фиксированные адреса Яндекса - они известны и стабильны, сетевой
+    ///    поиск для них лишний;
+    /// 3) SRV-записи RFC 6764 (_caldavs._tcp/_carddavs._tcp) - это прямое
+    ///    заявление владельца домена о том, где живёт DAV, и единственный
+    ///    источник, умеющий указать чужой хост и нестандартный порт;
+    ///    .well-known работает только когда DAV на том же хосте, что и сайт,
+    ///    поэтому SRV идёт раньше;
+    /// 4) .well-known-редирект по домену почты - более распространён, но
+    ///    менее выразителен;
+    /// 5) провайдерские дефолты - последнее средство, к разбору домена
+    ///    отношения не имеющее.
+    ///
+    /// Найденные адреса сохраняются на аккаунте, чтобы не искать их заново
+    /// при каждой синхронизации.
     async fn resolve_dav_bases(
         &self,
         account: &Account,
@@ -907,7 +921,13 @@ impl AccountManager {
         if let Some((_, domain)) = account.email.rsplit_once('@') {
             let origin = format!("https://{domain}");
             if caldav_url.is_none() {
+                caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS).await;
+            }
+            if caldav_url.is_none() {
                 caldav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CALDAV).await;
+            }
+            if carddav_url.is_none() {
+                carddav_url = dav::discover_srv(domain, dav::SRV_CARDDAVS).await;
             }
             if carddav_url.is_none() {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
