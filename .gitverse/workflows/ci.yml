@@ -30,8 +30,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Каждый тест хранилища открывает свою базу SQLCipher, а это key
+      # derivation на каждое соединение пула. В LXC-раннере с тремя
+      # параллельными job-ами полный веер тестов упирается в CPU и соединения
+      # начинают ждать дольше таймаута пула. Четырёх потоков хватает, чтобы
+      # прогон оставался быстрым и не зависел от соседних сборок.
       - name: Tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=4
 
   windows:
     # Нативный host-runner обязателен: Tauri/NSIS и WebView2 нельзя проверить

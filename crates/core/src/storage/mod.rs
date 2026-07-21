@@ -55,6 +55,12 @@ impl Db {
             .clamp(2, 8) as u32;
         let pool = SqlitePoolOptions::new()
             .max_connections(readers)
+            // Открытие каждого соединения SQLCipher - это key derivation, а он
+            // намеренно медленный. На слабом диске или под нагрузкой (свежий
+            // запуск, антивирус, параллельная синхронизация) стандартных 30
+            // секунд sqlx не хватает, и пользователь получает ошибку открытия
+            // хранилища там, где нужно было просто подождать.
+            .acquire_timeout(std::time::Duration::from_secs(120))
             .connect_with(encrypted_options(&db_path, database_key, true))
             .await?;
         // Единственное соединение = очередь записи. Ждать в ней можно сколько
