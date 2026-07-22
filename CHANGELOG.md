@@ -9,10 +9,16 @@ versions use Semantic Versioning.
 
 ## [0.1.7] - 2026-07-23
 
+### Fixed
+
+- The Windows installer showed an "Already Installed" page suggesting to
+  uninstall the app when run manually over an older version. Upgrades now
+  install right away, matching the built-in updater; the page remains only
+  for same-version reinstalls and downgrades.
+
 ### Changed
 
-- Technical release: verifies the auto-update chain through GitHub Releases.
-  No functional changes.
+- CI pins tauri-cli (2.11.4); the NSIS template is vendored.
 
 ## [0.1.6] - 2026-07-22
 
