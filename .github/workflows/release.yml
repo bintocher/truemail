@@ -91,7 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: Установить tauri-cli
-        run: cargo binstall tauri-cli --locked --no-confirm
+        # Версия зафиксирована: NSIS-шаблон вендорен с этого тега
+        # (apps/desktop/src-tauri/nsis/installer.nsi). При обновлении версии
+        # перевендорить шаблон.
+        run: cargo binstall tauri-cli --version 2.11.4 --locked --no-confirm
       - name: Сборка пакетов
         run: |
           cd apps/desktop/src-tauri
@@ -117,7 +120,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: Установить tauri-cli
-        run: cargo binstall tauri-cli --locked --no-confirm
+        # Версия зафиксирована: NSIS-шаблон вендорен с этого тега
+        # (apps/desktop/src-tauri/nsis/installer.nsi). При обновлении версии
+        # перевендорить шаблон.
+        run: cargo binstall tauri-cli --version 2.11.4 --locked --no-confirm
       - name: Сборка NSIS
         run: |
           .\scripts\dev.ps1 -Check
@@ -146,7 +152,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: Установить tauri-cli
-        run: cargo binstall tauri-cli --locked --no-confirm
+        # Версия зафиксирована: NSIS-шаблон вендорен с этого тега
+        # (apps/desktop/src-tauri/nsis/installer.nsi). При обновлении версии
+        # перевендорить шаблон.
+        run: cargo binstall tauri-cli --version 2.11.4 --locked --no-confirm
       - name: Сборка пакетов
         run: |
           cd apps/desktop/src-tauri
