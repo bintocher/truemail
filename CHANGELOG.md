@@ -7,6 +7,13 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-23
+
+### Changed
+
+- Technical release: verifies the auto-update chain through GitHub Releases.
+  No functional changes.
+
 ## [0.1.6] - 2026-07-22
 
 ### Fixed
