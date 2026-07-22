@@ -1,0 +1,76 @@
+name: Rust CI
+
+# Проверки идут в dev (разработка) и на каждый pull request dev -> master.
+# На master ci не дублируем: там release.yml всё равно собирает и проверяет.
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+# Новый push в ту же ветку отменяет предыдущий незавершённый прогон.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      # Системный OpenSSL вместо vendored: иначе он собирается из исходников
+      # и съедает минуты на пустом месте.
+      OPENSSL_NO_VENDOR: 1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Системные зависимости Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  windows:
+    # Нативная Windows: Tauri/NSIS и WebView2 нельзя проверить в Linux.
+    # Strawberry Perl и NASM (нужны vendored OpenSSL для SQLCipher)
+    # предустановлены в образе windows-latest.
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: |
+          .\scripts\dev.ps1 -Check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: |
+          .\scripts\dev.ps1 -Check
+          cargo test --workspace --locked
+
+  macos:
+    # arm64 (Apple Silicon): macOS-специфичные ветки (keychain, tray,
+    # autostart) и Tauri-бандл нельзя проверить в Linux-раннере.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked

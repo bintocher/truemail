@@ -231,7 +231,8 @@ fn api_error(message: impl Into<String>) -> ApiError {
     }
 }
 
-const DEFAULT_UPDATE_ENDPOINT: &str = "https://chernov.gitverse.site/truemail/latest.json";
+const DEFAULT_UPDATE_ENDPOINT: &str =
+    "https://github.com/bintocher/truemail/releases/latest/download/latest.json";
 
 fn update_manifest_endpoint() -> CmdResult<url::Url> {
     let value = std::env::var("TRUEMAIL_UPDATE_ENDPOINT")
@@ -4141,7 +4142,7 @@ mod update_tests {
     fn update_manifest_is_public_and_uses_https() {
         let endpoint = url::Url::parse(DEFAULT_UPDATE_ENDPOINT).unwrap();
         assert_eq!(endpoint.scheme(), "https");
-        assert_eq!(endpoint.host_str(), Some("chernov.gitverse.site"));
+        assert_eq!(endpoint.host_str(), Some("github.com"));
         assert!(endpoint.path().ends_with("/latest.json"));
     }
 }

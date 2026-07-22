@@ -1,0 +1,216 @@
+name: Release
+
+# Только master. Релиз публикуется, когда версия в Cargo.toml выросла - для
+# существующего тега сборка пропускается. Схема: meta создаёт черновик релиза,
+# три платформы параллельно собирают и заливают ассеты, manifest собирает
+# updater latest.json и публикует релиз.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ключ подписи пакетов обновления (tauri-plugin-updater).
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+  # OAuth client id/secret вшиваются в бинарник на компиляции (option_env! в
+  # crates/core). Без них релизная сборка не может обновлять OAuth-токены и
+  # пользователь видит "токен не настроен".
+  TRUEMAIL_GOOGLE_CLIENT_ID: ${{ secrets.TRUEMAIL_GOOGLE_CLIENT_ID }}
+  TRUEMAIL_GOOGLE_CLIENT_SECRET: ${{ secrets.TRUEMAIL_GOOGLE_CLIENT_SECRET }}
+  TRUEMAIL_YANDEX_CLIENT_ID: ${{ secrets.TRUEMAIL_YANDEX_CLIENT_ID }}
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Версия из Cargo.toml
+        id: version
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          echo "Версия: $version"
+      - name: Нужен ли релиз
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --json isDraft -q .isDraft >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+              # Остатки прерванного прогона: пересоздаём черновик начисто.
+              gh release delete "$TAG" --yes
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Релиз $TAG уже опубликован - сборка пропускается"
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Черновик релиза
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" --draft --target "$GITHUB_SHA" \
+            --title "truemail $TAG" --notes-file docs/RELEASE_NOTES.md
+
+  linux:
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    env:
+      OPENSSL_NO_VENDOR: 1
+      # Страховка для окружений без FUSE: linuxdeploy распаковывается
+      # вместо монтирования.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Системные зависимости Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
+            rpm patchelf
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Установить tauri-cli
+        run: cargo binstall tauri-cli --locked --no-confirm
+      - name: Сборка пакетов
+        run: |
+          cd apps/desktop/src-tauri
+          cargo tauri build --bundles deb,rpm,appimage
+      - name: Залить ассеты
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          find target/release/bundle -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.AppImage.sig' \) \
+            -exec gh release upload "$TAG" {} --clobber \;
+
+  windows:
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Установить tauri-cli
+        run: cargo binstall tauri-cli --locked --no-confirm
+      - name: Сборка NSIS
+        run: |
+          .\scripts\dev.ps1 -Check
+          Push-Location apps\desktop\src-tauri
+          try { cargo tauri build --bundles nsis } finally { Pop-Location }
+      - name: Залить ассеты
+        # GitHub принимает .exe ассетом напрямую - zip-обёртка времён GitVerse
+        # не нужна, updater ставит NSIS-инсталлятор по его же .sig.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          $files = Get-ChildItem target\release\bundle\nsis -File |
+            Where-Object { $_.Name -like '*.exe' -or $_.Name -like '*.exe.sig' }
+          if (-not ($files | Where-Object { $_.Name -like '*.exe' })) { throw 'NSIS installer not found' }
+          if (-not ($files | Where-Object { $_.Name -like '*.exe.sig' })) { throw 'NSIS signature not found' }
+          foreach ($f in $files) { gh release upload $env:TAG $f.FullName --clobber }
+
+  macos:
+    # Нативная arm64-сборка: .dmg для установки и .app.tar.gz для updater.
+    needs: meta
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@main
+      - name: Установить tauri-cli
+        run: cargo binstall tauri-cli --locked --no-confirm
+      - name: Сборка пакетов
+        run: |
+          cd apps/desktop/src-tauri
+          cargo tauri build --bundles app,dmg
+      - name: Залить ассеты
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          find target/release/bundle -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
+            -exec gh release upload "$TAG" {} --clobber \;
+
+  manifest:
+    # Собирает updater latest.json из ассетов всех платформ, заливает его
+    # ассетом релиза и публикует черновик. Endpoint приложения:
+    # releases/latest/download/latest.json - стабильный URL последнего релиза.
+    needs: [meta, linux, windows, macos]
+    if: needs.meta.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" --json assets -q '.assets[].name' > assets.txt
+          mkdir -p sigs
+          gh release download "$TAG" --pattern '*.sig' --dir sigs
+          python3 - <<'PY'
+          import datetime, json, os, pathlib
+          tag = os.environ["TAG"]
+          repo = os.environ["REPO"]
+          assets = pathlib.Path("assets.txt").read_text().split()
+          sigs = {p.name: p.read_text().strip() for p in pathlib.Path("sigs").iterdir()}
+          url = lambda name: f"https://github.com/{repo}/releases/download/{tag}/{name}"
+          specs = [
+              ("windows-x86_64", ".exe"),
+              ("linux-x86_64", ".AppImage"),
+              ("darwin-aarch64", ".app.tar.gz"),
+          ]
+          platforms = {}
+          for key, suffix in specs:
+              pkg = next((a for a in assets if a.endswith(suffix)), None)
+              if pkg and pkg + ".sig" in sigs:
+                  platforms[key] = {"signature": sigs[pkg + ".sig"], "url": url(pkg)}
+          missing = {k for k, _ in specs} - set(platforms)
+          if missing:
+              raise SystemExit(f"нет платформ для манифеста: {sorted(missing)}")
+          manifest = {
+              "version": tag.lstrip("v"),
+              "notes": f"truemail update {tag}",
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          pathlib.Path("latest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+      - name: Опубликовать релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          gh release upload "$TAG" latest.json --clobber
+          gh release edit "$TAG" --draft=false --latest
