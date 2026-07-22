@@ -7,4 +7,4 @@ support its development.
 
 For commercial licensing inquiries: bintocher@yandex.com.
 
-Author: Chernov ([@chernov](https://gitverse.ru/chernov/truemail)).
+Author: Chernov ([@bintocher](https://github.com/bintocher/truemail)).

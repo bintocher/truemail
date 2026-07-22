@@ -7,11 +7,11 @@ members = [
 exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["chernov <bintocher@yandex.com>"]
-repository = "https://gitverse.ru/chernov/truemail"
+repository = "https://github.com/bintocher/truemail"
 rust-version = "1.85"
 
 [workspace.dependencies]

@@ -7,6 +7,20 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-07-22
+
+### Fixed
+
+- Release builds shipped without embedded Google OAuth client credentials, so
+  token refresh failed with "account not configured" and Gmail sync stopped.
+  CI now embeds the OAuth client id/secret at compile time.
+
+### Changed
+
+- The project moved to GitHub: https://github.com/bintocher/truemail. Sources,
+  CI, releases and the updater manifest now live there; the built-in updater
+  points at the GitHub release feed.
+
 ## [0.1.5] - 2026-07-21
 
 ### Added
