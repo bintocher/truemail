@@ -1,12 +1,12 @@
 name: Rust CI
 
-# Проверки идут в dev (разработка) и на каждый pull request dev -> master.
-# На master ci не дублируем: там release.yml всё равно собирает и проверяет.
+# Проверки идут в dev (разработка) и на каждый pull request dev -> main.
+# На main ci не дублируем: там release.yml всё равно собирает и проверяет.
 on:
   push:
     branches: [dev]
   pull_request:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 # Новый push в ту же ветку отменяет предыдущий незавершённый прогон.
