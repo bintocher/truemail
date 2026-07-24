@@ -172,6 +172,18 @@ document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,
   const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
   if(msg){const id=Number(msg.dataset.messageId);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag)posMenu(ctxtag,e);}else if(smart){ctxsmart.dataset.index=smart.dataset.smartIndex;posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}} });
 document.addEventListener('click',closeAllCtxMenus);
+// Esc закрывает верхнее открытое окно: сначала контекстные меню, затем модалки.
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  if([ctxmenu,ctxsmart,ctxfolder,ctxcontact,ctxtag].some(menu=>menu&&menu.classList.contains('open'))){closeAllCtxMenus();return;}
+  const overlays=[...document.querySelectorAll('.raw-overlay,.overlay.open')];
+  const top=overlays[overlays.length-1];if(!top)return;
+  e.preventDefault();
+  const closer=top.querySelector('.label-cancel,.template-close,.snooze-cancel,.confirm-cancel');
+  if(top.id==='auxOverlay')top.classList.remove('open');
+  else if(closer)closer.click();
+  else top.remove();
+});
 [ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m.querySelectorAll('.tmi:not(.tmi-check)').forEach(i=>i.onclick=()=>m.classList.remove('open')));
 ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить тег «${contextTag.name}»? Он снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Тег удалён','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));
 // Создание тега и сворачивание раздела.
