@@ -106,6 +106,9 @@ let stickyReadIds=new Set();
 // Режим счётчика писем на папку: 'u' непрочитанные, 't' всего, 'ut' оба, 'n'
 // ничего. По умолчанию 'u'. Ключ - id папки. Хранится в настройке folder_counters.
 let folderCounterModes={};
+// Теги (метки) и активный тег для фильтра списка писем.
+let coreTags=[];
+let currentTagName=null;
 let currentMessageRows=[];
 let activeMessage=null;
 let activeFullMessage=null;

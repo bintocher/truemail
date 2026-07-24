@@ -103,6 +103,8 @@
   .brand .logo svg{width:22px;height:22px;} .brand b{font-size:15px;letter-spacing:-.01em;}
   .navlabel{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);padding:12px 14px 4px;display:flex;align-items:center;}
   .navlabel .add{margin-left:auto;cursor:pointer;opacity:.7;} .navlabel .add:hover{opacity:1;}
+  .navlabel-toggle{cursor:pointer;gap:5px;} .navlabel-toggle .nav-chev{display:inline-flex;transition:transform .15s;} .navlabel-toggle .nav-chev svg{width:12px;height:12px;} .navlabel-toggle:not(.collapsed) .nav-chev{transform:rotate(90deg);}
+  .tags-nav.collapsed{display:none;} .tag-row .tag-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;} .tag-row .tag-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} .tag-row .count{margin-left:auto;}
   .navitem{display:flex;align-items:center;gap:10px;padding:7px 8px;margin:1px 8px;border-radius:var(--radius);
     color:var(--text-2);cursor:pointer;user-select:none;font-size:var(--fs);}
   button.navitem,.navlabel button.add{border:0;background:transparent;font:inherit;text-align:left}.navlabel button.add{color:inherit;padding:2px}
