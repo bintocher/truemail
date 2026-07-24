@@ -1657,6 +1657,123 @@ pub async fn fetch_password_message_raw(
     fetch_message_raw(session, folder_path, uid).await
 }
 
+/// Догрузить более старые письма папки (бесконечная прокрутка): письма с датой
+/// строго раньше `before` (ISO 8601), не больше `limit` самых свежих среди них.
+async fn fetch_older_messages(
+    mut session: OAuthSession,
+    folder_path: &str,
+    before: &str,
+    limit: usize,
+) -> Result<Vec<DiscoveredMessage>> {
+    session
+        .select(folder_path)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-select".into(),
+            message: format!("{folder_path}: {error}"),
+        })?;
+    // IMAP SEARCH BEFORE ждёт дату вида "17-Jul-2026" (день, по INTERNALDATE).
+    let date = chrono::DateTime::parse_from_rfc3339(before)
+        .map(|value| value.date_naive())
+        .or_else(|_| {
+            chrono::NaiveDate::parse_from_str(before.get(..10).unwrap_or(before), "%Y-%m-%d")
+        })
+        .map_err(|_| Error::Backend {
+            backend: "imap-older".into(),
+            message: format!("некорректная дата {before}"),
+        })?
+        .format("%d-%b-%Y")
+        .to_string();
+    let mut uids = session
+        .uid_search(format!("BEFORE {date}"))
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-search".into(),
+            message: format!("{folder_path}: {error}"),
+        })?
+        .into_iter()
+        .collect::<Vec<u32>>();
+    uids.sort_unstable();
+    // Самые свежие среди старых (наибольшие UID) - следующие за уже показанными.
+    let take = uids.split_off(uids.len().saturating_sub(limit.max(1)));
+    if take.is_empty() {
+        let _ = session.logout().await;
+        return Ok(Vec::new());
+    }
+    let set = take
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let fetched = session
+        .uid_fetch(set, MESSAGE_FETCH_ITEMS)
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-fetch".into(),
+            message: error.to_string(),
+        })?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| Error::Backend {
+            backend: "imap-fetch".into(),
+            message: error.to_string(),
+        })?;
+    let mut messages = Vec::new();
+    for fetch in fetched {
+        let Some(uid) = fetch.uid else { continue };
+        let Some(raw) = fetch.body() else { continue };
+        let flags: Vec<_> = fetch.flags().collect();
+        messages.push(DiscoveredMessage {
+            folder_path: folder_path.to_owned(),
+            uid,
+            remote_id: None,
+            size: fetch.size,
+            seen: flags
+                .iter()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Seen)),
+            flagged: flags
+                .iter()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Flagged)),
+            answered: flags
+                .iter()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Answered)),
+            draft: flags
+                .iter()
+                .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
+            raw: raw.to_vec(),
+            body_fetched: true,
+        });
+    }
+    let _ = session.logout().await;
+    Ok(messages)
+}
+
+pub async fn fetch_older_oauth(
+    host: &str,
+    email: &str,
+    access_token: &str,
+    folder_path: &str,
+    before: &str,
+    limit: usize,
+) -> Result<Vec<DiscoveredMessage>> {
+    let session = connect_oauth(host, email, access_token).await?;
+    fetch_older_messages(session, folder_path, before, limit).await
+}
+
+pub async fn fetch_older_password(
+    host: &str,
+    port: u16,
+    security: Security,
+    username: &str,
+    password: &str,
+    folder_path: &str,
+    before: &str,
+    limit: usize,
+) -> Result<Vec<DiscoveredMessage>> {
+    let session = connect_password(host, port, security, username, password).await?;
+    fetch_older_messages(session, folder_path, before, limit).await
+}
+
 async fn fetch_message_raw(
     mut session: OAuthSession,
     folder_path: &str,
