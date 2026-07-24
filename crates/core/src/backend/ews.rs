@@ -655,7 +655,7 @@ impl EwsBackend {
     }
 
     async fn folders(&self, password: &str) -> Result<Vec<DiscoveredFolder>> {
-        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
+        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:ParentFolderId"/></t:AdditionalProperties></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
         let response = self.soap(password, "FindFolder", body).await?;
         parse_folders(&response)
     }
@@ -1277,10 +1277,19 @@ fn parse_folders(xml: &str) -> Result<Vec<DiscoveredFolder>> {
         let unread = node_text(node, "UnreadCount")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        // ParentFolderId связывает папку с родителем. У папок верхнего уровня он
+        // указывает на msgfolderroot, которого нет среди синхронизируемых папок,
+        // поэтому parent_id при разрешении останется NULL - это и есть корень.
+        let parent_remote_path = node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "ParentFolderId")
+            .and_then(|child| child.attribute("Id"))
+            .map(str::to_owned);
         folders.push(DiscoveredFolder {
             remote_path: id.to_owned(),
             display_name: name.to_owned(),
             role: infer_folder_role(name, name),
+            parent_remote_path,
             unread_count: unread,
             total_count: total,
             uidvalidity: None,

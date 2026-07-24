@@ -115,6 +115,16 @@ async function openGallery(full,att,messageId){
 }
 function folderTitle(folder){const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};return names[folder?.role]||folder?.display_name||folder?.remote_path||'';}
 function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
+// Порядок и глубина папок. Если бэкенд отдал parent_id (Exchange) - строим
+// дерево, дети под родителем. Иначе (IMAP) глубина по разделителям remote_path.
+function folderTreeRows(folders){
+  const byId=new Map(folders.map(folder=>[folder.id,folder]));
+  const hasTree=folders.some(folder=>folder.parent_id&&byId.has(folder.parent_id));
+  if(!hasTree)return sortedFolders(folders).map(folder=>({folder,depth:Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length)}));
+  const children=new Map();folders.forEach(folder=>{const parent=(folder.parent_id&&byId.has(folder.parent_id))?folder.parent_id:0;if(!children.has(parent))children.set(parent,[]);children.get(parent).push(folder);});
+  const rows=[];const walk=(list,depth)=>sortedFolders(list).forEach(folder=>{rows.push({folder,depth});walk(children.get(folder.id)||[],depth+1);});walk(children.get(0)||[],0);
+  return rows;
+}
 // Счётчик писем у папки: 'u' непрочитанные, 't' всего, 'ut' оба (непрочит/всего), 'n' ничего.
 function folderCounterMode(folder){return folderCounterModes[folder?.id]||'u';}
 function folderCountBadge(folder){const mode=folderCounterMode(folder),showU=mode.includes('u'),showT=mode.includes('t');if(!showU&&!showT)return '';const u=folder.unread_count||0,t=folder.total_count||0;if(showU&&showT)return `${u}/${t}`;if(showT)return `${t}`;return u>0?`${u}`:'';}
@@ -337,9 +347,8 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
     anchor.after(header);anchor=header;
     const sub=document.createElement('div');sub.className='acc-sub'+(accountOpen?' open':'');
-    const accountFolders=sortedFolders(foldersByAccount[index]||[]);
-    accountFolders.forEach(folder=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
-      const icon=folderIcon(folder);const depth=Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length);row.style.paddingLeft=`${14+depth*14}px`;
+    folderTreeRows(foldersByAccount[index]||[]).forEach(({folder,depth})=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
+      const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;
       row.querySelector('.folder-name').textContent=folderTitle(folder);updateFolderBadge(row,folder);
       const openFolder=()=>{goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
