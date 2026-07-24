@@ -42,6 +42,7 @@
   "countUnread": "Show unread count",
   "countTotal": "Show total count",
   "navTags": "Tags",
+  "tagsLead": "Colored labels for messages. Create, rename, recolor and delete them. Tagged messages are gathered in the Tags section on the left.",
   "createTag": "Create tag",
   "editTag": "Rename / color",
   "deleteTag": "Delete tag",

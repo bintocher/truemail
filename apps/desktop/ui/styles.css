@@ -104,7 +104,10 @@
   .navlabel{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);padding:12px 14px 4px;display:flex;align-items:center;}
   .navlabel .add{margin-left:auto;cursor:pointer;opacity:.7;} .navlabel .add:hover{opacity:1;}
   .navlabel-toggle{cursor:pointer;} .navlabel-toggle::before{content:"";display:inline-block;width:0;height:0;border-left:4px solid currentColor;border-top:3px solid transparent;border-bottom:3px solid transparent;margin-right:7px;transition:transform .15s;} .navlabel-toggle:not(.collapsed)::before{transform:rotate(90deg);}
-  .tags-nav.collapsed{display:none;} .tag-row .tag-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;} .tag-row .tag-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} .tag-row .count{margin-left:auto;}
+  .tags-nav.collapsed{display:none;} .tag-row .tag-dot{width:11px;height:11px;border-radius:3px;flex:0 0 auto;} .tag-row .tag-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} .tag-row .count{margin-left:auto;}
+  .msg-tag{display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:10px;padding:1px 8px;margin-top:3px;font-size:10px;line-height:1.5;color:#fff;background:var(--tag-color,#888);}
+  .flag-menu .flag-dot{border-radius:3px;} .tmi.has-submenu::after{content:"\203A";margin-left:auto;padding-left:10px;color:var(--text-3);font-size:15px;line-height:1;}
+  .tag-settings-row{display:flex;align-items:center;gap:10px;padding:9px 4px;border-top:1px solid var(--border);} .tag-settings-row:first-child{border-top:0;} .tag-settings-row .tag-dot{width:13px;height:13px;border-radius:3px;flex:0 0 auto;} .tag-settings-row .count{color:var(--text-3);font-size:12px;}
   .navitem{display:flex;align-items:center;gap:10px;padding:7px 8px;margin:1px 8px;border-radius:var(--radius);
     color:var(--text-2);cursor:pointer;user-select:none;font-size:var(--fs);}
   button.navitem,.navlabel button.add{border:0;background:transparent;font:inherit;text-align:left}.navlabel button.add{color:inherit;padding:2px}
