@@ -98,6 +98,11 @@ let coreContacts=[];
 let coreCalendarData={calendars:[],events:[]};
 let currentFolderId=null;
 let currentSmartIndex=0;
+// Письма, прочитанные в текущем показе списка. Удерживаются видимыми, даже
+// если перестали проходить фильтр "непрочитанные" (умная папка или ручной
+// фильтр), пока пользователь не сменит папку/раздел. Очищается в
+// applyListOptions при resetScroll.
+let stickyReadIds=new Set();
 let currentMessageRows=[];
 let activeMessage=null;
 let activeFullMessage=null;
