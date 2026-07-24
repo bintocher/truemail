@@ -36,6 +36,7 @@
     deleteFolder: (folderId) => invoke("delete_folder", { folderId }),
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
+    fetchOlderMessages: (folderId, before, limit = 500) => invoke("fetch_older_messages", { folderId, before, limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
     exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),

@@ -144,7 +144,11 @@ async function loadNextMessagePage(){
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;
   try{
-    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}const page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length===MESSAGE_PAGE_SIZE);}
+    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
+      // Локальные письма кончились - но на сервере в папке их больше: догружаем
+      // следующую порцию с сервера и снова читаем из базы.
+      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);if(folder&&(folder.total_count||0)>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,MESSAGE_PAGE_SIZE);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){console.error('truemail backfill:',error);}}}
+      messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
   }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;}
 }

@@ -654,6 +654,29 @@ impl EwsBackend {
             .await
     }
 
+    /// Письма папки строго старше даты `before` (для догрузки при прокрутке).
+    /// Сортировка по убыванию даты - следующие за уже показанными.
+    async fn older_messages_in_folder(
+        &self,
+        password: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        let restriction = format!(
+            r#"<m:Restriction><t:IsLessThan><t:FieldURI FieldURI="item:DateTimeReceived"/><t:FieldURIOrConstant><t:Constant Value="{}"/></t:FieldURIOrConstant></t:IsLessThan></m:Restriction>"#,
+            escape(before)
+        );
+        let body = format!(
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>{restriction}<m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            limit,
+            escape(folder_path)
+        );
+        let response = self.soap(password, "FindItem", &body).await?;
+        let ids = parse_item_ids(&response)?;
+        self.messages_by_ids(password, folder_path, &ids).await
+    }
+
     async fn folders(&self, password: &str) -> Result<Vec<DiscoveredFolder>> {
         let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:ParentFolderId"/></t:AdditionalProperties></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
         let response = self.soap(password, "FindFolder", body).await?;
@@ -3038,6 +3061,18 @@ impl MailBackend for EwsBackend {
             remote_id.ok_or_else(|| Error::AccountConfig("EWS: нет remote_id письма".into()))?,
         )
         .await
+    }
+
+    async fn fetch_older_messages(
+        &self,
+        _email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        self.older_messages_in_folder(credential, folder_path, before, limit)
+            .await
     }
 }
 

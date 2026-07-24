@@ -1537,6 +1537,20 @@ pub async fn list_messages_page(
 }
 
 #[tauri::command]
+pub async fn fetch_older_messages(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    before: String,
+    limit: Option<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .fetch_older_folder_messages(folder_id, &before, limit.unwrap_or(500).max(1) as usize)
+        .await?)
+}
+
+#[tauri::command]
 pub async fn get_message(state: State<'_, AppState>, message_id: i64) -> CmdResult<MessageFull> {
     let core = core(&state).await?;
     // Если письмо вне кэша (raw вычищен по глубине хранения) - докачиваем с сервера.
