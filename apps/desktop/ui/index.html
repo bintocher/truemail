@@ -121,6 +121,7 @@
       <button type="button" class="sec" data-set="toolbar"><i data-i="grip"></i><span data-i18n="setToolbar">Панель письма</span></button>
       <button type="button" class="sec" data-set="accounts"><i data-i="user"></i><span data-i18n="navAccounts">Аккаунты</span></button>
       <button type="button" class="sec" data-set="smart"><i data-i="star"></i><span data-i18n="navSmartFolders">Умные папки</span></button>
+      <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Теги</span></button>
       <button type="button" class="sec" data-set="rules"><i data-i="filter"></i><span data-i18n="processingRules">Правила обработки</span></button>
       <button type="button" class="sec" data-set="unified"><i data-i="inbox"></i><span data-i18n="setUnified">Сквозные папки</span></button>
       <button type="button" class="sec" data-set="folders"><i data-i="folder"></i><span data-i18n="setFolders">Сопоставление папок</span></button>
@@ -204,6 +205,12 @@
         <h1 data-i18n="navSmartFolders">Умные папки</h1><p class="lead" data-i18n="smartLead">Папки, которые сами собирают письма по условиям (все входящие, с вложениями, за сегодня и любые ваши). Меняйте порядок, показывайте/скрывайте, редактируйте условия.</p>
         <button class="btn primary" id="smartNew2"><i data-i="plus"></i><span data-i18n="createSmartFolder">Создать умную папку</span></button>
         <div class="card mt-20"><div class="cb" id="smartList"></div></div>
+      </div>
+
+      <div class="setpage" id="set-tags">
+        <h1 data-i18n="navTags">Теги</h1><p class="lead" data-i18n="tagsLead">Цветные метки для писем. Создавайте, переименовывайте, меняйте цвет и удаляйте. Помеченные письма собираются в разделе «Теги» слева.</p>
+        <button class="btn primary" id="tagNew2"><i data-i="plus"></i><span data-i18n="createTag">Создать тег</span></button>
+        <div class="card mt-20"><div class="cb" id="tagSettingsList"></div></div>
       </div>
 
       <div class="setpage" id="set-rules">
