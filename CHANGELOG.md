@@ -11,28 +11,23 @@ versions use Semantic Versioning.
 
 ### Fixed
 
-- The Windows installer showed an "Already Installed" page suggesting to
-  uninstall the app when run manually over an older version. Upgrades now
-  install right away, matching the built-in updater; the page remains only
-  for same-version reinstalls and downgrades.
-
-### Changed
-
-- CI pins tauri-cli (2.11.4); the NSIS template is vendored.
+- Installing a new version over an older one no longer asks you to remove the
+  previous one first - the update installs straight away and keeps your mail
+  and settings. You are still asked to uninstall only when installing the same
+  version again or going back to an older one.
 
 ## [0.1.6] - 2026-07-22
 
 ### Fixed
 
-- Release builds shipped without embedded Google OAuth client credentials, so
-  token refresh failed with "account not configured" and Gmail sync stopped.
-  CI now embeds the OAuth client id/secret at compile time.
+- The app could lose access to Google mail and show "account not configured":
+  sign-in stopped renewing and Gmail stopped updating. Sign-in now stays
+  connected as it should.
 
 ### Changed
 
-- The project moved to GitHub: https://github.com/bintocher/truemail. Sources,
-  CI, releases and the updater manifest now live there; the built-in updater
-  points at the GitHub release feed.
+- The project moved to GitHub: https://github.com/bintocher/truemail. Sources
+  and updates now come from there; the update arrives on its own, as usual.
 
 ## [0.1.5] - 2026-07-21
 
