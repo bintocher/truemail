@@ -187,7 +187,7 @@ document.addEventListener('keydown',e=>{
   if(closer)closer.click();else top.classList.remove('open');
 });
 [ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m.querySelectorAll('.tmi:not(.tmi-check)').forEach(i=>i.onclick=()=>m.classList.remove('open')));
-ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить тег «${contextTag.name}»? Он снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Тег удалён','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));
+ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить метку «${contextTag.name}»? Она снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Метка удалена','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));
 // Создание тега и сворачивание раздела.
 document.getElementById('addTag')?.addEventListener('click',()=>openLabelCreator(null));
 // Меню флажков (пользовательских меток) для письма.
@@ -233,7 +233,7 @@ function openLabelCreator(message){
 // Редактор существующего тега: имя, цвет, удаление.
 function openLabelEditor(label){
   const overlay=document.createElement('div');overlay.className='raw-overlay';
-  overlay.innerHTML=`<div class="label-box"><h3>${L('Тег','Tag')}</h3><input class="inp label-name" placeholder="${L('Название метки','Label name')}" maxlength="40"><div class="label-colors"></div><div class="label-actions"><button type="button" class="btn danger-btn label-delete">${L('Удалить','Delete')}</button><span class="grow"></span><button type="button" class="btn label-cancel">${L('Отмена','Cancel')}</button><button type="button" class="btn primary label-save">${L('Сохранить','Save')}</button></div></div>`;
+  overlay.innerHTML=`<div class="label-box"><h3>${L('Метка','Tag')}</h3><input class="inp label-name" placeholder="${L('Название метки','Label name')}" maxlength="40"><div class="label-colors"></div><div class="label-actions"><button type="button" class="btn danger-btn label-delete">${L('Удалить','Delete')}</button><span class="grow"></span><button type="button" class="btn label-cancel">${L('Отмена','Cancel')}</button><button type="button" class="btn primary label-save">${L('Сохранить','Save')}</button></div></div>`;
   document.body.appendChild(overlay);
   overlay.querySelector('.label-name').value=label.name||'';
   let chosen=label.color||ACCOUNT_COLORS[0];
@@ -242,8 +242,8 @@ function openLabelEditor(label){
   const close=()=>overlay.remove();
   overlay.querySelector('.label-cancel').onclick=close;
   overlay.onclick=e=>{if(e.target===overlay)close();};
-  overlay.querySelector('.label-delete').onclick=async()=>{if(!confirm(L(`Удалить тег «${label.name}»? Он снимется со всех писем.`,`Delete tag "${label.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(label.id);if(currentTagName===label.name)currentTagName=null;await window.reloadCoreData?.();close();showToast(L('Тег удалён','Tag deleted'));}catch(error){showToast(error.message||String(error));}};
-  overlay.querySelector('.label-save').onclick=async()=>{const name=overlay.querySelector('.label-name').value.trim();if(!name){showToast(L('Введите название метки','Enter a label name'));return;}try{await window.tm.updateLabel(label.id,name,chosen);if(currentTagName===label.name)currentTagName=name;await window.reloadCoreData?.();close();showToast(L('Тег обновлён','Tag updated'));}catch(error){showToast(error.message||String(error));}};
+  overlay.querySelector('.label-delete').onclick=async()=>{if(!confirm(L(`Удалить метку «${label.name}»? Она снимется со всех писем.`,`Delete tag "${label.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(label.id);if(currentTagName===label.name)currentTagName=null;await window.reloadCoreData?.();close();showToast(L('Метка удалена','Tag deleted'));}catch(error){showToast(error.message||String(error));}};
+  overlay.querySelector('.label-save').onclick=async()=>{const name=overlay.querySelector('.label-name').value.trim();if(!name){showToast(L('Введите название метки','Enter a label name'));return;}try{await window.tm.updateLabel(label.id,name,chosen);if(currentTagName===label.name)currentTagName=name;await window.reloadCoreData?.();close();showToast(L('Метка обновлена','Tag updated'));}catch(error){showToast(error.message||String(error));}};
   overlay.querySelector('.label-name').focus();
 }
 // ПКМ-меню письма = все действия панели письма (tbActions, даже выключенные) + доп.
@@ -251,7 +251,7 @@ function buildContextMenu(){
   ctxmenu.innerHTML='';
   tbActions.forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
   const sep=document.createElement('div');sep.className='tmsep';ctxmenu.appendChild(sep);
-  (smartIsEnglish()?[['flag','flag','Add tag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Добавить тег'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top});}});ctxmenu.appendChild(item);});
+  (smartIsEnglish()?[['flag','flag','Add tag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Добавить метку'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top});}});ctxmenu.appendChild(item);});
   renderIcons(ctxmenu);
 }
 ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;ctxmenu.classList.remove('open');const action=item.dataset.contextAction;
