@@ -125,7 +125,8 @@
   .nav-spacer{flex:1;}
 
   .list{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--bg);user-select:none;-webkit-user-select:none;position:relative;}
-  .list-loading{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);z-index:6;display:flex;align-items:center;justify-content:center;width:34px;height:34px;background:var(--bg);border:1px solid var(--border);border-radius:50%;box-shadow:var(--shadow);}
+  .list-loading{position:absolute;left:0;right:0;bottom:0;z-index:6;display:flex;align-items:center;gap:9px;padding:8px 14px;background:var(--bg);border-top:1px solid var(--border);box-shadow:0 -2px 8px rgba(0,0,0,.06);font-size:12px;color:var(--text-2);}
+  .list-loading-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   .spinner{width:16px;height:16px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:tm-spin .7s linear infinite;}
   @keyframes tm-spin{to{transform:rotate(360deg);}}
   .list input[type="text"],.list .search input{user-select:text;-webkit-user-select:text;}

@@ -347,6 +347,7 @@ fn run() -> anyhow::Result<()> {
             commands::list_messages,
             commands::list_messages_page,
             commands::fetch_older_messages,
+            commands::ui_log,
             commands::get_message,
             commands::message_raw,
             commands::export_message_eml,

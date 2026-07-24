@@ -1536,6 +1536,13 @@ pub async fn list_messages_page(
         .await?)
 }
 
+/// Запись сообщения фронтенда в общий лог приложения (truemail.log) - чтобы
+/// диагностировать загрузку/прокрутку в одном месте с бэкендом.
+#[tauri::command]
+pub fn ui_log(message: String) {
+    tracing::info!("[ui] {message}");
+}
+
 #[tauri::command]
 pub async fn fetch_older_messages(
     state: State<'_, AppState>,

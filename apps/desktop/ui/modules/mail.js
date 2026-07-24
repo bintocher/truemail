@@ -329,7 +329,7 @@ function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normal
 const coreSmartRows=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
-  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true);
+  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
   try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),cursor=existing.at(-1);
     let rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);
     // Локальная выборка кончилась - догружаем старые письма с сервера по папкам,

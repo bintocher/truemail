@@ -140,15 +140,30 @@ document.addEventListener('pointerup',()=>{selectionDragMode=null;});
 function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i];if(s)e.innerHTML=s;});}
 
 const msgsEl=document.getElementById('msgs');
-function setListLoading(on){document.getElementById('listLoading')?.classList.toggle('hidden',!on);}
+let listLoadTimer=null,listLoadStart=0,listLoadLabel='';
+function setListLoading(on,label){
+  const box=document.getElementById('listLoading');if(!box)return;const text=box.querySelector('.list-loading-text');
+  if(on){
+    if(listLoadTimer)clearInterval(listLoadTimer);
+    listLoadStart=performance.now();listLoadLabel=label||'данные';
+    box.classList.remove('hidden');
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(text)text.textContent=`Загружаю ${listLoadLabel}… прошло ${s} с`;};
+    tick();listLoadTimer=setInterval(tick,100);
+    window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
+  }else{
+    if(listLoadTimer){clearInterval(listLoadTimer);listLoadTimer=null;}
+    if(!box.classList.contains('hidden')){const s=((performance.now()-listLoadStart)/1000).toFixed(1);window.tm?.uiLog?.(`загрузка завершена: ${listLoadLabel} за ${s} с`);console.log('[load done]',listLoadLabel,s+'s');}
+    box.classList.add('hidden');
+  }
+}
 async function loadNextMessagePage(){
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
-  loadingMoreMessages=true;setListLoading(true);
+  loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       // Локальные письма кончились - но на сервере в папке их больше: догружаем
       // следующую порцию с сервера и снова читаем из базы.
-      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);if(folder&&(folder.total_count||0)>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,MESSAGE_PAGE_SIZE);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){console.error('truemail backfill:',error);}}}
+      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,MESSAGE_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
       messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
   }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;setListLoading(false);}

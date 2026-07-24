@@ -874,8 +874,10 @@ impl AccountManager {
             .into_iter()
             .find(|item| item.id == folder.account_id)
         else {
+            tracing::warn!(folder_id, "догрузка: аккаунт папки не найден");
             return Ok(0);
         };
+        tracing::info!(folder_id, before, provider = ?account.provider, remote_path = %folder.remote_path, "догрузка: запрос старых писем с сервера");
         let credential = self.mail_credential(&account).await?;
         let backend = Self::mail_backend(&account)?;
         let messages = backend
@@ -887,6 +889,11 @@ impl AccountManager {
                 limit,
             )
             .await?;
+        tracing::info!(
+            folder_id,
+            fetched = messages.len(),
+            "догрузка: сервер вернул письма"
+        );
         if messages.is_empty() {
             return Ok(0);
         }
