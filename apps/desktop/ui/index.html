@@ -218,8 +218,9 @@
           </div>
           <div class="rule-condition-grid rule-action-grid">
             <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
-            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option></select></div>
+            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option><option value="label" data-i18n="actAssignTag">Назначить тег</option></select></div>
             <div class="fld rule-target-field"><label data-i18n="ruleFolderLabel">Папка</label><select class="sel" id="ruleTarget"></select></div>
+            <div class="fld rule-tag-field hidden"><label data-i18n="ruleTagLabel">Тег</label><select class="sel" id="ruleTag"></select></div>
           </div>
           <label class="aux-check"><input type="checkbox" id="ruleExisting"> <span data-i18n="ruleApplyExisting">Применить также к уже загруженным письмам</span></label>
           <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="ruleCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i><span data-i18n="deleteRule">Удалить правило</span></button></div>

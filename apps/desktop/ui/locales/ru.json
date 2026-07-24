@@ -347,6 +347,8 @@
   "ruleApplyExisting": "Применить также к уже загруженным письмам",
   "ruleFieldLabel": "Поле",
   "ruleFolderLabel": "Папка",
+  "ruleTagLabel": "Тег",
+  "actAssignTag": "Назначить тег",
   "ruleNameLabel": "Название",
   "ruleNamePlaceholder": "Например: Чеки в Финансы",
   "ruleOperatorLabel": "Сравнение",

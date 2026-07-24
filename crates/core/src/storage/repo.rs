@@ -3466,7 +3466,7 @@ impl Db {
 
     pub async fn list_mail_rules(&self) -> Result<Vec<MailRule>> {
         let rows: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
                     enabled, progress_message_id, sort_order
              FROM mail_rules ORDER BY sort_order, created_at, id",
         )
@@ -3488,11 +3488,26 @@ impl Db {
         }
         if !matches!(rule.field.as_str(), "sender" | "subject")
             || !matches!(rule.operator.as_str(), "contains" | "equals")
-            || !matches!(rule.action.as_str(), "move" | "archive" | "spam" | "trash")
+            || !matches!(
+                rule.action.as_str(),
+                "move" | "archive" | "spam" | "trash" | "label"
+            )
         {
             return Err(crate::Error::AccountConfig(
                 "правило содержит неподдерживаемое условие или действие".into(),
             ));
+        }
+        if rule.action == "label" {
+            let label_id = rule
+                .label_id
+                .ok_or_else(|| crate::Error::AccountConfig("для правила не выбран тег".into()))?;
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM labels WHERE id=?")
+                .bind(label_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if exists.is_none() {
+                return Err(crate::Error::AccountConfig("тег правила не найден".into()));
+            }
         }
         let mut tx = self.begin_write().await?;
         if let Some(account_id) = rule.account_id {
@@ -3551,13 +3566,13 @@ impl Db {
         };
         sqlx::query(
             "INSERT INTO mail_rules(
-                id, name, field, operator, value, account_id, action, folder_id,
+                id, name, field, operator, value, account_id, action, folder_id, label_id,
                 enabled, progress_message_id, sort_order
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, field=excluded.field, operator=excluded.operator,
                 value=excluded.value, account_id=excluded.account_id,
-                action=excluded.action, folder_id=excluded.folder_id,
+                action=excluded.action, folder_id=excluded.folder_id, label_id=excluded.label_id,
                 enabled=excluded.enabled, progress_message_id=excluded.progress_message_id,
                 updated_at=datetime('now')",
         )
@@ -3569,6 +3584,7 @@ impl Db {
         .bind(rule.account_id)
         .bind(&rule.action)
         .bind((rule.action == "move").then_some(rule.folder_id).flatten())
+        .bind((rule.action == "label").then_some(rule.label_id).flatten())
         .bind(rule.enabled)
         .bind(progress)
         .bind(sort_order)
@@ -3609,7 +3625,7 @@ impl Db {
     pub async fn process_mail_rules(&self) -> Result<usize> {
         let mut tx = self.begin_write().await?;
         let mut rules: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
                     enabled, progress_message_id, sort_order
              FROM mail_rules WHERE enabled=1 ORDER BY sort_order, created_at, id",
         )
@@ -3667,6 +3683,22 @@ impl Db {
             });
             if let Some(index) = matching {
                 let rule = &rules[index];
+                if rule.action == "label" {
+                    // Метки локальные - вешаем сразу, без outbox/сервера.
+                    let label_id = rule.label_id.ok_or_else(|| {
+                        crate::Error::AccountConfig(format!("у правила {} не задан тег", rule.name))
+                    })?;
+                    let result = sqlx::query(
+                        "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
+                    )
+                    .bind(message.id)
+                    .bind(label_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if result.rows_affected() > 0 {
+                        queued += 1;
+                    }
+                } else {
                 let target = if rule.action == "move" {
                     let folder_id = rule.folder_id.ok_or_else(|| {
                         crate::Error::AccountConfig(format!(
@@ -3718,6 +3750,7 @@ impl Db {
                     .execute(&mut *tx)
                     .await?;
                     queued += 1;
+                }
                 }
             }
             for rule in &mut rules {
@@ -4632,6 +4665,7 @@ struct MailRuleRow {
     account_id: Option<i64>,
     action: String,
     folder_id: Option<i64>,
+    label_id: Option<i64>,
     enabled: i64,
     progress_message_id: i64,
     sort_order: i64,
@@ -4648,6 +4682,7 @@ impl From<MailRuleRow> for MailRule {
             account_id: rule.account_id,
             action: rule.action,
             folder_id: rule.folder_id,
+            label_id: rule.label_id,
             enabled: rule.enabled != 0,
             progress_message_id: rule.progress_message_id,
             sort_order: rule.sort_order,
