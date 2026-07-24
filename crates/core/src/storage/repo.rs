@@ -3717,58 +3717,58 @@ impl Db {
                         queued += 1;
                     }
                 } else {
-                let target = if rule.action == "move" {
-                    let folder_id = rule.folder_id.ok_or_else(|| {
-                        crate::Error::AccountConfig(format!(
-                            "у правила {} нет папки назначения",
-                            rule.name
-                        ))
-                    })?;
-                    sqlx::query_as::<_, (i64, String)>(
-                        "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
-                    )
-                    .bind(folder_id)
-                    .bind(message.account_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                } else {
-                    sqlx::query_as::<_, (i64, String)>(
+                    let target = if rule.action == "move" {
+                        let folder_id = rule.folder_id.ok_or_else(|| {
+                            crate::Error::AccountConfig(format!(
+                                "у правила {} нет папки назначения",
+                                rule.name
+                            ))
+                        })?;
+                        sqlx::query_as::<_, (i64, String)>(
+                            "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                        )
+                        .bind(folder_id)
+                        .bind(message.account_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    } else {
+                        sqlx::query_as::<_, (i64, String)>(
                         "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
                     )
                     .bind(message.account_id)
                     .bind(&rule.action)
                     .fetch_optional(&mut *tx)
                     .await?
-                }
-                .ok_or_else(|| {
-                    crate::Error::AccountConfig(format!(
-                        "для правила {} не найдена папка назначения",
-                        rule.name
-                    ))
-                })?;
-                if target.0 != message.folder_id {
-                    let payload = serde_json::json!({
-                        "message_id": message.id,
-                        "folder_id": message.folder_id,
-                        "folder_path": message.remote_path,
-                        "uid": message.uid,
-                        "remote_id": message.remote_id,
-                        "target_folder_id": target.0,
-                        "target_folder_path": target.1,
-                        "rule_id": rule.id,
-                    });
-                    sqlx::query(
-                        "INSERT INTO outbox_ops(
+                    }
+                    .ok_or_else(|| {
+                        crate::Error::AccountConfig(format!(
+                            "для правила {} не найдена папка назначения",
+                            rule.name
+                        ))
+                    })?;
+                    if target.0 != message.folder_id {
+                        let payload = serde_json::json!({
+                            "message_id": message.id,
+                            "folder_id": message.folder_id,
+                            "folder_path": message.remote_path,
+                            "uid": message.uid,
+                            "remote_id": message.remote_id,
+                            "target_folder_id": target.0,
+                            "target_folder_path": target.1,
+                            "rule_id": rule.id,
+                        });
+                        sqlx::query(
+                            "INSERT INTO outbox_ops(
                             account_id, message_id, op_kind, payload, status, next_attempt_at
                          ) VALUES(?, ?, 'move', ?, 'pending', datetime('now'))",
-                    )
-                    .bind(message.account_id)
-                    .bind(message.id)
-                    .bind(payload.to_string())
-                    .execute(&mut *tx)
-                    .await?;
-                    queued += 1;
-                }
+                        )
+                        .bind(message.account_id)
+                        .bind(message.id)
+                        .bind(payload.to_string())
+                        .execute(&mut *tx)
+                        .await?;
+                        queued += 1;
+                    }
                 }
             }
             for rule in &mut rules {

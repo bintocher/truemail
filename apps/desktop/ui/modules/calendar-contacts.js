@@ -190,7 +190,6 @@ document.addEventListener('keydown',e=>{
 ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить тег «${contextTag.name}»? Он снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Тег удалён','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));
 // Создание тега и сворачивание раздела.
 document.getElementById('addTag')?.addEventListener('click',()=>openLabelCreator(null));
-document.querySelector('[data-navlabel="tags"]')?.addEventListener('click',event=>{if(event.target.closest('.add'))return;const collapsed=document.getElementById('tagsNav')?.classList.toggle('collapsed');event.currentTarget.classList.toggle('collapsed',collapsed);window.tm?.setSetting('tags_nav_collapsed',collapsed?'1':'0').catch(console.error);});
 // Меню флажков (пользовательских меток) для письма.
 async function openFlagMenu(message,event){
   if(!message){showToast(L('Сначала выберите письмо','Select a message first'));return;}
