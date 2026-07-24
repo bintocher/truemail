@@ -538,6 +538,11 @@
   .chips{display:flex;flex-wrap:wrap;gap:6px;}
   .chip{display:inline-flex;align-items:center;gap:7px;background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:3px 10px 3px 3px;font-size:12.5px;}
   .chip .ava{width:20px;height:20px;border-radius:50%;font-size:9px;} .chip .rl{color:var(--text-3);font-size:11px;} .chip .x{cursor:pointer;color:var(--text-3);} .chip .x:hover{color:var(--danger);}
+  .chip{padding:3px 10px;} .chip .chip-x{cursor:pointer;color:var(--text-3);border:0;background:none;font-size:15px;line-height:1;padding:0;} .chip .chip-x:hover{color:var(--danger);}
+  .date-chips,.reminder-chips{display:flex;flex-wrap:wrap;gap:6px;} .date-chips:empty,.reminder-chips:empty{display:none;}
+  .weekday-row{display:flex;flex-wrap:wrap;gap:5px;} .weekday-btn{border:1px solid var(--border);background:var(--panel);border-radius:8px;padding:5px 9px;font-size:12.5px;cursor:pointer;color:var(--text-2);} .weekday-btn.on{background:var(--accent);color:var(--accent-text);border-color:var(--accent);}
+  .toggle-chip{cursor:pointer;color:var(--text-2);} .toggle-chip.on{background:var(--accent);color:var(--accent-text);border-color:var(--accent);}
+  .event-recur-options{display:flex;flex-direction:column;gap:12px;margin-bottom:13px;}
   .dt{display:flex;gap:8px;} .dt input[type="time"]{max-width:120px;}
   input[type="date"].inp,input[type="time"].inp{font-family:inherit;}
   .baseline{display:flex;align-items:baseline;gap:8px;margin-bottom:12px;} .storage-big{font-size:26px;font-weight:700;letter-spacing:-.02em;} .storage-sub{color:var(--text-3);font-size:13px;}
