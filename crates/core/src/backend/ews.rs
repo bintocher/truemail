@@ -142,6 +142,58 @@ fn node_text<'a>(node: Node<'a, 'a>, name: &str) -> Option<&'a str> {
         .and_then(|child| child.text())
 }
 
+/// Ответ участника EWS (ResponseType) -> PARTSTAT iCalendar. Организатора
+/// помечаем ACCEPTED - он не участник в смысле кнопок ответа, а сам инициатор.
+fn ews_response_to_partstat(response: &str) -> &'static str {
+    match response {
+        "Accept" => "ACCEPTED",
+        "Decline" => "DECLINED",
+        "Tentative" => "TENTATIVE",
+        "Organizer" => "ACCEPTED",
+        _ => "NEEDS-ACTION",
+    }
+}
+
+/// Участники CalendarItem: обязательные и необязательные, со статусом ответа.
+/// Без них UI не знает свой PARTSTAT и не показывает кнопки ответа на
+/// приглашение (resolve_my_attendance по email аккаунта).
+fn parse_ews_attendees<'a>(item: Node<'a, 'a>) -> Vec<Attendee> {
+    let mut attendees = Vec::new();
+    for (container_tag, role) in [
+        ("RequiredAttendees", "REQ-PARTICIPANT"),
+        ("OptionalAttendees", "OPT-PARTICIPANT"),
+    ] {
+        let Some(container) = item
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == container_tag)
+        else {
+            continue;
+        };
+        for attendee in container
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Attendee")
+        {
+            let Some(email) = node_text(attendee, "EmailAddress").map(str::to_owned) else {
+                continue;
+            };
+            let partstat = attendee
+                .children()
+                .find(|node| node.is_element() && node.tag_name().name() == "ResponseType")
+                .and_then(|node| node.text())
+                .map(ews_response_to_partstat)
+                .unwrap_or("NEEDS-ACTION");
+            attendees.push(Attendee {
+                email,
+                name: node_text(attendee, "Name").map(str::to_owned),
+                role: Some(role.to_owned()),
+                partstat: Some(partstat.to_owned()),
+                rsvp: true,
+            });
+        }
+    }
+    attendees
+}
+
 fn response_error(body: &str) -> Option<String> {
     let document = Document::parse(body).ok()?;
     let response = document
@@ -1405,7 +1457,7 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
             exdates: None,
             rdates: None,
             status,
-            attendees: Vec::new(),
+            attendees: parse_ews_attendees(item),
             alarms: Vec::new(),
             timezone: None,
             transp: None,
@@ -3288,6 +3340,27 @@ mod tests {
         let events = parse_calendar_items(occurrence).expect("calendar response");
         assert_eq!(events[0].rrule, None);
         assert_eq!(events[0].recurrence_id, None);
+    }
+
+    #[test]
+    fn calendar_item_parses_attendees_with_response_status() {
+        let xml = r#"<Envelope><CalendarItem><ItemId Id="evt-1"/><Subject>Встреча</Subject><Start>2026-07-20T07:00:00Z</Start><End>2026-07-20T08:00:00Z</End><IsAllDayEvent>false</IsAllDayEvent><Organizer><Mailbox><EmailAddress>boss@example.test</EmailAddress></Mailbox></Organizer><RequiredAttendees><Attendee><Mailbox><Name>Иван</Name><EmailAddress>ivan@example.test</EmailAddress></Mailbox><ResponseType>Accept</ResponseType></Attendee></RequiredAttendees><OptionalAttendees><Attendee><Mailbox><EmailAddress>opt@example.test</EmailAddress></Mailbox><ResponseType>NoResponseReceived</ResponseType></Attendee></OptionalAttendees></CalendarItem></Envelope>"#;
+        let events = parse_calendar_items(xml).expect("calendar response");
+        let attendees = &events[0].attendees;
+        assert_eq!(attendees.len(), 2);
+        let ivan = attendees
+            .iter()
+            .find(|a| a.email == "ivan@example.test")
+            .expect("required attendee");
+        assert_eq!(ivan.partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(ivan.role.as_deref(), Some("REQ-PARTICIPANT"));
+        assert_eq!(ivan.name.as_deref(), Some("Иван"));
+        let opt = attendees
+            .iter()
+            .find(|a| a.email == "opt@example.test")
+            .expect("optional attendee");
+        assert_eq!(opt.partstat.as_deref(), Some("NEEDS-ACTION"));
+        assert_eq!(opt.role.as_deref(), Some("OPT-PARTICIPANT"));
     }
 
     #[test]
