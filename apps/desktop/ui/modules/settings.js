@@ -60,7 +60,7 @@ function applyStorageStatus(storage){document.querySelector('.storage-big').text
 const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElementById('sortMenu'),filterButton=document.getElementById('filterBtn'),sortButton=document.getElementById('sortBtn');
 filterButton.onclick=e=>{e.stopPropagation();filterMenu.classList.toggle('hidden');sortMenu.classList.add('hidden');};sortButton.onclick=e=>{e.stopPropagation();sortMenu.classList.toggle('hidden');filterMenu.classList.add('hidden');};
 document.addEventListener('click',event=>{if(!filterMenu.contains(event.target)&&!filterButton.contains(event.target))filterMenu.classList.add('hidden');if(!sortMenu.contains(event.target)&&!sortButton.contains(event.target))sortMenu.classList.add('hidden');});
-function applyListOptions(resetScroll=false,title=null){if(resetScroll)stickyReadIds.clear();let rows=currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
+function applyListOptions(resetScroll=false,title=null){if(resetScroll)stickyReadIds.clear();let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
   // Удержать письма, прочитанные в этом показе списка: они выпали из smartRows
   // (умная папка "непрочитанные") или из unread-фильтра только из-за смены seen.
   if(stickyReadIds.size){const present=new Set(rows.map(m=>m.id));stickyReadIds.forEach(id=>{const held=messages.find(m=>m.id===id);if(held&&!present.has(id))rows.push(held);});}
@@ -155,6 +155,7 @@ if(notifyPositionSelect)notifyPositionSelect.onchange=e=>{window.tm?.setNotifyPo
 
 window.applyCoreSettings=function(settings){
   try{folderCounterModes=JSON.parse(settings.folder_counters||'{}')||{};}catch(_){folderCounterModes={};}
+  if(settings.tags_nav_collapsed==='1'){document.getElementById('tagsNav')?.classList.add('collapsed');document.querySelector('[data-navlabel="tags"]')?.classList.add('collapsed');}
   if(settings.external_api_port)document.getElementById('apiPort').value=settings.external_api_port;if(settings.external_api_enabled==='1')window.tm?.startExternalApi(Number(settings.external_api_port)||34981).then(refreshApiSettings).catch(console.error);
   // Без сохранённого значения показываем платформенный дефолт (как в NotifyAnchor).
   if(notifyPositionSelect)notifyPositionSelect.value=settings.notify_position||(/mac/i.test(navigator.platform)?'top-right':'bottom-right');

@@ -25,6 +25,9 @@
       <button type="button" class="navitem topnav" data-nav="calendar"><i data-i="cal"></i><span data-i18n="navCalendar">Календарь</span><span class="count">3</span></button>
       <button type="button" class="navitem topnav" data-nav="contacts"><i data-i="people"></i><span data-i18n="navContacts">Контакты</span></button>
 
+      <div class="navlabel navlabel-toggle" data-navlabel="tags"><i data-i="chevR" class="nav-chev"></i><span data-i18n="navTags">Теги</span> <button type="button" class="add" id="addTag" data-i18n-title="createTag" title="Создать тег"><i data-i="plus"></i></button></div>
+      <div id="tagsNav" class="tags-nav"></div>
+
       <div class="navlabel"><span data-i18n="navSmartFolders">Умные папки</span> <button type="button" class="add" id="addSmart" data-i18n-title="createSmartFolder" title="Создать умную папку"><i data-i="plus"></i></button></div>
       <button type="button" class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label" data-i18n="navAllInbox">Все входящие</span><span class="count"></span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i><span class="smart-label" data-i18n="navAllImportant">Все важные</span><span class="count"></span></button>
@@ -515,6 +518,12 @@
   <div class="tmi" data-folder-action="create"><i data-i="plus"></i><span data-i18n="createFolder">Создать папку</span></div>
   <div class="tmi" data-folder-action="rename"><i data-i="edit"></i><span data-i18n="rename">Переименовать</span></div>
   <div class="tmi danger-menu-item" data-folder-action="delete"><i data-i="trash"></i><span data-i18n="deleteFolder">Удалить папку</span></div>
+</div>
+<div class="ctxmenu" id="ctxtag">
+  <div class="tmi" data-tag-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
+  <div class="tmsep"></div>
+  <div class="tmi" data-tag-action="edit"><i data-i="edit"></i><span data-i18n="editTag">Переименовать / цвет</span></div>
+  <div class="tmi danger-menu-item" data-tag-action="delete"><i data-i="trash"></i><span data-i18n="deleteTag">Удалить тег</span></div>
 </div>
 
 <div class="ctxmenu" id="ctxcontact">
