@@ -154,6 +154,7 @@ const notifyPositionSelect=document.getElementById('notifyPosition');
 if(notifyPositionSelect)notifyPositionSelect.onchange=e=>{window.tm?.setNotifyPosition(e.target.value).catch(console.error);};
 
 window.applyCoreSettings=function(settings){
+  try{folderCounterModes=JSON.parse(settings.folder_counters||'{}')||{};}catch(_){folderCounterModes={};}
   if(settings.external_api_port)document.getElementById('apiPort').value=settings.external_api_port;if(settings.external_api_enabled==='1')window.tm?.startExternalApi(Number(settings.external_api_port)||34981).then(refreshApiSettings).catch(console.error);
   // Без сохранённого значения показываем платформенный дефолт (как в NotifyAnchor).
   if(notifyPositionSelect)notifyPositionSelect.value=settings.notify_position||(/mac/i.test(navigator.platform)?'top-right':'bottom-right');

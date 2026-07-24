@@ -39,6 +39,8 @@
   "contactLocalOnlyNotice": "This contact is stored on this device only: the account provider does not support contact sync.",
   "copy": "Copy",
   "createFolder": "Create folder",
+  "countUnread": "Show unread count",
+  "countTotal": "Show total count",
   "eventRsvpAccepted": "You accepted the invitation",
   "eventRsvpDeclined": "You declined the invitation",
   "eventRsvpDelegated": "Response delegated to another attendee",

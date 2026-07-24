@@ -103,6 +103,9 @@ let currentSmartIndex=0;
 // фильтр), пока пользователь не сменит папку/раздел. Очищается в
 // applyListOptions при resetScroll.
 let stickyReadIds=new Set();
+// Режим счётчика писем на папку: 'u' непрочитанные, 't' всего, 'ut' оба, 'n'
+// ничего. По умолчанию 'u'. Ключ - id папки. Хранится в настройке folder_counters.
+let folderCounterModes={};
 let currentMessageRows=[];
 let activeMessage=null;
 let activeFullMessage=null;
