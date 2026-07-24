@@ -629,7 +629,7 @@ impl Db {
 
     pub async fn list_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
         let rows = sqlx::query_as::<_, FolderRow>(
-            "SELECT id, account_id, remote_path, display_name, role, unread_count, total_count
+            "SELECT id, account_id, remote_path, display_name, role, parent_id, unread_count, total_count
              FROM folders WHERE account_id = ? ORDER BY id",
         )
         .bind(account_id)
@@ -640,7 +640,7 @@ impl Db {
 
     pub async fn folder(&self, folder_id: i64) -> Result<Folder> {
         let row = sqlx::query_as::<_, FolderRow>(
-            "SELECT id, account_id, remote_path, display_name, role, unread_count, total_count FROM folders WHERE id=?",
+            "SELECT id, account_id, remote_path, display_name, role, parent_id, unread_count, total_count FROM folders WHERE id=?",
         )
         .bind(folder_id)
         .fetch_one(&self.pool)
@@ -732,6 +732,24 @@ impl Db {
             .bind(folder.highestmodseq.map(|value| value as i64))
             .execute(&mut *tx)
             .await?;
+        }
+        // Второй проход: разрешаем parent_id по remote_path родителя (родитель
+        // мог быть вставлен позже в этом же батче). Родитель верхнего уровня
+        // (msgfolderroot и т.п.) среди папок отсутствует - parent_id остаётся NULL.
+        for folder in folders {
+            if let Some(parent) = folder.parent_remote_path.as_deref() {
+                sqlx::query(
+                    "UPDATE folders SET parent_id = (
+                         SELECT id FROM folders WHERE account_id=? AND remote_path=?
+                     ) WHERE account_id=? AND remote_path=?",
+                )
+                .bind(account_id)
+                .bind(parent)
+                .bind(account_id)
+                .bind(&folder.remote_path)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -4564,6 +4582,7 @@ struct FolderRow {
     remote_path: String,
     display_name: String,
     role: Option<String>,
+    parent_id: Option<i64>,
     unread_count: i64,
     total_count: i64,
 }
@@ -4584,6 +4603,7 @@ impl From<FolderRow> for Folder {
             remote_path: r.remote_path,
             display_name: r.display_name,
             role,
+            parent_id: r.parent_id,
             unread_count: r.unread_count,
             total_count: r.total_count,
         }

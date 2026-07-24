@@ -18,6 +18,10 @@ pub struct DiscoveredFolder {
     pub remote_path: String,
     pub display_name: String,
     pub role: Option<FolderRole>,
+    /// remote_path родительской папки для построения дерева (Exchange). None -
+    /// корневая папка или провайдер без явной иерархии (у IMAP вложенность в
+    /// самом remote_path через разделитель).
+    pub parent_remote_path: Option<String>,
     pub unread_count: i64,
     pub total_count: i64,
     pub uidvalidity: Option<u32>,
@@ -985,6 +989,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             remote_path,
             display_name,
             role,
+            parent_remote_path: None,
             unread_count: status.unseen.unwrap_or(0) as i64,
             total_count: status.exists as i64,
             uidvalidity: None,
