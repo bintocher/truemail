@@ -227,7 +227,10 @@ function expandConversationIds(ids){
     if(!source){out.add(id);return;}
     const key=conversationKey(source);
     if(expandedConversations.has(key)){out.add(id);return;}
-    messages.forEach(item=>{if(conversationKey(item)===key)out.add(item.id);});
+    // Только в пределах папки исходного письма: беседа может жить в нескольких
+    // папках (Входящие/Отправленные), но действие над строкой не должно трогать
+    // одноимённые письма из других папок.
+    messages.forEach(item=>{if(item.folder_id===source.folder_id&&conversationKey(item)===key)out.add(item.id);});
   });
   return [...out];
 }
