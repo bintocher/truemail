@@ -37,7 +37,7 @@
 
       <div class="navlabel" data-navlabel="accounts"><span data-i18n="navAccounts">Аккаунты</span> <button type="button" class="add" id="addAcct" data-i18n-title="addAccount" title="Добавить аккаунт"><i data-i="plus"></i></button></div>
 
-      <div class="navlabel" data-navlabel="tags"><span data-i18n="navTags">Теги</span> <button type="button" class="add" id="addTag" data-i18n-title="createTag" title="Создать тег"><i data-i="plus"></i></button></div>
+      <div class="navlabel" data-navlabel="tags"><span data-i18n="navTags">Метки</span> <button type="button" class="add" id="addTag" data-i18n-title="createTag" title="Создать метку"><i data-i="plus"></i></button></div>
       <div id="tagsNav" class="tags-nav"></div>
 
       <div class="nav-spacer"></div>
@@ -53,6 +53,7 @@
         <button type="button" class="search" id="searchBox"><i data-i="search"></i><span class="search-placeholder" data-i18n="searchAllPlaceholder">Поиск по всем ящикам</span><span class="kbd">Ctrl K</span></button>
       </div>
       <div class="msgs" id="msgs"></div>
+      <div class="list-loading hidden" id="listLoading"><span class="spinner"></span></div>
     </section>
 
     <section class="thread">
@@ -121,7 +122,7 @@
       <button type="button" class="sec" data-set="toolbar"><i data-i="grip"></i><span data-i18n="setToolbar">Панель письма</span></button>
       <button type="button" class="sec" data-set="accounts"><i data-i="user"></i><span data-i18n="navAccounts">Аккаунты</span></button>
       <button type="button" class="sec" data-set="smart"><i data-i="star"></i><span data-i18n="navSmartFolders">Умные папки</span></button>
-      <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Теги</span></button>
+      <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Метки</span></button>
       <button type="button" class="sec" data-set="rules"><i data-i="filter"></i><span data-i18n="processingRules">Правила обработки</span></button>
       <button type="button" class="sec" data-set="unified"><i data-i="inbox"></i><span data-i18n="setUnified">Сквозные папки</span></button>
       <button type="button" class="sec" data-set="folders"><i data-i="folder"></i><span data-i18n="setFolders">Сопоставление папок</span></button>
@@ -208,8 +209,8 @@
       </div>
 
       <div class="setpage" id="set-tags">
-        <h1 data-i18n="navTags">Теги</h1><p class="lead" data-i18n="tagsLead">Цветные метки для писем. Создавайте, переименовывайте, меняйте цвет и удаляйте. Помеченные письма собираются в разделе «Теги» слева.</p>
-        <button class="btn primary" id="tagNew2"><i data-i="plus"></i><span data-i18n="createTag">Создать тег</span></button>
+        <h1 data-i18n="navTags">Метки</h1><p class="lead" data-i18n="tagsLead">Цветные метки для писем. Создавайте, переименовывайте, меняйте цвет и удаляйте. Помеченные письма собираются в разделе «Метки» слева.</p>
+        <button class="btn primary" id="tagNew2"><i data-i="plus"></i><span data-i18n="createTag">Создать метку</span></button>
         <div class="card mt-20"><div class="cb" id="tagSettingsList"></div></div>
       </div>
 
@@ -225,9 +226,9 @@
           </div>
           <div class="rule-condition-grid rule-action-grid">
             <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
-            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option><option value="label" data-i18n="actAssignTag">Назначить тег</option></select></div>
+            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option><option value="label" data-i18n="actAssignTag">Назначить метку</option></select></div>
             <div class="fld rule-target-field"><label data-i18n="ruleFolderLabel">Папка</label><select class="sel" id="ruleTarget"></select></div>
-            <div class="fld rule-tag-field hidden"><label data-i18n="ruleTagLabel">Тег</label><select class="sel" id="ruleTag"></select></div>
+            <div class="fld rule-tag-field hidden"><label data-i18n="ruleTagLabel">Метка</label><select class="sel" id="ruleTag"></select></div>
           </div>
           <label class="aux-check"><input type="checkbox" id="ruleExisting"> <span data-i18n="ruleApplyExisting">Применить также к уже загруженным письмам</span></label>
           <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="ruleCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i><span data-i18n="deleteRule">Удалить правило</span></button></div>
@@ -538,7 +539,7 @@
   <div class="tmi" data-tag-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
   <div class="tmsep"></div>
   <div class="tmi" data-tag-action="edit"><i data-i="edit"></i><span data-i18n="editTag">Переименовать / цвет</span></div>
-  <div class="tmi danger-menu-item" data-tag-action="delete"><i data-i="trash"></i><span data-i18n="deleteTag">Удалить тег</span></div>
+  <div class="tmi danger-menu-item" data-tag-action="delete"><i data-i="trash"></i><span data-i18n="deleteTag">Удалить метку</span></div>
 </div>
 
 <div class="ctxmenu" id="ctxcontact">
