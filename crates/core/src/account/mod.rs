@@ -857,6 +857,47 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Догрузить с сервера письма папки старше даты `before` и сохранить в базу.
+    /// Для бесконечной прокрутки: когда локальные письма кончились, а на сервере
+    /// их больше. Возвращает число сохранённых. Провайдеры без поддержки вернут 0.
+    pub async fn fetch_older_folder_messages(
+        &self,
+        folder_id: i64,
+        before: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let folder = self.db.folder(folder_id).await?;
+        let Some(account) = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|item| item.id == folder.account_id)
+        else {
+            return Ok(0);
+        };
+        let credential = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
+        let messages = backend
+            .fetch_older_messages(
+                &account.email,
+                &credential,
+                &folder.remote_path,
+                before,
+                limit,
+            )
+            .await?;
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let count = messages.len();
+        self.db
+            .save_discovered_messages(account.id, &messages)
+            .await?;
+        tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
+        Ok(count)
+    }
+
     /// Очистить кэш всех аккаунтов по их глубине хранения. Вызывается ОДИН РАЗ
     /// при старте приложения: в течение сессии свежие письма не удаляются, а
     /// письма за рамками периода при открытии докачиваются с сервера.

@@ -235,6 +235,20 @@ pub trait MailBackend: Send + Sync {
         uid: u32,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>>;
+    /// Догрузить более старые письма папки (бесконечная прокрутка): строго
+    /// старше даты `before` (ISO 8601), не более `limit`. По умолчанию не
+    /// поддерживается - возвращает пусто.
+    async fn fetch_older_messages(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        let _ = (email, credential, folder_path, before, limit);
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
