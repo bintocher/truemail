@@ -179,10 +179,12 @@ document.addEventListener('keydown',e=>{
   const overlays=[...document.querySelectorAll('.raw-overlay,.overlay.open')];
   const top=overlays[overlays.length-1];if(!top)return;
   e.preventDefault();
+  // .raw-overlay всегда создаётся заново - его можно удалять. Постоянные окна
+  // (.overlay: auxOverlay, smartOverlay, linkOverlay и др.) только скрываем,
+  // иначе повторно не откроются. Динамические .overlay закрываем их же кнопкой.
+  if(top.classList.contains('raw-overlay')){top.remove();return;}
   const closer=top.querySelector('.label-cancel,.template-close,.snooze-cancel,.confirm-cancel');
-  if(top.id==='auxOverlay')top.classList.remove('open');
-  else if(closer)closer.click();
-  else top.remove();
+  if(closer)closer.click();else top.classList.remove('open');
 });
 [ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m.querySelectorAll('.tmi:not(.tmi-check)').forEach(i=>i.onclick=()=>m.classList.remove('open')));
 ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить тег «${contextTag.name}»? Он снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Тег удалён','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));

@@ -63,7 +63,11 @@ document.addEventListener('click',event=>{if(!filterMenu.contains(event.target)&
 function applyListOptions(resetScroll=false,title=null){if(resetScroll)stickyReadIds.clear();let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
   // Удержать письма, прочитанные в этом показе списка: они выпали из smartRows
   // (умная папка "непрочитанные") или из unread-фильтра только из-за смены seen.
-  if(stickyReadIds.size){const present=new Set(rows.map(m=>m.id));stickyReadIds.forEach(id=>{const held=messages.find(m=>m.id===id);if(held&&!present.has(id))rows.push(held);});}
+  if(stickyReadIds.size){const present=new Set(rows.map(m=>m.id));stickyReadIds.forEach(id=>{if(present.has(id))return;const held=messages.find(m=>m.id===id);if(!held)return;
+    // Удерживаем письмо, только если оно всё ещё принадлежит текущему списку -
+    // иначе перемещённое (архив/корзина) всплыло бы в чужой папке.
+    const belongs=currentTagName!=null?(held.labels||[]).includes(currentTagName):currentFolderId!==null?held.folder_id===currentFolderId:true;
+    if(belongs)rows.push(held);});}
   const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);}
 filterMenu.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=()=>applyListOptions(true));document.getElementById('filterText')?.addEventListener('input',()=>applyListOptions(true));sortMenu.querySelectorAll('button').forEach(button=>button.onclick=()=>{sortMenu.dataset.sort=button.dataset.sort;sortMenu.classList.add('hidden');applyListOptions(true);});
 
