@@ -240,8 +240,11 @@
         }, 5 * 60 * 1000);
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
+            // Только фоновая синхронизация. Полную перезагрузку списка тут НЕ
+            // делаем: она сбрасывала список на первую страницу и теряла и
+            // догруженные письма, и позицию прокрутки при возврате в окно
+            // (alt-tab). Новые письма подтянет realtime и периодический sync.
             window.tm.syncAuxiliaryAccounts().catch(console.error);
-            scheduleReload(100);
           }
         });
       }

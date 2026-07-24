@@ -343,7 +343,11 @@ function filterSmart(index,resetScroll=true){window.setListLoading?.(false);curr
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
-  coreAccounts=accounts;coreFolders=foldersByAccount.flat();messages=loadedMessages;coreContacts=contacts;coreCalendarData=calendarData;
+  coreAccounts=accounts;coreFolders=foldersByAccount.flat();coreContacts=contacts;coreCalendarData=calendarData;
+  // Объединяем догруженные ранее письма со свежей выборкой (свежая версия
+  // побеждает по id), иначе перезагрузка данных стирала бы всё, что пользователь
+  // подгрузил прокруткой, и список сбрасывался бы на первую страницу.
+  {const merged=new Map(messages.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   renderRulesList();
   refreshTagsNav();
