@@ -165,7 +165,7 @@ document.querySelectorAll('.nav .navlabel').forEach(lbl=>{
 /* custom right-click menu (suppress browser default) */
 const ctxmenu=document.getElementById('ctxmenu'),ctxsmart=document.getElementById('ctxsmart'),ctxfolder=document.getElementById('ctxfolder'),ctxcontact=document.getElementById('ctxcontact');
 let contextFolder=null,contextFolderOpen=null,contextContact=null;
-function posMenu(menu,e){menu.style.left=Math.min(e.clientX,window.innerWidth-244)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-330)+'px';menu.classList.add('open');}
+function posMenu(menu,e){menu.classList.add('open');const w=menu.offsetWidth,h=menu.offsetHeight;menu.style.left=Math.max(8,Math.min(e.clientX,window.innerWidth-w-8))+'px';menu.style.top=Math.max(8,Math.min(e.clientY,window.innerHeight-h-8))+'px';}
 document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;e.preventDefault();
   ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');ctxcontact.classList.remove('open');
   const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]');
