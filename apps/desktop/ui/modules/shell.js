@@ -117,6 +117,9 @@ let editingRuleId=null;
 const MESSAGE_INITIAL_PAGE_SIZE=100;
 const MESSAGE_PAGE_SIZE=500;
 const SMART_MESSAGE_PAGE_SIZE=500;
+// Догрузка с сервера идёт маленькими порциями - чтобы результат появлялся
+// быстро, а не ждать пока скачаются сотни писем разом.
+const BACKFILL_PAGE_SIZE=15;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
@@ -142,18 +145,18 @@ function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s
 const msgsEl=document.getElementById('msgs');
 let listLoadTimer=null,listLoadStart=0,listLoadLabel='';
 function setListLoading(on,label){
-  const box=document.getElementById('listLoading');if(!box)return;const text=box.querySelector('.list-loading-text');
+  const box=document.getElementById('listLoading'),status=document.getElementById('appStatus');
   if(on){
     if(listLoadTimer)clearInterval(listLoadTimer);
     listLoadStart=performance.now();listLoadLabel=label||'данные';
-    box.classList.remove('hidden');
-    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(text)text.textContent=`Загружаю ${listLoadLabel}… прошло ${s} с`;};
+    box?.classList.remove('hidden');status?.classList.remove('hidden');
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=`Загружаю ${listLoadLabel}… прошло ${s} с`;};
     tick();listLoadTimer=setInterval(tick,100);
     window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
   }else{
     if(listLoadTimer){clearInterval(listLoadTimer);listLoadTimer=null;}
-    if(!box.classList.contains('hidden')){const s=((performance.now()-listLoadStart)/1000).toFixed(1);window.tm?.uiLog?.(`загрузка завершена: ${listLoadLabel} за ${s} с`);console.log('[load done]',listLoadLabel,s+'s');}
-    box.classList.add('hidden');
+    if(box&&!box.classList.contains('hidden')){const s=((performance.now()-listLoadStart)/1000).toFixed(1);window.tm?.uiLog?.(`загрузка завершена: ${listLoadLabel} за ${s} с`);console.log('[load done]',listLoadLabel,s+'s');}
+    box?.classList.add('hidden');status?.classList.add('hidden');
   }
 }
 async function loadNextMessagePage(){
@@ -163,12 +166,21 @@ async function loadNextMessagePage(){
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       // Локальные письма кончились - но на сервере в папке их больше: догружаем
       // следующую порцию с сервера и снова читаем из базы.
-      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,MESSAGE_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
       messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
-  }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;setListLoading(false);}
+  }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+}
+// Если письма не заполнили экран (короткий список), а на сервере их больше -
+// подгружаем следующую порцию автоматически, не дожидаясь прокрутки.
+function ensureListFilled(){
+  const el=document.getElementById('msgs');if(!el)return;
+  if(loadingMoreMessages||loadingSmartCoverage)return;
+  const hasMore=currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
+  if(hasMore&&el.scrollHeight<=el.clientHeight+40){setTimeout(()=>loadNextMessagePage(),0);}
 }
 window.setListLoading=setListLoading;
+window.ensureListFilled=ensureListFilled;
 msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240)loadNextMessagePage();},{passive:true});
 
 /* thread action buttons -> compose */
