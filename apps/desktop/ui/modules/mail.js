@@ -211,6 +211,21 @@ function collapseConversations(rows){
   });
   return result;
 }
+// В режиме диалогов групповая операция над свёрнутой беседой применяется ко всем
+// её письмам. Развёрнутую беседу не расширяем - действие идёт по конкретному письму.
+function expandConversationIds(ids){
+  if(!conversationsEnabled)return ids;
+  const out=new Set();
+  ids.forEach(id=>{
+    const source=messages.find(item=>item.id===id);
+    if(!source){out.add(id);return;}
+    const key=conversationKey(source);
+    if(expandedConversations.has(key)){out.add(id);return;}
+    messages.forEach(item=>{if(conversationKey(item)===key)out.add(item.id);});
+  });
+  return [...out];
+}
+window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
 async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
