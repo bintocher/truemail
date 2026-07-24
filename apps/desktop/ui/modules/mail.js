@@ -274,7 +274,12 @@ function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
   currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)msgsEl.scrollTop=0;messageWindowStart=-1;messageWindowEnd=-1;
-  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();renderMessageWindow(true);updateSelectionUi();
+  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();
+  // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
+  // папок (несколько аккаунтов) - число аккаунтов.
+  const sub=document.getElementById('mailAccountCount');
+  if(sub){if(currentFolderId!==null||currentTagName!=null){const n=rows.length,en=wizardLocale==='en',word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');sub.textContent=`${n} ${word}`;}else{const n=coreAccounts.length,en=wizardLocale==='en',word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');sub.textContent=`${n} ${word}`;}}
+  renderMessageWindow(true);updateSelectionUi();
   if(!rows.length)document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;
   else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id))document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
 }
