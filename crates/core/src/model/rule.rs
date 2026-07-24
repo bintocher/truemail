@@ -12,6 +12,7 @@ pub struct MailRule {
     pub account_id: Option<i64>,
     pub action: String,
     pub folder_id: Option<i64>,
+    pub label_id: Option<i64>,
     pub enabled: bool,
     pub progress_message_id: i64,
     pub sort_order: i64,
@@ -27,6 +28,8 @@ pub struct MailRuleInput {
     pub account_id: Option<i64>,
     pub action: String,
     pub folder_id: Option<i64>,
+    #[serde(default)]
+    pub label_id: Option<i64>,
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
 }

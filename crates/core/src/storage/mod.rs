@@ -1988,6 +1988,7 @@ mod tests {
                 account_id: Some(account.id),
                 action: "archive".into(),
                 folder_id: None,
+                label_id: None,
                 enabled: true,
             },
             true,

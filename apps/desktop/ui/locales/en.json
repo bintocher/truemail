@@ -347,6 +347,8 @@
   "ruleApplyExisting": "Also apply to already loaded messages",
   "ruleFieldLabel": "Field",
   "ruleFolderLabel": "Folder",
+  "ruleTagLabel": "Tag",
+  "actAssignTag": "Assign tag",
   "ruleNameLabel": "Name",
   "ruleNamePlaceholder": "For example: Receipts to Finance",
   "ruleOperatorLabel": "Comparison",
