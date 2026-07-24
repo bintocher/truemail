@@ -459,18 +459,24 @@
         <details class="event-advanced">
           <summary data-i18n="eventAdvanced">Повторение, участники и другие поля</summary>
           <div class="event-advanced-body">
-            <div class="aux-two">
-              <div class="fld"><label data-i18n="eventRecurrence">Повторение</label><select class="sel" id="eventRecurrence"><option value="" data-i18n="eventRepeatNone">Не повторять</option><option value="FREQ=DAILY" data-i18n="eventRepeatDaily">Каждый день</option><option value="FREQ=WEEKLY" data-i18n="eventRepeatWeekly">Каждую неделю</option><option value="FREQ=MONTHLY" data-i18n="eventRepeatMonthly">Каждый месяц</option><option value="FREQ=YEARLY" data-i18n="eventRepeatYearly">Каждый год</option><option value="custom" data-i18n="eventRepeatCustom">Своё правило RRULE</option></select></div>
-              <div class="fld event-rrule-custom hidden"><label data-i18n="eventRrule">Правило RRULE</label><input class="inp" id="eventRrule" placeholder="FREQ=WEEKLY;BYDAY=MO,WE"></div>
+            <div class="fld"><label data-i18n="eventRecurrence">Повторение</label><select class="sel" id="eventRecurrence"><option value="" data-i18n="eventRepeatNone">Не повторять</option><option value="DAILY" data-i18n="eventRepeatDaily">Каждый день</option><option value="WEEKLY" data-i18n="eventRepeatWeekly">Каждую неделю</option><option value="MONTHLY" data-i18n="eventRepeatMonthly">Каждый месяц</option><option value="YEARLY" data-i18n="eventRepeatYearly">Каждый год</option></select></div>
+            <div class="event-recur-options hidden">
+              <div class="aux-two">
+                <div class="fld"><label data-i18n="eventRecurEvery">Повторять каждые</label><div class="fc-inline"><input class="inp scale-input" id="eventRecurInterval" type="number" min="1" value="1"><span class="event-recur-unit"></span></div></div>
+                <div class="fld"><label data-i18n="eventRecurEnds">Заканчивается</label><select class="sel" id="eventRecurEnd"><option value="never" data-i18n="eventRecurNever">Никогда</option><option value="until" data-i18n="eventRecurUntil">До даты</option><option value="count" data-i18n="eventRecurCount">После N повторений</option></select></div>
+              </div>
+              <div class="fld event-recur-weekdays hidden"><label data-i18n="eventRecurWeekdays">По дням недели</label><div class="weekday-row" id="eventRecurWeekdays"></div></div>
+              <div class="fld event-recur-until-field hidden"><label data-i18n="eventRecurUntilDate">Дата окончания</label><input class="inp" id="eventRecurUntilDate" type="date"></div>
+              <div class="fld event-recur-count-field hidden"><label data-i18n="eventRecurCountNum">Сколько повторений</label><input class="inp scale-input" id="eventRecurCountNum" type="number" min="1" value="10"></div>
             </div>
             <div class="aux-two">
-              <div class="fld"><label data-i18n="eventExceptions">Исключить даты (по одной в строке)</label><textarea class="inp event-lines" id="eventExdates" placeholder="20260720T070000Z"></textarea></div>
-              <div class="fld"><label data-i18n="eventExtraDates">Дополнительные даты (по одной в строке)</label><textarea class="inp event-lines" id="eventRdates" placeholder="20260721T070000Z"></textarea></div>
+              <div class="fld"><label data-i18n="eventExceptions">Исключить даты</label><div class="date-chips" id="eventExdatesChips"></div><div class="fc-inline mt-8"><input class="inp" id="eventExdateAdd" type="date"><button type="button" class="btn sm" id="eventExdateAddBtn" data-i18n="add">Добавить</button></div></div>
+              <div class="fld"><label data-i18n="eventExtraDates">Дополнительные даты</label><div class="date-chips" id="eventRdatesChips"></div><div class="fc-inline mt-8"><input class="inp" id="eventRdateAdd" type="date"><button type="button" class="btn sm" id="eventRdateAddBtn" data-i18n="add">Добавить</button></div></div>
             </div>
-            <div class="fld"><label data-i18n="eventAttendees">Участники (по одному в строке)</label><textarea class="inp event-lines" id="eventAttendees" data-i18n-placeholder="eventAttendeesPlaceholder" placeholder="Имя &lt;user@example.com&gt;"></textarea></div>
+            <div class="fld"><label data-i18n="eventAttendees">Участники</label><div class="date-chips" id="eventAttendeesChips"></div><div class="fc-inline mt-8"><input class="inp grow" id="eventAttendeeAdd" type="text" data-i18n-placeholder="eventAttendeesPlaceholder" placeholder="Имя &lt;user@example.com&gt;"><button type="button" class="btn sm" id="eventAttendeeAddBtn" data-i18n="add">Добавить</button></div></div>
             <div class="aux-two">
               <div class="fld"><label data-i18n="eventOrganizer">Организатор</label><input class="inp" id="eventOrganizer" type="email"></div>
-              <div class="fld"><label data-i18n="eventReminders">Напоминания в минутах (по одному в строке)</label><textarea class="inp event-lines" id="eventAlarms" placeholder="10&#10;60"></textarea></div>
+              <div class="fld"><label data-i18n="eventReminders">Напоминания</label><div class="reminder-chips" id="eventAlarmsChips"></div></div>
             </div>
             <div class="aux-two">
               <div class="fld"><label data-i18n="eventTimezone">Часовой пояс</label><input class="inp" id="eventTimezone" placeholder="Europe/Moscow"></div>
