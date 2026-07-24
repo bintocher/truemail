@@ -438,8 +438,9 @@
     <div class="mh"><i data-i="cal" id="auxIcon"></i><h3 id="auxTitle" data-i18n="event">Событие</h3><button class="iconbtn x" id="auxClose" data-i18n-aria="close" aria-label="Закрыть"><i data-i="back"></i></button></div>
     <form id="eventForm">
       <div class="mb aux-form">
-        <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
-        <div class="fld"><label data-i18n="calendarOrTaskList">Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
+        <div class="fld" id="eventAccountField"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
+        <div class="fld" id="eventCalendarField"><label data-i18n="calendarOrTaskList">Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
+        <div class="fld hidden" id="eventSourceText"><span class="event-source-line"></span></div>
         <div class="fld"><label data-i18n="titleLabel">Название</label><input class="inp" id="eventSummary" required></div>
         <div class="fld hidden" id="eventRsvpBox">
           <label data-i18n="eventRsvpLabel">Ваш ответ</label>
