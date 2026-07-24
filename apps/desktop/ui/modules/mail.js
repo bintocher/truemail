@@ -252,7 +252,24 @@ async function showMessage(message){
     head.querySelector('.mail-from').textContent=fromName||fromEmail;
     head.querySelector('.mail-address').textContent=fromName&&fromEmail?`(${fromEmail})`:'';
     const ccList=(full.meta.cc||[]).map(address=>address.name||address.email).filter(Boolean);
-    if(ccList.length){const line=document.createElement('div');line.className='mail-ccline';const shown=ccList.length<=3?ccList.join(', '):L(`${ccList.slice(0,3).join(', ')} и ещё ${ccList.length-3}`,`${ccList.slice(0,3).join(', ')} and ${ccList.length-3} more`);line.textContent=L(`Копия: ${shown}`,`Cc: ${shown}`);line.title=ccList.join(', ');head.appendChild(line);}
+    if(ccList.length){
+      const line=document.createElement('div');line.className='mail-ccline';
+      // <=2 - показываем всех; иначе первые двое и "+X", клик раскрывает полный
+      // список в несколько строк с кнопкой "Свернуть".
+      const render=expanded=>{
+        line.innerHTML='';line.classList.toggle('expanded',expanded);
+        const label=document.createElement('span');label.className='mail-cc-label';label.textContent=L('Копия: ','Cc: ');line.appendChild(label);
+        const names=document.createElement('span');names.className='mail-cc-names';line.appendChild(names);
+        if(ccList.length>2&&!expanded){
+          names.textContent=ccList.slice(0,2).join(', ')+' ';
+          const more=document.createElement('button');more.type='button';more.className='mail-cc-toggle';more.textContent=`+${ccList.length-2}`;more.title=L('Показать всех','Show all');more.onclick=()=>render(true);line.appendChild(more);
+        }else{
+          names.textContent=ccList.join(', ');
+          if(ccList.length>2){const less=document.createElement('button');less.type='button';less.className='mail-cc-toggle';less.textContent=L('Свернуть','Collapse');less.onclick=()=>render(false);line.appendChild(less);}
+        }
+      };
+      render(false);head.appendChild(line);
+    }
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
     article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){message.flags.seen=true;stickyReadIds.add(message.id);document.querySelector(`.msg[data-message-id="${message.id}"]`)?.classList.remove('unread');window.tm?.markSeen(message.id,true).catch(console.error);}
   }catch(error){body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=error.message||String(error);body.appendChild(err);}
