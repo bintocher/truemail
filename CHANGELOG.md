@@ -7,6 +7,53 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-25
+
+### Added
+
+- Labels for mail: a section of their own in the sidebar, a list of labels with
+  colours in settings, assigning a label straight from the message menu and a
+  coloured badge in the list. Sorting rules can also assign a label on their
+  own.
+- The message list loads older mail from the server by itself when you scroll to
+  the end: in batches, with an indicator and a clear status. Works for Exchange,
+  Gmail and ordinary mail (Yandex, Outlook and others). If the list holds only a
+  few messages, the app tops it up without waiting for you to scroll.
+- For every folder you can choose what is shown next to its name: the total
+  number of messages, the number of unread ones, or nothing.
+- In conversation mode actions apply to the whole thread at once: mark as read,
+  move, delete.
+- The "Cc" list in the message header expands on click.
+- Esc closes any pop-up window.
+
+### Fixed
+
+- The message context menu no longer runs off the edge of the window - it always
+  opens towards the visible side.
+- An opened message no longer disappears from unread at that very moment: it
+  stays where it is until you move on to another one.
+- Exchange folders line up in the same tree as on the server: nested folders no
+  longer scatter across the top level.
+- Meeting invitations from Exchange show their participants, and the reply
+  buttons finally appear.
+- Meeting reply buttons are now the same width, and the chosen reply is
+  highlighted.
+- The message list header no longer says "4 accounts" when a single account's
+  folder is open - it shows the number of messages in that folder instead.
+- The message list no longer jumps back to the top when you switch to another
+  program and back, or when the data refreshes.
+- Yandex Mail loads older messages again - the request used to go out for
+  nothing and the list hit a ceiling.
+- Loading older messages no longer repeats them or gets stuck in the same place.
+
+### Changed
+
+- A calendar event is set up by clicking ready-made fields instead of typing
+  service strings by hand. The account and the calendar are shown as text when
+  editing an event, and the window is wider - every field is visible at once.
+- In the Russian interface everything is called "метка": some places used to say
+  "тег" and others "метка".
+
 ## [0.1.7] - 2026-07-23
 
 ### Fixed
