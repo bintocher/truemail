@@ -184,14 +184,19 @@ function setListLoading(on,label){
 // раньше через свою папку, и тогда страница целиком состояла бы из уже
 // известных, а прокрутка метки останавливалась бы на первой же странице.
 const tagHasMore=new Map(),tagCursor=new Map();
+// Поколение пагинации: сброс во время запроса не должен получить курсор от
+// страницы, заказанной до него, - иначе после фоновой перезагрузки список метки
+// продолжился бы с середины и в начале осталась бы дыра.
+let tagPagingEpoch=0;
 async function loadNextTagPage(){
   const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
   loadingMoreMessages=true;setListLoading(true,tag);
   try{
     const known=new Set(messages.map(message=>message.id));
-    const cursor=tagCursor.get(tag)||null;
+    const cursor=tagCursor.get(tag)||null,epoch=tagPagingEpoch;
     const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
     messages.push(...page.filter(message=>!known.has(message.id)));
+    if(epoch!==tagPagingEpoch)return;
     // Курсор двигаем по последней строке страницы, даже если письмо уже было в
     // памяти. Дата пустая - передаём пустую строку, а не null: null означал бы
     // "начни сначала", и страница вернулась бы та же самая.
@@ -203,7 +208,7 @@ async function loadNextTagPage(){
   finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
 }
 window.loadNextTagPage=loadNextTagPage;
-window.resetTagPaging=tag=>{tagHasMore.delete(tag);tagCursor.delete(tag);};
+window.resetTagPaging=tag=>{tagPagingEpoch++;tagHasMore.delete(tag);tagCursor.delete(tag);};
 async function loadNextMessagePage(){
   if(currentTagName!=null){await loadNextTagPage();return;}
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;

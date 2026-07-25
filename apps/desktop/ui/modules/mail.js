@@ -372,7 +372,10 @@ async function loadSmartCoveragePage(index,reset=false){
       // кандидатов пересобирается каждый проход, и позиция в нём ничего не
       // значит. Когда обойдены все, круг начинается заново.
       let visited=smartBackfillVisited.get(folder.id);
-      if(!visited){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
+      if(!visited||reset){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
+      // Папки, которых больше нет среди кандидатов, из круга убираем - иначе
+      // множество копило бы id удалённых папок.
+      visited.forEach(id=>{if(!candidates.some(source=>source.id===id))visited.delete(id);});
       if(candidates.every(source=>visited.has(source.id)))visited.clear();
       const picked=candidates.filter(source=>!visited.has(source.id)).slice(0,SMART_BACKFILL_FOLDERS);
       picked.forEach(source=>visited.add(source.id));

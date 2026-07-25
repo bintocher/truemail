@@ -1757,9 +1757,9 @@ async fn older_than_cursor(
         // ответы с UID - сервер шлёт в тот же поток и незапрошенные FETCH с
         // флагами, у которых заголовка нет по определению.
         if items.contains("HEADER.FIELDS")
-            && fetched
-                .iter()
-                .any(|fetch| fetch.uid.is_some() && fetch.header().is_none())
+            && fetched.iter().any(|fetch| {
+                fetch.uid.is_some_and(|uid| probe.contains(&uid)) && fetch.header().is_none()
+            })
         {
             items = "(UID BODY.PEEK[HEADER])";
             fetched = fetch_header_dates(session, folder_path, probe, items).await?;
@@ -1768,6 +1768,11 @@ async fn older_than_cursor(
             .iter()
             .filter_map(|fetch| {
                 let uid = fetch.uid?;
+                // Сервер шлёт в тот же поток обновления флагов по чужим письмам -
+                // берём только то, что сами спрашивали.
+                if !probe.contains(&uid) {
+                    return None;
+                }
                 match header_date(fetch) {
                     Some(date) if date >= cursor => None,
                     Some(date) => Some((date, uid)),
