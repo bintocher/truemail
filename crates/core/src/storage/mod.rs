@@ -489,6 +489,46 @@ mod tests {
         );
     }
 
+    /// Миграция 0034 переводит даты писем в UTC средствами SQLite. Проверяем,
+    /// что strftime действительно понимает смещение вида "+03:00" и не отдаёт
+    /// NULL - иначе миграция затёрла бы даты.
+    #[tokio::test]
+    async fn sqlite_rewrites_offset_dates_to_utc() {
+        let root = std::env::temp_dir().join(format!("truemail-dates-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let database_key = DatabaseKey::from_key(random_key());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+
+        let (converted,): (Option<String>,) =
+            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
+                .bind("2026-07-20T10:00:00+03:00")
+                .fetch_one(&db.pool)
+                .await
+                .expect("convert offset date");
+        assert_eq!(converted.as_deref(), Some("2026-07-20T07:00:00+00:00"));
+
+        let (already_utc,): (Option<String>,) =
+            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
+                .bind("2026-07-20T07:00:00+00:00")
+                .fetch_one(&db.pool)
+                .await
+                .expect("convert utc date");
+        assert_eq!(already_utc.as_deref(), Some("2026-07-20T07:00:00+00:00"));
+
+        // Мусор миграция пропускает: условие strftime(...) IS NOT NULL.
+        let (broken,): (Option<String>,) =
+            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
+                .bind("не дата")
+                .fetch_one(&db.pool)
+                .await
+                .expect("convert broken date");
+        assert_eq!(broken, None);
+    }
+
     #[tokio::test]
     async fn settings_are_encrypted_in_sqlite_and_round_trip() {
         let root = std::env::temp_dir().join(format!("truemail-settings-{}", uuid::Uuid::new_v4()));
