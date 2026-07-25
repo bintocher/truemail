@@ -45,6 +45,15 @@ versions use Semantic Versioning.
 - Yandex Mail loads older messages again - the request used to go out for
   nothing and the list hit a ceiling.
 - Loading older messages no longer repeats them or gets stuck in the same place.
+- An action on a collapsed conversation applies to that conversation only:
+  messages with the same subject from other senders used to be caught too.
+- Mail rules no longer fire on old messages pulled in by scrolling - years-old
+  correspondence stays where it is instead of scattering across folders.
+- Deleting a label no longer deletes the rule that assigned it: the rule stays,
+  you only pick a label for it again.
+- Recurring events keep their settings when saved: day of month, ordinal week
+  and the end time of the repetition stay in place, and the server accepts the
+  exception dates without errors.
 
 ### Changed
 
