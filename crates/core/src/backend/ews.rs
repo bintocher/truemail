@@ -644,7 +644,9 @@ impl EwsBackend {
             })
             .unwrap_or_default();
         let body = format!(
-            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>{restriction}<m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            // Порядок элементов важен: по схеме FindItemType Restriction идёт до
+            // SortOrder, иначе Exchange отвечает ErrorSchemaValidation.
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
             limit,
             escape(&folder.remote_path)
         );
@@ -663,12 +665,16 @@ impl EwsBackend {
         before: &str,
         limit: usize,
     ) -> Result<Vec<DiscoveredMessage>> {
+        // Курсор приходит из даты письма в базе, а она берётся из заголовка Date,
+        // то есть из времени отправки. Поэтому и фильтр, и сортировка идут по
+        // item:DateTimeSent: по DateTimeReceived шкалы расходились и догрузка то
+        // пропускала письма, то возвращала уже показанные.
         let restriction = format!(
-            r#"<m:Restriction><t:IsLessThan><t:FieldURI FieldURI="item:DateTimeReceived"/><t:FieldURIOrConstant><t:Constant Value="{}"/></t:FieldURIOrConstant></t:IsLessThan></m:Restriction>"#,
+            r#"<m:Restriction><t:IsLessThan><t:FieldURI FieldURI="item:DateTimeSent"/><t:FieldURIOrConstant><t:Constant Value="{}"/></t:FieldURIOrConstant></t:IsLessThan></m:Restriction>"#,
             escape(before)
         );
         let body = format!(
-            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>{restriction}<m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeSent"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
             limit,
             escape(folder_path)
         );

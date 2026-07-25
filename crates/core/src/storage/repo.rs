@@ -1813,6 +1813,36 @@ impl Db {
         Ok(counts)
     }
 
+    /// Пометить письма как догруженные вглубь папки, чтобы правила их не
+    /// трогали: у старой переписки новые rowid, и без пометки правила разослали
+    /// бы её по папкам на сервере как только что пришедшую.
+    pub async fn mark_backfilled(
+        &self,
+        account_id: i64,
+        folder_id: i64,
+        uids: &[u32],
+    ) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "UPDATE messages SET backfilled=1 WHERE account_id=",
+        );
+        query.push_bind(account_id);
+        query.push(" AND folder_id=");
+        query.push_bind(folder_id);
+        query.push(" AND uid IN (");
+        let mut separated = query.separated(",");
+        for uid in uids {
+            separated.push_bind(*uid as i64);
+        }
+        separated.push_unseparated(")");
+        let mut tx = self.begin_write().await?;
+        query.build().execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn save_discovered_messages(
         &self,
         account_id: i64,
@@ -1943,7 +1973,11 @@ impl Db {
                 message.subject().unwrap_or_default().to_owned(),
                 preview,
                 body_text,
-                message.date().map(|date| date.to_rfc3339()),
+                // Дату держим в UTC: курсор страниц и слияние списка сравнивают
+                // её как строку, а при смешанных смещениях ("+03:00" и "Z")
+                // такое сравнение путало порядок - письма пропадали между
+                // страницами или возвращались повторно.
+                message.date().map(Self::normalized_date),
                 attachment_rows,
                 auth("dkim"),
                 auth("spf"),
@@ -2214,6 +2248,50 @@ impl Db {
     // ---------- Письма ----------
 
     /// Список писем папки (метаданные), новые сверху.
+    /// Дата письма в едином виде - UTC со смещением "+00:00". Заголовок Date
+    /// приходит в зоне отправителя, а страницы писем и слияние списка сравнивают
+    /// дату как строку: смешанные смещения ломали порядок.
+    fn normalized_date(date: &mail_parser::DateTime) -> String {
+        chrono::DateTime::from_timestamp(date.to_timestamp(), 0)
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+            .unwrap_or_else(|| date.to_rfc3339())
+    }
+
+    /// Дописать письмам их метки: строка `messages` меток не содержит, они лежат
+    /// в отдельной таблице. Без этого бейджи в списке, счётчики и фильтр по метке
+    /// видели метки только в умных папках, где выборка заполняет их сама.
+    async fn attach_labels(&self, messages: &mut [MessageMeta]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT ml.message_id, l.name FROM message_labels ml
+             JOIN labels l ON l.id = ml.label_id WHERE ml.message_id IN (",
+        );
+        let mut separated = query.separated(",");
+        for message in messages.iter() {
+            separated.push_bind(message.id);
+        }
+        separated.push_unseparated(")");
+        let rows = query
+            .build_query_as::<(i64, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_message = std::collections::HashMap::<i64, Vec<String>>::new();
+        for (message_id, name) in rows {
+            by_message.entry(message_id).or_default().push(name);
+        }
+        for message in messages.iter_mut() {
+            if let Some(names) = by_message.remove(&message.id) {
+                message.labels = names;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_messages(&self, folder_id: i64, limit: i64) -> Result<Vec<MessageMeta>> {
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
@@ -2227,13 +2305,18 @@ impl Db {
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                     AND o.status IN ('pending','processing','retry')
                )
-             ORDER BY date DESC LIMIT ?",
+             ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        // Порядок тот же, что у курсорных страниц: (date DESC, id DESC). Сортировка
+        // только по дате рассогласовывала первую страницу с курсором, и письма с
+        // одинаковой датой могли не попасть ни в одну страницу.
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
     }
 
     /// Cursor page ordered by `(date DESC, id DESC)`. Unlike OFFSET this stays
@@ -2264,7 +2347,7 @@ impl Db {
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                     AND o.status IN ('pending','processing','retry')
                )
-             ORDER BY date DESC, id DESC LIMIT ?",
+             ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
         .bind(date)
@@ -2273,7 +2356,85 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Курсорная страница писем с меткой. Раздел меток раньше показывал только
+    /// то, что уже загружено в память по папкам, и письмо с меткой за пределами
+    /// загруженных страниц не появлялось вовсе.
+    pub async fn list_label_messages_page(
+        &self,
+        label: &str,
+        before_date: Option<&str>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MessageMeta>> {
+        let limit = limit.clamp(1, 500);
+        let rows = match (before_date, before_id) {
+            (Some(date), Some(id)) => {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE id IN (SELECT ml.message_id FROM message_labels ml
+                                  JOIN labels l ON l.id = ml.label_id WHERE l.name = ?)
+                       AND (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o
+                          WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
+                            AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(label)
+                .bind(date)
+                .bind(date)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            _ => {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE id IN (SELECT ml.message_id FROM message_labels ml
+                                  JOIN labels l ON l.id = ml.label_id WHERE l.name = ?)
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o
+                          WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
+                            AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                )
+                .bind(label)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Сколько писем у каждой метки - для счётчика в разделе меток: считать по
+    /// загруженным в память письмам значило показывать заниженное число.
+    pub async fn label_message_counts(&self) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT l.name, COUNT(ml.message_id) FROM labels l
+             LEFT JOIN message_labels ml ON ml.label_id = l.id
+             GROUP BY l.id ORDER BY l.name COLLATE NOCASE",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn list_recent_messages(&self, limit: i64) -> Result<Vec<MessageMeta>> {
@@ -2469,7 +2630,12 @@ impl Db {
             .into_iter()
             .map(|row| (row.id, MessageMeta::from(row)))
             .collect::<std::collections::HashMap<_, _>>();
-        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+        let mut messages = ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
     }
 
     /// Данные для докачки письма с сервера, когда полный MIME ещё не загружен:
@@ -3662,7 +3828,8 @@ impl Db {
             "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
                     m.remote_id, m.from_name, m.from_addr, m.subject
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE m.id>? AND (f.role IS NULL OR f.role NOT IN
+             WHERE m.id>? AND m.backfilled=0
+               AND (f.role IS NULL OR f.role NOT IN
                     ('sent','drafts','archive','spam','trash'))
                AND NOT EXISTS (
                     SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
@@ -3679,6 +3846,9 @@ impl Db {
             let matching = rules.iter().position(|rule| {
                 if message.id <= rule.progress_message_id
                     || rule.account_id.is_some_and(|id| id != message.account_id)
+                    // Метку правила удалили - правило ждёт новой, а не валит
+                    // обработку остальных.
+                    || (rule.action == "label" && rule.label_id.is_none())
                 {
                     return false;
                 }

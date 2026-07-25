@@ -78,6 +78,17 @@ document.querySelectorAll('[data-openacct]').forEach(el=>el.onclick=()=>setSecti
 /* ---------- account colors + messages ---------- */
 const avc=['#e5342a','#0058ff','#5b63d3','#2f9e5f','#c2456b','#b5761c','#0f9b8e','#7a4fd0'];
 let messages=[];
+// Письма, ушедшие из папки по действию пользователя. Пока перемещение или
+// удаление ждёт очереди, выборка их уже не отдаёт, а локальная копия осталась бы
+// висеть в прежней папке - поэтому убираем их из списка сразу и держим id, пока
+// перезагрузка не подтвердит новое место письма.
+function forgetMessages(ids){
+  const gone=new Set(ids.map(Number).filter(Number.isFinite));
+  if(!gone.size)return;
+  messages=messages.filter(message=>!gone.has(message.id));
+  gone.forEach(id=>selectedMessageIds.delete(id));
+}
+window.forgetMessages=forgetMessages;
 let coreFolders=[];
 let coreAccounts=[];
 // 16 нейтральных цветов аккаунта, читаемых в светлой и тёмной теме.
@@ -120,6 +131,9 @@ const SMART_MESSAGE_PAGE_SIZE=500;
 // Догрузка с сервера идёт маленькими порциями - чтобы результат появлялся
 // быстро, а не ждать пока скачаются сотни писем разом.
 const BACKFILL_PAGE_SIZE=15;
+// Сколько папок-источников умная папка догружает за один проход: каждая - это
+// отдельное подключение к серверу, остальные подхватит следующий проход.
+const SMART_BACKFILL_FOLDERS=5;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
@@ -148,9 +162,9 @@ function setListLoading(on,label){
   const box=document.getElementById('listLoading'),status=document.getElementById('appStatus');
   if(on){
     if(listLoadTimer)clearInterval(listLoadTimer);
-    listLoadStart=performance.now();listLoadLabel=label||'данные';
+    listLoadStart=performance.now();listLoadLabel=label||L('данные','data');
     box?.classList.remove('hidden');status?.classList.remove('hidden');
-    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=`Загружаю ${listLoadLabel}… прошло ${s} с`;};
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=L(`Загружаю ${listLoadLabel}… прошло ${s} с`,`Loading ${listLoadLabel}… ${s} s elapsed`);};
     tick();listLoadTimer=setInterval(tick,100);
     window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
   }else{
@@ -159,7 +173,28 @@ function setListLoading(on,label){
     box?.classList.add('hidden');status?.classList.add('hidden');
   }
 }
+// Страницы писем по метке идут прямо из базы: раньше раздел метки показывал
+// только те письма, что уже загружены по папкам, и метка на письме из глубины
+// ящика не показывалась вовсе.
+const tagHasMore=new Map();
+async function loadNextTagPage(){
+  const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
+  loadingMoreMessages=true;setListLoading(true,tag);
+  try{
+    const known=new Set(messages.map(message=>message.id));
+    const loaded=messages.filter(message=>(message.labels||[]).includes(tag));
+    const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date||null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
+    const fresh=page.filter(message=>!known.has(message.id));
+    messages.push(...fresh);tagHasMore.set(tag,fresh.length>0);
+    if(currentTagName===tag)applyListOptions(false);
+  }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
+  finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+}
+window.loadNextTagPage=loadNextTagPage;
+window.resetTagPaging=tag=>tagHasMore.delete(tag);
 async function loadNextMessagePage(){
+  if(currentTagName!=null){await loadNextTagPage();return;}
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
@@ -177,19 +212,27 @@ async function loadNextMessagePage(){
       if(!fresh.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
       messages.push(...fresh);page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,fresh.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
-  }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+  }catch(error){console.error('truemail pagination:',error);paginationFailed=true;}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
 }
 // Если письма не заполнили экран (короткий список), а на сервере их больше -
-// подгружаем следующую порцию автоматически, не дожидаясь прокрутки.
+// подгружаем следующую порцию автоматически, не дожидаясь прокрутки. Подряд
+// таких доборов не больше AUTO_FILL_LIMIT: при включённом фильтре список
+// остаётся коротким, сколько ни грузи, и цикл выкачал бы всю папку порциями,
+// каждая - отдельное подключение к серверу. После ошибки автодобор тоже
+// останавливаем, иначе он бился бы в неё без остановки.
+const AUTO_FILL_LIMIT=5;
+let autoFillStreak=0,paginationFailed=false;
+function resetAutoFill(){autoFillStreak=0;paginationFailed=false;}
+window.resetAutoFill=resetAutoFill;
 function ensureListFilled(){
   const el=document.getElementById('msgs');if(!el)return;
-  if(loadingMoreMessages||loadingSmartCoverage)return;
-  const hasMore=currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
-  if(hasMore&&el.scrollHeight<=el.clientHeight+40){setTimeout(()=>loadNextMessagePage(),0);}
+  if(loadingMoreMessages||loadingSmartCoverage||paginationFailed||autoFillStreak>=AUTO_FILL_LIMIT)return;
+  const hasMore=currentTagName!=null?tagHasMore.get(currentTagName)!==false:currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
+  if(hasMore&&el.scrollHeight<=el.clientHeight+40){autoFillStreak++;setTimeout(()=>loadNextMessagePage(),0);}
 }
 window.setListLoading=setListLoading;
 window.ensureListFilled=ensureListFilled;
-msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240)loadNextMessagePage();},{passive:true});
+msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage();}},{passive:true});
 
 /* thread action buttons -> compose */
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=()=>{

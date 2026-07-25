@@ -1536,6 +1536,31 @@ pub async fn list_messages_page(
         .await?)
 }
 
+#[tauri::command]
+pub async fn list_label_messages_page(
+    state: State<'_, AppState>,
+    label: String,
+    before_date: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<MessageMeta>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_label_messages_page(
+            &label,
+            before_date.as_deref(),
+            before_id,
+            limit.unwrap_or(100),
+        )
+        .await?)
+}
+
+#[tauri::command]
+pub async fn label_message_counts(state: State<'_, AppState>) -> CmdResult<Vec<(String, i64)>> {
+    Ok(core(&state).await?.db.label_message_counts().await?)
+}
+
 /// Запись сообщения фронтенда в общий лог приложения (truemail.log) - чтобы
 /// диагностировать загрузку/прокрутку в одном месте с бэкендом.
 #[tauri::command]

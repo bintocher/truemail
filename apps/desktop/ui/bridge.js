@@ -41,6 +41,8 @@ window.corePageSize = 100;
     deleteFolder: (folderId) => invoke("delete_folder", { folderId }),
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
+    listLabelMessagesPage: (label, beforeDate, beforeId, limit = 100) => invoke("list_label_messages_page", { label, beforeDate, beforeId, limit }),
+    labelMessageCounts: () => invoke("label_message_counts"),
     fetchOlderMessages: (folderId, before, limit = 500) => invoke("fetch_older_messages", { folderId, before, limit }),
     uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
     getMessage: (messageId) => invoke("get_message", { messageId }),

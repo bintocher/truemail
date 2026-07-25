@@ -346,6 +346,8 @@ fn run() -> anyhow::Result<()> {
             commands::delete_folder,
             commands::list_messages,
             commands::list_messages_page,
+            commands::list_label_messages_page,
+            commands::label_message_counts,
             commands::fetch_older_messages,
             commands::ui_log,
             commands::get_message,

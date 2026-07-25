@@ -186,17 +186,16 @@ fn google_event_body(input: &EventInput) -> Value {
             "minutes": alarm.trigger_minutes,
         })).collect::<Vec<_>>(),
     });
-    let recurrence = [
-        input.rrule.as_ref().map(|value| format!("RRULE:{value}")),
-        input
-            .exdates
-            .as_ref()
-            .map(|value| format!("EXDATE:{value}")),
-        input.rdates.as_ref().map(|value| format!("RDATE:{value}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
+    let mut recurrence = Vec::new();
+    if let Some(rrule) = input.rrule.as_ref() {
+        recurrence.push(format!("RRULE:{rrule}"));
+    }
+    if let Some(exdates) = input.exdates.as_ref() {
+        recurrence.extend(recurrence_lines("EXDATE", exdates));
+    }
+    if let Some(rdates) = input.rdates.as_ref() {
+        recurrence.extend(recurrence_lines("RDATE", rdates));
+    }
     if !recurrence.is_empty() {
         body["recurrence"] = json!(recurrence);
     }
@@ -321,6 +320,41 @@ fn ical_date(value: &str, all_day: bool) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
+/// Строки EXDATE/RDATE в формате iCalendar. Форма отдаёт даты как "2026-07-20",
+/// а сервер ждёт "20260720" - в прежнем виде DAV отвергал запись или молча терял
+/// исключения. Чистые даты и моменты времени в одной строке смешивать нельзя,
+/// поэтому они уходят разными строками, а даты помечаются VALUE=DATE.
+fn recurrence_lines(name: &str, value: &str) -> Vec<String> {
+    let (mut dates, mut moments) = (Vec::new(), Vec::new());
+    for item in value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(item, "%Y-%m-%d") {
+            dates.push(date.format("%Y%m%d").to_string());
+        } else if let Ok(moment) = chrono::DateTime::parse_from_rfc3339(item) {
+            moments.push(moment.to_utc().format("%Y%m%dT%H%M%SZ").to_string());
+        } else {
+            // Уже компактный вид - пришёл с сервера, оставляем как есть.
+            let compact = item.to_ascii_uppercase();
+            if compact.len() == 8 && compact.chars().all(|c| c.is_ascii_digit()) {
+                dates.push(compact);
+            } else {
+                moments.push(compact);
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    if !dates.is_empty() {
+        lines.push(format!("{name};VALUE=DATE:{}", dates.join(",")));
+    }
+    if !moments.is_empty() {
+        lines.push(format!("{name}:{}", moments.join(",")));
+    }
+    lines
+}
+
 fn dav_event_body(uid: &str, input: &EventInput) -> String {
     let start_key = if input.all_day {
         "DTSTART;VALUE=DATE"
@@ -357,10 +391,10 @@ fn dav_event_body(uid: &str, input: &EventInput) -> String {
         lines.push(format!("RECURRENCE-ID:{recurrence_id}"));
     }
     if let Some(exdates) = &input.exdates {
-        lines.push(format!("EXDATE:{exdates}"));
+        lines.extend(recurrence_lines("EXDATE", exdates));
     }
     if let Some(rdates) = &input.rdates {
-        lines.push(format!("RDATE:{rdates}"));
+        lines.extend(recurrence_lines("RDATE", rdates));
     }
     if let Some(timezone) = &input.timezone {
         lines.push(format!("X-WR-TIMEZONE:{}", ical_escape(timezone)));
@@ -912,6 +946,25 @@ pub async fn delete_contact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recurrence_lines_use_icalendar_format() {
+        // Форма отдаёт даты как "2026-07-20" - в таком виде сервер запись
+        // отвергал. Даты и моменты времени должны уходить разными строками.
+        let lines = recurrence_lines("EXDATE", "2026-07-20, 2026-07-21T10:00:00+03:00");
+        assert_eq!(
+            lines,
+            vec![
+                "EXDATE;VALUE=DATE:20260720".to_owned(),
+                "EXDATE:20260721T070000Z".to_owned(),
+            ]
+        );
+        // Значение, пришедшее с сервера, остаётся как есть.
+        assert_eq!(
+            recurrence_lines("RDATE", "20260722T090000Z"),
+            vec!["RDATE:20260722T090000Z".to_owned()]
+        );
+    }
 
     #[test]
     fn builds_writable_google_event_body() {

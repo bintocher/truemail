@@ -1677,10 +1677,22 @@ fn parse_cursor_datetime(before: &str) -> Result<chrono::DateTime<chrono::FixedO
         .map(|naive| naive.and_utc().fixed_offset())
 }
 
-/// Отобрать UID писем строго старше курсора. SEARCH BEFORE отбирает по дню, так
-/// что письма дня курсора приходят вместе с более новыми - точную границу
-/// проверяем по INTERNALDATE (дешёвый FETCH без тела). Возвращает не больше
-/// `limit` самых свежих подходящих (наибольшие UID).
+/// Дата из заголовка Date. Курсор догрузки ведётся по дате письма из базы, а
+/// там лежит именно заголовок Date - по нему и сверяем границу. Время доставки
+/// (INTERNALDATE) для этого не годится: у перенесённого ящика оно у всех писем
+/// одинаковое, и страница либо пустела, либо возвращала уже показанное.
+fn header_date(fetch: &async_imap::types::Fetch) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let text = String::from_utf8_lossy(fetch.header()?);
+    let line = text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("date:"))?;
+    chrono::DateTime::parse_from_rfc2822(line.split_once(':')?.1.trim()).ok()
+}
+
+/// Отобрать UID писем строго старше курсора. SEARCH отбирает по дню, так что
+/// письма дня курсора приходят вместе с более новыми - точную границу проверяем
+/// по заголовку Date (дешёвый FETCH без тела). Возвращает не больше `limit`
+/// самых свежих подходящих; окно расширяется, пока страница не набрана.
 async fn older_than_cursor(
     session: &mut OAuthSession,
     folder_path: &str,
@@ -1694,13 +1706,8 @@ async fn older_than_cursor(
     let mut window = limit + OLDER_PROBE_MARGIN;
     loop {
         let probe = &uids[uids.len().saturating_sub(window)..];
-        let set = probe
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
         let fetched = session
-            .uid_fetch(set, "(UID INTERNALDATE)")
+            .uid_fetch(uid_set(probe), "(UID BODY.PEEK[HEADER.FIELDS (DATE)])")
             .await
             .map_err(|error| Error::Backend {
                 backend: "imap-older".into(),
@@ -1716,20 +1723,27 @@ async fn older_than_cursor(
             .iter()
             .filter_map(|fetch| {
                 let uid = fetch.uid?;
-                // Дату не отдали - письмо берём: повторная запись безвредна
-                // (save_discovered_messages идемпотентен), потеря письма - нет.
-                match fetch.internal_date() {
+                match header_date(fetch) {
                     Some(date) if date >= cursor => None,
-                    _ => Some(uid),
+                    Some(date) => Some((date, uid)),
+                    // Заголовок не прочитался - письмо берём: повторная запись
+                    // безвредна (save_discovered_messages идемпотентен), потеря
+                    // письма - нет.
+                    None => Some((cursor, uid)),
                 }
             })
-            .collect::<Vec<u32>>();
-        matched.sort_unstable();
-        // Пусто и окно ещё не покрыло всю выборку - в него попал только день
-        // курсора; расширяем, иначе догрузка встала бы на месте.
-        if !matched.is_empty() || probe.len() == uids.len() {
+            .collect::<Vec<_>>();
+        // Страница - самые свежие по дате письма, а не по UID: после переноса
+        // или копирования письма старое письмо может иметь наибольший UID, и
+        // отбор по UID уводил курсор далеко в прошлое, пропуская весь диапазон.
+        matched.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        if matched.len() >= limit || probe.len() == uids.len() {
             let start = matched.len().saturating_sub(limit);
-            return Ok(matched.split_off(start));
+            return Ok(matched
+                .split_off(start)
+                .into_iter()
+                .map(|(_, uid)| uid)
+                .collect());
         }
         window = window.saturating_mul(4);
     }
@@ -1751,34 +1765,34 @@ async fn fetch_older_messages(
             message: format!("{folder_path}: {error}"),
         })?;
     // Курсор приходит с точным временем самого старого показанного письма, а
-    // SEARCH BEFORE сравнивает INTERNALDATE только по дню. Поэтому ищем с
-    // запасом - BEFORE следующего дня, чтобы день курсора попал в выборку
-    // целиком, - а точную границу применяем сами по INTERNALDATE. Иначе письма
-    // того же дня, что курсор, но старше его по времени, терялись безвозвратно.
+    // SEARCH сравнивает даты только по дню. Поэтому ищем с запасом - по день
+    // курсора включительно, - а точную границу применяем сами по заголовку Date.
+    // Иначе письма того же дня, что курсор, но старше его по времени, терялись
+    // безвозвратно. SENTBEFORE сравнивает заголовок Date, то есть ту же
+    // величину, что и курсор; серверы без него (редкость) обслуживаем через
+    // BEFORE по времени доставки.
     let cursor = parse_cursor_datetime(before)?;
     let date = (cursor.date_naive() + chrono::Days::new(1))
         .format("%d-%b-%Y")
         .to_string();
-    let mut uids = session
-        .uid_search(format!("BEFORE {date}"))
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-search".into(),
-            message: format!("{folder_path}: {error}"),
-        })?
-        .into_iter()
-        .collect::<Vec<u32>>();
+    let found = match session.uid_search(format!("SENTBEFORE {date}")).await {
+        Ok(found) => found,
+        Err(_) => session
+            .uid_search(format!("BEFORE {date}"))
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-search".into(),
+                message: format!("{folder_path}: {error}"),
+            })?,
+    };
+    let mut uids = found.into_iter().collect::<Vec<u32>>();
     uids.sort_unstable();
     let take = older_than_cursor(&mut session, folder_path, &uids, cursor, limit.max(1)).await?;
     if take.is_empty() {
         let _ = session.logout().await;
         return Ok(Vec::new());
     }
-    let set = take
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+    let set = uid_set(&take);
     let fetched = session
         .uid_fetch(set, MESSAGE_FETCH_ITEMS)
         .await

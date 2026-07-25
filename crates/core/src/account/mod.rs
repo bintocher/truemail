@@ -901,6 +901,14 @@ impl AccountManager {
         self.db
             .save_discovered_messages(account.id, &messages)
             .await?;
+        // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
+        let uids = messages
+            .iter()
+            .map(|message| message.uid)
+            .collect::<Vec<_>>();
+        self.db
+            .mark_backfilled(account.id, folder_id, &uids)
+            .await?;
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(count)
     }
