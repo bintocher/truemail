@@ -330,7 +330,10 @@ const coreSmartRows=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
   if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
-  try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),cursor=existing.at(-1),known=new Set(existing.map(message=>message.id));
+  try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),known=new Set(existing.map(message=>message.id));
+    // Курсор - истинный минимум (старейшая дата, затем наименьший id), иначе при
+    // равных датах запрос вернёт уже показанные письма и прокрутка встанет.
+    const cursor=existing.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
     let rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);
     let fresh=rows.filter(message=>!known.has(message.id));
     // Прогресс - по новым письмам, а не по длине страницы (могут прийти дубли).

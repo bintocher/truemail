@@ -163,7 +163,13 @@ async function loadNextMessagePage(){
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
-    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
+    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId);
+      // Курсор - ИСТИННЫЙ минимум (самая старая дата, затем наименьший id).
+      // Сортировка только по дате давала неверный курсор при равных датах, и
+      // запрос возвращал уже показанные письма (дубли), из-за чего прокрутка
+      // крутилась вхолостую, а догрузка не запускалась.
+      const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+      if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       let fresh=page.filter(message=>!known.has(message.id));
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
       // выборка по курсору может вернуть уже показанные письма (дубли по
