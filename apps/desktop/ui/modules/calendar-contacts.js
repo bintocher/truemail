@@ -163,15 +163,33 @@ document.querySelectorAll('.nav .navlabel').forEach(lbl=>{
 });
 
 /* custom right-click menu (suppress browser default) */
-const ctxmenu=document.getElementById('ctxmenu'),ctxsmart=document.getElementById('ctxsmart'),ctxfolder=document.getElementById('ctxfolder'),ctxcontact=document.getElementById('ctxcontact');
-let contextFolder=null,contextFolderOpen=null,contextContact=null;
-function posMenu(menu,e){menu.style.left=Math.min(e.clientX,window.innerWidth-244)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-330)+'px';menu.classList.add('open');}
+const ctxmenu=document.getElementById('ctxmenu'),ctxsmart=document.getElementById('ctxsmart'),ctxfolder=document.getElementById('ctxfolder'),ctxcontact=document.getElementById('ctxcontact'),ctxtag=document.getElementById('ctxtag');
+let contextFolder=null,contextFolderOpen=null,contextContact=null,contextTag=null;
+function closeAllCtxMenus(){[ctxmenu,ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m&&m.classList.remove('open'));}
+function posMenu(menu,e){menu.classList.add('open');const w=menu.offsetWidth,h=menu.offsetHeight;menu.style.left=Math.max(8,Math.min(e.clientX,window.innerWidth-w-8))+'px';menu.style.top=Math.max(8,Math.min(e.clientY,window.innerHeight-h-8))+'px';}
 document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;e.preventDefault();
-  ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');ctxcontact.classList.remove('open');
-  const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]');
-  if(msg){const id=Number(msg.dataset.messageId);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(smart){ctxsmart.dataset.index=smart.dataset.smartIndex;posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}} });
-document.addEventListener('click',()=>{ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');ctxcontact.classList.remove('open');});
-[ctxsmart,ctxfolder,ctxcontact].forEach(m=>m.querySelectorAll('.tmi').forEach(i=>i.onclick=()=>m.classList.remove('open')));
+  closeAllCtxMenus();
+  const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
+  if(msg){const id=Number(msg.dataset.messageId);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag)posMenu(ctxtag,e);}else if(smart){ctxsmart.dataset.index=smart.dataset.smartIndex;posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}} });
+document.addEventListener('click',closeAllCtxMenus);
+// Esc закрывает верхнее открытое окно: сначала контекстные меню, затем модалки.
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape')return;
+  if([ctxmenu,ctxsmart,ctxfolder,ctxcontact,ctxtag].some(menu=>menu&&menu.classList.contains('open'))){closeAllCtxMenus();return;}
+  const overlays=[...document.querySelectorAll('.raw-overlay,.overlay.open')];
+  const top=overlays[overlays.length-1];if(!top)return;
+  e.preventDefault();
+  // .raw-overlay всегда создаётся заново - его можно удалять. Постоянные окна
+  // (.overlay: auxOverlay, smartOverlay, linkOverlay и др.) только скрываем,
+  // иначе повторно не откроются. Динамические .overlay закрываем их же кнопкой.
+  if(top.classList.contains('raw-overlay')){top.remove();return;}
+  const closer=top.querySelector('.label-cancel,.template-close,.snooze-cancel,.confirm-cancel');
+  if(closer)closer.click();else top.classList.remove('open');
+});
+[ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m.querySelectorAll('.tmi:not(.tmi-check)').forEach(i=>i.onclick=()=>m.classList.remove('open')));
+ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить метку «${contextTag.name}»? Она снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Метка удалена','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));
+// Создание тега и сворачивание раздела.
+document.getElementById('addTag')?.addEventListener('click',()=>openLabelCreator(null));
 // Меню флажков (пользовательских меток) для письма.
 async function openFlagMenu(message,event){
   if(!message){showToast(L('Сначала выберите письмо','Select a message first'));return;}
@@ -212,12 +230,28 @@ function openLabelCreator(message){
   overlay.querySelector('.label-save').onclick=async()=>{const name=overlay.querySelector('.label-name').value.trim();if(!name){showToast(L('Введите название метки','Enter a label name'));return;}try{const id=await window.tm.createLabel(name,chosen);if(message)await window.tm.toggleMessageLabel(message.id,id,true);await window.reloadCoreData?.();close();showToast(L('Метка создана','Label created'));}catch(error){showToast(error.message||String(error));}};
   overlay.querySelector('.label-name').focus();
 }
+// Редактор существующего тега: имя, цвет, удаление.
+function openLabelEditor(label){
+  const overlay=document.createElement('div');overlay.className='raw-overlay';
+  overlay.innerHTML=`<div class="label-box"><h3>${L('Метка','Tag')}</h3><input class="inp label-name" placeholder="${L('Название метки','Label name')}" maxlength="40"><div class="label-colors"></div><div class="label-actions"><button type="button" class="btn danger-btn label-delete">${L('Удалить','Delete')}</button><span class="grow"></span><button type="button" class="btn label-cancel">${L('Отмена','Cancel')}</button><button type="button" class="btn primary label-save">${L('Сохранить','Save')}</button></div></div>`;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.label-name').value=label.name||'';
+  let chosen=label.color||ACCOUNT_COLORS[0];
+  const colors=overlay.querySelector('.label-colors');
+  ACCOUNT_COLORS.forEach(color=>{const swatch=document.createElement('button');swatch.type='button';swatch.className='color-swatch'+(color===chosen?' on':'');swatch.style.background=color;swatch.onclick=()=>{chosen=color;colors.querySelectorAll('.color-swatch').forEach(item=>item.classList.toggle('on',item===swatch));};colors.appendChild(swatch);});
+  const close=()=>overlay.remove();
+  overlay.querySelector('.label-cancel').onclick=close;
+  overlay.onclick=e=>{if(e.target===overlay)close();};
+  overlay.querySelector('.label-delete').onclick=async()=>{if(!confirm(L(`Удалить метку «${label.name}»? Она снимется со всех писем.`,`Delete tag "${label.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(label.id);if(currentTagName===label.name)currentTagName=null;await window.reloadCoreData?.();close();showToast(L('Метка удалена','Tag deleted'));}catch(error){showToast(error.message||String(error));}};
+  overlay.querySelector('.label-save').onclick=async()=>{const name=overlay.querySelector('.label-name').value.trim();if(!name){showToast(L('Введите название метки','Enter a label name'));return;}try{await window.tm.updateLabel(label.id,name,chosen);if(currentTagName===label.name)currentTagName=name;await window.reloadCoreData?.();close();showToast(L('Метка обновлена','Tag updated'));}catch(error){showToast(error.message||String(error));}};
+  overlay.querySelector('.label-name').focus();
+}
 // ПКМ-меню письма = все действия панели письма (tbActions, даже выключенные) + доп.
 function buildContextMenu(){
   ctxmenu.innerHTML='';
   tbActions.forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
   const sep=document.createElement('div');sep.className='tmsep';ctxmenu.appendChild(sep);
-  (smartIsEnglish()?[['flag','flag','Flag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Флажок'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;ctxmenu.appendChild(item);});
+  (smartIsEnglish()?[['flag','flag','Add tag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Добавить метку'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top});}});ctxmenu.appendChild(item);});
   renderIcons(ctxmenu);
 }
 ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;ctxmenu.classList.remove('open');const action=item.dataset.contextAction;
@@ -227,7 +261,7 @@ ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
   executeToolbarAction(action);
 });
-ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='create'){const name=prompt(L(`Имя новой папки внутри «${contextFolder.display_name}»`,`New folder name inside "${contextFolder.display_name}"`),'');if(!name||!name.trim())return;try{await window.tm.createFolder(contextFolder.account_id,contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка создана на сервере','Folder created on the server'));}catch(error){showToast(error.message||String(error));}return;}
+ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='count-total'||action==='count-unread'){const key=action==='count-total'?'t':'u';const set=new Set((folderCounterModes[contextFolder.id]||'u').split('').filter(c=>c==='u'||c==='t'));set.has(key)?set.delete(key):set.add(key);folderCounterModes[contextFolder.id]=['u','t'].filter(k=>set.has(k)).join('')||'n';window.tm.setSetting('folder_counters',JSON.stringify(folderCounterModes)).catch(console.error);item.classList.toggle('on',set.has(key));updateFolderBadge(document.querySelector(`.folder-row[data-folder-id="${contextFolder.id}"]`),contextFolder);return;}if(action==='create'){const name=prompt(L(`Имя новой папки внутри «${contextFolder.display_name}»`,`New folder name inside "${contextFolder.display_name}"`),'');if(!name||!name.trim())return;try{await window.tm.createFolder(contextFolder.account_id,contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка создана на сервере','Folder created on the server'));}catch(error){showToast(error.message||String(error));}return;}
   if(action==='rename'){const name=prompt(L('Новое имя папки','New folder name'),contextFolder.display_name);if(!name||name.trim()===contextFolder.display_name)return;try{await window.tm.renameFolder(contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка переименована на сервере','Folder renamed on the server'));}catch(error){showToast(error.message||String(error));}return;}if(action==='delete'){if(!confirm(L(`Удалить папку «${contextFolder.display_name}» на сервере? Письма внутри также будут удалены.`,`Delete the folder "${contextFolder.display_name}" on the server? Messages inside will also be deleted.`)))return;try{await window.tm.deleteFolder(contextFolder.id);await window.reloadCoreData();showToast(L('Папка удалена на сервере','Folder deleted on the server'));}catch(error){showToast(error.message||String(error));}}}));
 ctxcontact.querySelectorAll('[data-contact-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextContact)return;const action=item.dataset.contactAction,email=contextContact.emails?.[0]?.email;if(action==='edit'){openContactEditor(contextContact);return;}if(action==='compose'){resetComposer();setRecipients('compTo',[{name:contextContact.display_name||'',email}]);document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');await applyComposerSignature('new');return;}if(action==='copy'){try{await navigator.clipboard.writeText(email);showToast(L('Email скопирован','Email copied'));}catch(error){showToast(error.message||String(error));}return;}if(action==='delete'){if(!confirm(L(`Удалить контакт «${contextContact.display_name||email||''}»?`,`Delete contact "${contextContact.display_name||email||''}"?`)))return;try{await window.tm.deleteContact(contextContact.id);await window.reloadCoreData();showToast(L('Контакт удалён','Contact deleted'));}catch(error){showToast(error.message||String(error));}}}));
 

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260720-2">
+  <link rel="stylesheet" href="styles.css?v=20260725-1">
 </head>
 <body>
 
@@ -37,6 +37,9 @@
 
       <div class="navlabel" data-navlabel="accounts"><span data-i18n="navAccounts">Аккаунты</span> <button type="button" class="add" id="addAcct" data-i18n-title="addAccount" title="Добавить аккаунт"><i data-i="plus"></i></button></div>
 
+      <div class="navlabel" data-navlabel="tags"><span data-i18n="navTags">Метки</span> <button type="button" class="add" id="addTag" data-i18n-title="createTag" title="Создать метку"><i data-i="plus"></i></button></div>
+      <div id="tagsNav" class="tags-nav"></div>
+
       <div class="nav-spacer"></div>
     </aside>
 
@@ -50,6 +53,7 @@
         <button type="button" class="search" id="searchBox"><i data-i="search"></i><span class="search-placeholder" data-i18n="searchAllPlaceholder">Поиск по всем ящикам</span><span class="kbd">Ctrl K</span></button>
       </div>
       <div class="msgs" id="msgs"></div>
+      <div class="list-loading hidden" id="listLoading"><span class="spinner"></span></div>
     </section>
 
     <section class="thread">
@@ -118,6 +122,7 @@
       <button type="button" class="sec" data-set="toolbar"><i data-i="grip"></i><span data-i18n="setToolbar">Панель письма</span></button>
       <button type="button" class="sec" data-set="accounts"><i data-i="user"></i><span data-i18n="navAccounts">Аккаунты</span></button>
       <button type="button" class="sec" data-set="smart"><i data-i="star"></i><span data-i18n="navSmartFolders">Умные папки</span></button>
+      <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Метки</span></button>
       <button type="button" class="sec" data-set="rules"><i data-i="filter"></i><span data-i18n="processingRules">Правила обработки</span></button>
       <button type="button" class="sec" data-set="unified"><i data-i="inbox"></i><span data-i18n="setUnified">Сквозные папки</span></button>
       <button type="button" class="sec" data-set="folders"><i data-i="folder"></i><span data-i18n="setFolders">Сопоставление папок</span></button>
@@ -203,6 +208,12 @@
         <div class="card mt-20"><div class="cb" id="smartList"></div></div>
       </div>
 
+      <div class="setpage" id="set-tags">
+        <h1 data-i18n="navTags">Метки</h1><p class="lead" data-i18n="tagsLead">Цветные метки для писем. Создавайте, переименовывайте, меняйте цвет и удаляйте. Помеченные письма собираются в разделе «Метки» слева.</p>
+        <button class="btn primary" id="tagNew2"><i data-i="plus"></i><span data-i18n="createTag">Создать метку</span></button>
+        <div class="card mt-20"><div class="cb" id="tagSettingsList"></div></div>
+      </div>
+
       <div class="setpage" id="set-rules">
         <h1 data-i18n="processingRules">Правила обработки</h1><p class="lead" data-i18n="rulesLead">Автоматически обрабатывайте новые письма по отправителю или теме: перемещайте в папку, архив, спам или корзину.</p>
         <button class="btn primary" id="ruleNew"><i data-i="plus"></i><span data-i18n="createRule">Создать правило</span></button>
@@ -215,8 +226,9 @@
           </div>
           <div class="rule-condition-grid rule-action-grid">
             <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
-            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option></select></div>
+            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option><option value="label" data-i18n="actAssignTag">Назначить метку</option></select></div>
             <div class="fld rule-target-field"><label data-i18n="ruleFolderLabel">Папка</label><select class="sel" id="ruleTarget"></select></div>
+            <div class="fld rule-tag-field hidden"><label data-i18n="ruleTagLabel">Метка</label><select class="sel" id="ruleTag"></select></div>
           </div>
           <label class="aux-check"><input type="checkbox" id="ruleExisting"> <span data-i18n="ruleApplyExisting">Применить также к уже загруженным письмам</span></label>
           <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="ruleCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i><span data-i18n="deleteRule">Удалить правило</span></button></div>
@@ -435,8 +447,9 @@
     <div class="mh"><i data-i="cal" id="auxIcon"></i><h3 id="auxTitle" data-i18n="event">Событие</h3><button class="iconbtn x" id="auxClose" data-i18n-aria="close" aria-label="Закрыть"><i data-i="back"></i></button></div>
     <form id="eventForm">
       <div class="mb aux-form">
-        <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
-        <div class="fld"><label data-i18n="calendarOrTaskList">Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
+        <div class="fld" id="eventAccountField"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="eventAccount" required></select></div>
+        <div class="fld" id="eventCalendarField"><label data-i18n="calendarOrTaskList">Календарь или список задач</label><select class="sel" id="eventCalendar" required></select></div>
+        <div class="fld hidden" id="eventSourceText"><span class="event-source-line"></span></div>
         <div class="fld"><label data-i18n="titleLabel">Название</label><input class="inp" id="eventSummary" required></div>
         <div class="fld hidden" id="eventRsvpBox">
           <label data-i18n="eventRsvpLabel">Ваш ответ</label>
@@ -454,18 +467,24 @@
         <details class="event-advanced">
           <summary data-i18n="eventAdvanced">Повторение, участники и другие поля</summary>
           <div class="event-advanced-body">
-            <div class="aux-two">
-              <div class="fld"><label data-i18n="eventRecurrence">Повторение</label><select class="sel" id="eventRecurrence"><option value="" data-i18n="eventRepeatNone">Не повторять</option><option value="FREQ=DAILY" data-i18n="eventRepeatDaily">Каждый день</option><option value="FREQ=WEEKLY" data-i18n="eventRepeatWeekly">Каждую неделю</option><option value="FREQ=MONTHLY" data-i18n="eventRepeatMonthly">Каждый месяц</option><option value="FREQ=YEARLY" data-i18n="eventRepeatYearly">Каждый год</option><option value="custom" data-i18n="eventRepeatCustom">Своё правило RRULE</option></select></div>
-              <div class="fld event-rrule-custom hidden"><label data-i18n="eventRrule">Правило RRULE</label><input class="inp" id="eventRrule" placeholder="FREQ=WEEKLY;BYDAY=MO,WE"></div>
+            <div class="fld"><label data-i18n="eventRecurrence">Повторение</label><select class="sel" id="eventRecurrence"><option value="" data-i18n="eventRepeatNone">Не повторять</option><option value="DAILY" data-i18n="eventRepeatDaily">Каждый день</option><option value="WEEKLY" data-i18n="eventRepeatWeekly">Каждую неделю</option><option value="MONTHLY" data-i18n="eventRepeatMonthly">Каждый месяц</option><option value="YEARLY" data-i18n="eventRepeatYearly">Каждый год</option></select></div>
+            <div class="event-recur-options hidden">
+              <div class="aux-two">
+                <div class="fld"><label data-i18n="eventRecurEvery">Повторять каждые</label><div class="fc-inline"><input class="inp scale-input" id="eventRecurInterval" type="number" min="1" value="1"><span class="event-recur-unit"></span></div></div>
+                <div class="fld"><label data-i18n="eventRecurEnds">Заканчивается</label><select class="sel" id="eventRecurEnd"><option value="never" data-i18n="eventRecurNever">Никогда</option><option value="until" data-i18n="eventRecurUntil">До даты</option><option value="count" data-i18n="eventRecurCount">После N повторений</option></select></div>
+              </div>
+              <div class="fld event-recur-weekdays hidden"><label data-i18n="eventRecurWeekdays">По дням недели</label><div class="weekday-row" id="eventRecurWeekdays"></div></div>
+              <div class="fld event-recur-until-field hidden"><label data-i18n="eventRecurUntilDate">Дата окончания</label><input class="inp" id="eventRecurUntilDate" type="date"></div>
+              <div class="fld event-recur-count-field hidden"><label data-i18n="eventRecurCountNum">Сколько повторений</label><input class="inp scale-input" id="eventRecurCountNum" type="number" min="1" value="10"></div>
             </div>
             <div class="aux-two">
-              <div class="fld"><label data-i18n="eventExceptions">Исключить даты (по одной в строке)</label><textarea class="inp event-lines" id="eventExdates" placeholder="20260720T070000Z"></textarea></div>
-              <div class="fld"><label data-i18n="eventExtraDates">Дополнительные даты (по одной в строке)</label><textarea class="inp event-lines" id="eventRdates" placeholder="20260721T070000Z"></textarea></div>
+              <div class="fld"><label data-i18n="eventExceptions">Исключить даты</label><div class="date-chips" id="eventExdatesChips"></div><div class="fc-inline mt-8"><input class="inp" id="eventExdateAdd" type="date"><button type="button" class="btn sm" id="eventExdateAddBtn" data-i18n="add">Добавить</button></div></div>
+              <div class="fld"><label data-i18n="eventExtraDates">Дополнительные даты</label><div class="date-chips" id="eventRdatesChips"></div><div class="fc-inline mt-8"><input class="inp" id="eventRdateAdd" type="date"><button type="button" class="btn sm" id="eventRdateAddBtn" data-i18n="add">Добавить</button></div></div>
             </div>
-            <div class="fld"><label data-i18n="eventAttendees">Участники (по одному в строке)</label><textarea class="inp event-lines" id="eventAttendees" data-i18n-placeholder="eventAttendeesPlaceholder" placeholder="Имя &lt;user@example.com&gt;"></textarea></div>
+            <div class="fld"><label data-i18n="eventAttendees">Участники</label><div class="date-chips" id="eventAttendeesChips"></div><div class="fc-inline mt-8"><input class="inp grow" id="eventAttendeeAdd" type="text" data-i18n-placeholder="eventAttendeesPlaceholder" placeholder="Имя &lt;user@example.com&gt;"><button type="button" class="btn sm" id="eventAttendeeAddBtn" data-i18n="add">Добавить</button></div></div>
             <div class="aux-two">
               <div class="fld"><label data-i18n="eventOrganizer">Организатор</label><input class="inp" id="eventOrganizer" type="email"></div>
-              <div class="fld"><label data-i18n="eventReminders">Напоминания в минутах (по одному в строке)</label><textarea class="inp event-lines" id="eventAlarms" placeholder="10&#10;60"></textarea></div>
+              <div class="fld"><label data-i18n="eventReminders">Напоминания</label><div class="reminder-chips" id="eventAlarmsChips"></div></div>
             </div>
             <div class="aux-two">
               <div class="fld"><label data-i18n="eventTimezone">Часовой пояс</label><input class="inp" id="eventTimezone" placeholder="Europe/Moscow"></div>
@@ -509,9 +528,18 @@
   <div class="tmi" data-folder-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
   <div class="tmi" data-folder-action="settings"><i data-i="settings"></i><span data-i18n="configureMapping">Настроить сопоставление</span></div>
   <div class="tmsep"></div>
+  <div class="tmi tmi-check" data-folder-action="count-unread"><i data-i="inbox"></i><span data-i18n="countUnread">Показывать непрочитанные</span><span class="tmi-mark"></span></div>
+  <div class="tmi tmi-check" data-folder-action="count-total"><i data-i="inbox"></i><span data-i18n="countTotal">Показывать всего писем</span><span class="tmi-mark"></span></div>
+  <div class="tmsep"></div>
   <div class="tmi" data-folder-action="create"><i data-i="plus"></i><span data-i18n="createFolder">Создать папку</span></div>
   <div class="tmi" data-folder-action="rename"><i data-i="edit"></i><span data-i18n="rename">Переименовать</span></div>
   <div class="tmi danger-menu-item" data-folder-action="delete"><i data-i="trash"></i><span data-i18n="deleteFolder">Удалить папку</span></div>
+</div>
+<div class="ctxmenu" id="ctxtag">
+  <div class="tmi" data-tag-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
+  <div class="tmsep"></div>
+  <div class="tmi" data-tag-action="edit"><i data-i="edit"></i><span data-i18n="editTag">Переименовать / цвет</span></div>
+  <div class="tmi danger-menu-item" data-tag-action="delete"><i data-i="trash"></i><span data-i18n="deleteTag">Удалить метку</span></div>
 </div>
 
 <div class="ctxmenu" id="ctxcontact">
@@ -621,14 +649,15 @@
   </div>
 </div>
 
-<script src="modules/shell.js?v=20260718-3"></script>
-<script src="modules/calendar-contacts.js?v=20260720-4"></script>
+<script src="modules/shell.js?v=20260725-1"></script>
+<script src="modules/calendar-contacts.js?v=20260725-1"></script>
 <script src="modules/commands-accessibility.js?v=20260720-1"></script>
-<script src="modules/smart-rules.js?v=20260721-1"></script>
+<script src="modules/smart-rules.js?v=20260725-1"></script>
 <script src="modules/i18n-onboarding.js?v=20260720-1"></script>
-<script src="modules/mail.js?v=20260721-1"></script>
-<script src="modules/composer.js?v=20260717-1"></script>
-<script src="modules/settings.js?v=20260720-1"></script>
-<script src="bridge.js?v=20260721-1"></script>
+<script src="modules/mail.js?v=20260725-1"></script>
+<script src="modules/composer.js?v=20260725-1"></script>
+<script src="modules/settings.js?v=20260725-1"></script>
+<script src="bridge.js?v=20260725-1"></script>
+<div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

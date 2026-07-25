@@ -7,32 +7,83 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-25
+
+### Added
+
+- Labels for mail: a section of their own in the sidebar, a list of labels with
+  colours in settings, assigning a label straight from the message menu and a
+  coloured badge in the list. Sorting rules can also assign a label on their
+  own.
+- The message list loads older mail from the server by itself when you scroll to
+  the end: in batches, with an indicator and a clear status. Works for Exchange,
+  Gmail and ordinary mail (Yandex, Outlook and others). If the list holds only a
+  few messages, the app tops it up without waiting for you to scroll.
+- For every folder you can choose what is shown next to its name: the total
+  number of messages, the number of unread ones, or nothing.
+- In conversation mode actions apply to the whole thread at once: mark as read,
+  move, delete.
+- The "Cc" list in the message header expands on click.
+- Esc closes any pop-up window.
+
+### Fixed
+
+- The message context menu no longer runs off the edge of the window - it always
+  opens towards the visible side.
+- An opened message no longer disappears from unread at that very moment: it
+  stays where it is until you move on to another one.
+- Exchange folders line up in the same tree as on the server: nested folders no
+  longer scatter across the top level.
+- Meeting invitations from Exchange show their participants, and the reply
+  buttons finally appear.
+- Meeting reply buttons are now the same width, and the chosen reply is
+  highlighted.
+- The message list header no longer says "4 accounts" when a single account's
+  folder is open - it shows the number of messages in that folder instead.
+- The message list no longer jumps back to the top when you switch to another
+  program and back, or when the data refreshes.
+- Yandex Mail loads older messages again - the request used to go out for
+  nothing and the list hit a ceiling.
+- Loading older messages no longer repeats them or gets stuck in the same place.
+- An action on a collapsed conversation applies to that conversation only:
+  messages with the same subject from other senders used to be caught too.
+- Mail rules no longer fire on old messages pulled in by scrolling - years-old
+  correspondence stays where it is instead of scattering across folders.
+- Deleting a label no longer deletes the rule that assigned it: the rule stays,
+  you only pick a label for it again.
+- Recurring events keep their settings when saved: day of month, ordinal week
+  and the end time of the repetition stay in place, and the server accepts the
+  exception dates without errors.
+
+### Changed
+
+- A calendar event is set up by clicking ready-made fields instead of typing
+  service strings by hand. The account and the calendar are shown as text when
+  editing an event, and the window is wider - every field is visible at once.
+- In the Russian interface everything is called "метка": some places used to say
+  "тег" and others "метка".
+
 ## [0.1.7] - 2026-07-23
 
 ### Fixed
 
-- The Windows installer showed an "Already Installed" page suggesting to
-  uninstall the app when run manually over an older version. Upgrades now
-  install right away, matching the built-in updater; the page remains only
-  for same-version reinstalls and downgrades.
-
-### Changed
-
-- CI pins tauri-cli (2.11.4); the NSIS template is vendored.
+- Installing a new version over an older one no longer asks you to remove the
+  previous one first - the update installs straight away and keeps your mail
+  and settings. You are still asked to uninstall only when installing the same
+  version again or going back to an older one.
 
 ## [0.1.6] - 2026-07-22
 
 ### Fixed
 
-- Release builds shipped without embedded Google OAuth client credentials, so
-  token refresh failed with "account not configured" and Gmail sync stopped.
-  CI now embeds the OAuth client id/secret at compile time.
+- The app could lose access to Google mail and show "account not configured":
+  sign-in stopped renewing and Gmail stopped updating. Sign-in now stays
+  connected as it should.
 
 ### Changed
 
-- The project moved to GitHub: https://github.com/bintocher/truemail. Sources,
-  CI, releases and the updater manifest now live there; the built-in updater
-  points at the GitHub release feed.
+- The project moved to GitHub: https://github.com/bintocher/truemail. Sources
+  and updates now come from there; the update arrives on its own, as usual.
 
 ## [0.1.5] - 2026-07-21
 

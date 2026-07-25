@@ -629,7 +629,7 @@ impl Db {
 
     pub async fn list_folders(&self, account_id: i64) -> Result<Vec<Folder>> {
         let rows = sqlx::query_as::<_, FolderRow>(
-            "SELECT id, account_id, remote_path, display_name, role, unread_count, total_count
+            "SELECT id, account_id, remote_path, display_name, role, parent_id, unread_count, total_count
              FROM folders WHERE account_id = ? ORDER BY id",
         )
         .bind(account_id)
@@ -640,7 +640,7 @@ impl Db {
 
     pub async fn folder(&self, folder_id: i64) -> Result<Folder> {
         let row = sqlx::query_as::<_, FolderRow>(
-            "SELECT id, account_id, remote_path, display_name, role, unread_count, total_count FROM folders WHERE id=?",
+            "SELECT id, account_id, remote_path, display_name, role, parent_id, unread_count, total_count FROM folders WHERE id=?",
         )
         .bind(folder_id)
         .fetch_one(&self.pool)
@@ -732,6 +732,24 @@ impl Db {
             .bind(folder.highestmodseq.map(|value| value as i64))
             .execute(&mut *tx)
             .await?;
+        }
+        // Второй проход: разрешаем parent_id по remote_path родителя (родитель
+        // мог быть вставлен позже в этом же батче). Родитель верхнего уровня
+        // (msgfolderroot и т.п.) среди папок отсутствует - parent_id остаётся NULL.
+        for folder in folders {
+            if let Some(parent) = folder.parent_remote_path.as_deref() {
+                sqlx::query(
+                    "UPDATE folders SET parent_id = (
+                         SELECT id FROM folders WHERE account_id=? AND remote_path=?
+                     ) WHERE account_id=? AND remote_path=?",
+                )
+                .bind(account_id)
+                .bind(parent)
+                .bind(account_id)
+                .bind(&folder.remote_path)
+                .execute(&mut *tx)
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1795,10 +1813,15 @@ impl Db {
         Ok(counts)
     }
 
+    /// `backfilled` - письма подняты прокруткой вглубь папки. Пометка ставится в
+    /// той же транзакции, что и вставка: у старой переписки новые rowid, и пока
+    /// флага нет, подоспевшая проверка правил разослала бы её по папкам на
+    /// сервере как только что пришедшую.
     pub async fn save_discovered_messages(
         &self,
         account_id: i64,
         messages: &[crate::backend::DiscoveredMessage],
+        backfilled: bool,
     ) -> Result<()> {
         use mail_parser::{MessageParser, MimeHeaders};
         use std::collections::HashSet;
@@ -1925,7 +1948,11 @@ impl Db {
                 message.subject().unwrap_or_default().to_owned(),
                 preview,
                 body_text,
-                message.date().map(|date| date.to_rfc3339()),
+                // Дату держим в UTC: курсор страниц и слияние списка сравнивают
+                // её как строку, а при смешанных смещениях ("+03:00" и "Z")
+                // такое сравнение путало порядок - письма пропадали между
+                // страницами или возвращались повторно.
+                message.date().map(Self::normalized_date),
                 attachment_rows,
                 auth("dkim"),
                 auth("spf"),
@@ -1997,8 +2024,11 @@ impl Db {
                     raw_ref.clone()
                 };
                 sqlx::query(
-                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched)
-                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    // backfilled намеренно не входит в DO UPDATE SET: письмо,
+                    // уже лежавшее в базе, не должно стать "догруженным" из-за
+                    // перекрытия страниц - иначе правила его больше не увидят.
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled)
+                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(folder_id, uid) DO UPDATE SET
                         remote_id=coalesce(excluded.remote_id,messages.remote_id), rfc822_message_id=excluded.rfc822_message_id, in_reply_to=excluded.in_reply_to,
                         references_ids=excluded.references_ids, from_name=excluded.from_name,
@@ -2016,7 +2046,8 @@ impl Db {
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
                 .bind(source.draft as i64).bind(!attachments.is_empty() as i64).bind(dkim).bind(spf)
-                .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64).execute(&mut *tx).await?;
+                .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64)
+                .bind(backfilled as i64).execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
                 if preserve_full_body {
                     if raw_ref != effective_ref {
@@ -2196,6 +2227,50 @@ impl Db {
     // ---------- Письма ----------
 
     /// Список писем папки (метаданные), новые сверху.
+    /// Дата письма в едином виде - UTC со смещением "+00:00". Заголовок Date
+    /// приходит в зоне отправителя, а страницы писем и слияние списка сравнивают
+    /// дату как строку: смешанные смещения ломали порядок.
+    fn normalized_date(date: &mail_parser::DateTime) -> String {
+        chrono::DateTime::from_timestamp(date.to_timestamp(), 0)
+            .map(|value| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+            .unwrap_or_else(|| date.to_rfc3339())
+    }
+
+    /// Дописать письмам их метки: строка `messages` меток не содержит, они лежат
+    /// в отдельной таблице. Без этого бейджи в списке, счётчики и фильтр по метке
+    /// видели метки только в умных папках, где выборка заполняет их сама.
+    async fn attach_labels(&self, messages: &mut [MessageMeta]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT ml.message_id, l.name FROM message_labels ml
+             JOIN labels l ON l.id = ml.label_id WHERE ml.message_id IN (",
+        );
+        let mut separated = query.separated(",");
+        for message in messages.iter() {
+            separated.push_bind(message.id);
+        }
+        separated.push_unseparated(")");
+        let rows = query
+            .build_query_as::<(i64, String)>()
+            .fetch_all(&self.pool)
+            .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_message = std::collections::HashMap::<i64, Vec<String>>::new();
+        for (message_id, name) in rows {
+            by_message.entry(message_id).or_default().push(name);
+        }
+        for message in messages.iter_mut() {
+            if let Some(names) = by_message.remove(&message.id) {
+                message.labels = names;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_messages(&self, folder_id: i64, limit: i64) -> Result<Vec<MessageMeta>> {
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
@@ -2209,13 +2284,18 @@ impl Db {
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                     AND o.status IN ('pending','processing','retry')
                )
-             ORDER BY date DESC LIMIT ?",
+             ORDER BY date DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        // Порядок тот же, что у курсорных страниц: (date DESC, id DESC). Сортировка
+        // только по дате рассогласовывала первую страницу с курсором, и письма с
+        // одинаковой датой могли не попасть ни в одну страницу.
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
     }
 
     /// Cursor page ordered by `(date DESC, id DESC)`. Unlike OFFSET this stays
@@ -2255,7 +2335,94 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Курсорная страница писем с меткой. Раздел меток раньше показывал только
+    /// то, что уже загружено в память по папкам, и письмо с меткой за пределами
+    /// загруженных страниц не появлялось вовсе.
+    pub async fn list_label_messages_page(
+        &self,
+        label: &str,
+        before_date: Option<&str>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MessageMeta>> {
+        let limit = limit.clamp(1, 500);
+        let rows = match (before_date, before_id) {
+            (Some(date), Some(id)) => {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE id IN (SELECT ml.message_id FROM message_labels ml
+                                  JOIN labels l ON l.id = ml.label_id WHERE l.name = ?)
+                       AND (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o
+                          WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
+                            AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY date DESC, id DESC LIMIT ?",
+                )
+                .bind(label)
+                .bind(date)
+                .bind(date)
+                .bind(id)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            _ => {
+                sqlx::query_as::<_, MessageRow>(
+                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+                     FROM messages
+                     WHERE id IN (SELECT ml.message_id FROM message_labels ml
+                                  JOIN labels l ON l.id = ml.label_id WHERE l.name = ?)
+                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM outbox_ops o
+                          WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
+                            AND o.status IN ('pending','processing','retry')
+                       )
+                     ORDER BY date DESC, id DESC LIMIT ?",
+                )
+                .bind(label)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+        let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
+    }
+
+    /// Сколько писем у каждой метки - для счётчика в разделе меток: считать по
+    /// загруженным в память письмам значило показывать заниженное число.
+    pub async fn label_message_counts(&self) -> Result<Vec<(String, i64)>> {
+        // Условия те же, что в list_label_messages_page, иначе счётчик обещал бы
+        // больше писем, чем раздел метки показывает.
+        Ok(sqlx::query_as(
+            "SELECT l.name, COUNT(m.id) FROM labels l
+             LEFT JOIN message_labels ml ON ml.label_id = l.id
+             LEFT JOIN messages m ON m.id = ml.message_id
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= datetime('now'))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM outbox_ops o
+                     WHERE o.message_id = m.id AND o.op_kind IN ('move','delete')
+                       AND o.status IN ('pending','processing','retry')
+                  )
+             GROUP BY l.id ORDER BY l.name COLLATE NOCASE",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     pub async fn list_recent_messages(&self, limit: i64) -> Result<Vec<MessageMeta>> {
@@ -2451,7 +2618,12 @@ impl Db {
             .into_iter()
             .map(|row| (row.id, MessageMeta::from(row)))
             .collect::<std::collections::HashMap<_, _>>();
-        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+        let mut messages = ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect::<Vec<_>>();
+        self.attach_labels(&mut messages).await?;
+        Ok(messages)
     }
 
     /// Данные для докачки письма с сервера, когда полный MIME ещё не загружен:
@@ -3466,7 +3638,7 @@ impl Db {
 
     pub async fn list_mail_rules(&self) -> Result<Vec<MailRule>> {
         let rows: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
                     enabled, progress_message_id, sort_order
              FROM mail_rules ORDER BY sort_order, created_at, id",
         )
@@ -3488,11 +3660,26 @@ impl Db {
         }
         if !matches!(rule.field.as_str(), "sender" | "subject")
             || !matches!(rule.operator.as_str(), "contains" | "equals")
-            || !matches!(rule.action.as_str(), "move" | "archive" | "spam" | "trash")
+            || !matches!(
+                rule.action.as_str(),
+                "move" | "archive" | "spam" | "trash" | "label"
+            )
         {
             return Err(crate::Error::AccountConfig(
                 "правило содержит неподдерживаемое условие или действие".into(),
             ));
+        }
+        if rule.action == "label" {
+            let label_id = rule
+                .label_id
+                .ok_or_else(|| crate::Error::AccountConfig("для правила не выбран тег".into()))?;
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM labels WHERE id=?")
+                .bind(label_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if exists.is_none() {
+                return Err(crate::Error::AccountConfig("тег правила не найден".into()));
+            }
         }
         let mut tx = self.begin_write().await?;
         if let Some(account_id) = rule.account_id {
@@ -3551,13 +3738,13 @@ impl Db {
         };
         sqlx::query(
             "INSERT INTO mail_rules(
-                id, name, field, operator, value, account_id, action, folder_id,
+                id, name, field, operator, value, account_id, action, folder_id, label_id,
                 enabled, progress_message_id, sort_order
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, field=excluded.field, operator=excluded.operator,
                 value=excluded.value, account_id=excluded.account_id,
-                action=excluded.action, folder_id=excluded.folder_id,
+                action=excluded.action, folder_id=excluded.folder_id, label_id=excluded.label_id,
                 enabled=excluded.enabled, progress_message_id=excluded.progress_message_id,
                 updated_at=datetime('now')",
         )
@@ -3569,6 +3756,7 @@ impl Db {
         .bind(rule.account_id)
         .bind(&rule.action)
         .bind((rule.action == "move").then_some(rule.folder_id).flatten())
+        .bind((rule.action == "label").then_some(rule.label_id).flatten())
         .bind(rule.enabled)
         .bind(progress)
         .bind(sort_order)
@@ -3609,7 +3797,7 @@ impl Db {
     pub async fn process_mail_rules(&self) -> Result<usize> {
         let mut tx = self.begin_write().await?;
         let mut rules: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id,
+            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
                     enabled, progress_message_id, sort_order
              FROM mail_rules WHERE enabled=1 ORDER BY sort_order, created_at, id",
         )
@@ -3619,16 +3807,26 @@ impl Db {
             tx.commit().await?;
             return Ok(0);
         }
-        let min_progress = rules
+        // Правила с удалённой меткой ждут новой и прогресс не двигают, поэтому в
+        // границу пакета они не входят: иначе их застывший прогресс держал бы
+        // выборку на старых письмах, остальные правила пропускали бы весь пакет
+        // как уже пройденный, и через 500 писем разбор почты встал бы совсем.
+        let Some(min_progress) = rules
             .iter()
+            .filter(|rule| !(rule.action == "label" && rule.label_id.is_none()))
             .map(|rule| rule.progress_message_id)
             .min()
-            .unwrap_or(0);
+        else {
+            // Все правила ждут выбора метки - читать пакет писем незачем.
+            tx.commit().await?;
+            return Ok(0);
+        };
         let messages: Vec<RuleMessageRow> = sqlx::query_as(
             "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
                     m.remote_id, m.from_name, m.from_addr, m.subject
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE m.id>? AND (f.role IS NULL OR f.role NOT IN
+             WHERE m.id>? AND m.backfilled=0
+               AND (f.role IS NULL OR f.role NOT IN
                     ('sent','drafts','archive','spam','trash'))
                AND NOT EXISTS (
                     SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
@@ -3645,6 +3843,9 @@ impl Db {
             let matching = rules.iter().position(|rule| {
                 if message.id <= rule.progress_message_id
                     || rule.account_id.is_some_and(|id| id != message.account_id)
+                    // Метку правила удалили - правило ждёт новой, а не валит
+                    // обработку остальных.
+                    || (rule.action == "label" && rule.label_id.is_none())
                 {
                     return false;
                 }
@@ -3667,60 +3868,83 @@ impl Db {
             });
             if let Some(index) = matching {
                 let rule = &rules[index];
-                let target = if rule.action == "move" {
-                    let folder_id = rule.folder_id.ok_or_else(|| {
-                        crate::Error::AccountConfig(format!(
-                            "у правила {} нет папки назначения",
-                            rule.name
-                        ))
+                if rule.action == "label" {
+                    // Метки локальные - вешаем сразу, без outbox/сервера.
+                    let label_id = rule.label_id.ok_or_else(|| {
+                        crate::Error::AccountConfig(format!("у правила {} не задан тег", rule.name))
                     })?;
-                    sqlx::query_as::<_, (i64, String)>(
-                        "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                    let result = sqlx::query(
+                        "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
                     )
-                    .bind(folder_id)
-                    .bind(message.account_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                    .bind(message.id)
+                    .bind(label_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    if result.rows_affected() > 0 {
+                        queued += 1;
+                    }
                 } else {
-                    sqlx::query_as::<_, (i64, String)>(
+                    let target = if rule.action == "move" {
+                        let folder_id = rule.folder_id.ok_or_else(|| {
+                            crate::Error::AccountConfig(format!(
+                                "у правила {} нет папки назначения",
+                                rule.name
+                            ))
+                        })?;
+                        sqlx::query_as::<_, (i64, String)>(
+                            "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                        )
+                        .bind(folder_id)
+                        .bind(message.account_id)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    } else {
+                        sqlx::query_as::<_, (i64, String)>(
                         "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
                     )
                     .bind(message.account_id)
                     .bind(&rule.action)
                     .fetch_optional(&mut *tx)
                     .await?
-                }
-                .ok_or_else(|| {
-                    crate::Error::AccountConfig(format!(
-                        "для правила {} не найдена папка назначения",
-                        rule.name
-                    ))
-                })?;
-                if target.0 != message.folder_id {
-                    let payload = serde_json::json!({
-                        "message_id": message.id,
-                        "folder_id": message.folder_id,
-                        "folder_path": message.remote_path,
-                        "uid": message.uid,
-                        "remote_id": message.remote_id,
-                        "target_folder_id": target.0,
-                        "target_folder_path": target.1,
-                        "rule_id": rule.id,
-                    });
-                    sqlx::query(
-                        "INSERT INTO outbox_ops(
+                    }
+                    .ok_or_else(|| {
+                        crate::Error::AccountConfig(format!(
+                            "для правила {} не найдена папка назначения",
+                            rule.name
+                        ))
+                    })?;
+                    if target.0 != message.folder_id {
+                        let payload = serde_json::json!({
+                            "message_id": message.id,
+                            "folder_id": message.folder_id,
+                            "folder_path": message.remote_path,
+                            "uid": message.uid,
+                            "remote_id": message.remote_id,
+                            "target_folder_id": target.0,
+                            "target_folder_path": target.1,
+                            "rule_id": rule.id,
+                        });
+                        sqlx::query(
+                            "INSERT INTO outbox_ops(
                             account_id, message_id, op_kind, payload, status, next_attempt_at
                          ) VALUES(?, ?, 'move', ?, 'pending', datetime('now'))",
-                    )
-                    .bind(message.account_id)
-                    .bind(message.id)
-                    .bind(payload.to_string())
-                    .execute(&mut *tx)
-                    .await?;
-                    queued += 1;
+                        )
+                        .bind(message.account_id)
+                        .bind(message.id)
+                        .bind(payload.to_string())
+                        .execute(&mut *tx)
+                        .await?;
+                        queued += 1;
+                    }
                 }
             }
             for rule in &mut rules {
+                // Правило с удалённой меткой пропущено, а не выполнено: прогресс
+                // ему не двигаем, иначе после выбора новой метки письма этого
+                // периода остались бы неразмеченными навсегда.
+                if rule.action == "label" && rule.label_id.is_none() {
+                    continue;
+                }
                 if message.id > rule.progress_message_id {
                     rule.progress_message_id = message.id;
                 }
@@ -3992,7 +4216,7 @@ impl Db {
                          SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                            AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(date)
                 .bind(date)
@@ -4011,7 +4235,7 @@ impl Db {
                          SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                            AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(SCAN_PAGE_SIZE)
                 .fetch_all(&self.pool)
@@ -4531,6 +4755,7 @@ struct FolderRow {
     remote_path: String,
     display_name: String,
     role: Option<String>,
+    parent_id: Option<i64>,
     unread_count: i64,
     total_count: i64,
 }
@@ -4551,6 +4776,7 @@ impl From<FolderRow> for Folder {
             remote_path: r.remote_path,
             display_name: r.display_name,
             role,
+            parent_id: r.parent_id,
             unread_count: r.unread_count,
             total_count: r.total_count,
         }
@@ -4632,6 +4858,7 @@ struct MailRuleRow {
     account_id: Option<i64>,
     action: String,
     folder_id: Option<i64>,
+    label_id: Option<i64>,
     enabled: i64,
     progress_message_id: i64,
     sort_order: i64,
@@ -4648,6 +4875,7 @@ impl From<MailRuleRow> for MailRule {
             account_id: rule.account_id,
             action: rule.action,
             folder_id: rule.folder_id,
+            label_id: rule.label_id,
             enabled: rule.enabled != 0,
             progress_message_id: rule.progress_message_id,
             sort_order: rule.sort_order,

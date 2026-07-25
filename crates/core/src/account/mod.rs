@@ -788,7 +788,7 @@ impl AccountManager {
             )
             .await?;
         self.db
-            .save_discovered_messages(account.id, &discovery.messages)
+            .save_discovered_messages(account.id, &discovery.messages, false)
             .await?;
         // Письма к этому моменту уже в БД и получили локальные id - можно
         // достать их для уведомления. Только Входящие (роль 'inbox'): другие
@@ -855,6 +855,55 @@ impl AccountManager {
         self.db.store_fetched_raw(message_id, &raw).await?;
         tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
+    }
+
+    /// Догрузить с сервера письма папки старше даты `before` и сохранить в базу.
+    /// Для бесконечной прокрутки: когда локальные письма кончились, а на сервере
+    /// их больше. Возвращает число сохранённых. Провайдеры без поддержки вернут 0.
+    pub async fn fetch_older_folder_messages(
+        &self,
+        folder_id: i64,
+        before: &str,
+        limit: usize,
+    ) -> Result<usize> {
+        let folder = self.db.folder(folder_id).await?;
+        let Some(account) = self
+            .db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|item| item.id == folder.account_id)
+        else {
+            tracing::warn!(folder_id, "догрузка: аккаунт папки не найден");
+            return Ok(0);
+        };
+        tracing::info!(folder_id, before, provider = ?account.provider, remote_path = %folder.remote_path, "догрузка: запрос старых писем с сервера");
+        let credential = self.mail_credential(&account).await?;
+        let backend = Self::mail_backend(&account)?;
+        let messages = backend
+            .fetch_older_messages(
+                &account.email,
+                &credential,
+                &folder.remote_path,
+                before,
+                limit,
+            )
+            .await?;
+        tracing::info!(
+            folder_id,
+            fetched = messages.len(),
+            "догрузка: сервер вернул письма"
+        );
+        if messages.is_empty() {
+            return Ok(0);
+        }
+        let count = messages.len();
+        // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
+        self.db
+            .save_discovered_messages(account.id, &messages, true)
+            .await?;
+        tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
+        Ok(count)
     }
 
     /// Очистить кэш всех аккаунтов по их глубине хранения. Вызывается ОДИН РАЗ
@@ -2035,7 +2084,11 @@ impl AccountManager {
                                     Ok(_) => {
                                         match self
                                             .db
-                                            .save_discovered_messages(account.id, &imap.messages)
+                                            .save_discovered_messages(
+                                                account.id,
+                                                &imap.messages,
+                                                false,
+                                            )
                                             .await
                                         {
                                             Ok(()) => {

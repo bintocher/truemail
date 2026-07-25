@@ -445,6 +445,7 @@ impl JmapBackend {
                     remote_path: mailbox.id,
                     display_name: mailbox.name,
                     role: mailbox.role.as_deref().and_then(jmap_role),
+                    parent_remote_path: None,
                     unread_count: mailbox.unread_emails,
                     total_count: mailbox.total_emails,
                     uidvalidity: None,
@@ -618,6 +619,7 @@ impl MailBackend for JmapBackend {
                 remote_path: mailbox.id,
                 display_name: mailbox.name,
                 role: mailbox.role.as_deref().and_then(jmap_role),
+                parent_remote_path: None,
                 unread_count: mailbox.unread_emails,
                 total_count: mailbox.total_emails,
                 uidvalidity: None,
@@ -1237,7 +1239,7 @@ mod tests {
         db.save_discovered_folders(account.id, &discovery.folders)
             .await
             .unwrap();
-        db.save_discovered_messages(account.id, &discovery.messages)
+        db.save_discovered_messages(account.id, &discovery.messages, false)
             .await
             .unwrap();
         db.save_folder_sync_tokens(account.id, &discovery.folders)

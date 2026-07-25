@@ -78,6 +78,17 @@ document.querySelectorAll('[data-openacct]').forEach(el=>el.onclick=()=>setSecti
 /* ---------- account colors + messages ---------- */
 const avc=['#e5342a','#0058ff','#5b63d3','#2f9e5f','#c2456b','#b5761c','#0f9b8e','#7a4fd0'];
 let messages=[];
+// Письма, ушедшие из папки по действию пользователя. Пока перемещение или
+// удаление ждёт очереди, выборка их уже не отдаёт, а локальная копия осталась бы
+// висеть в прежней папке - поэтому убираем их из списка сразу и держим id, пока
+// перезагрузка не подтвердит новое место письма.
+function forgetMessages(ids){
+  const gone=new Set(ids.map(Number).filter(Number.isFinite));
+  if(!gone.size)return;
+  messages=messages.filter(message=>!gone.has(message.id));
+  gone.forEach(id=>selectedMessageIds.delete(id));
+}
+window.forgetMessages=forgetMessages;
 let coreFolders=[];
 let coreAccounts=[];
 // 16 нейтральных цветов аккаунта, читаемых в светлой и тёмной теме.
@@ -98,6 +109,17 @@ let coreContacts=[];
 let coreCalendarData={calendars:[],events:[]};
 let currentFolderId=null;
 let currentSmartIndex=0;
+// Письма, прочитанные в текущем показе списка. Удерживаются видимыми, даже
+// если перестали проходить фильтр "непрочитанные" (умная папка или ручной
+// фильтр), пока пользователь не сменит папку/раздел. Очищается в
+// applyListOptions при resetScroll.
+let stickyReadIds=new Set();
+// Режим счётчика писем на папку: 'u' непрочитанные, 't' всего, 'ut' оба, 'n'
+// ничего. По умолчанию 'u'. Ключ - id папки. Хранится в настройке folder_counters.
+let folderCounterModes={};
+// Теги (метки) и активный тег для фильтра списка писем.
+let coreTags=[];
+let currentTagName=null;
 let currentMessageRows=[];
 let activeMessage=null;
 let activeFullMessage=null;
@@ -106,6 +128,12 @@ let editingRuleId=null;
 const MESSAGE_INITIAL_PAGE_SIZE=100;
 const MESSAGE_PAGE_SIZE=500;
 const SMART_MESSAGE_PAGE_SIZE=500;
+// Догрузка с сервера идёт маленькими порциями - чтобы результат появлялся
+// быстро, а не ждать пока скачаются сотни писем разом.
+const BACKFILL_PAGE_SIZE=15;
+// Сколько папок-источников умная папка догружает за один проход: каждая - это
+// отдельное подключение к серверу, остальные подхватит следующий проход.
+const SMART_BACKFILL_FOLDERS=5;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 let loadingMoreMessages=false;
@@ -129,15 +157,101 @@ document.addEventListener('pointerup',()=>{selectionDragMode=null;});
 function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i];if(s)e.innerHTML=s;});}
 
 const msgsEl=document.getElementById('msgs');
-async function loadNextMessagePage(){
-  if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
-  loadingMoreMessages=true;
-  try{
-    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}const page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length===MESSAGE_PAGE_SIZE);}
-    if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
-  }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;}
+// Свой признак языка, а не общий L(): тот объявлен в модуле, который грузится
+// позже этого, и обращение к нему до загрузки падало бы с ошибкой.
+function listLoadingIsEnglish(){return document.documentElement.lang==='en';}
+let listLoadTimer=null,listLoadStart=0,listLoadLabel='';
+function setListLoading(on,label){
+  const box=document.getElementById('listLoading'),status=document.getElementById('appStatus');
+  if(on){
+    if(listLoadTimer)clearInterval(listLoadTimer);
+    listLoadStart=performance.now();listLoadLabel=label||(listLoadingIsEnglish()?'data':'данные');
+    box?.classList.remove('hidden');status?.classList.remove('hidden');
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=listLoadingIsEnglish()?`Loading ${listLoadLabel}… ${s} s elapsed`:`Загружаю ${listLoadLabel}… прошло ${s} с`;};
+    tick();listLoadTimer=setInterval(tick,100);
+    window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
+  }else{
+    if(listLoadTimer){clearInterval(listLoadTimer);listLoadTimer=null;}
+    if(box&&!box.classList.contains('hidden')){const s=((performance.now()-listLoadStart)/1000).toFixed(1);window.tm?.uiLog?.(`загрузка завершена: ${listLoadLabel} за ${s} с`);console.log('[load done]',listLoadLabel,s+'s');}
+    box?.classList.add('hidden');status?.classList.add('hidden');
+  }
 }
-msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240)loadNextMessagePage();},{passive:true});
+// Страницы писем по метке идут прямо из базы: раньше раздел метки показывал
+// только те письма, что уже загружены по папкам, и метка на письме из глубины
+// ящика не показывалась вовсе.
+// Пагинация метки ведёт собственный курсор - последнюю отданную строку. По
+// общему списку писем её вести нельзя: письма этой метки могли попасть в память
+// раньше через свою папку, и тогда страница целиком состояла бы из уже
+// известных, а прокрутка метки останавливалась бы на первой же странице.
+const tagHasMore=new Map(),tagCursor=new Map();
+// Поколение пагинации: сброс во время запроса не должен получить курсор от
+// страницы, заказанной до него, - иначе после фоновой перезагрузки список метки
+// продолжился бы с середины и в начале осталась бы дыра.
+let tagPagingEpoch=0;
+async function loadNextTagPage(){
+  const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
+  loadingMoreMessages=true;setListLoading(true,tag);
+  try{
+    const cursor=tagCursor.get(tag)||null,epoch=tagPagingEpoch;
+    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
+    // Пагинацию сбросили, пока шёл запрос, - страница уже не наша. Вливать её
+    // нельзя: список писем за время ожидания успели заменить новым массивом, и
+    // письма легли бы вторыми экземплярами.
+    if(epoch!==tagPagingEpoch)return;
+    const known=new Set(messages.map(message=>message.id));
+    messages.push(...page.filter(message=>!known.has(message.id)));
+    // Курсор двигаем по последней строке страницы, даже если письмо уже было в
+    // памяти. Дата пустая - передаём пустую строку, а не null: null означал бы
+    // "начни сначала", и страница вернулась бы та же самая.
+    const last=page[page.length-1];
+    if(last)tagCursor.set(tag,{date:last.date||'',id:last.id});
+    tagHasMore.set(tag,page.length>=MESSAGE_PAGE_SIZE);
+    if(currentTagName===tag)applyListOptions(false);
+  }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
+  finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+}
+window.loadNextTagPage=loadNextTagPage;
+window.resetTagPaging=tag=>{tagPagingEpoch++;tagHasMore.delete(tag);tagCursor.delete(tag);};
+async function loadNextMessagePage(){
+  if(currentTagName!=null){await loadNextTagPage();return;}
+  if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
+  loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
+  try{
+    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId);
+      // Курсор - ИСТИННЫЙ минимум (самая старая дата, затем наименьший id).
+      // Сортировка только по дате давала неверный курсор при равных датах, и
+      // запрос возвращал уже показанные письма (дубли), из-за чего прокрутка
+      // крутилась вхолостую, а догрузка не запускалась.
+      const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+      if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
+      let fresh=page.filter(message=>!known.has(message.id));
+      // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
+      // выборка по курсору может вернуть уже показанные письма (дубли по
+      // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
+      if(!fresh.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      messages.push(...fresh);page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,fresh.length>0);}
+    if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
+  }catch(error){console.error('truemail pagination:',error);paginationFailed=true;}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+}
+// Если письма не заполнили экран (короткий список), а на сервере их больше -
+// подгружаем следующую порцию автоматически, не дожидаясь прокрутки. Подряд
+// таких доборов не больше AUTO_FILL_LIMIT: при включённом фильтре список
+// остаётся коротким, сколько ни грузи, и цикл выкачал бы всю папку порциями,
+// каждая - отдельное подключение к серверу. После ошибки автодобор тоже
+// останавливаем, иначе он бился бы в неё без остановки.
+const AUTO_FILL_LIMIT=5;
+let autoFillStreak=0,paginationFailed=false;
+function resetAutoFill(){autoFillStreak=0;paginationFailed=false;}
+window.resetAutoFill=resetAutoFill;
+function ensureListFilled(){
+  const el=document.getElementById('msgs');if(!el)return;
+  if(loadingMoreMessages||loadingSmartCoverage||paginationFailed||autoFillStreak>=AUTO_FILL_LIMIT)return;
+  const hasMore=currentTagName!=null?tagHasMore.get(currentTagName)!==false:currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
+  if(hasMore&&el.scrollHeight<=el.clientHeight+40){autoFillStreak++;setTimeout(()=>loadNextMessagePage(),0);}
+}
+window.setListLoading=setListLoading;
+window.ensureListFilled=ensureListFilled;
+msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage();}},{passive:true});
 
 /* thread action buttons -> compose */
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=()=>{

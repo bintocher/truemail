@@ -142,6 +142,58 @@ fn node_text<'a>(node: Node<'a, 'a>, name: &str) -> Option<&'a str> {
         .and_then(|child| child.text())
 }
 
+/// Ответ участника EWS (ResponseType) -> PARTSTAT iCalendar. Организатора
+/// помечаем ACCEPTED - он не участник в смысле кнопок ответа, а сам инициатор.
+fn ews_response_to_partstat(response: &str) -> &'static str {
+    match response {
+        "Accept" => "ACCEPTED",
+        "Decline" => "DECLINED",
+        "Tentative" => "TENTATIVE",
+        "Organizer" => "ACCEPTED",
+        _ => "NEEDS-ACTION",
+    }
+}
+
+/// Участники CalendarItem: обязательные и необязательные, со статусом ответа.
+/// Без них UI не знает свой PARTSTAT и не показывает кнопки ответа на
+/// приглашение (resolve_my_attendance по email аккаунта).
+fn parse_ews_attendees<'a>(item: Node<'a, 'a>) -> Vec<Attendee> {
+    let mut attendees = Vec::new();
+    for (container_tag, role) in [
+        ("RequiredAttendees", "REQ-PARTICIPANT"),
+        ("OptionalAttendees", "OPT-PARTICIPANT"),
+    ] {
+        let Some(container) = item
+            .children()
+            .find(|node| node.is_element() && node.tag_name().name() == container_tag)
+        else {
+            continue;
+        };
+        for attendee in container
+            .children()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Attendee")
+        {
+            let Some(email) = node_text(attendee, "EmailAddress").map(str::to_owned) else {
+                continue;
+            };
+            let partstat = attendee
+                .children()
+                .find(|node| node.is_element() && node.tag_name().name() == "ResponseType")
+                .and_then(|node| node.text())
+                .map(ews_response_to_partstat)
+                .unwrap_or("NEEDS-ACTION");
+            attendees.push(Attendee {
+                email,
+                name: node_text(attendee, "Name").map(str::to_owned),
+                role: Some(role.to_owned()),
+                partstat: Some(partstat.to_owned()),
+                rsvp: true,
+            });
+        }
+    }
+    attendees
+}
+
 fn response_error(body: &str) -> Option<String> {
     let document = Document::parse(body).ok()?;
     let response = document
@@ -592,7 +644,12 @@ impl EwsBackend {
             })
             .unwrap_or_default();
         let body = format!(
-            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/><m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder>{restriction}<m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            // Порядок элементов важен: по схеме FindItemType Restriction идёт до
+            // SortOrder, иначе Exchange отвечает ErrorSchemaValidation.
+            // Сортировка - по DateTimeSent, как и в догрузке: в базе лежит дата
+            // из заголовка письма, и по ней же считается курсор страниц. Отбор
+            // по сроку хранения остаётся по дате получения.
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeSent"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
             limit,
             escape(&folder.remote_path)
         );
@@ -602,8 +659,35 @@ impl EwsBackend {
             .await
     }
 
+    /// Письма папки строго старше даты `before` (для догрузки при прокрутке).
+    /// Сортировка по убыванию даты - следующие за уже показанными.
+    async fn older_messages_in_folder(
+        &self,
+        password: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        // Курсор приходит из даты письма в базе, а она берётся из заголовка Date,
+        // то есть из времени отправки. Поэтому и фильтр, и сортировка идут по
+        // item:DateTimeSent: по DateTimeReceived шкалы расходились и догрузка то
+        // пропускала письма, то возвращала уже показанные.
+        let restriction = format!(
+            r#"<m:Restriction><t:IsLessThan><t:FieldURI FieldURI="item:DateTimeSent"/><t:FieldURIOrConstant><t:Constant Value="{}"/></t:FieldURIOrConstant></t:IsLessThan></m:Restriction>"#,
+            escape(before)
+        );
+        let body = format!(
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeSent"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            limit,
+            escape(folder_path)
+        );
+        let response = self.soap(password, "FindItem", &body).await?;
+        let ids = parse_item_ids(&response)?;
+        self.messages_by_ids(password, folder_path, &ids).await
+    }
+
     async fn folders(&self, password: &str) -> Result<Vec<DiscoveredFolder>> {
-        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
+        let body = r#"<m:FindFolder Traversal="Deep"><m:FolderShape><t:BaseShape>Default</t:BaseShape><t:AdditionalProperties><t:FieldURI FieldURI="folder:ParentFolderId"/></t:AdditionalProperties></m:FolderShape><m:ParentFolderIds><t:DistinguishedFolderId Id="msgfolderroot"/></m:ParentFolderIds></m:FindFolder>"#;
         let response = self.soap(password, "FindFolder", body).await?;
         parse_folders(&response)
     }
@@ -1225,10 +1309,19 @@ fn parse_folders(xml: &str) -> Result<Vec<DiscoveredFolder>> {
         let unread = node_text(node, "UnreadCount")
             .and_then(|value| value.parse().ok())
             .unwrap_or(0);
+        // ParentFolderId связывает папку с родителем. У папок верхнего уровня он
+        // указывает на msgfolderroot, которого нет среди синхронизируемых папок,
+        // поэтому parent_id при разрешении останется NULL - это и есть корень.
+        let parent_remote_path = node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "ParentFolderId")
+            .and_then(|child| child.attribute("Id"))
+            .map(str::to_owned);
         folders.push(DiscoveredFolder {
             remote_path: id.to_owned(),
             display_name: name.to_owned(),
             role: infer_folder_role(name, name),
+            parent_remote_path,
             unread_count: unread,
             total_count: total,
             uidvalidity: None,
@@ -1405,7 +1498,7 @@ fn parse_calendar_items(xml: &str) -> Result<Vec<DavEvent>> {
             exdates: None,
             rdates: None,
             status,
-            attendees: Vec::new(),
+            attendees: parse_ews_attendees(item),
             alarms: Vec::new(),
             timezone: None,
             transp: None,
@@ -2978,6 +3071,18 @@ impl MailBackend for EwsBackend {
         )
         .await
     }
+
+    async fn fetch_older_messages(
+        &self,
+        _email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        self.older_messages_in_folder(credential, folder_path, before, limit)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -3288,6 +3393,27 @@ mod tests {
         let events = parse_calendar_items(occurrence).expect("calendar response");
         assert_eq!(events[0].rrule, None);
         assert_eq!(events[0].recurrence_id, None);
+    }
+
+    #[test]
+    fn calendar_item_parses_attendees_with_response_status() {
+        let xml = r#"<Envelope><CalendarItem><ItemId Id="evt-1"/><Subject>Встреча</Subject><Start>2026-07-20T07:00:00Z</Start><End>2026-07-20T08:00:00Z</End><IsAllDayEvent>false</IsAllDayEvent><Organizer><Mailbox><EmailAddress>boss@example.test</EmailAddress></Mailbox></Organizer><RequiredAttendees><Attendee><Mailbox><Name>Иван</Name><EmailAddress>ivan@example.test</EmailAddress></Mailbox><ResponseType>Accept</ResponseType></Attendee></RequiredAttendees><OptionalAttendees><Attendee><Mailbox><EmailAddress>opt@example.test</EmailAddress></Mailbox><ResponseType>NoResponseReceived</ResponseType></Attendee></OptionalAttendees></CalendarItem></Envelope>"#;
+        let events = parse_calendar_items(xml).expect("calendar response");
+        let attendees = &events[0].attendees;
+        assert_eq!(attendees.len(), 2);
+        let ivan = attendees
+            .iter()
+            .find(|a| a.email == "ivan@example.test")
+            .expect("required attendee");
+        assert_eq!(ivan.partstat.as_deref(), Some("ACCEPTED"));
+        assert_eq!(ivan.role.as_deref(), Some("REQ-PARTICIPANT"));
+        assert_eq!(ivan.name.as_deref(), Some("Иван"));
+        let opt = attendees
+            .iter()
+            .find(|a| a.email == "opt@example.test")
+            .expect("optional attendee");
+        assert_eq!(opt.partstat.as_deref(), Some("NEEDS-ACTION"));
+        assert_eq!(opt.role.as_deref(), Some("OPT-PARTICIPANT"));
     }
 
     #[test]

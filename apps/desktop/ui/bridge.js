@@ -1,5 +1,10 @@
 // Мост между фронтендом и ядром truemail через Tauri invoke.
 
+// Размер страницы писем на папку при полной перезагрузке данных. Список писем
+// сверяется с этим числом, когда решает, исчезло письмо из папки или просто не
+// попало в страницу, - поэтому значение общее, а не локальное.
+window.corePageSize = 100;
+
 (function () {
   const tauri = window.__TAURI__;
   if (!tauri || !tauri.core) {
@@ -36,6 +41,10 @@
     deleteFolder: (folderId) => invoke("delete_folder", { folderId }),
     listMessages: (folderId, limit) => invoke("list_messages", { folderId, limit }),
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
+    listLabelMessagesPage: (label, beforeDate, beforeId, limit = 100) => invoke("list_label_messages_page", { label, beforeDate, beforeId, limit }),
+    labelMessageCounts: () => invoke("label_message_counts"),
+    fetchOlderMessages: (folderId, before, limit = 500) => invoke("fetch_older_messages", { folderId, before, limit }),
+    uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
     exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),
@@ -178,7 +187,7 @@
     const allFolders = folders.flat();
     const unifiedSources = await window.tm.listUnifiedSources();
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
-    const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, 100)));
+    const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
     const [contacts, calendarData, smartFolders, storage] = await Promise.all([
       window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),
     ]);
@@ -238,8 +247,11 @@
         }, 5 * 60 * 1000);
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
+            // Только фоновая синхронизация. Полную перезагрузку списка тут НЕ
+            // делаем: она сбрасывала список на первую страницу и теряла и
+            // догруженные письма, и позицию прокрутки при возврате в окно
+            // (alt-tab). Новые письма подтянет realtime и периодический sync.
             window.tm.syncAuxiliaryAccounts().catch(console.error);
-            scheduleReload(100);
           }
         });
       }

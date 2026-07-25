@@ -102,6 +102,7 @@ pub struct Folder {
     pub remote_path: String,
     pub display_name: String,
     pub role: Option<FolderRole>,
+    pub parent_id: Option<i64>,
     pub unread_count: i64,
     pub total_count: i64,
 }

@@ -1,12 +1,12 @@
 name: Release
 
-# Только master. Релиз публикуется, когда версия в Cargo.toml выросла - для
+# Только main. Релиз публикуется, когда версия в Cargo.toml выросла - для
 # существующего тега сборка пропускается. Схема: meta создаёт черновик релиза,
 # три платформы параллельно собирают и заливают ассеты, manifest собирает
 # updater latest.json и публикует релиз.
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

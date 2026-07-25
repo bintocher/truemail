@@ -1537,6 +1537,52 @@ pub async fn list_messages_page(
 }
 
 #[tauri::command]
+pub async fn list_label_messages_page(
+    state: State<'_, AppState>,
+    label: String,
+    before_date: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+) -> CmdResult<Vec<MessageMeta>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_label_messages_page(
+            &label,
+            before_date.as_deref(),
+            before_id,
+            limit.unwrap_or(100),
+        )
+        .await?)
+}
+
+#[tauri::command]
+pub async fn label_message_counts(state: State<'_, AppState>) -> CmdResult<Vec<(String, i64)>> {
+    Ok(core(&state).await?.db.label_message_counts().await?)
+}
+
+/// Запись сообщения фронтенда в общий лог приложения (truemail.log) - чтобы
+/// диагностировать загрузку/прокрутку в одном месте с бэкендом.
+#[tauri::command]
+pub fn ui_log(message: String) {
+    tracing::info!("[ui] {message}");
+}
+
+#[tauri::command]
+pub async fn fetch_older_messages(
+    state: State<'_, AppState>,
+    folder_id: i64,
+    before: String,
+    limit: Option<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .fetch_older_folder_messages(folder_id, &before, limit.unwrap_or(500).max(1) as usize)
+        .await?)
+}
+
+#[tauri::command]
 pub async fn get_message(state: State<'_, AppState>, message_id: i64) -> CmdResult<MessageFull> {
     let core = core(&state).await?;
     // Если письмо вне кэша (raw вычищен по глубине хранения) - докачиваем с сервера.

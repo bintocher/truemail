@@ -115,6 +115,33 @@ async function openGallery(full,att,messageId){
 }
 function folderTitle(folder){const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};return names[folder?.role]||folder?.display_name||folder?.remote_path||'';}
 function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
+// Порядок и глубина папок. Если бэкенд отдал parent_id (Exchange) - строим
+// дерево, дети под родителем. Иначе (IMAP) глубина по разделителям remote_path.
+function folderTreeRows(folders){
+  const byId=new Map(folders.map(folder=>[folder.id,folder]));
+  const hasTree=folders.some(folder=>folder.parent_id&&byId.has(folder.parent_id));
+  if(!hasTree)return sortedFolders(folders).map(folder=>({folder,depth:Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length)}));
+  const children=new Map();folders.forEach(folder=>{const parent=(folder.parent_id&&byId.has(folder.parent_id))?folder.parent_id:0;if(!children.has(parent))children.set(parent,[]);children.get(parent).push(folder);});
+  const rows=[];const walk=(list,depth)=>sortedFolders(list).forEach(folder=>{rows.push({folder,depth});walk(children.get(folder.id)||[],depth+1);});walk(children.get(0)||[],0);
+  return rows;
+}
+// Счётчик писем у папки: 'u' непрочитанные, 't' всего, 'ut' оба (непрочит/всего), 'n' ничего.
+function folderCounterMode(folder){return folderCounterModes[folder?.id]||'u';}
+function folderCountBadge(folder){const mode=folderCounterMode(folder),showU=mode.includes('u'),showT=mode.includes('t');if(!showU&&!showT)return '';const u=folder.unread_count||0,t=folder.total_count||0;if(showU&&showT)return `${u}/${t}`;if(showT)return `${t}`;return u>0?`${u}`:'';}
+function updateFolderBadge(row,folder){if(!row)return;let badge=row.querySelector('.count');const text=folderCountBadge(folder);if(text){if(!badge){badge=document.createElement('span');badge.className='count';row.appendChild(badge);}badge.textContent=text;}else if(badge){badge.remove();}}
+// Раздел тегов: список меток в навигации, клик - письма с этим тегом.
+// Счётчик метки берём из базы: по загруженным в память письмам он показывал
+// заниженное число, пока пользователь не прокрутит все папки.
+let coreTagCounts=new Map();
+function tagMessageCount(name){return coreTagCounts.has(name)?coreTagCounts.get(name):messages.reduce((total,message)=>total+((message.labels||[]).includes(name)?1:0),0);}
+function renderTagsNav(){const host=document.getElementById('tagsNav');if(!host)return;host.innerHTML='';coreTags.forEach(tag=>{const row=document.createElement('button');row.type='button';row.className='navitem tag-row'+(currentTagName===tag.name?' active':'');row.dataset.tagId=tag.id;row.innerHTML='<span class="tag-dot"></span><span class="tag-name"></span><span class="count"></span>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);if(count)row.querySelector('.count').textContent=count;row.onclick=()=>filterTag(tag);host.appendChild(row);});}
+function renderTagSettings(){const host=document.getElementById('tagSettingsList');if(!host)return;host.innerHTML='';if(!coreTags.length){host.innerHTML=`<div class="note-muted">${L('Меток пока нет','No tags yet')}</div>`;return;}coreTags.forEach(tag=>{const row=document.createElement('div');row.className='tag-settings-row';row.innerHTML='<span class="tag-dot"></span><span class="tag-name grow"></span><span class="count"></span><button type="button" class="btn sm tag-edit"></button>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);row.querySelector('.count').textContent=count?`${count}`:'';row.querySelector('.tag-edit').textContent=L('Изменить','Edit');row.querySelector('.tag-edit').onclick=()=>openLabelEditor(tag);host.appendChild(row);});}
+async function refreshTagsNav(){try{coreTags=await window.tm.listLabels();}catch(_){coreTags=[];}
+  try{coreTagCounts=new Map(await window.tm.labelMessageCounts());}catch(_){coreTagCounts=new Map();}
+  renderTagsNav();renderTagSettings();}
+document.getElementById('tagNew2')?.addEventListener('click',()=>openLabelCreator(null));
+function filterTag(tag){window.setListLoading?.(false);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));currentTagName=tag.name;currentFolderId=null;currentSmartIndex=null;window.resetTagPaging?.(tag.name);applyListOptions(true,tag.name);renderTagsNav();window.loadNextTagPage?.();}
+window.refreshTagsNav=refreshTagsNav;
 function contactPhoneLabel(phone){return phone?`${phone.number||''}${phone.extension?` ${L('доб.','ext.')} ${phone.extension}`:''}`:'';}
 // Одна строка адреса для поиска и подписи карточки: пустые компоненты просто
 // выпадают, чтобы не оставалось висящих запятых.
@@ -187,12 +214,16 @@ async function renderHtmlMessage(container,html,sender){
   if(blocked){const notice=document.createElement('div');notice.className='blocked';const text=document.createElement('span');text.textContent=L('Удалённые изображения заблокированы для защиты от отслеживания.','Remote images are blocked to prevent tracking.');const button=document.createElement('button');button.type='button';button.textContent=L(`Показывать от ${sender}`,`Always show from ${sender}`);button.onclick=async()=>{await window.tm?.setImageSenderTrusted(normalizedSender,true);container.replaceChildren();await renderHtmlMessage(container,html,sender);};notice.append(text,button);container.appendChild(notice);}
   const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title=L('Содержимое HTML-письма','HTML message content');frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};container.appendChild(frame);
 }
-// Беседы (threading): гибрид по цепочке ответов (thread_id) и нормализованной теме,
-// в пределах аккаунта. Одна строка на беседу со счётчиком, разворот показывает письма.
+// Беседы (threading): по цепочке ответов (thread_id) в пределах аккаунта. Одна
+// строка на беседу со счётчиком, разворот показывает письма.
 let conversationsEnabled=false;
 const expandedConversations=new Set();
-function normalizeSubject(subject){return String(subject||'').replace(/^(\s*(re|fwd?|fw|отв|пересл)\s*:\s*)+/i,'').trim().toLowerCase();}
-function conversationKey(message){const subject=normalizeSubject(message.subject);return `${message.account_id}|${subject||('thread-'+(message.thread_id??message.id))}`;}
+// Ключ беседы - только цепочка письма. Письмо без цепочки составляет группу из
+// себя одного: по одной теме объединять нельзя ни в списке, ни тем более в
+// действиях - иначе одно нажатие уносило бы в корзину письма разных
+// отправителей с темой вида "Счёт", а thread_id есть далеко не у всех писем
+// (его получают только ответы и те, кому ответили).
+function conversationKey(message){return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|m:${message.id}`;}
 function collapseConversations(rows){
   const groups=new Map();
   rows.forEach(message=>{const key=conversationKey(message);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(message);});
@@ -207,9 +238,32 @@ function collapseConversations(rows){
   });
   return result;
 }
+// В режиме диалогов групповая операция над свёрнутой беседой применяется ко всем
+// её письмам. Развёрнутую беседу не расширяем - действие идёт по конкретному письму.
+function expandConversationIds(ids){
+  if(!conversationsEnabled)return ids;
+  const out=new Set();
+  ids.forEach(id=>{
+    const source=messages.find(item=>item.id===id);
+    if(!source){out.add(id);return;}
+    const key=conversationKey(source);
+    if(expandedConversations.has(key)){out.add(id);return;}
+    // Действие идёт по тому же ключу и по тому же набору писем, из которого
+    // собрана строка списка. По всему кэшу расширять нельзя: при активном
+    // фильтре или в разделе метки строка показывает одно письмо, а под действие
+    // ушла бы вся цепочка папки - включая прочитанные и письма без метки.
+    out.add(id);
+    // Только в пределах папки исходного письма: беседа может жить в нескольких
+    // папках (Входящие/Отправленные), но действие над строкой не должно трогать
+    // письма из других папок.
+    (lastListRows.length?lastListRows:messages).forEach(item=>{if(item.folder_id===source.folder_id&&conversationKey(item)===key)out.add(item.id);});
+  });
+  return [...out];
+}
+window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
 function createMessageRow(message,index){
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
   const initial=(message.from?.name||message.from?.email||'?').trim()[0].toUpperCase();
@@ -219,6 +273,7 @@ function createMessageRow(message,index){
   row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
   row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
   row.querySelector('.time-hm').textContent=message.date?new Date(message.date).toLocaleTimeString(document.documentElement.lang,{hour:'2-digit',minute:'2-digit'}):'';
+  if(message.labels?.length){const meta=row.querySelector('.meta');message.labels.forEach(name=>{const tag=coreTags.find(item=>item.name===name);const badge=document.createElement('span');badge.className='msg-tag';badge.textContent=name;badge.style.setProperty('--tag-color',tag?.color||'#888');meta.appendChild(badge);});}
   row.ondragstart=event=>{if(!selectedMessageIds.has(message.id)){selectedMessageIds.clear();selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();}row.classList.add('mail-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-truemail-messages',JSON.stringify([...selectedMessageIds]));};row.ondragend=()=>{row.classList.remove('mail-dragging');document.querySelectorAll('.folder-row.drop-hi').forEach(item=>item.classList.remove('drop-hi'));};
   let swipe=null,suppressClick=false;row.onpointerdown=event=>{if(event.pointerType==='mouse'||event.button!==0)return;swipe={id:event.pointerId,x:event.clientX,y:event.clientY,dx:0};};row.onpointermove=event=>{if(!swipe||event.pointerId!==swipe.id)return;const dx=event.clientX-swipe.x,dy=event.clientY-swipe.y;if(Math.abs(dy)>Math.abs(dx)&&Math.abs(dy)>10){swipe=null;row.style.transform='';return;}if(Math.abs(dx)<8)return;event.preventDefault();swipe.dx=dx;row.classList.add('swiping');row.classList.toggle('swipe-archive',dx>0);row.classList.toggle('swipe-trash',dx<0);row.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`;};const finishSwipe=event=>{if(!swipe||event.pointerId!==swipe.id)return;const action=Math.abs(swipe.dx)>=80?(swipe.dx>0?'archive':'trash'):null;swipe=null;row.classList.remove('swiping','swipe-archive','swipe-trash');row.style.transform='';if(action){suppressClick=true;setTimeout(()=>{suppressClick=false;},250);window.performMessageActionForIds?.(action,[message.id]);}};row.onpointerup=finishSwipe;row.onpointercancel=finishSwipe;
   row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
@@ -236,7 +291,12 @@ function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
   currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)msgsEl.scrollTop=0;messageWindowStart=-1;messageWindowEnd=-1;
-  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();renderMessageWindow(true);updateSelectionUi();
+  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();
+  // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
+  // папок (несколько аккаунтов) - число аккаунтов.
+  const sub=document.getElementById('mailAccountCount');
+  if(sub){if(currentFolderId!==null||currentTagName!=null){const n=rows.length,en=wizardLocale==='en',word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');sub.textContent=`${n} ${word}`;}else{const n=coreAccounts.length,en=wizardLocale==='en',word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');sub.textContent=`${n} ${word}`;}}
+  renderMessageWindow(true);updateSelectionUi();
   if(!rows.length)document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;
   else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id))document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
 }
@@ -252,9 +312,26 @@ async function showMessage(message){
     head.querySelector('.mail-from').textContent=fromName||fromEmail;
     head.querySelector('.mail-address').textContent=fromName&&fromEmail?`(${fromEmail})`:'';
     const ccList=(full.meta.cc||[]).map(address=>address.name||address.email).filter(Boolean);
-    if(ccList.length){const line=document.createElement('div');line.className='mail-ccline';const shown=ccList.length<=3?ccList.join(', '):L(`${ccList.slice(0,3).join(', ')} и ещё ${ccList.length-3}`,`${ccList.slice(0,3).join(', ')} and ${ccList.length-3} more`);line.textContent=L(`Копия: ${shown}`,`Cc: ${shown}`);line.title=ccList.join(', ');head.appendChild(line);}
+    if(ccList.length){
+      const line=document.createElement('div');line.className='mail-ccline';
+      // <=2 - показываем всех; иначе первые двое и "+X", клик раскрывает полный
+      // список в несколько строк с кнопкой "Свернуть".
+      const render=expanded=>{
+        line.innerHTML='';line.classList.toggle('expanded',expanded);
+        const label=document.createElement('span');label.className='mail-cc-label';label.textContent=L('Копия: ','Cc: ');line.appendChild(label);
+        const names=document.createElement('span');names.className='mail-cc-names';line.appendChild(names);
+        if(ccList.length>2&&!expanded){
+          names.textContent=ccList.slice(0,2).join(', ')+' ';
+          const more=document.createElement('button');more.type='button';more.className='mail-cc-toggle';more.textContent=`+${ccList.length-2}`;more.title=L('Показать всех','Show all');more.onclick=()=>render(true);line.appendChild(more);
+        }else{
+          names.textContent=ccList.join(', ');
+          if(ccList.length>2){const less=document.createElement('button');less.type='button';less.className='mail-cc-toggle';less.textContent=L('Свернуть','Collapse');less.onclick=()=>render(false);line.appendChild(less);}
+        }
+      };
+      render(false);head.appendChild(line);
+    }
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
-    article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){message.flags.seen=true;document.querySelector(`.msg[data-message-id="${message.id}"]`)?.classList.remove('unread');window.tm?.markSeen(message.id,true).catch(console.error);}
+    article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){message.flags.seen=true;stickyReadIds.add(message.id);document.querySelector(`.msg[data-message-id="${message.id}"]`)?.classList.remove('unread');window.tm?.markSeen(message.id,true).catch(console.error);}
   }catch(error){body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=error.message||String(error);body.appendChild(err);}
 }
 function smartMessageValue(message,field){const folder=coreFolders.find(item=>item.id===message.folder_id);switch(field){
@@ -264,22 +341,88 @@ function smartConditionMatches(message,source){const condition=normalizeSmartCon
   const left=String(raw).toLocaleLowerCase(),right=String(condition.v).toLocaleLowerCase();if(condition.o==='not_contains')return !left.includes(right);if(condition.o==='equals')return left===right;if(condition.o==='not_equals')return left!==right;if(condition.o==='starts_with')return left.startsWith(right);if(condition.o==='ends_with')return left.endsWith(right);return left.includes(right);}
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
+// Папки-источники, уже обойдённые догрузкой в текущем круге, по умным папкам.
+const smartBackfillVisited=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
-  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;
-  try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),cursor=existing.at(-1),rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE),known=new Set(existing.map(message=>message.id)),combined=[...existing,...rows.filter(message=>!known.has(message.id))];coreSmartRows.set(folder.id,combined);smartHasMore.set(folder.id,rows.length===SMART_MESSAGE_PAGE_SIZE);const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=[...byId.values()];
-  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;if(currentSmartIndex===index&&currentFolderId===null)applyListOptions(false);if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset);}
+  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
+  try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),known=new Set(existing.map(message=>message.id));
+    // Курсор - истинный минимум (старейшая дата, затем наименьший id), иначе при
+    // равных датах запрос вернёт уже показанные письма и прокрутка встанет.
+    const cursor=existing.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+    let rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);
+    let fresh=rows.filter(message=>!known.has(message.id));
+    // Прогресс - по новым письмам, а не по длине страницы (могут прийти дубли).
+    // Нет новых, а на сервере больше - догружаем по папкам-источникам и повторяем.
+    // Догружаем по всем папкам-источникам, а не только по тем, что уже дали
+    // совпадения: папка без единого совпавшего письма иначе не догружалась бы
+    // никогда. Курсор берём по самой папке - общий курсор умной папки мог быть
+    // новее её писем, и диапазон между ними оставался бы пропущенным. За один
+    // проход обходим не больше SMART_BACKFILL_FOLDERS папок: каждая - отдельное
+    // подключение к серверу, остальные подхватит следующий проход.
+    if(!fresh.length&&cursor?.date){
+      // Сначала папки с наибольшим отставанием: при неизменном порядке первые
+      // пять крупных папок забирали бы все проходы, а остальные не догрузились
+      // бы никогда. Число писем по папкам считаем за один проход по списку.
+      const localCounts=new Map();messages.forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
+      const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-(localCounts.get(source.id)||0)}))
+        .filter(item=>window.coreUnifiedSettings?.[item.source.id]!=='0'&&item.behind>0)
+        .sort((left,right)=>right.behind-left.behind).map(item=>item.source);
+      // Держим множество уже обойдённых папок этой умной папки: список
+      // кандидатов пересобирается каждый проход, и позиция в нём ничего не
+      // значит. Когда обойдены все, круг начинается заново.
+      // Круг обхода живёт на каждую умную папку и переживает перезагрузку
+      // данных: фоновая синхронизация идёт постоянно и приходит сюда с reset,
+      // а обнуление круга на каждый такой заход означало бы вечный возврат к
+      // тем же самым крупным папкам.
+      let visited=smartBackfillVisited.get(folder.id);
+      if(!visited){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
+      // Папки, которых больше нет среди кандидатов, из круга убираем - иначе
+      // множество копило бы id удалённых папок.
+      visited.forEach(id=>{if(!candidates.some(source=>source.id===id))visited.delete(id);});
+      if(candidates.every(source=>visited.has(source.id)))visited.clear();
+      const picked=candidates.filter(source=>!visited.has(source.id)).slice(0,SMART_BACKFILL_FOLDERS);
+      picked.forEach(source=>visited.add(source.id));
+      if(candidates.length>picked.length)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${picked.length}`);
+      let fetchedAny=false;
+      for(const source of picked){
+        const local=messages.filter(message=>message.folder_id===source.id);
+        const folderCursor=local.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+        try{if((await window.tm?.fetchOlderMessages(source.id,folderCursor?.date||cursor.date,BACKFILL_PAGE_SIZE))>0)fetchedAny=true;}catch(error){console.error('truemail smart backfill:',error);}
+      }
+      if(fetchedAny){rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);fresh=rows.filter(message=>!known.has(message.id));}}
+    const combined=[...existing,...fresh];coreSmartRows.set(folder.id,combined);smartHasMore.set(folder.id,fresh.length>0);const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=[...byId.values()];
+  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;window.setListLoading?.(false);if(currentSmartIndex===index&&currentFolderId===null){applyListOptions(false);window.ensureListFilled?.();}if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset);}
 }
-function filterSmart(index,resetScroll=true){currentSmartIndex=index;currentFolderId=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true);}
+function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true);}
 
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
-  const previousFolder=currentFolderId,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
+  const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
-  coreAccounts=accounts;coreFolders=foldersByAccount.flat();messages=loadedMessages;coreContacts=contacts;coreCalendarData=calendarData;
+  coreAccounts=accounts;coreFolders=foldersByAccount.flat();coreContacts=contacts;coreCalendarData=calendarData;
+  // Объединяем догруженные ранее письма со свежей выборкой (свежая версия
+  // побеждает по id), иначе перезагрузка данных стирала бы всё, что пользователь
+  // подгрузил прокруткой, и список сбрасывался бы на первую страницу.
+  // Старую копию храним только если она за границей свежей страницы папки: письмо
+  // внутри страницы, которого в выборке нет, из папки ушло (перемещено, удалено,
+  // ждёт отправки в очереди) - иначе оно продолжало бы висеть в прежней папке.
+  {const page=window.corePageSize||100,freshById=new Map(loadedMessages.map(message=>[message.id,message])),counts=new Map(),edges=new Map();
+   loadedMessages.forEach(message=>{const folder=message.folder_id;counts.set(folder,(counts.get(folder)||0)+1);
+     const date=message.date||'',edge=edges.get(folder);if(!edge||date<edge.date||(date===edge.date&&message.id<edge.id))edges.set(folder,{date,id:message.id});});
+   const survived=messages.filter(message=>{if(freshById.has(message.id))return true;
+     const edge=edges.get(message.folder_id);if(!edge||(counts.get(message.folder_id)||0)<page)return false;
+     const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
+   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
-  renderRulesList();
+  // Список правил ждёт загрузки меток: правило с действием "поставить метку"
+  // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
+  // проверяем открытую метку - её могли удалить, и тогда уходим в умную папку.
+  refreshTagsNav().then(()=>{renderRulesList();
+    if(currentTagName!=null&&!coreTags.some(tag=>tag.name===currentTagName)){const gone=currentTagName;currentTagName=null;window.resetTagPaging?.(gone);if(smartFolders.length)filterSmart(currentSmartIndex??0,false);else applyListOptions(true,messagesTitle());}});
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
-  coreFolders.forEach(folder=>folderHasMore.set(folder.id,messages.filter(message=>message.folder_id===folder.id).length===MESSAGE_INITIAL_PAGE_SIZE));
+  // Прокрутка активна, если локальная страница заполнена ИЛИ на сервере писем
+  // больше, чем загружено локально (тогда при прокрутке идёт догрузка с сервера).
+  coreFolders.forEach(folder=>{const localCount=messages.filter(message=>message.folder_id===folder.id).length;folderHasMore.set(folder.id,localCount===MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;
@@ -291,17 +434,23 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
     anchor.after(header);anchor=header;
     const sub=document.createElement('div');sub.className='acc-sub'+(accountOpen?' open':'');
-    const accountFolders=sortedFolders(foldersByAccount[index]||[]);
-    accountFolders.forEach(folder=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
-      const icon=folderIcon(folder);const depth=Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length);row.style.paddingLeft=`${14+depth*14}px`;
-      row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>${folder.unread_count?'<span class="count"></span>':''}`;
-      row.querySelector('.folder-name').textContent=folderTitle(folder);if(folder.unread_count)row.querySelector('.count').textContent=folder.unread_count;
-      const openFolder=()=>{goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;applyListOptions(true,folderTitle(folder));};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));ctxfolder.style.left=`${Math.min(event.clientX,innerWidth-250)}px`;ctxfolder.style.top=`${Math.min(event.clientY,innerHeight-190)}px`;ctxfolder.classList.add('open');};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
+    folderTreeRows(foldersByAccount[index]||[]).forEach(({folder,depth})=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
+      const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
+      row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;
+      row.querySelector('.folder-name').textContent=folderTitle(folder);updateFolderBadge(row,folder);
+      const openFolder=()=>{window.setListLoading?.(false);goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
     anchor.after(sub);anchor=sub;
   });
   renderIcons(document.querySelector('.nav'));
   if(previousFolder!==null&&coreFolders.some(folder=>folder.id===previousFolder)){
     currentFolderId=previousFolder;currentSmartIndex=null;const folder=coreFolders.find(item=>item.id===previousFolder);document.querySelector(`.folder-row[data-folder-id="${previousFolder}"]`)?.classList.add('active');applyListOptions(false,folderTitle(folder));
+  // Просмотр метки переживает перезагрузку данных: раньше любая фоновая
+  // синхронизация выбрасывала из метки в первую умную папку.
+  }else if(previousTag!=null&&coreTags.some(tag=>tag.name===previousTag)){
+    // Список писем метки перезагрузка обнуляет вместе с остальным - страницу
+    // метки набираем заново, иначе раздел остался бы пустым без возможности
+    // прокрутки.
+    currentTagName=previousTag;currentFolderId=null;currentSmartIndex=null;renderTagsNav();window.resetTagPaging?.(previousTag);applyListOptions(false,previousTag);window.loadNextTagPage?.();
   }else filterSmart(previousSmart??0,false);
   if(previousMessageId&&messages.some(message=>message.id===previousMessageId)){activeMessage=messages.find(message=>message.id===previousMessageId);document.querySelector(`.msg[data-message-id="${previousMessageId}"]`)?.classList.add('active');}else if(previousMessageId){activeMessage=null;activeFullMessage=null;document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;}
   if(messages.length)document.querySelector('.thread .actions')?.classList.remove('hidden');

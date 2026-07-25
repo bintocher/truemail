@@ -235,6 +235,20 @@ pub trait MailBackend: Send + Sync {
         uid: u32,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>>;
+    /// Догрузить более старые письма папки (бесконечная прокрутка): строго
+    /// старше даты `before` (ISO 8601), не более `limit`. По умолчанию не
+    /// поддерживается - возвращает пусто.
+    async fn fetch_older_messages(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        let _ = (email, credential, folder_path, before, limit);
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -348,6 +362,25 @@ impl MailBackend for YandexBackend {
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_oauth_message_raw("imap.yandex.com", email, credential, folder_path, uid).await
+    }
+
+    async fn fetch_older_messages(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        imap::fetch_older_oauth(
+            "imap.yandex.com",
+            email,
+            credential,
+            folder_path,
+            before,
+            limit,
+        )
+        .await
     }
 }
 
@@ -590,6 +623,25 @@ impl MailBackend for OutlookBackend {
         imap::fetch_oauth_message_raw("outlook.office365.com", email, credential, folder_path, uid)
             .await
     }
+
+    async fn fetch_older_messages(
+        &self,
+        email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        imap::fetch_older_oauth(
+            "outlook.office365.com",
+            email,
+            credential,
+            folder_path,
+            before,
+            limit,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -784,6 +836,27 @@ impl MailBackend for GenericImapBackend {
             credential,
             folder_path,
             uid,
+        )
+        .await
+    }
+
+    async fn fetch_older_messages(
+        &self,
+        _email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        imap::fetch_older_password(
+            &self.imap.host,
+            self.imap.port,
+            self.imap.security,
+            &self.username,
+            credential,
+            folder_path,
+            before,
+            limit,
         )
         .await
     }
