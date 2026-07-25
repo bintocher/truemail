@@ -1239,7 +1239,7 @@ mod tests {
         db.save_discovered_folders(account.id, &discovery.folders)
             .await
             .unwrap();
-        db.save_discovered_messages(account.id, &discovery.messages)
+        db.save_discovered_messages(account.id, &discovery.messages, false)
             .await
             .unwrap();
         db.save_folder_sync_tokens(account.id, &discovery.folders)

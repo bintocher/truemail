@@ -219,7 +219,10 @@ async function renderHtmlMessage(container,html,sender){
 let conversationsEnabled=false;
 const expandedConversations=new Set();
 function normalizeSubject(subject){return String(subject||'').replace(/^(\s*(re|fwd?|fw|отв|пересл)\s*:\s*)+/i,'').trim().toLowerCase();}
-function conversationKey(message){const subject=normalizeSubject(message.subject);return `${message.account_id}|${subject||('thread-'+(message.thread_id??message.id))}`;}
+// Ключ беседы - цепочка письма; тема остаётся запасным вариантом для писем без
+// цепочки. По одной теме объединять нельзя: групповое действие над строкой
+// уносило бы в корзину письма разных отправителей с темой вида "Счёт".
+function conversationKey(message){const subject=normalizeSubject(message.subject);return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|s:${subject||('self-'+message.id)}`;}
 function collapseConversations(rows){
   const groups=new Map();
   rows.forEach(message=>{const key=conversationKey(message);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(message);});
@@ -244,16 +247,14 @@ function expandConversationIds(ids){
     if(!source){out.add(id);return;}
     const key=conversationKey(source);
     if(expandedConversations.has(key)){out.add(id);return;}
-    // Действие идёт строго по цепочке письма (thread_id), а не по теме: письма
-    // с одинаковой темой ("Счёт", "Заказ") от разных отправителей - разные
-    // беседы, и одно нажатие отправляло бы их все в корзину. Тема годится для
-    // показа группы, но не для операций. Без цепочки трогаем только само письмо.
+    // Действие идёт по тому же ключу, по которому строка собрана в списке, -
+    // по цепочке письма. Письмо без цепочки составляет группу из себя одного,
+    // так что под действие попадает только оно само.
     out.add(id);
-    if(source.thread_id==null)return;
     // Только в пределах папки исходного письма: беседа может жить в нескольких
     // папках (Входящие/Отправленные), но действие над строкой не должно трогать
     // письма из других папок.
-    messages.forEach(item=>{if(item.folder_id===source.folder_id&&item.thread_id===source.thread_id)out.add(item.id);});
+    messages.forEach(item=>{if(item.folder_id===source.folder_id&&conversationKey(item)===key)out.add(item.id);});
   });
   return [...out];
 }
@@ -338,6 +339,8 @@ function smartConditionMatches(message,source){const condition=normalizeSmartCon
   const left=String(raw).toLocaleLowerCase(),right=String(condition.v).toLocaleLowerCase();if(condition.o==='not_contains')return !left.includes(right);if(condition.o==='equals')return left===right;if(condition.o==='not_equals')return left!==right;if(condition.o==='starts_with')return left.startsWith(right);if(condition.o==='ends_with')return left.endsWith(right);return left.includes(right);}
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
+// С какой папки начинать очередной проход догрузки умной папки.
+let smartBackfillOffset=0;
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
   if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
@@ -356,10 +359,19 @@ async function loadSmartCoveragePage(index,reset=false){
     // проход обходим не больше SMART_BACKFILL_FOLDERS папок: каждая - отдельное
     // подключение к серверу, остальные подхватит следующий проход.
     if(!fresh.length&&cursor?.date){
-      const candidates=coreFolders.filter(source=>window.coreUnifiedSettings?.[source.id]!=='0'&&(source.total_count||0)>messages.filter(message=>message.folder_id===source.id).length);
-      if(candidates.length>SMART_BACKFILL_FOLDERS)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${SMART_BACKFILL_FOLDERS}`);
+      // Сначала папки с наибольшим отставанием: при неизменном порядке первые
+      // пять крупных папок забирали бы все проходы, а остальные не догрузились
+      // бы никогда.
+      const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-messages.filter(message=>message.folder_id===source.id).length}))
+        .filter(item=>window.coreUnifiedSettings?.[item.source.id]!=='0'&&item.behind>0)
+        .sort((left,right)=>right.behind-left.behind).map(item=>item.source);
+      // Каждый проход начинается с того места, где закончился прошлый, - иначе
+      // крупные папки забирали бы все проходы себе.
+      const picked=[];for(let step=0;step<Math.min(SMART_BACKFILL_FOLDERS,candidates.length);step++)picked.push(candidates[(smartBackfillOffset+step)%candidates.length]);
+      if(candidates.length)smartBackfillOffset=(smartBackfillOffset+picked.length)%candidates.length;
+      if(candidates.length>picked.length)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${picked.length}`);
       let fetchedAny=false;
-      for(const source of candidates.slice(0,SMART_BACKFILL_FOLDERS)){
+      for(const source of picked){
         const local=messages.filter(message=>message.folder_id===source.id);
         const folderCursor=local.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
         try{if((await window.tm?.fetchOlderMessages(source.id,folderCursor?.date||cursor.date,BACKFILL_PAGE_SIZE))>0)fetchedAny=true;}catch(error){console.error('truemail smart backfill:',error);}
@@ -389,8 +401,9 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
    const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Список правил ждёт загрузки меток: правило с действием "поставить метку"
-  // без них показывало метку как "?".
-  refreshTagsNav().then(renderRulesList);
+  // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
+  // проверяем открытую метку - её могли удалить, и тогда уходим в умную папку.
+  refreshTagsNav().then(()=>{renderRulesList();if(currentTagName!=null&&!coreTags.some(tag=>tag.name===currentTagName)){currentTagName=null;filterSmart(currentSmartIndex??0,false);}});
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
   // Прокрутка активна, если локальная страница заполнена ИЛИ на сервере писем
   // больше, чем загружено локально (тогда при прокрутке идёт догрузка с сервера).
@@ -419,7 +432,10 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Просмотр метки переживает перезагрузку данных: раньше любая фоновая
   // синхронизация выбрасывала из метки в первую умную папку.
   }else if(previousTag!=null&&coreTags.some(tag=>tag.name===previousTag)){
-    currentTagName=previousTag;currentFolderId=null;currentSmartIndex=null;renderTagsNav();applyListOptions(false,previousTag);
+    // Список писем метки перезагрузка обнуляет вместе с остальным - страницу
+    // метки набираем заново, иначе раздел остался бы пустым без возможности
+    // прокрутки.
+    currentTagName=previousTag;currentFolderId=null;currentSmartIndex=null;renderTagsNav();window.resetTagPaging?.(previousTag);applyListOptions(false,previousTag);window.loadNextTagPage?.();
   }else filterSmart(previousSmart??0,false);
   if(previousMessageId&&messages.some(message=>message.id===previousMessageId)){activeMessage=messages.find(message=>message.id===previousMessageId);document.querySelector(`.msg[data-message-id="${previousMessageId}"]`)?.classList.add('active');}else if(previousMessageId){activeMessage=null;activeFullMessage=null;document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;}
   if(messages.length)document.querySelector('.thread .actions')?.classList.remove('hidden');

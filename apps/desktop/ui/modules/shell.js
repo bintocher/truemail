@@ -157,14 +157,17 @@ document.addEventListener('pointerup',()=>{selectionDragMode=null;});
 function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i];if(s)e.innerHTML=s;});}
 
 const msgsEl=document.getElementById('msgs');
+// Свой признак языка, а не общий L(): тот объявлен в модуле, который грузится
+// позже этого, и обращение к нему до загрузки падало бы с ошибкой.
+function listLoadingIsEnglish(){return document.documentElement.lang==='en';}
 let listLoadTimer=null,listLoadStart=0,listLoadLabel='';
 function setListLoading(on,label){
   const box=document.getElementById('listLoading'),status=document.getElementById('appStatus');
   if(on){
     if(listLoadTimer)clearInterval(listLoadTimer);
-    listLoadStart=performance.now();listLoadLabel=label||L('данные','data');
+    listLoadStart=performance.now();listLoadLabel=label||(listLoadingIsEnglish()?'data':'данные');
     box?.classList.remove('hidden');status?.classList.remove('hidden');
-    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=L(`Загружаю ${listLoadLabel}… прошло ${s} с`,`Loading ${listLoadLabel}… ${s} s elapsed`);};
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=listLoadingIsEnglish()?`Loading ${listLoadLabel}… ${s} s elapsed`:`Загружаю ${listLoadLabel}… прошло ${s} с`;};
     tick();listLoadTimer=setInterval(tick,100);
     window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
   }else{
@@ -176,23 +179,27 @@ function setListLoading(on,label){
 // Страницы писем по метке идут прямо из базы: раньше раздел метки показывал
 // только те письма, что уже загружены по папкам, и метка на письме из глубины
 // ящика не показывалась вовсе.
-const tagHasMore=new Map();
+const tagHasMore=new Map(),tagPagingStarted=new Set();
 async function loadNextTagPage(){
   const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
   loadingMoreMessages=true;setListLoading(true,tag);
   try{
     const known=new Set(messages.map(message=>message.id));
-    const loaded=messages.filter(message=>(message.labels||[]).includes(tag));
+    // Первая страница метки идёт без курсора: письма с этой меткой могут быть
+    // новее всего, что лежит в памяти, и от курсора по памяти они бы не нашлись.
+    const loaded=tagPagingStarted.has(tag)?messages.filter(message=>(message.labels||[]).includes(tag)):[];
     const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
     const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date||null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
     const fresh=page.filter(message=>!known.has(message.id));
-    messages.push(...fresh);tagHasMore.set(tag,fresh.length>0);
+    messages.push(...fresh);tagPagingStarted.add(tag);
+    // Страница пришла полной - возможно, есть ещё; неполная означает конец.
+    tagHasMore.set(tag,page.length>=MESSAGE_PAGE_SIZE);
     if(currentTagName===tag)applyListOptions(false);
   }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
   finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
 }
 window.loadNextTagPage=loadNextTagPage;
-window.resetTagPaging=tag=>tagHasMore.delete(tag);
+window.resetTagPaging=tag=>{tagHasMore.delete(tag);tagPagingStarted.delete(tag);};
 async function loadNextMessagePage(){
   if(currentTagName!=null){await loadNextTagPage();return;}
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;

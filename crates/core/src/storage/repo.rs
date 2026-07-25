@@ -1813,40 +1813,15 @@ impl Db {
         Ok(counts)
     }
 
-    /// Пометить письма как догруженные вглубь папки, чтобы правила их не
-    /// трогали: у старой переписки новые rowid, и без пометки правила разослали
-    /// бы её по папкам на сервере как только что пришедшую.
-    pub async fn mark_backfilled(
-        &self,
-        account_id: i64,
-        folder_id: i64,
-        uids: &[u32],
-    ) -> Result<()> {
-        if uids.is_empty() {
-            return Ok(());
-        }
-        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "UPDATE messages SET backfilled=1 WHERE account_id=",
-        );
-        query.push_bind(account_id);
-        query.push(" AND folder_id=");
-        query.push_bind(folder_id);
-        query.push(" AND uid IN (");
-        let mut separated = query.separated(",");
-        for uid in uids {
-            separated.push_bind(*uid as i64);
-        }
-        separated.push_unseparated(")");
-        let mut tx = self.begin_write().await?;
-        query.build().execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
+    /// `backfilled` - письма подняты прокруткой вглубь папки. Пометка ставится в
+    /// той же транзакции, что и вставка: у старой переписки новые rowid, и пока
+    /// флага нет, подоспевшая проверка правил разослала бы её по папкам на
+    /// сервере как только что пришедшую.
     pub async fn save_discovered_messages(
         &self,
         account_id: i64,
         messages: &[crate::backend::DiscoveredMessage],
+        backfilled: bool,
     ) -> Result<()> {
         use mail_parser::{MessageParser, MimeHeaders};
         use std::collections::HashSet;
@@ -2049,8 +2024,11 @@ impl Db {
                     raw_ref.clone()
                 };
                 sqlx::query(
-                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched)
-                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    // backfilled намеренно не входит в DO UPDATE SET: письмо,
+                    // уже лежавшее в базе, не должно стать "догруженным" из-за
+                    // перекрытия страниц - иначе правила его больше не увидят.
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled)
+                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(folder_id, uid) DO UPDATE SET
                         remote_id=coalesce(excluded.remote_id,messages.remote_id), rfc822_message_id=excluded.rfc822_message_id, in_reply_to=excluded.in_reply_to,
                         references_ids=excluded.references_ids, from_name=excluded.from_name,
@@ -2068,7 +2046,8 @@ impl Db {
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
                 .bind(source.draft as i64).bind(!attachments.is_empty() as i64).bind(dkim).bind(spf)
-                .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64).execute(&mut *tx).await?;
+                .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64)
+                .bind(backfilled as i64).execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
                 if preserve_full_body {
                     if raw_ref != effective_ref {
@@ -2305,7 +2284,7 @@ impl Db {
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                     AND o.status IN ('pending','processing','retry')
                )
-             ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+             ORDER BY date DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
         .bind(limit)
@@ -2347,7 +2326,7 @@ impl Db {
                   WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                     AND o.status IN ('pending','processing','retry')
                )
-             ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+             ORDER BY date DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
         .bind(date)
@@ -2388,7 +2367,7 @@ impl Db {
                           WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                             AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(label)
                 .bind(date)
@@ -2412,7 +2391,7 @@ impl Db {
                           WHERE o.message_id=messages.id AND o.op_kind IN ('move','delete')
                             AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(label)
                 .bind(limit)
@@ -2428,9 +2407,18 @@ impl Db {
     /// Сколько писем у каждой метки - для счётчика в разделе меток: считать по
     /// загруженным в память письмам значило показывать заниженное число.
     pub async fn label_message_counts(&self) -> Result<Vec<(String, i64)>> {
+        // Условия те же, что в list_label_messages_page, иначе счётчик обещал бы
+        // больше писем, чем раздел метки показывает.
         Ok(sqlx::query_as(
-            "SELECT l.name, COUNT(ml.message_id) FROM labels l
+            "SELECT l.name, COUNT(m.id) FROM labels l
              LEFT JOIN message_labels ml ON ml.label_id = l.id
+             LEFT JOIN messages m ON m.id = ml.message_id
+                  AND (m.snoozed_until IS NULL OR m.snoozed_until <= datetime('now'))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM outbox_ops o
+                     WHERE o.message_id = m.id AND o.op_kind IN ('move','delete')
+                       AND o.status IN ('pending','processing','retry')
+                  )
              GROUP BY l.id ORDER BY l.name COLLATE NOCASE",
         )
         .fetch_all(&self.pool)
@@ -3942,6 +3930,12 @@ impl Db {
                 }
             }
             for rule in &mut rules {
+                // Правило с удалённой меткой пропущено, а не выполнено: прогресс
+                // ему не двигаем, иначе после выбора новой метки письма этого
+                // периода остались бы неразмеченными навсегда.
+                if rule.action == "label" && rule.label_id.is_none() {
+                    continue;
+                }
                 if message.id > rule.progress_message_id {
                     rule.progress_message_id = message.id;
                 }
@@ -4213,7 +4207,7 @@ impl Db {
                          SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                            AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(date)
                 .bind(date)
@@ -4232,7 +4226,7 @@ impl Db {
                          SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
                            AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
                        )
-                     ORDER BY COALESCE(date, '') DESC, id DESC LIMIT ?",
+                     ORDER BY date DESC, id DESC LIMIT ?",
                 )
                 .bind(SCAN_PAGE_SIZE)
                 .fetch_all(&self.pool)

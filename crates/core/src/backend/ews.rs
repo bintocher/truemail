@@ -646,7 +646,10 @@ impl EwsBackend {
         let body = format!(
             // Порядок элементов важен: по схеме FindItemType Restriction идёт до
             // SortOrder, иначе Exchange отвечает ErrorSchemaValidation.
-            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeReceived"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
+            // Сортировка - по DateTimeSent, как и в догрузке: в базе лежит дата
+            // из заголовка письма, и по ней же считается курсор страниц. Отбор
+            // по сроку хранения остаётся по дате получения.
+            r#"<m:FindItem Traversal="Shallow"><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape><m:IndexedPageItemView MaxEntriesReturned="{}" Offset="0" BasePoint="Beginning"/>{restriction}<m:SortOrder><t:FieldOrder Order="Descending"><t:FieldURI FieldURI="item:DateTimeSent"/></t:FieldOrder></m:SortOrder><m:ParentFolderIds><t:FolderId Id="{}"/></m:ParentFolderIds></m:FindItem>"#,
             limit,
             escape(&folder.remote_path)
         );

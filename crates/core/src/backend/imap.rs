@@ -68,8 +68,9 @@ pub struct DiscoveredMessage {
 
 type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
 const MESSAGE_FETCH_ITEMS: &str = "(UID BODY.PEEK[] FLAGS RFC822.SIZE)";
-/// Запас UID к странице догрузки: SEARCH BEFORE отбирает по дню, поэтому в
-/// начало окна попадают письма дня курсора, которые ещё не прошли границу.
+/// Запас UID к странице догрузки: SEARCH отбирает по дню, поэтому в начало окна
+/// попадают письма дня курсора, которые ещё не прошли границу. При нехватке
+/// окно расширяется.
 const OLDER_PROBE_MARGIN: usize = 200;
 
 fn uid_set(uids: &[u32]) -> String {
@@ -1681,12 +1682,51 @@ fn parse_cursor_datetime(before: &str) -> Result<chrono::DateTime<chrono::FixedO
 /// там лежит именно заголовок Date - по нему и сверяем границу. Время доставки
 /// (INTERNALDATE) для этого не годится: у перенесённого ящика оно у всех писем
 /// одинаковое, и страница либо пустела, либо возвращала уже показанное.
+fn parse_header_date(header: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    let text = String::from_utf8_lossy(header);
+    let mut lines = text.lines();
+    let mut value = String::new();
+    for line in lines.by_ref() {
+        if line.to_ascii_lowercase().starts_with("date:") {
+            value.push_str(line.split_once(':')?.1.trim());
+            break;
+        }
+    }
+    if value.is_empty() {
+        return None;
+    }
+    // Заголовок может быть свёрнут: продолжение начинается с пробела или табуляции.
+    for line in lines {
+        if !line.starts_with([' ', '\t']) {
+            break;
+        }
+        value.push(' ');
+        value.push_str(line.trim());
+    }
+    chrono::DateTime::parse_from_rfc2822(value.trim()).ok()
+}
+
 fn header_date(fetch: &async_imap::types::Fetch) -> Option<chrono::DateTime<chrono::FixedOffset>> {
-    let text = String::from_utf8_lossy(fetch.header()?);
-    let line = text
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("date:"))?;
-    chrono::DateTime::parse_from_rfc2822(line.split_once(':')?.1.trim()).ok()
+    parse_header_date(fetch.header()?)
+}
+
+async fn fetch_header_dates(
+    session: &mut OAuthSession,
+    folder_path: &str,
+    uids: &[u32],
+    items: &str,
+) -> Result<Vec<async_imap::types::Fetch>> {
+    let failed = |error: async_imap::error::Error| Error::Backend {
+        backend: "imap-older".into(),
+        message: format!("{folder_path}: {error}"),
+    };
+    session
+        .uid_fetch(uid_set(uids), items)
+        .await
+        .map_err(failed)?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(failed)
 }
 
 /// Отобрать UID писем строго старше курсора. SEARCH отбирает по дню, так что
@@ -1704,21 +1744,20 @@ async fn older_than_cursor(
         return Ok(Vec::new());
     }
     let mut window = limit + OLDER_PROBE_MARGIN;
+    // Забираем только заголовок Date - это десятки байт на письмо против
+    // килобайтов у полного заголовка. Если сервер ответил без него, повторяем
+    // запрос полной секцией: остаться без даты значит потерять границу страницы.
+    let mut items = "(UID BODY.PEEK[HEADER.FIELDS (DATE)])";
     loop {
         let probe = &uids[uids.len().saturating_sub(window)..];
-        let fetched = session
-            .uid_fetch(uid_set(probe), "(UID BODY.PEEK[HEADER.FIELDS (DATE)])")
-            .await
-            .map_err(|error| Error::Backend {
-                backend: "imap-older".into(),
-                message: format!("{folder_path}: {error}"),
-            })?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|error| Error::Backend {
-                backend: "imap-older".into(),
-                message: format!("{folder_path}: {error}"),
-            })?;
+        let mut fetched = fetch_header_dates(session, folder_path, probe, items).await?;
+        if !fetched.is_empty()
+            && items.contains("HEADER.FIELDS")
+            && fetched.iter().all(|fetch| fetch.header().is_none())
+        {
+            items = "(UID BODY.PEEK[HEADER])";
+            fetched = fetch_header_dates(session, folder_path, probe, items).await?;
+        }
         let mut matched = fetched
             .iter()
             .filter_map(|fetch| {
@@ -1728,8 +1767,10 @@ async fn older_than_cursor(
                     Some(date) => Some((date, uid)),
                     // Заголовок не прочитался - письмо берём: повторная запись
                     // безвредна (save_discovered_messages идемпотентен), потеря
-                    // письма - нет.
-                    None => Some((cursor, uid)),
+                    // письма - нет. Ключом даём начало эпохи, чтобы такие письма
+                    // уходили в конец очереди и не вытесняли датированные из
+                    // страницы на каждом заходе.
+                    None => Some((chrono::DateTime::UNIX_EPOCH.fixed_offset(), uid)),
                 }
             })
             .collect::<Vec<_>>();
@@ -1772,7 +1813,11 @@ async fn fetch_older_messages(
     // величину, что и курсор; серверы без него (редкость) обслуживаем через
     // BEFORE по времени доставки.
     let cursor = parse_cursor_datetime(before)?;
-    let date = (cursor.date_naive() + chrono::Days::new(1))
+    // Запас в двое суток: SEARCH сравнивает дату письма в его собственной зоне, а
+    // курсор приходит в UTC. Смещение доходит до +14 часов, поэтому письмо
+    // старше курсора может числиться уже следующим днём и в границу "+1 день" не
+    // попадало бы.
+    let date = (cursor.date_naive() + chrono::Days::new(2))
         .format("%d-%b-%Y")
         .to_string();
     let found = match session.uid_search(format!("SENTBEFORE {date}")).await {
@@ -1971,12 +2016,50 @@ fn encode_modified_utf7(value: &str) -> String {
 mod utf7_tests {
     use super::{
         MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, imap_store_commands,
-        mime_message_id, sent_mailbox_candidate, uid_set, validate_folder_name,
+        mime_message_id, parse_cursor_datetime, parse_header_date, sent_mailbox_candidate, uid_set,
+        validate_folder_name,
     };
 
     #[test]
     fn qresync_known_uids_are_compacted_without_inventing_gaps() {
         assert_eq!(uid_set(&[9, 2, 3, 4, 9, 12, 13]), "2:4,9,12:13");
+    }
+
+    #[test]
+    fn header_date_is_read_from_full_header_section() {
+        // Граница догрузки считается по этой дате: не разберём заголовок -
+        // страница поедет и письма начнут теряться.
+        let header = b"Received: from mx.example.test\r\nDate: Mon, 20 Jul 2026 10:30:00 +0300\r\nSubject: Demo\r\n\r\n";
+        let parsed = parse_header_date(header).expect("date header");
+        assert_eq!(parsed.to_utc().to_rfc3339(), "2026-07-20T07:30:00+00:00");
+
+        // Свёрнутый заголовок: продолжение с отступа.
+        let folded = b"Date: Mon, 20 Jul 2026\r\n 10:30:00 +0300\r\nSubject: Demo\r\n\r\n";
+        assert_eq!(
+            parse_header_date(folded).expect("folded date").to_utc(),
+            parsed.to_utc()
+        );
+
+        assert!(parse_header_date(b"Subject: no date here\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn backfill_cursor_accepts_iso_and_plain_dates() {
+        assert_eq!(
+            parse_cursor_datetime("2026-07-20T10:30:00+03:00")
+                .expect("iso cursor")
+                .to_utc()
+                .to_rfc3339(),
+            "2026-07-20T07:30:00+00:00"
+        );
+        assert_eq!(
+            parse_cursor_datetime("2026-07-20")
+                .expect("plain cursor")
+                .to_utc()
+                .to_rfc3339(),
+            "2026-07-20T00:00:00+00:00"
+        );
+        assert!(parse_cursor_datetime("вчера").is_err());
     }
 
     #[test]

@@ -938,6 +938,7 @@ mod tests {
                 raw: calendar_raw.to_vec(),
                 body_fetched: true,
             }],
+            false,
         )
         .await
         .expect("save calendar attachment");
@@ -1004,6 +1005,7 @@ mod tests {
                 raw: b"Subject: Meeting\r\n\r\npreview".to_vec(),
                 body_fetched: false,
             }],
+            false,
         )
         .await
         .expect("save metadata projection over full body");
@@ -1045,6 +1047,7 @@ mod tests {
                 raw: b"Subject: Large\r\n\r\nsmall preview".to_vec(),
                 body_fetched: false,
             }],
+            false,
         )
         .await
         .expect("save metadata-only message");

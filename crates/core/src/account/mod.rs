@@ -788,7 +788,7 @@ impl AccountManager {
             )
             .await?;
         self.db
-            .save_discovered_messages(account.id, &discovery.messages)
+            .save_discovered_messages(account.id, &discovery.messages, false)
             .await?;
         // Письма к этому моменту уже в БД и получили локальные id - можно
         // достать их для уведомления. Только Входящие (роль 'inbox'): другие
@@ -898,16 +898,9 @@ impl AccountManager {
             return Ok(0);
         }
         let count = messages.len();
-        self.db
-            .save_discovered_messages(account.id, &messages)
-            .await?;
         // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
-        let uids = messages
-            .iter()
-            .map(|message| message.uid)
-            .collect::<Vec<_>>();
         self.db
-            .mark_backfilled(account.id, folder_id, &uids)
+            .save_discovered_messages(account.id, &messages, true)
             .await?;
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(count)
@@ -2091,7 +2084,11 @@ impl AccountManager {
                                     Ok(_) => {
                                         match self
                                             .db
-                                            .save_discovered_messages(account.id, &imap.messages)
+                                            .save_discovered_messages(
+                                                account.id,
+                                                &imap.messages,
+                                                false,
+                                            )
                                             .await
                                         {
                                             Ok(()) => {
