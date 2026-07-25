@@ -179,30 +179,31 @@ function setListLoading(on,label){
 // Страницы писем по метке идут прямо из базы: раньше раздел метки показывал
 // только те письма, что уже загружены по папкам, и метка на письме из глубины
 // ящика не показывалась вовсе.
-const tagHasMore=new Map(),tagPagingStarted=new Set();
+// Пагинация метки ведёт собственный курсор - последнюю отданную строку. По
+// общему списку писем её вести нельзя: письма этой метки могли попасть в память
+// раньше через свою папку, и тогда страница целиком состояла бы из уже
+// известных, а прокрутка метки останавливалась бы на первой же странице.
+const tagHasMore=new Map(),tagCursor=new Map();
 async function loadNextTagPage(){
   const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
   loadingMoreMessages=true;setListLoading(true,tag);
   try{
     const known=new Set(messages.map(message=>message.id));
-    // Первая страница метки идёт без курсора: письма с этой меткой могут быть
-    // новее всего, что лежит в памяти, и от курсора по памяти они бы не нашлись.
-    // Письма без даты стоят в конце списка, но курсором служить не могут - по
-    // ним запрос вернул бы ту же первую страницу и прокрутка ходила бы по кругу.
-    const loaded=tagPagingStarted.has(tag)?messages.filter(message=>(message.labels||[]).includes(tag)&&message.date):[];
-    const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
-    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date||null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
-    const fresh=page.filter(message=>!known.has(message.id));
-    messages.push(...fresh);tagPagingStarted.add(tag);
-    // Прогресс меряем по новым письмам: страница может целиком состоять из уже
-    // показанных, и тогда дальше идти некуда.
-    tagHasMore.set(tag,fresh.length>0);
+    const cursor=tagCursor.get(tag)||null;
+    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
+    messages.push(...page.filter(message=>!known.has(message.id)));
+    // Курсор двигаем по последней строке страницы, даже если письмо уже было в
+    // памяти. Дата пустая - передаём пустую строку, а не null: null означал бы
+    // "начни сначала", и страница вернулась бы та же самая.
+    const last=page[page.length-1];
+    if(last)tagCursor.set(tag,{date:last.date||'',id:last.id});
+    tagHasMore.set(tag,page.length>=MESSAGE_PAGE_SIZE);
     if(currentTagName===tag)applyListOptions(false);
   }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
   finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
 }
 window.loadNextTagPage=loadNextTagPage;
-window.resetTagPaging=tag=>{tagHasMore.delete(tag);tagPagingStarted.delete(tag);};
+window.resetTagPaging=tag=>{tagHasMore.delete(tag);tagCursor.delete(tag);};
 async function loadNextMessagePage(){
   if(currentTagName!=null){await loadNextTagPage();return;}
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;

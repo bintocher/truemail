@@ -214,8 +214,8 @@ async function renderHtmlMessage(container,html,sender){
   if(blocked){const notice=document.createElement('div');notice.className='blocked';const text=document.createElement('span');text.textContent=L('Удалённые изображения заблокированы для защиты от отслеживания.','Remote images are blocked to prevent tracking.');const button=document.createElement('button');button.type='button';button.textContent=L(`Показывать от ${sender}`,`Always show from ${sender}`);button.onclick=async()=>{await window.tm?.setImageSenderTrusted(normalizedSender,true);container.replaceChildren();await renderHtmlMessage(container,html,sender);};notice.append(text,button);container.appendChild(notice);}
   const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title=L('Содержимое HTML-письма','HTML message content');frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};container.appendChild(frame);
 }
-// Беседы (threading): гибрид по цепочке ответов (thread_id) и нормализованной теме,
-// в пределах аккаунта. Одна строка на беседу со счётчиком, разворот показывает письма.
+// Беседы (threading): по цепочке ответов (thread_id) в пределах аккаунта. Одна
+// строка на беседу со счётчиком, разворот показывает письма.
 let conversationsEnabled=false;
 const expandedConversations=new Set();
 // Ключ беседы - только цепочка письма. Письмо без цепочки составляет группу из
@@ -248,14 +248,15 @@ function expandConversationIds(ids){
     if(!source){out.add(id);return;}
     const key=conversationKey(source);
     if(expandedConversations.has(key)){out.add(id);return;}
-    // Действие идёт по тому же ключу, по которому строка собрана в списке, -
-    // по цепочке письма. Письмо без цепочки составляет группу из себя одного,
-    // так что под действие попадает только оно само.
+    // Действие идёт по тому же ключу и по тому же набору писем, из которого
+    // собрана строка списка. По всему кэшу расширять нельзя: при активном
+    // фильтре или в разделе метки строка показывает одно письмо, а под действие
+    // ушла бы вся цепочка папки - включая прочитанные и письма без метки.
     out.add(id);
     // Только в пределах папки исходного письма: беседа может жить в нескольких
     // папках (Входящие/Отправленные), но действие над строкой не должно трогать
     // письма из других папок.
-    messages.forEach(item=>{if(item.folder_id===source.folder_id&&conversationKey(item)===key)out.add(item.id);});
+    (lastListRows.length?lastListRows:messages).forEach(item=>{if(item.folder_id===source.folder_id&&conversationKey(item)===key)out.add(item.id);});
   });
   return [...out];
 }
@@ -340,8 +341,8 @@ function smartConditionMatches(message,source){const condition=normalizeSmartCon
   const left=String(raw).toLocaleLowerCase(),right=String(condition.v).toLocaleLowerCase();if(condition.o==='not_contains')return !left.includes(right);if(condition.o==='equals')return left===right;if(condition.o==='not_equals')return left!==right;if(condition.o==='starts_with')return left.startsWith(right);if(condition.o==='ends_with')return left.endsWith(right);return left.includes(right);}
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
-// Папка, на которой закончился прошлый проход догрузки умной папки.
-let smartBackfillLastId=null;
+// Папки-источники, уже обойдённые догрузкой в текущем круге, по умным папкам.
+const smartBackfillVisited=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
   if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
@@ -367,12 +368,14 @@ async function loadSmartCoveragePage(index,reset=false){
       const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-(localCounts.get(source.id)||0)}))
         .filter(item=>window.coreUnifiedSettings?.[item.source.id]!=='0'&&item.behind>0)
         .sort((left,right)=>right.behind-left.behind).map(item=>item.source);
-      // Продолжаем с папки, следующей за обработанной в прошлый раз, - список
-      // кандидатов пересобирается каждый проход, поэтому запоминаем саму папку,
-      // а не её место в списке.
-      const resume=Math.max(0,candidates.findIndex(source=>source.id===smartBackfillLastId)+1);
-      const picked=[];for(let step=0;step<Math.min(SMART_BACKFILL_FOLDERS,candidates.length);step++)picked.push(candidates[(resume+step)%candidates.length]);
-      if(picked.length)smartBackfillLastId=picked[picked.length-1].id;
+      // Держим множество уже обойдённых папок этой умной папки: список
+      // кандидатов пересобирается каждый проход, и позиция в нём ничего не
+      // значит. Когда обойдены все, круг начинается заново.
+      let visited=smartBackfillVisited.get(folder.id);
+      if(!visited){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
+      if(candidates.every(source=>visited.has(source.id)))visited.clear();
+      const picked=candidates.filter(source=>!visited.has(source.id)).slice(0,SMART_BACKFILL_FOLDERS);
+      picked.forEach(source=>visited.add(source.id));
       if(candidates.length>picked.length)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${picked.length}`);
       let fetchedAny=false;
       for(const source of picked){

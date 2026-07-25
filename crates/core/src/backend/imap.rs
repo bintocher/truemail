@@ -1753,8 +1753,14 @@ async fn older_than_cursor(
         let mut fetched = fetch_header_dates(session, folder_path, probe, items).await?;
         // Хватает и одного письма без заголовка: без даты оно уедет в конец
         // очереди и до страницы доберётся только на дне папки, а в базе ляжет с
-        // пустой датой и оборвёт курсор догрузки этой папки.
-        if items.contains("HEADER.FIELDS") && fetched.iter().any(|fetch| fetch.header().is_none()) {
+        // пустой датой и оборвёт курсор догрузки этой папки. Смотрим только на
+        // ответы с UID - сервер шлёт в тот же поток и незапрошенные FETCH с
+        // флагами, у которых заголовка нет по определению.
+        if items.contains("HEADER.FIELDS")
+            && fetched
+                .iter()
+                .any(|fetch| fetch.uid.is_some() && fetch.header().is_none())
+        {
             items = "(UID BODY.PEEK[HEADER])";
             fetched = fetch_header_dates(session, folder_path, probe, items).await?;
         }

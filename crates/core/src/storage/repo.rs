@@ -3811,12 +3811,16 @@ impl Db {
         // границу пакета они не входят: иначе их застывший прогресс держал бы
         // выборку на старых письмах, остальные правила пропускали бы весь пакет
         // как уже пройденный, и через 500 писем разбор почты встал бы совсем.
-        let min_progress = rules
+        let Some(min_progress) = rules
             .iter()
             .filter(|rule| !(rule.action == "label" && rule.label_id.is_none()))
             .map(|rule| rule.progress_message_id)
             .min()
-            .unwrap_or(0);
+        else {
+            // Все правила ждут выбора метки - читать пакет писем незачем.
+            tx.commit().await?;
+            return Ok(0);
+        };
         let messages: Vec<RuleMessageRow> = sqlx::query_as(
             "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
                     m.remote_id, m.from_name, m.from_addr, m.subject
