@@ -68,6 +68,9 @@ pub struct DiscoveredMessage {
 
 type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
 const MESSAGE_FETCH_ITEMS: &str = "(UID BODY.PEEK[] FLAGS RFC822.SIZE)";
+/// Запас UID к странице догрузки: SEARCH BEFORE отбирает по дню, поэтому в
+/// начало окна попадают письма дня курсора, которые ещё не прошли границу.
+const OLDER_PROBE_MARGIN: usize = 200;
 
 fn uid_set(uids: &[u32]) -> String {
     let mut sorted = uids.to_vec();
@@ -1657,6 +1660,81 @@ pub async fn fetch_password_message_raw(
     fetch_message_raw(session, folder_path, uid).await
 }
 
+/// Разобрать курсор догрузки: ISO 8601 с временем либо просто дата - тогда
+/// границей считаем начало дня.
+fn parse_cursor_datetime(before: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(value) = chrono::DateTime::parse_from_rfc3339(before) {
+        return Ok(value);
+    }
+    let invalid = || Error::Backend {
+        backend: "imap-older".into(),
+        message: format!("некорректная дата {before}"),
+    };
+    chrono::NaiveDate::parse_from_str(before.get(..10).unwrap_or(before), "%Y-%m-%d")
+        .map_err(|_| invalid())?
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(invalid)
+        .map(|naive| naive.and_utc().fixed_offset())
+}
+
+/// Отобрать UID писем строго старше курсора. SEARCH BEFORE отбирает по дню, так
+/// что письма дня курсора приходят вместе с более новыми - точную границу
+/// проверяем по INTERNALDATE (дешёвый FETCH без тела). Возвращает не больше
+/// `limit` самых свежих подходящих (наибольшие UID).
+async fn older_than_cursor(
+    session: &mut OAuthSession,
+    folder_path: &str,
+    uids: &[u32],
+    cursor: chrono::DateTime<chrono::FixedOffset>,
+    limit: usize,
+) -> Result<Vec<u32>> {
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut window = limit + OLDER_PROBE_MARGIN;
+    loop {
+        let probe = &uids[uids.len().saturating_sub(window)..];
+        let set = probe
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetched = session
+            .uid_fetch(set, "(UID INTERNALDATE)")
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-older".into(),
+                message: format!("{folder_path}: {error}"),
+            })?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|error| Error::Backend {
+                backend: "imap-older".into(),
+                message: format!("{folder_path}: {error}"),
+            })?;
+        let mut matched = fetched
+            .iter()
+            .filter_map(|fetch| {
+                let uid = fetch.uid?;
+                // Дату не отдали - письмо берём: повторная запись безвредна
+                // (save_discovered_messages идемпотентен), потеря письма - нет.
+                match fetch.internal_date() {
+                    Some(date) if date >= cursor => None,
+                    _ => Some(uid),
+                }
+            })
+            .collect::<Vec<u32>>();
+        matched.sort_unstable();
+        // Пусто и окно ещё не покрыло всю выборку - в него попал только день
+        // курсора; расширяем, иначе догрузка встала бы на месте.
+        if !matched.is_empty() || probe.len() == uids.len() {
+            let start = matched.len().saturating_sub(limit);
+            return Ok(matched.split_off(start));
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
 /// Догрузить более старые письма папки (бесконечная прокрутка): письма с датой
 /// строго раньше `before` (ISO 8601), не больше `limit` самых свежих среди них.
 async fn fetch_older_messages(
@@ -1672,16 +1750,13 @@ async fn fetch_older_messages(
             backend: "imap-select".into(),
             message: format!("{folder_path}: {error}"),
         })?;
-    // IMAP SEARCH BEFORE ждёт дату вида "17-Jul-2026" (день, по INTERNALDATE).
-    let date = chrono::DateTime::parse_from_rfc3339(before)
-        .map(|value| value.date_naive())
-        .or_else(|_| {
-            chrono::NaiveDate::parse_from_str(before.get(..10).unwrap_or(before), "%Y-%m-%d")
-        })
-        .map_err(|_| Error::Backend {
-            backend: "imap-older".into(),
-            message: format!("некорректная дата {before}"),
-        })?
+    // Курсор приходит с точным временем самого старого показанного письма, а
+    // SEARCH BEFORE сравнивает INTERNALDATE только по дню. Поэтому ищем с
+    // запасом - BEFORE следующего дня, чтобы день курсора попал в выборку
+    // целиком, - а точную границу применяем сами по INTERNALDATE. Иначе письма
+    // того же дня, что курсор, но старше его по времени, терялись безвозвратно.
+    let cursor = parse_cursor_datetime(before)?;
+    let date = (cursor.date_naive() + chrono::Days::new(1))
         .format("%d-%b-%Y")
         .to_string();
     let mut uids = session
@@ -1694,8 +1769,7 @@ async fn fetch_older_messages(
         .into_iter()
         .collect::<Vec<u32>>();
     uids.sort_unstable();
-    // Самые свежие среди старых (наибольшие UID) - следующие за уже показанными.
-    let take = uids.split_off(uids.len().saturating_sub(limit.max(1)));
+    let take = older_than_cursor(&mut session, folder_path, &uids, cursor, limit.max(1)).await?;
     if take.is_empty() {
         let _ = session.logout().await;
         return Ok(Vec::new());

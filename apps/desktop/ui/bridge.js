@@ -1,5 +1,10 @@
 // Мост между фронтендом и ядром truemail через Tauri invoke.
 
+// Размер страницы писем на папку при полной перезагрузке данных. Список писем
+// сверяется с этим числом, когда решает, исчезло письмо из папки или просто не
+// попало в страницу, - поэтому значение общее, а не локальное.
+window.corePageSize = 100;
+
 (function () {
   const tauri = window.__TAURI__;
   if (!tauri || !tauri.core) {
@@ -180,7 +185,7 @@
     const allFolders = folders.flat();
     const unifiedSources = await window.tm.listUnifiedSources();
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
-    const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, 100)));
+    const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
     const [contacts, calendarData, smartFolders, storage] = await Promise.all([
       window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),
     ]);

@@ -351,7 +351,16 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Объединяем догруженные ранее письма со свежей выборкой (свежая версия
   // побеждает по id), иначе перезагрузка данных стирала бы всё, что пользователь
   // подгрузил прокруткой, и список сбрасывался бы на первую страницу.
-  {const merged=new Map(messages.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
+  // Старую копию храним только если она за границей свежей страницы папки: письмо
+  // внутри страницы, которого в выборке нет, из папки ушло (перемещено, удалено,
+  // ждёт отправки в очереди) - иначе оно продолжало бы висеть в прежней папке.
+  {const page=window.corePageSize||100,freshById=new Map(loadedMessages.map(message=>[message.id,message])),counts=new Map(),edges=new Map();
+   loadedMessages.forEach(message=>{const folder=message.folder_id;counts.set(folder,(counts.get(folder)||0)+1);
+     const date=message.date||'',edge=edges.get(folder);if(!edge||date<edge.date||(date===edge.date&&message.id<edge.id))edges.set(folder,{date,id:message.id});});
+   const survived=messages.filter(message=>{if(freshById.has(message.id))return true;
+     const edge=edges.get(message.folder_id);if(!edge||(counts.get(message.folder_id)||0)<page)return false;
+     const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
+   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   renderRulesList();
   refreshTagsNav();
