@@ -164,10 +164,12 @@ async function loadNextMessagePage(){
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId).sort(byDateDesc),cursor=loaded.at(-1);if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
-      // Локальные письма кончились - но на сервере в папке их больше: догружаем
-      // следующую порцию с сервера и снова читаем из базы.
-      if(!page.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0)page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
-      messages.push(...page.filter(message=>!known.has(message.id)));page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,page.length>0);}
+      let fresh=page.filter(message=>!known.has(message.id));
+      // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
+      // выборка по курсору может вернуть уже показанные письма (дубли по
+      // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
+      if(!fresh.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      messages.push(...fresh);page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,fresh.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
   }catch(error){console.error('truemail pagination:',error);}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
 }
