@@ -1750,15 +1750,21 @@ async fn older_than_cursor(
     let mut items = "(UID BODY.PEEK[HEADER.FIELDS (DATE)])";
     loop {
         let probe = &uids[uids.len().saturating_sub(window)..];
+        // Окно доходит до всей папки, поэтому спрошенные UID держим множеством:
+        // поиск по срезу на сотне тысяч писем стоил бы квадрата сравнений.
+        let asked = probe
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<u32>>();
         let mut fetched = fetch_header_dates(session, folder_path, probe, items).await?;
         // Хватает и одного письма без заголовка: без даты оно уедет в конец
         // очереди и до страницы доберётся только на дне папки, а в базе ляжет с
         // пустой датой и оборвёт курсор догрузки этой папки. Смотрим только на
-        // ответы с UID - сервер шлёт в тот же поток и незапрошенные FETCH с
-        // флагами, у которых заголовка нет по определению.
+        // ответы по спрошенным UID - сервер шлёт в тот же поток и незапрошенные
+        // FETCH с флагами, у которых заголовка нет по определению.
         if items.contains("HEADER.FIELDS")
             && fetched.iter().any(|fetch| {
-                fetch.uid.is_some_and(|uid| probe.contains(&uid)) && fetch.header().is_none()
+                fetch.uid.is_some_and(|uid| asked.contains(&uid)) && fetch.header().is_none()
             })
         {
             items = "(UID BODY.PEEK[HEADER])";
@@ -1770,7 +1776,7 @@ async fn older_than_cursor(
                 let uid = fetch.uid?;
                 // Сервер шлёт в тот же поток обновления флагов по чужим письмам -
                 // берём только то, что сами спрашивали.
-                if !probe.contains(&uid) {
+                if !asked.contains(&uid) {
                     return None;
                 }
                 match header_date(fetch) {

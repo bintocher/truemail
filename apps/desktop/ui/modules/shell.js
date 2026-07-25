@@ -192,11 +192,14 @@ async function loadNextTagPage(){
   const tag=currentTagName;if(tag==null||loadingMoreMessages||tagHasMore.get(tag)===false)return;
   loadingMoreMessages=true;setListLoading(true,tag);
   try{
-    const known=new Set(messages.map(message=>message.id));
     const cursor=tagCursor.get(tag)||null,epoch=tagPagingEpoch;
     const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
-    messages.push(...page.filter(message=>!known.has(message.id)));
+    // Пагинацию сбросили, пока шёл запрос, - страница уже не наша. Вливать её
+    // нельзя: список писем за время ожидания успели заменить новым массивом, и
+    // письма легли бы вторыми экземплярами.
     if(epoch!==tagPagingEpoch)return;
+    const known=new Set(messages.map(message=>message.id));
+    messages.push(...page.filter(message=>!known.has(message.id)));
     // Курсор двигаем по последней строке страницы, даже если письмо уже было в
     // памяти. Дата пустая - передаём пустую строку, а не null: null означал бы
     // "начни сначала", и страница вернулась бы та же самая.

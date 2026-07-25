@@ -371,8 +371,12 @@ async function loadSmartCoveragePage(index,reset=false){
       // Держим множество уже обойдённых папок этой умной папки: список
       // кандидатов пересобирается каждый проход, и позиция в нём ничего не
       // значит. Когда обойдены все, круг начинается заново.
+      // Круг обхода живёт на каждую умную папку и переживает перезагрузку
+      // данных: фоновая синхронизация идёт постоянно и приходит сюда с reset,
+      // а обнуление круга на каждый такой заход означало бы вечный возврат к
+      // тем же самым крупным папкам.
       let visited=smartBackfillVisited.get(folder.id);
-      if(!visited||reset){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
+      if(!visited){visited=new Set();smartBackfillVisited.set(folder.id,visited);}
       // Папки, которых больше нет среди кандидатов, из круга убираем - иначе
       // множество копило бы id удалённых папок.
       visited.forEach(id=>{if(!candidates.some(source=>source.id===id))visited.delete(id);});
