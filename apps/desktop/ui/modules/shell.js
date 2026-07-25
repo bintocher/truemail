@@ -187,13 +187,16 @@ async function loadNextTagPage(){
     const known=new Set(messages.map(message=>message.id));
     // Первая страница метки идёт без курсора: письма с этой меткой могут быть
     // новее всего, что лежит в памяти, и от курсора по памяти они бы не нашлись.
-    const loaded=tagPagingStarted.has(tag)?messages.filter(message=>(message.labels||[]).includes(tag)):[];
+    // Письма без даты стоят в конце списка, но курсором служить не могут - по
+    // ним запрос вернул бы ту же первую страницу и прокрутка ходила бы по кругу.
+    const loaded=tagPagingStarted.has(tag)?messages.filter(message=>(message.labels||[]).includes(tag)&&message.date):[];
     const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
     const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date||null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
     const fresh=page.filter(message=>!known.has(message.id));
     messages.push(...fresh);tagPagingStarted.add(tag);
-    // Страница пришла полной - возможно, есть ещё; неполная означает конец.
-    tagHasMore.set(tag,page.length>=MESSAGE_PAGE_SIZE);
+    // Прогресс меряем по новым письмам: страница может целиком состоять из уже
+    // показанных, и тогда дальше идти некуда.
+    tagHasMore.set(tag,fresh.length>0);
     if(currentTagName===tag)applyListOptions(false);
   }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
   finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}

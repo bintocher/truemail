@@ -1692,15 +1692,15 @@ fn parse_header_date(header: &[u8]) -> Option<chrono::DateTime<chrono::FixedOffs
             break;
         }
     }
-    if value.is_empty() {
-        return None;
-    }
-    // Заголовок может быть свёрнут: продолжение начинается с пробела или табуляции.
+    // Заголовок может быть свёрнут: продолжение начинается с пробела или
+    // табуляции, а само значение бывает целиком на строке продолжения.
     for line in lines {
         if !line.starts_with([' ', '\t']) {
             break;
         }
-        value.push(' ');
+        if !value.is_empty() {
+            value.push(' ');
+        }
         value.push_str(line.trim());
     }
     chrono::DateTime::parse_from_rfc2822(value.trim()).ok()
@@ -1751,10 +1751,10 @@ async fn older_than_cursor(
     loop {
         let probe = &uids[uids.len().saturating_sub(window)..];
         let mut fetched = fetch_header_dates(session, folder_path, probe, items).await?;
-        if !fetched.is_empty()
-            && items.contains("HEADER.FIELDS")
-            && fetched.iter().all(|fetch| fetch.header().is_none())
-        {
+        // Хватает и одного письма без заголовка: без даты оно уедет в конец
+        // очереди и до страницы доберётся только на дне папки, а в базе ляжет с
+        // пустой датой и оборвёт курсор догрузки этой папки.
+        if items.contains("HEADER.FIELDS") && fetched.iter().any(|fetch| fetch.header().is_none()) {
             items = "(UID BODY.PEEK[HEADER])";
             fetched = fetch_header_dates(session, folder_path, probe, items).await?;
         }

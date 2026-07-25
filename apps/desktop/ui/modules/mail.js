@@ -218,11 +218,12 @@ async function renderHtmlMessage(container,html,sender){
 // в пределах аккаунта. Одна строка на беседу со счётчиком, разворот показывает письма.
 let conversationsEnabled=false;
 const expandedConversations=new Set();
-function normalizeSubject(subject){return String(subject||'').replace(/^(\s*(re|fwd?|fw|отв|пересл)\s*:\s*)+/i,'').trim().toLowerCase();}
-// Ключ беседы - цепочка письма; тема остаётся запасным вариантом для писем без
-// цепочки. По одной теме объединять нельзя: групповое действие над строкой
-// уносило бы в корзину письма разных отправителей с темой вида "Счёт".
-function conversationKey(message){const subject=normalizeSubject(message.subject);return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|s:${subject||('self-'+message.id)}`;}
+// Ключ беседы - только цепочка письма. Письмо без цепочки составляет группу из
+// себя одного: по одной теме объединять нельзя ни в списке, ни тем более в
+// действиях - иначе одно нажатие уносило бы в корзину письма разных
+// отправителей с темой вида "Счёт", а thread_id есть далеко не у всех писем
+// (его получают только ответы и те, кому ответили).
+function conversationKey(message){return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|m:${message.id}`;}
 function collapseConversations(rows){
   const groups=new Map();
   rows.forEach(message=>{const key=conversationKey(message);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(message);});
@@ -339,8 +340,8 @@ function smartConditionMatches(message,source){const condition=normalizeSmartCon
   const left=String(raw).toLocaleLowerCase(),right=String(condition.v).toLocaleLowerCase();if(condition.o==='not_contains')return !left.includes(right);if(condition.o==='equals')return left===right;if(condition.o==='not_equals')return left!==right;if(condition.o==='starts_with')return left.startsWith(right);if(condition.o==='ends_with')return left.endsWith(right);return left.includes(right);}
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
-// С какой папки начинать очередной проход догрузки умной папки.
-let smartBackfillOffset=0;
+// Папка, на которой закончился прошлый проход догрузки умной папки.
+let smartBackfillLastId=null;
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
 async function loadSmartCoveragePage(index,reset=false){
   if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
@@ -361,14 +362,17 @@ async function loadSmartCoveragePage(index,reset=false){
     if(!fresh.length&&cursor?.date){
       // Сначала папки с наибольшим отставанием: при неизменном порядке первые
       // пять крупных папок забирали бы все проходы, а остальные не догрузились
-      // бы никогда.
-      const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-messages.filter(message=>message.folder_id===source.id).length}))
+      // бы никогда. Число писем по папкам считаем за один проход по списку.
+      const localCounts=new Map();messages.forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
+      const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-(localCounts.get(source.id)||0)}))
         .filter(item=>window.coreUnifiedSettings?.[item.source.id]!=='0'&&item.behind>0)
         .sort((left,right)=>right.behind-left.behind).map(item=>item.source);
-      // Каждый проход начинается с того места, где закончился прошлый, - иначе
-      // крупные папки забирали бы все проходы себе.
-      const picked=[];for(let step=0;step<Math.min(SMART_BACKFILL_FOLDERS,candidates.length);step++)picked.push(candidates[(smartBackfillOffset+step)%candidates.length]);
-      if(candidates.length)smartBackfillOffset=(smartBackfillOffset+picked.length)%candidates.length;
+      // Продолжаем с папки, следующей за обработанной в прошлый раз, - список
+      // кандидатов пересобирается каждый проход, поэтому запоминаем саму папку,
+      // а не её место в списке.
+      const resume=Math.max(0,candidates.findIndex(source=>source.id===smartBackfillLastId)+1);
+      const picked=[];for(let step=0;step<Math.min(SMART_BACKFILL_FOLDERS,candidates.length);step++)picked.push(candidates[(resume+step)%candidates.length]);
+      if(picked.length)smartBackfillLastId=picked[picked.length-1].id;
       if(candidates.length>picked.length)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${picked.length}`);
       let fetchedAny=false;
       for(const source of picked){
@@ -403,7 +407,8 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Список правил ждёт загрузки меток: правило с действием "поставить метку"
   // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
   // проверяем открытую метку - её могли удалить, и тогда уходим в умную папку.
-  refreshTagsNav().then(()=>{renderRulesList();if(currentTagName!=null&&!coreTags.some(tag=>tag.name===currentTagName)){currentTagName=null;filterSmart(currentSmartIndex??0,false);}});
+  refreshTagsNav().then(()=>{renderRulesList();
+    if(currentTagName!=null&&!coreTags.some(tag=>tag.name===currentTagName)){const gone=currentTagName;currentTagName=null;window.resetTagPaging?.(gone);if(smartFolders.length)filterSmart(currentSmartIndex??0,false);else applyListOptions(true,messagesTitle());}});
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
   // Прокрутка активна, если локальная страница заполнена ИЛИ на сервере писем
   // больше, чем загружено локально (тогда при прокрутке идёт догрузка с сервера).
