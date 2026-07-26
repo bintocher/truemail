@@ -170,11 +170,43 @@ window.corePageSize = 100;
     window.openCalendarEventById?.(payload.event_id ?? null, payload.start ?? null);
   }).catch(console.error);
 
-  let reloadTimer = null;
-  function scheduleReload(delay = 250) {
-    clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => window.reloadCoreData?.().catch(console.error), delay);
+  // Полная перезагрузка данных - дорогая операция: запрос страницы писем по
+  // каждой папке каждого аккаунта плюс контакты, календари и умные папки. При
+  // активной синхронизации событий truemail-data-changed приходят десятки, и без
+  // ограничения снизу перезагрузки шли непрерывно. Держим минимальный интервал и
+  // не трогаем данные, пока окно скрыто: за свёрнутым окном обновлять список
+  // некому, а вернувшись, пользователь получит свежие данные сразу.
+  const MIN_RELOAD_INTERVAL = 5000;
+  let reloadTimer = null, lastReloadAt = 0, reloadPending = false, reloadRunning = false;
+  async function runReload() {
+    reloadTimer = null;
+    // Пока окно скрыто, обновлять список некому - помечаем и вернёмся к этому,
+    // когда окно снова покажут.
+    if (document.hidden) { reloadPending = true; return; }
+    // Перезагрузка идёт - вторую параллельно не пускаем: они завершались бы в
+    // произвольном порядке, и более старый ответ мог затереть свежий список.
+    if (reloadRunning) { reloadPending = true; return; }
+    reloadRunning = true;
+    reloadPending = false;
+    try { await window.reloadCoreData?.(); }
+    catch (e) { console.error(e); }
+    finally {
+      reloadRunning = false;
+      lastReloadAt = Date.now();
+      if (reloadPending) scheduleReload(0);
+    }
   }
+  // Именно throttle, а не debounce: уже назначенный запуск не переносим, иначе
+  // непрерывный поток событий синхронизации откладывал бы обновление
+  // бесконечно.
+  function scheduleReload(delay = 250) {
+    if (reloadTimer) return;
+    const wait = Math.max(delay, MIN_RELOAD_INTERVAL - (Date.now() - lastReloadAt));
+    reloadTimer = setTimeout(() => { runReload().catch(console.error); }, Math.max(0, wait));
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && reloadPending) scheduleReload(0);
+  });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
   tauri.event?.listen("truemail-storage-moved", async () => {
@@ -193,9 +225,20 @@ window.corePageSize = 100;
     ]);
     window.renderCoreAccounts?.(accounts, folders, messageGroups.flat(), contacts, calendarData, smartFolders, storage);
   }
-  window.reloadCoreData = async () => {
-    const accounts = await window.tm.listAccounts();
-    if (accounts.length) await loadCoreData(accounts);
+  // Перезагрузки выстраиваем в очередь: reloadCoreData зовут и обработчик
+  // событий, и модули после действий пользователя. Параллельные проходы
+  // завершались бы в произвольном порядке, и более старый ответ мог перерисовать
+  // список поверх свежего.
+  let coreReloadChain = null;
+  window.reloadCoreData = () => {
+    const run = async () => {
+      const accounts = await window.tm.listAccounts();
+      if (accounts.length) await loadCoreData(accounts);
+    };
+    const chained = coreReloadChain ? coreReloadChain.then(run, run) : run();
+    coreReloadChain = chained;
+    chained.catch(() => {}).then(() => { if (coreReloadChain === chained) coreReloadChain = null; });
+    return chained;
   };
 
   // Первичная загрузка только реальных данных из ядра.

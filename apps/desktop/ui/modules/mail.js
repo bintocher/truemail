@@ -286,11 +286,11 @@ function renderMessageWindow(force=false){
   let canvas=list.querySelector(':scope > .message-list-canvas');if(!canvas){canvas=document.createElement('div');canvas.className='message-list-canvas';list.replaceChildren(canvas);}canvas.style.height=`${total*messageRowHeight}px`;
   const fragment=document.createDocumentFragment(),windowEl=document.createElement('div');windowEl.className='message-list-window';windowEl.style.transform=`translateY(${start*messageRowHeight}px)`;for(let index=start;index<end;index++)windowEl.appendChild(createMessageRow(currentMessageRows[index],index));fragment.appendChild(windowEl);canvas.replaceChildren(fragment);
 }
-function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)msgsEl.scrollTop=top;else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)msgsEl.scrollTop=Math.max(0,bottom-msgsEl.clientHeight);renderMessageWindow(true);showMessage(currentMessageRows[index]);}
+function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)setMessageScrollTop(top);else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)setMessageScrollTop(Math.max(0,bottom-msgsEl.clientHeight));renderMessageWindow(true);showMessage(currentMessageRows[index]);}
 function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
-  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)msgsEl.scrollTop=0;messageWindowStart=-1;messageWindowEnd=-1;
+  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)setMessageScrollTop(0);messageWindowStart=-1;messageWindowEnd=-1;
   const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();
   // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
   // папок (несколько аккаунтов) - число аккаунтов.
@@ -344,8 +344,22 @@ const coreSmartRows=new Map();
 // Папки-источники, уже обойдённые догрузкой в текущем круге, по умным папкам.
 const smartBackfillVisited=new Map();
 function smartRows(index){const folder=smartFolders[index];return coreSmartRows.get(folder?.id)||smartRowsForFolder(folder);}
-async function loadSmartCoveragePage(index,reset=false){
-  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false};return;}const folder=smartFolders[index];if(!folder||(!reset&&smartHasMore.get(folder.id)===false))return;loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
+// serverBackfill=true разрешает ходить за старыми письмами на сервер. Такой
+// проход делаем только по прямому действию пользователя (докрутил список до
+// конца). Фоновая перезагрузка данных приходит сюда с serverBackfill=false:
+// иначе получалась самоподдерживающаяся петля - догрузка писала письма в базу,
+// база слала truemail-data-changed, обработчик перезагружал данные и снова
+// заходил сюда за догрузкой. Петля крутилась сутками, качала всю историю ящика
+// и держала список писем в памяти WebView целиком.
+async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
+  if(loadingSmartCoverage){queuedSmartCoverage={index,reset:reset||queuedSmartCoverage?.reset||false,serverBackfill:serverBackfill||queuedSmartCoverage?.serverBackfill||false};return;}const folder=smartFolders[index];if(!folder)return;
+  // reset обнуляет страницу умной папки, но не право снова идти на сервер:
+  // раньше через reset фоновая перезагрузка обходила признак "сервер больше
+  // ничего не даёт" и запускала догрузку заново на каждой синхронизации.
+  if(!reset&&smartHasMore.get(folder.id)===false)return;
+  if(serverBackfill&&smartServerExhausted.get(folder.id)===true)serverBackfill=false;
+  loadingSmartCoverage=true;window.setListLoading?.(true,smartFolderTitle(folder));
+  let circleClosed=false;
   try{const existing=reset?[]:(coreSmartRows.get(folder.id)||[]),known=new Set(existing.map(message=>message.id));
     // Курсор - истинный минимум (старейшая дата, затем наименьший id), иначе при
     // равных датах запрос вернёт уже показанные письма и прокрутка встанет.
@@ -360,11 +374,17 @@ async function loadSmartCoveragePage(index,reset=false){
     // новее её писем, и диапазон между ними оставался бы пропущенным. За один
     // проход обходим не больше SMART_BACKFILL_FOLDERS папок: каждая - отдельное
     // подключение к серверу, остальные подхватит следующий проход.
-    if(!fresh.length&&cursor?.date){
+    if(!fresh.length&&cursor?.date&&serverBackfill){
       // Сначала папки с наибольшим отставанием: при неизменном порядке первые
       // пять крупных папок забирали бы все проходы, а остальные не догрузились
-      // бы никогда. Число писем по папкам считаем за один проход по списку.
-      const localCounts=new Map();messages.forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
+      // бы никогда. Число писем и курсор по папкам считаем за один проход по
+      // списку: раньше внутри цикла по папкам шёл messages.filter, и на десятках
+      // папок с десятками тысяч писем это давало миллионы итераций на каждый
+      // проход догрузки.
+      const localCounts=new Map(),folderCursors=new Map();
+      messages.forEach(message=>{const id=message.folder_id;localCounts.set(id,(localCounts.get(id)||0)+1);
+        const min=folderCursors.get(id);if(!min){folderCursors.set(id,message);return;}
+        const cmp=String(message.date||'').localeCompare(String(min.date||''));if(cmp<0||(cmp===0&&message.id<min.id))folderCursors.set(id,message);});
       const candidates=coreFolders.map(source=>({source,behind:(source.total_count||0)-(localCounts.get(source.id)||0)}))
         .filter(item=>window.coreUnifiedSettings?.[item.source.id]!=='0'&&item.behind>0)
         .sort((left,right)=>right.behind-left.behind).map(item=>item.source);
@@ -380,21 +400,51 @@ async function loadSmartCoveragePage(index,reset=false){
       // Папки, которых больше нет среди кандидатов, из круга убираем - иначе
       // множество копило бы id удалённых папок.
       visited.forEach(id=>{if(!candidates.some(source=>source.id===id))visited.delete(id);});
-      if(candidates.every(source=>visited.has(source.id)))visited.clear();
+      if(candidates.every(source=>visited.has(source.id))){visited.clear();smartCircleFetched.delete(folder.id);}
       const picked=candidates.filter(source=>!visited.has(source.id)).slice(0,SMART_BACKFILL_FOLDERS);
       picked.forEach(source=>visited.add(source.id));
       if(candidates.length>picked.length)window.tm?.uiLog?.(`догрузка умной папки: папок ${candidates.length}, за проход ${picked.length}`);
-      let fetchedAny=false;
+      let fetchedAny=false,backfillFailed=false;
       for(const source of picked){
-        const local=messages.filter(message=>message.folder_id===source.id);
-        const folderCursor=local.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
-        try{if((await window.tm?.fetchOlderMessages(source.id,folderCursor?.date||cursor.date,BACKFILL_PAGE_SIZE))>0)fetchedAny=true;}catch(error){console.error('truemail smart backfill:',error);}
+        // Курсор папки: сначала тот, что вернуло ядро прошлым проходом, потом
+        // самое старое письмо в памяти. По списку писем его вести нельзя -
+        // догруженные письма, не подошедшие фильтру умной папки, в память не
+        // попадают, курсор стоял бы на месте и сервер отдавал бы ту же страницу.
+        const folderCursor=smartBackfillCursor.get(source.id)||folderCursors.get(source.id)?.date||cursor.date;
+        try{
+          const page=await window.tm?.fetchOlderMessages(source.id,folderCursor,BACKFILL_PAGE_SIZE);
+          if(page?.oldest)smartBackfillCursor.set(source.id,page.oldest);
+          if((page?.fetched||0)>0){fetchedAny=true;smartCircleFetched.set(folder.id,true);}
+        }catch(error){
+          // Упавшую папку возвращаем в круг: иначе следующий проход счёл бы её
+          // пройденной, круг закрылся бы без неё и умная папка замерла бы.
+          backfillFailed=true;visited.delete(source.id);console.error('truemail smart backfill:',error);
+        }
       }
-      if(fetchedAny){rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);fresh=rows.filter(message=>!known.has(message.id));}}
-    const combined=[...existing,...fresh];coreSmartRows.set(folder.id,combined);smartHasMore.set(folder.id,fresh.length>0);const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=[...byId.values()];
-  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;window.setListLoading?.(false);if(currentSmartIndex===index&&currentFolderId===null){applyListOptions(false);window.ensureListFilled?.();}if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset);}
+      if(fetchedAny){rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);fresh=rows.filter(message=>!known.has(message.id));}
+      // Круг закрыт - все папки-источники опрошены и ни один запрос не упал.
+      circleClosed=!backfillFailed&&candidates.every(source=>visited.has(source.id));
+      // Исчерпанной папку считаем, только когда круг закрыт и сервер за весь
+      // круг не отдал вообще ничего: история ящиков кончилась. Признак берём
+      // накопительный по кругу, а не по последнему проходу - иначе папка
+      // считалась бы исчерпанной, когда письма пришли в начале круга, а
+      // последняя пятёрка папок оказалась пустой. Если письма приходили, но
+      // фильтру не подошли, совпадения могут быть глубже - прокрутка должна
+      // продолжать копать, а не упираться в потолок.
+      if(circleClosed&&!fetchedAny&&smartCircleFetched.get(folder.id)!==true)smartServerExhausted.set(folder.id,true);}
+    const combined=[...existing,...fresh];coreSmartRows.set(folder.id,combined);
+    // Умная папка кончилась, только когда сервер обойден полностью и больше
+    // ничего не отдаёт. Пустая страница сама по себе концом не считается:
+    // локально совпадений нет, но следующий проход по другим папкам-источникам
+    // ещё может их принести, и прокрутка не должна вставать.
+    if(fresh.length||smartServerExhausted.get(folder.id)===true)smartHasMore.set(folder.id,fresh.length>0);
+    const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=trimMessages([...byId.values()],rows.map(message=>message.id));
+  }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;window.setListLoading?.(false);if(currentSmartIndex===index&&currentFolderId===null){applyListOptions(false);window.ensureListFilled?.(serverBackfill);}if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset,queued.serverBackfill);}
 }
-function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true);}
+// resetScroll=true - пользователь сам открыл умную папку: разрешаем ей снова
+// сходить на сервер. resetScroll=false - это фоновая перезагрузка данных, она
+// только обновляет страницу из локальной базы.
+function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;const folder=smartFolders[index];if(resetScroll&&folder){smartServerExhausted.delete(folder.id);smartCircleFetched.delete(folder.id);smartBackfillVisited.delete(folder.id);smartBackfillCursor.clear();}applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true,resetScroll);}
 
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
@@ -412,7 +462,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
    const survived=messages.filter(message=>{if(freshById.has(message.id))return true;
      const edge=edges.get(message.folder_id);if(!edge||(counts.get(message.folder_id)||0)<page)return false;
      const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
-   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=[...merged.values()];}
+   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=trimMessages([...merged.values()],loadedMessages.map(message=>message.id));}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Список правил ждёт загрузки меток: правило с действием "поставить метку"
   // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
@@ -422,7 +472,11 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const accountCount=document.getElementById('mailAccountCount');if(accountCount){const n=accounts.length,label=wizardLocale==='en'?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
   // Прокрутка активна, если локальная страница заполнена ИЛИ на сервере писем
   // больше, чем загружено локально (тогда при прокрутке идёт догрузка с сервера).
-  coreFolders.forEach(folder=>{const localCount=messages.filter(message=>message.folder_id===folder.id).length;folderHasMore.set(folder.id,localCount===MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});
+  // Счётчик писем по папкам считаем за один проход: messages.filter внутри
+  // цикла по папкам давал квадратичный обход (десятки папок на десятки тысяч
+  // писем) и заметно грузил процессор на каждой перезагрузке данных.
+  {const localCounts=new Map();messages.forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
+   coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount===MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});}
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;
@@ -459,7 +513,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   renderAccountSettings(accounts,foldersByAccount,calendarData.calendars||[]);
   if(storage)applyStorageStatus(storage);
   if(Object.keys(uiCatalog).length)applyUiCatalog(uiCatalog);
-  requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;msgsEl.scrollTop=messageScroll;});
+  requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;setMessageScrollTop(messageScroll);});
 };
 let accountOauthState='';
 let accountPasswordProvider='generic';

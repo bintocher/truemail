@@ -12,6 +12,18 @@ pub struct QueuedAction {
 /// Результат сохранения календарей/контактов провайдера: счётчики плюс
 /// смысловые изменения встреч (для будущих уведомлений - показ отдельным
 /// этапом, здесь только вычисляем дельту).
+/// Состояние папки для слепка синхронизации: по нему решается, менялось ли что-то
+/// в дереве папок и счётчиках писем.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct FolderState {
+    pub remote_path: String,
+    pub display_name: Option<String>,
+    pub role: Option<String>,
+    pub parent_id: Option<i64>,
+    pub unread_count: i64,
+    pub total_count: i64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AuxiliarySaveResult {
     pub calendars: usize,
@@ -753,6 +765,26 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Слепок состояния папок аккаунта - по записи на папку: путь, имя, роль,
+    /// родитель и счётчики писем. Синхронизация сравнивает слепок до и после
+    /// сохранения папок: появившаяся, переименованная, переехавшая папка или
+    /// сдвинувшиеся счётчики означают, что интерфейсу есть что перечитать.
+    /// Именно по папкам, а не суммами: +1 в одной папке и -1 в другой дали бы
+    /// одинаковую сумму, и изменение осталось бы незамеченным. Сравниваем
+    /// типизированные записи, а не склеенную строку - разделитель мог бы
+    /// встретиться в имени папки и спрятать изменение.
+    pub async fn folder_state_signature(&self, account_id: i64) -> Result<Vec<FolderState>> {
+        Ok(sqlx::query_as::<_, FolderState>(
+            "SELECT remote_path, display_name, role, parent_id,
+                    COALESCE(unread_count, 0) AS unread_count,
+                    COALESCE(total_count, 0) AS total_count
+               FROM folders WHERE account_id = ? ORDER BY remote_path",
+        )
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     /// Remove remote folders absent from a complete provider discovery.
@@ -2296,6 +2328,19 @@ impl Db {
         let mut messages = rows.into_iter().map(MessageMeta::from).collect::<Vec<_>>();
         self.attach_labels(&mut messages).await?;
         Ok(messages)
+    }
+
+    /// Дата самого старого письма папки. Нужна догрузке как курсор: фронтенд
+    /// вёл его по своему списку писем, но письма, не попавшие в фильтр открытой
+    /// умной папки, туда не добавлялись, курсор не двигался, и следующий проход
+    /// запрашивал у сервера ту же самую страницу.
+    pub async fn folder_oldest_message_date(&self, folder_id: i64) -> Result<Option<String>> {
+        let value: Option<Option<String>> =
+            sqlx::query_scalar("SELECT MIN(date) FROM messages WHERE folder_id = ?")
+                .bind(folder_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(value.flatten().filter(|date| !date.is_empty()))
     }
 
     /// Cursor page ordered by `(date DESC, id DESC)`. Unlike OFFSET this stays
@@ -5154,6 +5199,128 @@ mod notification_lookup_tests {
         .await
         .expect("insert message");
         message_id
+    }
+
+    #[tokio::test]
+    async fn folder_signature_reacts_to_new_folders_and_counters() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+
+        let before = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        seed_folder(&db, account_id, "Archive", Some("archive")).await;
+        let after_new_folder = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        assert_ne!(
+            before, after_new_folder,
+            "появление папки должно менять слепок"
+        );
+
+        sqlx::query("UPDATE folders SET unread_count = 7 WHERE id = ?")
+            .bind(inbox_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("update counter");
+        let after_counter = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        assert_ne!(
+            after_new_folder, after_counter,
+            "сдвиг счётчика писем должен менять слепок"
+        );
+
+        let repeated = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        assert_eq!(
+            after_counter, repeated,
+            "без изменений слепок обязан совпадать"
+        );
+
+        // Встречные изменения в разных папках не должны компенсировать друг
+        // друга: по суммам слепок остался бы прежним, и обновление потерялось.
+        let archive_id: i64 =
+            sqlx::query_scalar("SELECT id FROM folders WHERE account_id = ? AND remote_path = ?")
+                .bind(account_id)
+                .bind("Archive")
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("archive id");
+        sqlx::query("UPDATE folders SET unread_count = unread_count - 1 WHERE id = ?")
+            .bind(inbox_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("decrement inbox");
+        sqlx::query("UPDATE folders SET unread_count = unread_count + 1 WHERE id = ?")
+            .bind(archive_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("increment archive");
+        let after_swap = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        assert_ne!(
+            after_counter, after_swap,
+            "перенос непрочитанного между папками обязан менять слепок"
+        );
+
+        sqlx::query("UPDATE folders SET display_name = 'Входящие' WHERE id = ?")
+            .bind(inbox_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("rename folder");
+        let after_rename = db
+            .folder_state_signature(account_id)
+            .await
+            .expect("signature");
+        assert_ne!(
+            after_swap, after_rename,
+            "переименование папки обязано менять слепок"
+        );
+    }
+
+    #[tokio::test]
+    async fn oldest_message_date_is_the_backfill_cursor() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        assert_eq!(
+            db.folder_oldest_message_date(folder_id)
+                .await
+                .expect("oldest date"),
+            None,
+            "у пустой папки курсора нет"
+        );
+
+        for (uid, date) in [(1_i64, "2026-07-20T10:00:00Z"), (2, "2024-01-02T03:04:05Z")] {
+            sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, subject, date)                  VALUES (?, ?, ?, 'тест', ?)",
+            )
+            .bind(account_id)
+            .bind(folder_id)
+            .bind(uid)
+            .bind(date)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert message");
+        }
+
+        assert_eq!(
+            db.folder_oldest_message_date(folder_id)
+                .await
+                .expect("oldest date")
+                .as_deref(),
+            Some("2024-01-02T03:04:05Z"),
+            "курсором должна быть самая старая дата папки"
+        );
     }
 
     #[tokio::test]
