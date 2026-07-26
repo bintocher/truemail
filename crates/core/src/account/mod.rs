@@ -67,6 +67,20 @@ pub struct InboxSyncResult {
     pub new_messages: usize,
     pub had_baseline: bool,
     pub new_message_ids: Vec<i64>,
+    /// Синхронизация что-то изменила в базе: скачаны письма, пришли удаления,
+    /// обновления флагов или сменившиеся проекции писем. Плановая переустановка
+    /// наблюдения без изменений даёт false - интерфейсу нечего перезагружать.
+    pub changed: bool,
+}
+
+/// Результат догрузки старых писем папки: сколько пришло с сервера и какая
+/// теперь самая старая дата в папке локально. Дату фронтенд использует курсором
+/// следующего прохода - по своему списку писем он её вычислить не может, если
+/// догруженные письма не подошли фильтру открытой умной папки.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct BackfillPage {
+    pub fetched: usize,
+    pub oldest: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -764,22 +778,31 @@ impl AccountManager {
         // действительно новых remote_id, а не тем, что уже успело устареть.
         let unknown_remote_ids = self.db.unknown_remote_ids(account.id, &remote_ids).await?;
         let new_messages = unknown_remote_ids.len();
+        let folders_before = self.db.folder_state_signature(account.id).await?;
         self.db
             .save_discovered_folders(account.id, &discovery.folders)
             .await?;
-        self.db
+        let folders_changed = self.db.folder_state_signature(account.id).await? != folders_before;
+        let snapshot_removed = self
+            .db
             .reconcile_imap_snapshot(account.id, &discovery.server_uids, &discovery.reset_folders)
             .await?;
-        self.db
+        // Счётчики примененных изменений собираем по ходу: по ним решается,
+        // поднимать ли перезагрузку данных в интерфейсе.
+        let folders_reconciled = self
+            .db
             .reconcile_discovered_folders(account.id, &discovery.folders)
             .await?;
-        self.db
+        let vanished = self
+            .db
             .apply_imap_vanished(account.id, &discovery.deleted_uids)
             .await?;
-        self.db
+        let flags_applied = self
+            .db
             .apply_imap_flag_updates(account.id, &discovery.flag_updates)
             .await?;
-        self.db
+        let projections = self
+            .db
             .reconcile_remote_projections(
                 account.id,
                 &discovery.messages,
@@ -803,14 +826,28 @@ impl AccountManager {
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
-        if let Err(error) = self.db.process_mail_rules().await {
-            tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
-        }
+        let rules_applied = match self.db.process_mail_rules().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
+                0
+            }
+        };
+        let changed = downloaded > 0
+            || folders_changed
+            || snapshot_removed > 0
+            || folders_reconciled > 0
+            || vanished > 0
+            || flags_applied > 0
+            || projections > 0
+            || rules_applied > 0
+            || !discovery.reset_folders.is_empty();
         Ok(InboxSyncResult {
             downloaded,
             new_messages,
             had_baseline,
             new_message_ids,
+            changed,
         })
     }
 
@@ -865,7 +902,7 @@ impl AccountManager {
         folder_id: i64,
         before: &str,
         limit: usize,
-    ) -> Result<usize> {
+    ) -> Result<BackfillPage> {
         let folder = self.db.folder(folder_id).await?;
         let Some(account) = self
             .db
@@ -875,7 +912,7 @@ impl AccountManager {
             .find(|item| item.id == folder.account_id)
         else {
             tracing::warn!(folder_id, "догрузка: аккаунт папки не найден");
-            return Ok(0);
+            return Ok(BackfillPage::default());
         };
         tracing::info!(folder_id, before, provider = ?account.provider, remote_path = %folder.remote_path, "догрузка: запрос старых писем с сервера");
         let credential = self.mail_credential(&account).await?;
@@ -895,7 +932,12 @@ impl AccountManager {
             "догрузка: сервер вернул письма"
         );
         if messages.is_empty() {
-            return Ok(0);
+            // Курсор всё равно отдаём: он двигает следующий проход даже когда
+            // сервер на этой границе ничего не дал.
+            return Ok(BackfillPage {
+                fetched: 0,
+                oldest: self.db.folder_oldest_message_date(folder_id).await?,
+            });
         }
         let count = messages.len();
         // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
@@ -903,7 +945,10 @@ impl AccountManager {
             .save_discovered_messages(account.id, &messages, true)
             .await?;
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
-        Ok(count)
+        Ok(BackfillPage {
+            fetched: count,
+            oldest: self.db.folder_oldest_message_date(folder_id).await?,
+        })
     }
 
     /// Очистить кэш всех аккаунтов по их глубине хранения. Вызывается ОДИН РАЗ

@@ -1574,7 +1574,7 @@ pub async fn fetch_older_messages(
     folder_id: i64,
     before: String,
     limit: Option<i64>,
-) -> CmdResult<usize> {
+) -> CmdResult<truemail_core::account::BackfillPage> {
     Ok(core(&state)
         .await?
         .accounts
@@ -2919,9 +2919,16 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             } else {
                                 watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
+                            // Данные меняются не на каждой итерации: IDLE
+                            // переустанавливается сам примерно раз в 90 секунд, и
+                            // раньше каждая такая переустановка поднимала во
+                            // фронтенде полную перезагрузку данных (страница писем
+                            // по каждой папке, контакты, календари) вхолостую.
+                            let mail_changed;
                             match inbox_sync {
                                 Ok(result) => {
                                     let ids = notification_ids(&result);
+                                    mail_changed = result.changed || !ids.is_empty();
                                     if !ids.is_empty() {
                                         // Реальные новые письма логируем на info.
                                         tracing::info!(
@@ -2951,15 +2958,25 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                         );
                                     }
                                 }
-                                Err(error) => tracing::error!(
-                                    account = %truemail_core::logging::mask_email(&watch_account.email),
-                                    %error,
-                                    "не удалось дозагрузить входящие"
-                                ),
+                                Err(error) => {
+                                    // Синхронизация не атомарна: папки, удаления
+                                    // и часть писем могли уже лечь в базу до
+                                    // ошибки. Считаем данные изменившимися -
+                                    // лишняя перезагрузка дешевле, чем список,
+                                    // застрявший до следующего удачного прохода.
+                                    mail_changed = true;
+                                    tracing::error!(
+                                        account = %truemail_core::logging::mask_email(&watch_account.email),
+                                        %error,
+                                        "не удалось дозагрузить входящие"
+                                    );
+                                }
                             }
                             watch_syncing.lock().await.remove(&watch_account.id);
                             let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
-                            let _ = watch_app.emit("truemail-data-changed", watch_account.id);
+                            if mail_changed {
+                                let _ = watch_app.emit("truemail-data-changed", watch_account.id);
+                            }
                         }
                         Err(error) => {
                             // Разрыв простаивающего IDLE сервером/NAT (10054, close_notify,
@@ -4129,6 +4146,7 @@ mod update_tests {
                 new_messages: 50,
                 had_baseline: false,
                 new_message_ids: vec![1, 2, 3],
+                changed: true,
             })
             .is_empty(),
             "первый проход без базовой линии не должен вываливать историю"
@@ -4139,6 +4157,7 @@ mod update_tests {
                 new_messages: 1,
                 had_baseline: true,
                 new_message_ids: vec![42],
+                changed: true,
             })
             .to_vec(),
             vec![42_i64]
@@ -4149,6 +4168,7 @@ mod update_tests {
                 new_messages: 0,
                 had_baseline: true,
                 new_message_ids: vec![],
+                changed: true,
             })
             .is_empty()
         );

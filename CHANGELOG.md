@@ -7,6 +7,30 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-26
+
+### Fixed
+
+- The app no longer downloads mail and burns CPU while nobody is using it.
+  Smart-folder backfill ran in an endless loop: it pulled old messages from the
+  server, restarted itself when those messages hit the database, and kept going
+  for days. A day of uptime produced thousands of pointless server round-trips
+  and grew memory usage to several gigabytes.
+- The message list no longer grows in memory without bound: at most 8000 recent
+  messages are kept, and the open message plus everything on screen stay.
+- Data refresh after a sync runs at most once every 5 seconds, and is deferred
+  while the window is hidden - previously every sync event reloaded all folders,
+  contacts and calendars in full.
+- The routine mail-watch reconnect (roughly every 90 seconds) no longer triggers
+  a full data reload when nothing changed; new mail, deletions and flag changes
+  still refresh the list immediately.
+- The "Message sources for smart folders" settings block no longer restarts the
+  message list on every background refresh - only when the user changes the
+  sources. Previously this reset the list scroll position.
+- Restoring the scroll position after a data refresh is no longer mistaken for
+  user scrolling and no longer triggers a server fetch.
+- Message-list bookkeeping is faster: the per-folder pass is no longer quadratic.
+
 ## [0.2.0] - 2026-07-25
 
 ### Added

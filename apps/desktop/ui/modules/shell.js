@@ -89,6 +89,50 @@ function forgetMessages(ids){
   gone.forEach(id=>selectedMessageIds.delete(id));
 }
 window.forgetMessages=forgetMessages;
+// Потолок писем в памяти WebView. Без него список рос монотонно: догрузка
+// добавляла письма, а убирать их было некому, и за сутки работы массив
+// разрастался до десятков тысяч записей вместе со всеми копиями, которые
+// делают перерисовка и слияние при перезагрузке данных.
+const MESSAGE_MEMORY_LIMIT=8000;
+// Потолок мягкий и вытесняет только то, чего сейчас нет на экране: строки
+// текущего показа, открытое письмо, выделение, страницы открытой умной папки и
+// только что загруженную страницу сохраняем всегда. Иначе обрезка выбрасывала бы
+// письма из-под пользователя и останавливала прокрутку: свежая страница
+// вылетала бы сразу после загрузки, курсор не двигался, и список замирал.
+function trimMessages(list,keepIds=null){
+  if(list.length<=MESSAGE_MEMORY_LIMIT)return list;
+  const pinned=new Set(currentMessageRows.map(message=>message.id));
+  if(activeMessage)pinned.add(activeMessage.id);
+  selectedMessageIds.forEach(id=>pinned.add(id));
+  if(keepIds)keepIds.forEach(id=>pinned.add(id));
+  const smartFolder=currentSmartIndex!==null?smartFolders[currentSmartIndex]:null;
+  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).forEach(message=>pinned.add(message.id));
+  const kept=list.filter(message=>pinned.has(message.id));
+  const rest=list.filter(message=>!pinned.has(message.id)).sort(byDateDesc);
+  return kept.concat(rest.slice(0,Math.max(0,MESSAGE_MEMORY_LIMIT-kept.length)));
+}
+window.trimMessages=trimMessages;
+// Умные папки, для которых догрузка с сервера уже не даёт совпадений. Признак
+// снимается только когда пользователь сам открывает папку.
+const smartServerExhausted=new Map();
+// Курсор догрузки по папкам-источникам: самая старая дата, которую ядро уже
+// видело в папке локально. Ключ - id папки.
+const smartBackfillCursor=new Map();
+// Состояние догрузки удалённой умной папки держать незачем - иначе карты копили
+// бы ключи несуществующих папок.
+function forgetSmartFolderState(folderId){
+  smartServerExhausted.delete(folderId);
+  smartCircleFetched.delete(folderId);
+  smartHasMore.delete(folderId);
+  smartBackfillVisited.delete(folderId);
+  coreSmartRows.delete(folderId);
+}
+window.forgetSmartFolderState=forgetSmartFolderState;
+// Отдал ли сервер хоть что-то за текущий круг обхода папок-источников. Круг
+// длиннее одного прохода (за проход берётся SMART_BACKFILL_FOLDERS папок),
+// поэтому признак накопительный: по одному пустому проходу судить о конце
+// истории нельзя. Ключ - id умной папки.
+const smartCircleFetched=new Map();
 let coreFolders=[];
 let coreAccounts=[];
 // 16 нейтральных цветов аккаунта, читаемых в светлой и тёмной теме.
@@ -200,6 +244,7 @@ async function loadNextTagPage(){
     if(epoch!==tagPagingEpoch)return;
     const known=new Set(messages.map(message=>message.id));
     messages.push(...page.filter(message=>!known.has(message.id)));
+    messages=trimMessages(messages,page.map(message=>message.id));
     // Курсор двигаем по последней строке страницы, даже если письмо уже было в
     // памяти. Дата пустая - передаём пустую строку, а не null: null означал бы
     // "начни сначала", и страница вернулась бы та же самая.
@@ -212,9 +257,14 @@ async function loadNextTagPage(){
 }
 window.loadNextTagPage=loadNextTagPage;
 window.resetTagPaging=tag=>{tagPagingEpoch++;tagHasMore.delete(tag);tagCursor.delete(tag);};
-async function loadNextMessagePage(){
+// serverBackfill разрешает догрузку старых писем с сервера. Его ставят только
+// пути, идущие от действия пользователя (прокрутка до конца, автодобор короткого
+// списка под счётчиком AUTO_FILL_LIMIT). Фоновая перезагрузка данных на сервер
+// не ходит - иначе запись догруженных писем в базу снова поднимала бы
+// перезагрузку, и цикл не заканчивался бы никогда.
+async function loadNextMessagePage(serverBackfill=false){
   if(currentTagName!=null){await loadNextTagPage();return;}
-  if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
+  if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex,false,serverBackfill);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
     const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId);
@@ -228,10 +278,15 @@ async function loadNextMessagePage(){
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
       // выборка по курсору может вернуть уже показанные письма (дубли по
       // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
-      if(!fresh.length&&cursor.date){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetched=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
-      messages.push(...fresh);page.forEach(message=>known.add(message.id));folderHasMore.set(folderId,fresh.length>0);}
+      let backfillDone=false;
+      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));
+      // Концом папки считаем только удавшийся проход: пустая страница без похода
+      // на сервер и упавший запрос догрузки его не подтверждают - письма на
+      // сервере есть, и прокрутка пользователя должна их достать.
+      if(fresh.length||backfillDone)folderHasMore.set(folderId,fresh.length>0);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
-  }catch(error){console.error('truemail pagination:',error);paginationFailed=true;}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
+  }catch(error){console.error('truemail pagination:',error);paginationFailed=true;}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled(serverBackfill);}
 }
 // Если письма не заполнили экран (короткий список), а на сервере их больше -
 // подгружаем следующую порцию автоматически, не дожидаясь прокрутки. Подряд
@@ -241,17 +296,47 @@ async function loadNextMessagePage(){
 // останавливаем, иначе он бился бы в неё без остановки.
 const AUTO_FILL_LIMIT=5;
 let autoFillStreak=0,paginationFailed=false;
-function resetAutoFill(){autoFillStreak=0;paginationFailed=false;}
+// Признак "серию автодобора начал пользователь": resetAutoFill зовут только
+// пользовательские пути (открытие папки, метки, умной папки, прокрутка). Пока
+// признак стоит, автодобор короткого списка вправе сходить на сервер - иначе
+// папка, где локально писем меньше экрана, не догрузилась бы никогда: полосы
+// прокрутки нет, а значит и события scroll от пользователя не будет.
+let autoFillUserInitiated=false;
+function resetAutoFill(){autoFillStreak=0;paginationFailed=false;autoFillUserInitiated=true;}
 window.resetAutoFill=resetAutoFill;
-function ensureListFilled(){
+// allowServer=true только на путях от действия пользователя. Автодобор после
+// фоновой перезагрузки данных добирает список из локальной базы и на сервер не
+// ходит - иначе фон снова запускал бы догрузку и цикл замыкался.
+function ensureListFilled(allowServer=false){
   const el=document.getElementById('msgs');if(!el)return;
   if(loadingMoreMessages||loadingSmartCoverage||paginationFailed||autoFillStreak>=AUTO_FILL_LIMIT)return;
   const hasMore=currentTagName!=null?tagHasMore.get(currentTagName)!==false:currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
-  if(hasMore&&el.scrollHeight<=el.clientHeight+40){autoFillStreak++;setTimeout(()=>loadNextMessagePage(),0);}
+  // Автодобор ходит и на сервер, но только пока не исчерпан AUTO_FILL_LIMIT.
+  // Счётчик обнуляется исключительно действием пользователя (открытие папки,
+  // прокрутка), поэтому фоновая перезагрузка данных цикл не перезапускает.
+  if(hasMore&&el.scrollHeight<=el.clientHeight+40){
+    const server=allowServer||autoFillUserInitiated;
+    autoFillStreak++;
+    if(autoFillStreak>=AUTO_FILL_LIMIT)autoFillUserInitiated=false;
+    setTimeout(()=>loadNextMessagePage(server),0);
+  // Серия автодобора закончилась: список заполнен или догружать нечего. Право
+  // ходить на сервер снимаем сразу, иначе следующая фоновая перезагрузка
+  // подхватила бы флаг, оставшийся от давнего действия пользователя.
+  }else autoFillUserInitiated=false;
 }
 window.setListLoading=setListLoading;
 window.ensureListFilled=ensureListFilled;
-msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage();}},{passive:true});
+// Прокрутку списка мы двигаем и сами: восстанавливаем позицию после
+// перезагрузки данных, уводим к письму по клавише. Такое событие scroll не
+// должно считаться просьбой пользователя догрузить письма - иначе фоновая
+// перезагрузка снова уходила бы за письмами на сервер. Отличаем по времени:
+// событие приходит в том же кадре, что и присваивание.
+let programmaticScrollAt=0;
+function setMessageScrollTop(value){programmaticScrollAt=performance.now();msgsEl.scrollTop=value;}
+window.setMessageScrollTop=setMessageScrollTop;
+msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});
+  if(performance.now()-programmaticScrollAt<250)return;
+  if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage(true);}},{passive:true});
 
 /* thread action buttons -> compose */
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=()=>{
