@@ -205,7 +205,17 @@ window.corePageSize = 100;
     reloadTimer = setTimeout(() => { runReload().catch(console.error); }, Math.max(0, wait));
   }
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && reloadPending) scheduleReload(0);
+    if (document.hidden) {
+      // Окно скрыто: держать в памяти разметку списка и накопленные страницы
+      // незачем. Освобождаем и помечаем, что при возврате данные надо перечитать.
+      window.releaseHiddenMemory?.();
+      reloadPending = true;
+      return;
+    }
+    // Сначала рисуем из того, что осталось в памяти - список появляется сразу,
+    // а не через паузу троттлинга перезагрузки.
+    window.restoreAfterHidden?.();
+    if (reloadPending) scheduleReload(0);
   });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
@@ -231,6 +241,10 @@ window.corePageSize = 100;
   // список поверх свежего.
   let coreReloadChain = null;
   window.reloadCoreData = () => {
+    // Окно скрыто - данные читать некому: список всё равно очищен ради памяти, а
+    // перезагрузка наполнила бы его заново. Прямые вызовы приходят и из таймеров
+    // первых секунд после запуска, поэтому проверка тут, а не только в runReload.
+    if (document.hidden) { reloadPending = true; return Promise.resolve(); }
     const run = async () => {
       const accounts = await window.tm.listAccounts();
       if (accounts.length) await loadCoreData(accounts);
@@ -266,7 +280,18 @@ window.corePageSize = 100;
       await window.reloadMailRules?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
-      else await loadCoreData(accounts);
+      // Стартовая загрузка тоже наполняет список: пока она идёт, освобождение
+      // памяти при скрытом окне должно её дождаться, иначе очистка сработает
+      // впустую и список тут же наполнится заново.
+      else {
+        try { await loadCoreData(accounts); }
+        finally {
+          // Запуск свёрнутым (автозагрузка в трей) или сворачивание прямо во
+          // время стартовой загрузки: разметка успела построиться в скрытом окне,
+          // поэтому освобождаем сразу - обработчик сворачивания это пропустил.
+          if (document.hidden) { window.releaseHiddenMemory?.(); reloadPending = true; }
+        }
+      }
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
       if (accounts.length) {

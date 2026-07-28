@@ -134,6 +134,17 @@
   .listhead{padding:12px 14px 10px;border-bottom:1px solid var(--border);display:flex;flex-direction:column;gap:10px;}
   .list-options{position:absolute;top:48px;right:10px;z-index:35;width:210px;padding:8px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:4px;}
   .listhead{position:relative}.list-options label,.list-options button{padding:7px 8px;border:0;background:transparent;color:var(--text);font:inherit;text-align:left;border-radius:7px;cursor:pointer}.list-options label:hover,.list-options button:hover{background:var(--hover)}
+  /* Кнопка сброса фильтра: стоит слева от воронки и появляется, только когда
+     фильтр что-то отсекает. Подсказка со списком условий раскрывается по
+     наведению - через CSS, чтобы не держать обработчики на каждую строку. */
+  .filter-clear-wrap{position:relative;display:flex}
+  .filter-clear-wrap.hidden{display:none}
+  /* Воронку не подкрашиваем: рядом стоит обычная кнопка фильтра, и отличать
+     их должен красный крестик, а не второй цвет всей иконки. */
+  .filter-active-tip{position:absolute;top:calc(100% + 6px);right:0;z-index:40;min-width:190px;max-width:280px;padding:8px 10px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);display:none;text-align:left}
+  .filter-clear-wrap:hover .filter-active-tip,.filter-clear-wrap:focus-within .filter-active-tip{display:block}
+  .filter-active-head{font-size:12px;color:var(--text-3,#888);margin-bottom:4px}
+  .filter-active-row{font-size:13px;padding:2px 0;overflow-wrap:anywhere}
   .filter-text{padding:2px 2px 6px;border-bottom:1px solid var(--border);margin-bottom:4px}.filter-text input{width:100%;border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:7px;padding:7px 9px;font:inherit;font-size:13px;outline:none}.filter-text input:focus{border-color:var(--accent)}
   .listhead .row1{display:flex;align-items:center;justify-content:space-between;gap:8px;}
   .listhead h2{margin:0;font-size:15px;letter-spacing:-.01em;} .listhead .sub{font-size:12px;color:var(--text-3);font-weight:400;margin-left:6px;}

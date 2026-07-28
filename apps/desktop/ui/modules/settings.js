@@ -28,13 +28,25 @@ function renderAccountColorPicker(card,account){
     };
     grid.appendChild(swatch);
   });
+  // Обработчик на document живёт ровно столько, сколько живёт сама палитра.
+  // Раньше он вешался и не снимался, а renderAccountSettings перерисовывает
+  // карточки на каждой фоновой перезагрузке данных: за сутки набегали сотни
+  // обработчиков, каждый держал в памяти уже выброшенную из документа палитру со
+  // всеми её кнопками, и сборщик мусора не мог их освободить.
   document.addEventListener('click',close);
+  colorPickerCleanups.push(()=>document.removeEventListener('click',close));
   holder.append(button,grid);
+}
+// Снимаем обработчики палитр предыдущего рендера настроек.
+const colorPickerCleanups=[];
+function releaseAccountColorPickers(){
+  colorPickerCleanups.splice(0).forEach(cleanup=>cleanup());
 }
 
 async function renderSignatureSettings(card,account){const body=card.querySelector('.cb'),panel=document.createElement('section');panel.className='signature-settings';panel.innerHTML=`<div class="t">${L('Подписи','Signatures')}</div><div class="d">${L('Разные подписи для новых писем и ответов.','Separate signatures for new messages and replies.')}</div><div class="signature-grid"></div>`;body.appendChild(panel);const grid=panel.querySelector('.signature-grid');try{const values=await accountSignatures(account.id,true);for(const kind of ['new','reply']){const value=values.find(item=>item.kind===kind)||{body_html:'',enabled:false};const item=document.createElement('div');item.className='signature-item';item.innerHTML=`<div class="signature-item-head"><strong>${kind==='new'?L('Новое письмо','New message'):L('Ответ','Reply')}</strong><label><input type="checkbox"${value.enabled?' checked':''}> ${L('Включена','Enabled')}</label></div><div class="signature-editor" contenteditable="true" data-ph="${L('Текст подписи','Signature text')}"></div><button class="btn sm signature-save" type="button">${L('Сохранить','Save')}</button>`;const editor=item.querySelector('.signature-editor'),enabled=item.querySelector('input');editor.innerHTML=value.body_html||'';item.querySelector('.signature-save').onclick=async()=>{try{await window.tm.saveSignature(account.id,kind,editor.innerHTML,enabled.checked);signatureCache.delete(account.id);await accountSignatures(account.id);showToast(L('Подпись сохранена','Signature saved'));}catch(error){showToast(error.message||String(error));}};grid.appendChild(item);}}catch(error){panel.querySelector('.d').textContent=error.message||String(error);}}
 
 function renderAccountSettings(accounts,foldersByAccount,calendars){
+  releaseAccountColorPickers();
   const page=document.getElementById('set-accounts');page.querySelectorAll('.account-card').forEach(card=>card.remove());
   accounts.forEach((account,index)=>{const folders=foldersByAccount[index]||[],accountCalendars=calendars.filter(cal=>cal.account_id===account.id);const card=document.createElement('div');card.className='card account-card';card.innerHTML=`<div class="ch"><span class="ava ava-26 account-ava" style="background:${accountColorById(account.id)}"></span><div class="grow"><div class="account-name"></div><div class="account-email"></div><div class="account-stats"></div></div><div class="account-actions"><button type="button" class="btn sm account-rename"><i data-i="edit"></i>${L('Переименовать','Rename')}</button><button type="button" class="btn sm account-folders"><i data-i="folder"></i>${L('Папки','Folders')}</button><button type="button" class="btn sm account-reconnect"><i data-i="lock"></i>${L('Переподключить','Reconnect')}</button></div></div><div class="cb"><div class="frow"><div class="fl"><div class="t">${L('Цвет аккаунта','Account color')}</div><div class="d">${L('Для аватаров писем и панели папок.','For message avatars and the folder panel.')}</div></div><div class="fc"><div class="account-colors"></div></div></div><div class="t" style="margin-top:14px">${L('Хранить письма локально','Keep mail locally')}</div><div class="d">${L('Письма старше выбранного срока автоматически удаляются из локального кэша (на сервере остаются). Свежие письма кэшируются целиком и открываются мгновенно.','Messages older than the selected period are automatically removed from the local cache (they stay on the server). Recent messages are cached in full and open instantly.')}</div><div class="account-retention"><input type="number" class="inp ret-num" min="1" max="999" value="1"><select class="sel ret-unit"><option value="1">${L('дней','days')}</option><option value="7">${L('недель','weeks')}</option><option value="30">${L('месяцев','months')}</option></select><label class="ret-unlim"><input type="checkbox" class="ret-unlimited"> ${L('без ограничений','no limit')}</label></div><div class="t" style="margin-top:14px">${L('Календари и адресные книги определяются автоматически по адресу аккаунта.','Calendars and address books are detected automatically from the account address.')}</div><div class="account-calendars"></div></div>`;card.querySelector('.ava').textContent=(account.display_name||account.email)[0].toUpperCase();card.querySelector('.account-name').textContent=account.display_name||account.email;card.querySelector('.account-email').textContent=account.email;card.querySelector('.account-stats').textContent=L(`${folders.length} папок · ${accountCalendars.length} календарей`,`${folders.length} folders · ${accountCalendars.length} calendars`);card.querySelector('.account-rename').onclick=async()=>{const name=prompt(L('Название аккаунта','Account name'),account.display_name||account.email);if(!name||name.trim()===account.display_name)return;try{await window.tm.renameAccount(account.id,name.trim());await window.reloadCoreData();showToast(L('Название аккаунта сохранено','Account name saved'));}catch(error){showToast(error.message||String(error));}};card.querySelector('.account-folders').onclick=()=>setSection('folders');card.querySelector('.account-reconnect').onclick=()=>showAccountWizard(account.email);const chips=card.querySelector('.account-calendars');(accountCalendars.length?accountCalendars:[{name:L('Календарь ещё синхронизируется','Calendar is still syncing')}]).forEach(cal=>{const chip=document.createElement('span');chip.className='calendar-chip';chip.textContent=cal.name;chips.appendChild(chip);});
   renderAccountColorPicker(card,account);
@@ -62,9 +74,11 @@ const refreshSourceCount=(reloadList=false)=>{const enabled=coreFolders.filter(f
 function applyStorageStatus(storage){document.querySelector('.storage-big').textContent=formatBytes(storage.total_bytes);const path=document.querySelector('#set-storage .d.mono');if(path)path.textContent=storage.data_dir;document.querySelector('.storage-sub').textContent=`${wizardLocale==='en'?'database':'база'} ${formatBytes(storage.database_bytes)} · ${wizardLocale==='en'?'files':'файлы'} ${formatBytes(storage.blob_bytes)}`;const measured=Math.max(1,(storage.database_bytes||0)+(storage.blob_bytes||0));const db=document.querySelector('.usebar .seg-db'),blob=document.querySelector('.usebar .seg-blob');if(db)db.style.width=`${100*(storage.database_bytes||0)/measured}%`;if(blob)blob.style.width=`${100*(storage.blob_bytes||0)/measured}%`;}
 
 const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElementById('sortMenu'),filterButton=document.getElementById('filterBtn'),sortButton=document.getElementById('sortBtn');
-filterButton.onclick=e=>{e.stopPropagation();filterMenu.classList.toggle('hidden');sortMenu.classList.add('hidden');};sortButton.onclick=e=>{e.stopPropagation();sortMenu.classList.toggle('hidden');filterMenu.classList.add('hidden');};
+// Открыли фильтр - сразу ставим курсор в поле ввода: набирать текст можно
+// не целясь мышью. Фокус даём после снятия hidden, скрытый элемент его не берёт.
+filterButton.onclick=e=>{e.stopPropagation();const opened=filterMenu.classList.toggle('hidden')===false;sortMenu.classList.add('hidden');if(opened){const input=document.getElementById('filterText');input?.focus();input?.select();}};sortButton.onclick=e=>{e.stopPropagation();sortMenu.classList.toggle('hidden');filterMenu.classList.add('hidden');};
 document.addEventListener('click',event=>{if(!filterMenu.contains(event.target)&&!filterButton.contains(event.target))filterMenu.classList.add('hidden');if(!sortMenu.contains(event.target)&&!sortButton.contains(event.target))sortMenu.classList.add('hidden');});
-function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyReadIds.clear();window.resetAutoFill?.();}let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
+function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyReadIds.clear();window.resetAutoFill?.();window.forgetHiddenAnchor?.();}let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
   // Удержать письма, прочитанные в этом показе списка: они выпали из smartRows
   // (умная папка "непрочитанные") или из unread-фильтра только из-за смены seen.
   if(stickyReadIds.size){const present=new Set(rows.map(m=>m.id));stickyReadIds.forEach(id=>{if(present.has(id))return;const held=messages.find(m=>m.id===id);if(!held)return;
@@ -72,7 +86,33 @@ function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyRe
     // иначе перемещённое (архив/корзина) всплыло бы в чужой папке.
     const belongs=currentTagName!=null?(held.labels||[]).includes(currentTagName):currentFolderId!==null?held.folder_id===currentFolderId:true;
     if(belongs)rows.push(held);});}
-  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);}
+  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);window.updateFilterIndicator?.();}
+// Кнопка сброса фильтра появляется рядом с воронкой, только когда фильтр
+// действительно что-то отсекает. При наведении показывает, какие условия стоят -
+// иначе пользователю пришлось бы открывать меню, чтобы это вспомнить.
+const filterClearWrap=document.getElementById('filterClearWrap'),filterClearButton=document.getElementById('filterClearBtn'),filterActiveTip=document.getElementById('filterActiveTip');
+function activeFilterList(){
+  const labels=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.parentElement.querySelector('span')?.textContent?.trim()||input.dataset.filter);
+  const text=(document.getElementById('filterText')?.value||'').trim();
+  if(text)labels.unshift(`${L('Текст','Text')}: "${text}"`);
+  return labels;
+}
+function updateFilterIndicator(){
+  if(!filterClearWrap)return;
+  const labels=activeFilterList();
+  filterClearWrap.classList.toggle('hidden',labels.length===0);
+  if(!labels.length||!filterActiveTip)return;
+  filterActiveTip.innerHTML='';
+  const head=document.createElement('div');head.className='filter-active-head';head.textContent=L('Активные фильтры','Active filters');filterActiveTip.appendChild(head);
+  labels.forEach(label=>{const row=document.createElement('div');row.className='filter-active-row';row.textContent=label;filterActiveTip.appendChild(row);});
+}
+window.updateFilterIndicator=updateFilterIndicator;
+filterClearButton?.addEventListener('click',event=>{
+  event.stopPropagation();
+  filterMenu.querySelectorAll('input[type="checkbox"]').forEach(input=>{input.checked=false;});
+  const text=document.getElementById('filterText');if(text)text.value='';
+  applyListOptions(true);
+});
 filterMenu.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=()=>applyListOptions(true));document.getElementById('filterText')?.addEventListener('input',()=>applyListOptions(true));sortMenu.querySelectorAll('button').forEach(button=>button.onclick=()=>{sortMenu.dataset.sort=button.dataset.sort;sortMenu.classList.add('hidden');applyListOptions(true);});
 
 /* Ширины панелей. Пользователь задаёт их только мышью - за край панели;

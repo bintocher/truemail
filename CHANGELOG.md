@@ -7,6 +7,25 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-29
+
+### Added
+
+- A clear-filter button next to the funnel: it shows up only when a filter is
+  actually narrowing the list. Hovering lists the active conditions, clicking
+  removes all of them.
+- Opening the filter menu now puts the caret straight into the text field.
+
+### Fixed
+
+- Memory usage. The UI rendering process grew past a gigabyte; it now runs under
+  a heap cap and returns the excess to the system.
+- A leak in account settings: colour-picker handlers piled up on every
+  background data refresh and kept obsolete markup alive.
+- A hidden window now releases memory: the message list markup is dropped and is
+  not rebuilt while the window stays hidden. On return the list appears
+  immediately and scrolls back to the message you left off at.
+
 ## [0.2.1] - 2026-07-26
 
 ### Fixed

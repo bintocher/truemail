@@ -280,6 +280,9 @@ function createMessageRow(message,index){
   row.onclick=e=>{if(suppressClick)return;if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();lastSelectedMessageIndex=index;showMessage(message);};renderIcons(row);return row;
 }
 function renderMessageWindow(force=false){
+  // Окно скрыто - разметку не строим: её только что освободили ради памяти, и
+  // наполнять невидимый список заново незачем. Отрисуется при возврате окна.
+  if(document.hidden)return;
   messageRowHeight=Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--message-row-height'))||76;
   const list=msgsEl,total=currentMessageRows.length,viewport=Math.max(list.clientHeight,400),start=Math.max(0,Math.floor(list.scrollTop/messageRowHeight)-MESSAGE_WINDOW_OVERSCAN),end=Math.min(total,Math.ceil((list.scrollTop+viewport)/messageRowHeight)+MESSAGE_WINDOW_OVERSCAN);
   if(!force&&start===messageWindowStart&&end===messageWindowEnd)return;messageWindowStart=start;messageWindowEnd=end;
@@ -513,7 +516,10 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   renderAccountSettings(accounts,foldersByAccount,calendarData.calendars||[]);
   if(storage)applyStorageStatus(storage);
   if(Object.keys(uiCatalog).length)applyUiCatalog(uiCatalog);
-  requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;setMessageScrollTop(messageScroll);});
+  requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;setMessageScrollTop(messageScroll);
+    // Если окно было скрыто, позицию задаёт запомненное письмо, а не пиксели:
+    // список пришёл из базы заново и его высота изменилась.
+    window.restoreHiddenAnchor?.();});
 };
 let accountOauthState='';
 let accountPasswordProvider='generic';

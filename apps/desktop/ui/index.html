@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js"></script>
-  <link rel="stylesheet" href="styles.css?v=20260726-1">
+  <link rel="stylesheet" href="styles.css?v=20260729-1">
 </head>
 <body>
 
@@ -46,7 +46,7 @@
     <section class="list">
       <div class="listhead">
         <div class="row1"><div><h2 class="d-inline" data-i18n="navAllInbox">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
-          <div class="fields-inline"><button class="iconbtn" id="filterBtn" data-i18n-title="tipFilter" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" data-i18n-title="tipSort" title="Сортировка"><i data-i="sort"></i></button></div></div>
+          <div class="fields-inline"><div class="filter-clear-wrap hidden" id="filterClearWrap"><button class="iconbtn filter-clear" id="filterClearBtn" data-i18n-title="tipFilterClear" title="Сбросить фильтр"><i data-i="filterOff"></i></button><div class="filter-active-tip" id="filterActiveTip"></div></div><button class="iconbtn" id="filterBtn" data-i18n-title="tipFilter" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" data-i18n-title="tipSort" title="Сортировка"><i data-i="sort"></i></button></div></div>
         <div class="list-options hidden" id="filterMenu"><div class="filter-text"><input id="filterText" data-i18n-placeholder="filterPlaceholder" placeholder="Фильтр по тексту…" autocomplete="off"></div><label><input type="checkbox" data-filter="unread"> <span data-i18n="filterUnread">Только непрочитанные</span></label><label><input type="checkbox" data-filter="attachments"> <span data-i18n="filterAttachments">С вложениями</span></label><label><input type="checkbox" data-filter="flagged"> <span data-i18n="filterFlagged">Важные</span></label></div>
         <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc" data-i18n="sortNewest">Сначала новые</button><button data-sort="date-asc" data-i18n="sortOldest">Сначала старые</button><button data-sort="sender" data-i18n="sortSender">По отправителю</button><button data-sort="subject" data-i18n="sortSubject">По теме</button></div>
         <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount" data-i18n="selectedCountZero">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i><span data-i18n="selectAll">Выбрать все</span></button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i><span data-i18n="markRead">Прочитать</span></button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i><span data-i18n="actionArchive">В архив</span></button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i><span data-i18n="actionDelete">Удалить</span></button><button class="iconbtn ml-auto" id="bulkClear" data-i18n-title="tipClearSelection" title="Снять выделение"><i data-i="close"></i></button></div>
@@ -649,15 +649,15 @@
   </div>
 </div>
 
-<script src="modules/shell.js?v=20260726-1"></script>
+<script src="modules/shell.js?v=20260729-1"></script>
 <script src="modules/calendar-contacts.js?v=20260726-1"></script>
 <script src="modules/commands-accessibility.js?v=20260726-1"></script>
 <script src="modules/smart-rules.js?v=20260726-1"></script>
-<script src="modules/i18n-onboarding.js?v=20260726-1"></script>
-<script src="modules/mail.js?v=20260726-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260729-1"></script>
+<script src="modules/mail.js?v=20260729-1"></script>
 <script src="modules/composer.js?v=20260726-1"></script>
-<script src="modules/settings.js?v=20260726-1"></script>
-<script src="bridge.js?v=20260726-1"></script>
+<script src="modules/settings.js?v=20260729-1"></script>
+<script src="bridge.js?v=20260729-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>
