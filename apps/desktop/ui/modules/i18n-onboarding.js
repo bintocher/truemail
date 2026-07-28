@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260720-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260729-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -47,6 +47,9 @@ function relocalizeDynamic(){
     if(typeof renderRulesList==='function')renderRulesList();
     if(typeof renderContacts==='function')renderContacts();
     if(typeof updateSelectionUi==='function')updateSelectionUi();
+    // Подсказка активного фильтра собрана из подписей чекбоксов - после смены
+    // языка её надо пересобрать, иначе она осталась бы на прежнем языке.
+    if(typeof updateFilterIndicator==='function')updateFilterIndicator();
     const heading=document.querySelector('.listhead h2');
     if(heading){
       if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=folderTitle(folder);}

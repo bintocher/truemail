@@ -13,6 +13,10 @@ const ic={
   sun:S('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'),
   compose:S('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',16),
   filter:S('<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/>'),
+  // Сброс активного фильтра: та же воронка в полный размер, поверх неё красный
+  // крестик - он намеренно наезжает на её край, чтобы читался как "снять".
+  // Обводка вокруг крестика цветом фона отделяет его от линий воронки.
+  filterOff:S('<polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/><path d="M13 15l6 6M19 15l-6 6" stroke="var(--bg)" stroke-width="4.5"/><path d="M13 15l6 6M19 15l-6 6" stroke="var(--danger,#e5342a)" stroke-width="2.2"/>'),
   sort:S('<path d="M11 5h10M11 9h7M11 13h4M3 17l3 3 3-3M6 18V4"/>'),
   search:S('<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>'),
   reply:S('<polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',16),
@@ -112,6 +116,61 @@ function trimMessages(list,keepIds=null){
   return kept.concat(rest.slice(0,Math.max(0,MESSAGE_MEMORY_LIMIT-kept.length)));
 }
 window.trimMessages=trimMessages;
+// Окно скрыли (свернули в панель задач или в трей) - смотреть на список некому.
+// Освобождаем разметку списка: тысячи узлов строк с обработчиками и стилями
+// весят несоизмеримо больше, чем сами данные писем. Массивы писем при этом не
+// трогаем: список упорядочен, и пагинация продолжает его от самого старого
+// письма в памяти - вырезанный из середины кусок уже никогда не догрузился бы,
+// потому что страница за ним просто не запрашивается.
+let hiddenAnchorId=null,hiddenAnchorOffset=0,hiddenAnchorView='';
+// Ключ текущего раздела списка. Якорь прокрутки годится только для того же
+// раздела: пока окно скрыто, папку могли переключить с клавиатуры или из
+// уведомления, и старый id письма применился бы к чужому списку.
+function listViewKey(){return currentTagName!=null?`tag:${currentTagName}`:currentFolderId!==null?`folder:${currentFolderId}`:`smart:${smartFolders[currentSmartIndex??0]?.id??''}`;}
+function forgetHiddenAnchor(){hiddenAnchorId=null;hiddenAnchorView='';}
+window.forgetHiddenAnchor=forgetHiddenAnchor;
+function releaseHiddenMemory(){
+  const list=document.getElementById('msgs');
+  // Якорь - первое реально видимое письмо. Пиксельной позиции мало: после
+  // перезагрузки список приходит из базы заново, высота у него другая, и прежний
+  // scrollTop указал бы на чужое место. Берём именно видимое письмо, а не начало
+  // окна отрисовки - оно начинается выше видимой области на запас строк.
+  const scrollTop=list?list.scrollTop:0,anchorIndex=Math.min(Math.max(0,Math.floor(scrollTop/messageRowHeight)),Math.max(0,currentMessageRows.length-1));
+  hiddenAnchorId=currentMessageRows[anchorIndex]?.id??null;
+  hiddenAnchorOffset=Math.max(0,scrollTop-anchorIndex*messageRowHeight);
+  hiddenAnchorView=listViewKey();
+  if(list)list.replaceChildren();
+  messageWindowStart=-1;messageWindowEnd=-1;
+}
+window.releaseHiddenMemory=releaseHiddenMemory;
+// Окно вернули: список отрисовываем сразу из того, что осталось в памяти, не
+// дожидаясь фоновой перезагрузки - иначе пользователь несколько секунд смотрел
+// бы на пустое место. Свежие данные приедут следом и заменят показанное.
+function restoreAfterHidden(){
+  applyListOptions(false);
+  restoreHiddenAnchor(false);
+  // Пока окно было скрыто, автодобор не работал: если список короче экрана, он
+  // должен продолжиться теперь.
+  ensureListFilled();
+}
+// Возвращает список к письму, на котором пользователь остановился. Вызывается
+// дважды: сразу при показе окна и ещё раз после фоновой перезагрузки, которая
+// приходит позже и перерисовывает список заново. Поэтому первый вызов якорь не
+// забывает - иначе свежие данные встали бы на старую пиксельную позицию и
+// список прыгнул бы на числе новых писем сверху. Забываем якорь после
+// перезагрузки, при смене раздела и при прокрутке самим пользователем.
+function restoreHiddenAnchor(final=true){
+  if(hiddenAnchorId==null)return;
+  if(hiddenAnchorView!==listViewKey()){if(final)forgetHiddenAnchor();return;}
+  const index=currentMessageRows.findIndex(message=>message.id===hiddenAnchorId);
+  if(index<0){if(final)forgetHiddenAnchor();return;}
+  window.setMessageScrollTop?.(index*messageRowHeight+hiddenAnchorOffset);
+  renderMessageWindow(true);
+  if(final)forgetHiddenAnchor();
+}
+window.restoreAfterHidden=restoreAfterHidden;
+window.restoreHiddenAnchor=restoreHiddenAnchor;
+
 // Умные папки, для которых догрузка с сервера уже не даёт совпадений. Признак
 // снимается только когда пользователь сам открывает папку.
 const smartServerExhausted=new Map();
@@ -263,6 +322,11 @@ window.resetTagPaging=tag=>{tagPagingEpoch++;tagHasMore.delete(tag);tagCursor.de
 // не ходит - иначе запись догруженных писем в базу снова поднимала бы
 // перезагрузку, и цикл не заканчивался бы никогда.
 async function loadNextMessagePage(serverBackfill=false){
+  // Окно скрыли, пока добор стоял в очереди: наполнять невидимый список незачем,
+  // память только что освободили. Попытку возвращаем в счётчик - она не
+  // состоялась, и лимит автодобора не должен на неё тратиться. Вернётся окно -
+  // добор запустится заново.
+  if(document.hidden){if(autoFillStreak>0)autoFillStreak--;if(serverBackfill)autoFillUserInitiated=true;return;}
   if(currentTagName!=null){await loadNextTagPage();return;}
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex,false,serverBackfill);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
@@ -308,6 +372,7 @@ window.resetAutoFill=resetAutoFill;
 // фоновой перезагрузки данных добирает список из локальной базы и на сервер не
 // ходит - иначе фон снова запускал бы догрузку и цикл замыкался.
 function ensureListFilled(allowServer=false){
+  if(document.hidden)return;
   const el=document.getElementById('msgs');if(!el)return;
   if(loadingMoreMessages||loadingSmartCoverage||paginationFailed||autoFillStreak>=AUTO_FILL_LIMIT)return;
   const hasMore=currentTagName!=null?tagHasMore.get(currentTagName)!==false:currentFolderId!==null?folderHasMore.get(currentFolderId)!==false:(currentSmartIndex!==null&&smartHasMore.get(smartFolders[currentSmartIndex]?.id)!==false);
@@ -334,6 +399,10 @@ window.ensureListFilled=ensureListFilled;
 let programmaticScrollAt=0;
 function setMessageScrollTop(value){programmaticScrollAt=performance.now();msgsEl.scrollTop=value;}
 window.setMessageScrollTop=setMessageScrollTop;
+// Живой ввод в списке однозначно означает, что позицию выбирает пользователь -
+// запомненную забываем сразу, не дожидаясь события scroll: оно в первые
+// миллисекунды после показа окна считается программным.
+['wheel','pointerdown','keydown'].forEach(type=>msgsEl.addEventListener(type,forgetHiddenAnchor,{passive:true}));
 msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=requestAnimationFrame(()=>{messageWindowFrame=0;renderMessageWindow();});
   if(performance.now()-programmaticScrollAt<250)return;
   if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage(true);}},{passive:true});
