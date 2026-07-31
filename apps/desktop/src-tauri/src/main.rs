@@ -33,7 +33,9 @@ fn attachment_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
         .collect()
 }
 
-/// Завести пункт "Отправить -> truemail" один раз за установку.
+/// Завести пункт "Отправить -> truemail" один раз за установку. Работа идёт в
+/// отдельном потоке: ярлык создаёт powershell, и зависший на чужой машине
+/// процесс не должен задерживать показ окна.
 ///
 /// Установщик добавляет его только при обычной установке: при обновлении
 /// (updater запускает NSIS с /UPDATE) ярлыка ни у кого нет, и иначе фича не
@@ -43,17 +45,24 @@ fn attachment_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
 /// target/debug вместо установленной программы.
 #[cfg(all(windows, not(debug_assertions)))]
 fn ensure_sendto_shortcut(app: &tauri::AppHandle) {
-    let marker = data_dir().join("sendto-initialized");
+    // Маркер лежит в стандартном каталоге данных, а не в выбранном
+    // пользователем: иначе смена каталога выглядела бы как первый запуск и
+    // возвращала удалённый пункт. Деинсталлятор его убирает вместе с ярлыком.
+    let marker = default_data_dir().join("sendto-initialized");
     if marker.exists() {
         return;
     }
-    match commands::set_sendto_shortcut(app.clone(), true) {
+    let app = app.clone();
+    std::thread::spawn(move || match commands::set_sendto_shortcut(app, true) {
         Ok(()) => {
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             let _ = std::fs::write(&marker, "1");
             tracing::info!("добавлен пункт \"Отправить -> truemail\"");
         }
         Err(error) => tracing::warn!(error = %error.message, "пункт \"Отправить\" не создан"),
-    }
+    });
 }
 
 /// Открыть зашифрованное хранилище. Пока ключей нет (первый запуск), ядра тоже

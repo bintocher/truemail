@@ -23,5 +23,8 @@
   ${If} $UpdateMode <> 1
     SetShellVarContext current
     Delete "$APPDATA\Microsoft\Windows\SendTo\${PRODUCTNAME}.lnk"
+    ; Метка "пункт уже заводили" (ensure_sendto_shortcut в main.rs): без неё
+    ; переустановленная программа не завела бы пункт заново.
+    Delete "$LOCALAPPDATA\${PRODUCTNAME}\sendto-initialized"
   ${EndIf}
 !macroend

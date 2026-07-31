@@ -205,6 +205,7 @@ function refreshSystemIntegrationToggles(){
   if(autostartToggle)window.tm?.getAutostart?.().then(on=>autostartToggle.classList.toggle('on',!!on)).catch(console.error);
   if(sendToToggle)window.tm?.getSendtoShortcut?.().then(on=>sendToToggle.classList.toggle('on',!!on)).catch(console.error);
 }
+window.refreshSystemIntegrationToggles=refreshSystemIntegrationToggles;
 const checkUpdatesButton=document.getElementById('checkUpdates');
 if(checkUpdatesButton)checkUpdatesButton.onclick=async()=>{const status=document.getElementById('updateStatus');checkUpdatesButton.disabled=true;if(status)status.textContent=L('Проверяю новую версию…','Checking for a new version…');try{const info=await window.tm.checkForUpdate();if(info.available_version){if(status)status.textContent=L(`Доступна версия ${info.available_version}`,`Version ${info.available_version} is available`);showToast(L(`Доступен truemail ${info.available_version}`,`truemail ${info.available_version} is available`),L('Обновить','Update'),async()=>{if(status)status.textContent=L('Скачиваю и устанавливаю обновление…','Downloading and installing the update…');await window.tm.installUpdate();});}else if(status)status.textContent=L(`Установлена актуальная версия ${info.current_version}`,`Version ${info.current_version} is up to date`);}catch(error){if(status)status.textContent=error.message||String(error);}finally{checkUpdatesButton.disabled=false;}};
 const conversationsToggle=document.getElementById('conversationsToggle');

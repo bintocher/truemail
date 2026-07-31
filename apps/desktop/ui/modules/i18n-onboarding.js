@@ -74,7 +74,11 @@ async function finishOnboarding(){try{await window.tm?.setSetting('onboarding_co
   // Программу могли запустить из меню "Отправить" ещё до настройки: файлы всё
   // это время ждали в ядре, теперь есть куда их вложить.
   window.tmComposerReady=coreAccounts.length>0;
-  window.consumePendingAttachments?.();}
+  window.consumePendingAttachments?.();
+  // Пункт "Отправить" программа заводит сама при первом запуске, а автозапуск
+  // мог включиться раньше: после мастера показываем настоящее состояние обеих
+  // галочек, не дожидаясь перезапуска.
+  window.refreshSystemIntegrationToggles?.();}
 document.getElementById('wzFinish').onclick=finishOnboarding;
 document.getElementById('restartWizard').onclick=()=>showWizard(window.tmStorageReady?5:1);
 
