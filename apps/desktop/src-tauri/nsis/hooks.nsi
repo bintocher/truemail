@@ -4,16 +4,20 @@
 ; Пункт "Отправить -> truemail" в проводнике - это обычный ярлык в папке SendTo
 ; текущего пользователя. Программа принимает пути файлов аргументами и открывает
 ; новое письмо с ними во вложениях. Ту же галочку можно включить и выключить в
-; настройках программы (get_sendto_shortcut / set_sendto_shortcut в commands.rs);
-; имя ярлыка там задано строкой "truemail.lnk" и должно совпадать с PRODUCTNAME.
+; настройках программы (get_sendto_shortcut / set_sendto_shortcut в commands.rs):
+; там имя ярлыка берётся из productName, то есть из того же ${PRODUCTNAME}.
 
 !macro NSIS_HOOK_POSTINSTALL
   ; Папка SendTo всегда пользовательская, даже при установке на всю машину.
   SetShellVarContext current
-  ; При обновлении ярлык только поправляем, если он есть: создавать заново
-  ; нельзя - пользователь мог убрать пункт из меню сам.
-  ${If} $UpdateMode <> 1
-  ${OrIf} ${FileExists} "$APPDATA\Microsoft\Windows\SendTo\${PRODUCTNAME}.lnk"
+  ${If} ${FileExists} "$APPDATA\Microsoft\Windows\SendTo\${PRODUCTNAME}.lnk"
+    ; Ярлык уже стоит - обновляем цель на новый путь установки.
+    CreateShortcut "$APPDATA\Microsoft\Windows\SendTo\${PRODUCTNAME}.lnk" \
+      "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0
+  ${ElseIf} $UpdateMode <> 1
+  ${AndIf} $NoShortcutMode <> 1
+    ; Создаём только на обычной установке: при обновлении пункт мог быть убран
+    ; пользователем, а установка с /NS ярлыков не создаёт вовсе.
     CreateShortcut "$APPDATA\Microsoft\Windows\SendTo\${PRODUCTNAME}.lnk" \
       "$INSTDIR\${MAINBINARYNAME}.exe" "" "$INSTDIR\${MAINBINARYNAME}.exe" 0
   ${EndIf}

@@ -185,8 +185,12 @@ if(autostartToggle){
     catch(error){autostartToggle.classList.toggle('on');showToast(error.message||String(error));}
   });
 }
-// Пункт truemail в меню "Отправить" проводника (только Windows).
-const sendToToggle=document.getElementById('sendToToggle');
+// Пункт truemail в меню "Отправить" проводника. Меню есть только в Windows,
+// на остальных системах строку настройки не показываем вовсе.
+const sendToRow=document.getElementById('sendToRow');
+const windowsHost=/win/i.test(navigator.userAgentData?.platform||navigator.platform||'');
+if(sendToRow)sendToRow.classList.toggle('hidden',!windowsHost);
+const sendToToggle=windowsHost?document.getElementById('sendToToggle'):null;
 if(sendToToggle){
   sendToToggle.addEventListener('click',async()=>{
     const enabled=sendToToggle.classList.contains('on');

@@ -68,7 +68,10 @@ document.querySelectorAll('[data-wlang]').forEach(o=>o.onclick=async()=>{await w
 if(wizardLocale&&wizardText[wizardLocale])applyWizardLanguage(wizardLocale,false);
 document.getElementById('languageSetting').onchange=async e=>{await window.localizationReady;applyWizardLanguage(e.target.value);};
 document.querySelectorAll('[data-wtheme]').forEach(o=>o.onclick=()=>{document.querySelectorAll('[data-wtheme]').forEach(x=>x.classList.toggle('sel',x===o));setTheme(o.dataset.wtheme);});
-async function finishOnboarding(){try{await window.tm?.setSetting('onboarding_completed','true');await window.reloadCoreData?.();}catch(e){console.error(e);}showView('mailView');}
+async function finishOnboarding(){try{await window.tm?.setSetting('onboarding_completed','true');await window.reloadCoreData?.();}catch(e){console.error(e);}showView('mailView');
+  // Программу могли запустить из меню "Отправить" ещё до настройки: файлы всё
+  // это время ждали в ядре, теперь есть куда их вложить.
+  window.consumePendingAttachments?.();}
 document.getElementById('wzFinish').onclick=finishOnboarding;
 document.getElementById('restartWizard').onclick=()=>showWizard(window.tmStorageReady?5:1);
 

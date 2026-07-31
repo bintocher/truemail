@@ -234,6 +234,7 @@ fn run() -> anyhow::Result<()> {
             std::collections::HashSet::new(),
         )),
         pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
+        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -242,9 +243,16 @@ fn run() -> anyhow::Result<()> {
             show_main_window(app);
             // "Отправить -> truemail" на уже запущенной программе: второй
             // процесс отдаёт пути файлов сюда и выходит.
+            // Файлы кладём в ту же очередь, что и при холодном старте, а
+            // событие только будит интерфейс: если он ещё не подписался
+            // (второй экземпляр успел раньше), очередь заберётся при загрузке.
             let files = attachment_args(args);
             if !files.is_empty() {
-                let _ = app.emit("truemail-attach-files", files);
+                let state = app.state::<AppState>();
+                if let Ok(mut pending) = state.pending_attachments.lock() {
+                    pending.extend(files);
+                }
+                let _ = app.emit("truemail-attach-files", ());
             }
         }))
         .plugin(

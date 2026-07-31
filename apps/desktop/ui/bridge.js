@@ -161,12 +161,20 @@ window.corePageSize = 100;
   }).catch(console.error);
 
   // "Отправить -> truemail" в проводнике: пути файлов приходят аргументами
-  // процесса. При холодном старте они ждут в очереди ядра, на уже запущенной
-  // программе прилетают событием из второго процесса.
-  tauri.event?.listen("truemail-attach-files", event => {
-    const paths = event.payload;
-    if (Array.isArray(paths) && paths.length) window.composeWithFiles?.(paths);
+  // процесса и складываются в очередь ядра. Событие лишь сообщает, что очередь
+  // пополнил второй экземпляр программы.
+  tauri.event?.listen("truemail-attach-files", () => {
+    window.consumePendingAttachments?.();
   }).catch(console.error);
+
+  // Очередь файлов из аргументов запуска живёт в ядре, пока её не заберут:
+  // при запуске из проводника на ненастроенной программе письмо открывать
+  // некуда, и файлы ждут завершения мастера настройки.
+  window.consumePendingAttachments = function () {
+    return window.tm.takePendingAttachments()
+      .then(paths => { if (paths.length) window.composeWithFiles?.(paths); })
+      .catch(console.error);
+  };
 
   // Открытие письма по клику "Открыть" в своём уведомлении.
   tauri.event?.listen("truemail-open-message", async event => {
@@ -307,12 +315,9 @@ window.corePageSize = 100;
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
       // Запуск из меню "Отправить": файлы ждали в ядре, пока грузился интерфейс.
-      // Только на настроенной программе - в визарде композер открывать некуда.
-      if (onboardingCompleted === "true" && accounts.length) {
-        window.tm.takePendingAttachments()
-          .then(paths => { if (paths.length) window.composeWithFiles?.(paths); })
-          .catch(console.error);
-      }
+      // Только на настроенной программе - в визарде композер открывать некуда,
+      // поэтому очередь остаётся в ядре, а забирает её finishOnboarding.
+      if (onboardingCompleted === "true" && accounts.length) window.consumePendingAttachments();
       if (accounts.length) {
         const releaseSnoozed = async () => {
           const released = await window.tm.releaseDueSnoozes();

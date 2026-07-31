@@ -64,6 +64,10 @@ pub struct AppState {
     // Файлы, переданные аргументами при запуске (меню "Отправить" проводника).
     // Интерфейс забирает их, когда загрузится, и открывает композер с вложениями.
     pub pending_attachments: Arc<std::sync::Mutex<Vec<String>>>,
+    // Пути, которые ядро само отдало интерфейсу: только их read_local_file
+    // соглашается прочитать. Иначе команда была бы примитивом чтения любого
+    // файла пользователя для произвольного кода в окне.
+    pub allowed_attachments: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 pub fn default_keybindings() -> Vec<Keybinding> {
@@ -1711,32 +1715,33 @@ pub fn get_autostart(app: AppHandle) -> CmdResult<bool> {
     Ok(app.autolaunch().is_enabled().unwrap_or(false))
 }
 
-/// Имя ярлыка в папке "Отправить" проводника Windows.
+/// Путь к ярлыку truemail в папке SendTo текущего пользователя. Папка всегда
+/// пользовательская, даже когда программа поставлена на всю машину.
+///
+/// Имя ярлыка берём из productName - это же имя подставляет ${PRODUCTNAME} в
+/// nsis/hooks.nsi, так что установщик и настройки всегда работают с одним файлом.
 #[cfg(windows)]
-const SENDTO_SHORTCUT_NAME: &str = "truemail.lnk";
-
-/// Путь к ярлыку truemail в папке SendTo текущего пользователя.
-/// Папка всегда пользовательская, даже когда программа поставлена на всю машину.
-#[cfg(windows)]
-fn sendto_shortcut_path() -> Option<PathBuf> {
+fn sendto_shortcut_path(app: &AppHandle) -> Option<PathBuf> {
+    let name = format!("{}.lnk", app.package_info().name);
     std::env::var_os("APPDATA").map(|appdata| {
         PathBuf::from(appdata)
             .join("Microsoft")
             .join("Windows")
             .join("SendTo")
-            .join(SENDTO_SHORTCUT_NAME)
+            .join(name)
     })
 }
 
 /// Есть ли пункт truemail в меню "Отправить" проводника.
 #[tauri::command]
-pub fn get_sendto_shortcut() -> CmdResult<bool> {
+pub fn get_sendto_shortcut(app: AppHandle) -> CmdResult<bool> {
     #[cfg(windows)]
     {
-        Ok(sendto_shortcut_path().is_some_and(|path| path.exists()))
+        Ok(sendto_shortcut_path(&app).is_some_and(|path| path.exists()))
     }
     #[cfg(not(windows))]
     {
+        let _ = app;
         Ok(false)
     }
 }
@@ -1747,10 +1752,10 @@ pub fn get_sendto_shortcut() -> CmdResult<bool> {
 /// одного файла тянул бы зависимость windows-sys, а оболочка есть в любой
 /// поддерживаемой версии Windows.
 #[tauri::command]
-pub fn set_sendto_shortcut(enabled: bool) -> CmdResult<()> {
+pub fn set_sendto_shortcut(app: AppHandle, enabled: bool) -> CmdResult<()> {
     #[cfg(windows)]
     {
-        let link = sendto_shortcut_path().ok_or_else(|| ApiError {
+        let link = sendto_shortcut_path(&app).ok_or_else(|| ApiError {
             message: "не удалось определить папку \"Отправить\"".to_owned(),
         })?;
         if !enabled {
@@ -1802,10 +1807,18 @@ pub fn set_sendto_shortcut(enabled: bool) -> CmdResult<()> {
     }
     #[cfg(not(windows))]
     {
-        let _ = enabled;
+        let _ = (app, enabled);
         Err(ApiError {
             message: "пункт \"Отправить\" есть только в Windows".to_owned(),
         })
+    }
+}
+
+/// Запомнить пути, которые ядро отдало интерфейсу: только их потом разрешено
+/// прочитать через read_local_file.
+pub fn allow_attachment_paths(state: &AppState, paths: &[String]) {
+    if let Ok(mut allowed) = state.allowed_attachments.lock() {
+        allowed.extend(paths.iter().cloned());
     }
 }
 
@@ -1813,21 +1826,37 @@ pub fn set_sendto_shortcut(enabled: bool) -> CmdResult<()> {
 /// проводнике). Забираем один раз: повторный вызов вернёт пустой список.
 #[tauri::command]
 pub fn take_pending_attachments(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
-    let mut pending = state.pending_attachments.lock().map_err(|_| ApiError {
-        message: "очередь вложений повреждена".to_owned(),
-    })?;
-    Ok(std::mem::take(&mut *pending))
+    let paths = {
+        let mut pending = state.pending_attachments.lock().map_err(|_| ApiError {
+            message: "очередь вложений повреждена".to_owned(),
+        })?;
+        std::mem::take(&mut *pending)
+    };
+    allow_attachment_paths(&state, &paths);
+    Ok(paths)
 }
 
 /// Потолок на файл, добавляемый во вложение с диска. Больше почтовые серверы
 /// всё равно не принимают, а base64 в WebView раздувает такой файл втрое.
 const MAX_LOCAL_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 
-/// Прочитать файл с диска во вложение композера. Путь приходит из аргументов
-/// командной строки (меню "Отправить") - файл выбрал сам пользователь.
+/// Прочитать файл с диска во вложение композера. Читаем только пути, которые
+/// ядро само отдало интерфейсу из аргументов командной строки (меню
+/// "Отправить"): произвольная строка от фронтенда сделала бы из команды
+/// примитив чтения любого файла пользователя.
 #[tauri::command]
-pub fn read_local_file(path: String) -> CmdResult<AttachmentContent> {
+pub fn read_local_file(state: State<'_, AppState>, path: String) -> CmdResult<AttachmentContent> {
     use base64::Engine as _;
+    let known = state
+        .allowed_attachments
+        .lock()
+        .map(|allowed| allowed.contains(&path))
+        .unwrap_or(false);
+    if !known {
+        return Err(ApiError {
+            message: format!("файл {path} не передавался программе"),
+        });
+    }
     let path = PathBuf::from(path);
     let meta = std::fs::metadata(&path).map_err(|error| ApiError {
         message: format!("не удалось открыть файл {}: {error}", path.display()),
