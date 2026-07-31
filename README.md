@@ -40,6 +40,7 @@ Interface:
 - Light and dark themes, accent colour, three list densities.
 - Two modes: normal and expert, the latter with additional settings.
 - Built-in new-mail notifications, a system tray icon, start on system startup.
+- "Send to -> truemail" in Windows Explorer: the files become attachments in a new message.
 
 ## Build and run
 

@@ -6,6 +6,10 @@ document.querySelectorAll('#calViews button').forEach(b=>b.onclick=()=>{
   calSection.dataset.cv=b.dataset.cv;
   window.tm?.setSetting('calendar_view',b.dataset.cv).catch(console.error);
   if(b.dataset.cv==='month')renderCalendarData();else {renderWeekDay(visibleCalendarEvents());document.getElementById('calTitle').textContent=calendarTitleText(b.dataset.cv);}});
+/* "Сегодня": возврат к текущей дате в том представлении, что выбрано сейчас */
+function renderCalendarCursor(){const view=calSection.dataset.cv||'month';if(view==='month')renderCalendarData();else{renderWeekDay(visibleCalendarEvents());document.getElementById('calTitle').textContent=calendarTitleText(view);}}
+const calTodayButton=document.getElementById('calToday');
+if(calTodayButton)calTodayButton.onclick=()=>{calendarCursor=new Date();renderCalendarCursor();};
 document.querySelectorAll('[data-cal-nav]').forEach(button=>button.onclick=()=>{const direction=button.dataset.calNav==='prev'?-1:1,view=calSection.dataset.cv||'month';if(view==='day')calendarCursor.setDate(calendarCursor.getDate()+direction);else if(view==='week')calendarCursor.setDate(calendarCursor.getDate()+7*direction);else {const day=calendarCursor.getDate();calendarCursor.setDate(1);calendarCursor.setMonth(calendarCursor.getMonth()+direction);calendarCursor.setDate(Math.min(day,new Date(calendarCursor.getFullYear(),calendarCursor.getMonth()+1,0).getDate()));}renderCalendarData();if(view!=='month')document.querySelector(`#calViews button[data-cv="${view}"]`)?.click();});
 
 /* smart folder modal */

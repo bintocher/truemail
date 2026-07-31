@@ -22,6 +22,60 @@ const WINDOW_STATE_FLAGS: StateFlags = StateFlags::SIZE
 use tauri_plugin_global_shortcut::ShortcutState;
 use truemail_core::Core;
 
+/// Файлы из аргументов командной строки: проводник передаёт пути через пункт
+/// "Отправить". Флаги (--hidden от автозапуска) и несуществующие пути
+/// отбрасываем, первым аргументом идёт сам исполняемый файл.
+fn attachment_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    args.into_iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| std::path::Path::new(arg).is_file())
+        .collect()
+}
+
+/// Завести пункт "Отправить -> truemail" один раз за установку. Работа идёт в
+/// отдельном потоке: ярлык создаёт powershell, и зависший на чужой машине
+/// процесс не должен задерживать показ окна.
+///
+/// Установщик добавляет его только при обычной установке: при обновлении
+/// (updater запускает NSIS с /UPDATE) ярлыка ни у кого нет, и иначе фича не
+/// доехала бы до тех, кто уже пользуется программой. Маркер в каталоге данных
+/// гарантирует единственную попытку - удалённый пользователем пункт обратно не
+/// возвращается. В отладочной сборке не трогаем: ярлык указывал бы на
+/// target/debug вместо установленной программы.
+#[cfg(all(windows, not(debug_assertions)))]
+fn ensure_sendto_shortcut(app: &tauri::AppHandle) {
+    // Маркер лежит в стандартном каталоге данных, а не в выбранном
+    // пользователем: иначе смена каталога выглядела бы как первый запуск и
+    // возвращала удалённый пункт. Деинсталлятор его убирает вместе с ярлыком.
+    let marker = default_data_dir().join("sendto-initialized");
+    if marker.exists() {
+        return;
+    }
+    let app = app.clone();
+    std::thread::spawn(move || match commands::set_sendto_shortcut(app, true) {
+        Ok(()) => {
+            if let Some(parent) = marker.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&marker, "1");
+            tracing::info!("добавлен пункт \"Отправить -> truemail\"");
+        }
+        Err(error) => tracing::warn!(error = %error.message, "пункт \"Отправить\" не создан"),
+    });
+}
+
+/// Открыть зашифрованное хранилище. Пока ключей нет (первый запуск), ядра тоже
+/// нет: его создаст мастер настройки после сбора энтропии.
+fn open_core() -> anyhow::Result<Option<Arc<Core>>> {
+    if !truemail_core::crypto::keys_initialized()? {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(tauri::async_runtime::block_on(
+        Core::bootstrap(data_dir()),
+    )?)))
+}
+
 /// Показать и сфокусировать главное окно (из трея/клика).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -66,16 +120,23 @@ fn dirs_data_dir() -> Option<std::path::PathBuf> {
 
 fn main() {
     if let Err(error) = run() {
-        tracing::error!(%error, "truemail failed to start");
-        let _ = rfd::MessageDialog::new()
-            .set_title("truemail — ошибка запуска")
-            .set_description(format!(
-                "Приложение не удалось запустить.\n\n{error}\n\nДанные не были изменены."
-            ))
-            .set_level(rfd::MessageLevel::Error)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+        show_startup_error(&error);
     }
+}
+
+/// Единственный способ сообщить об ошибке запуска: у релизной сборки нет
+/// консоли (windows_subsystem = "windows"), поэтому без диалога пользователь
+/// увидел бы просто не запустившуюся программу.
+fn show_startup_error(error: &dyn std::fmt::Display) {
+    tracing::error!(%error, "truemail failed to start");
+    let _ = rfd::MessageDialog::new()
+        .set_title("truemail — ошибка запуска")
+        .set_description(format!(
+            "Приложение не удалось запустить.\n\n{error}\n\nДанные не были изменены."
+        ))
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// Потолок кучи JavaScript в процессе отрисовки WebView2, МБ. Интерфейс держит
@@ -184,31 +245,16 @@ fn run() -> anyhow::Result<()> {
     }
     tracing::info!(log_dir = %log_dir.display(), "логирование инициализировано");
 
-    // На новой установке ядро создаст визард после сбора пользовательской
-    // энтропии. На настроенной — открываем SQLCipher сразу.
-    let rt = tokio::runtime::Runtime::new()?;
-    let core = if truemail_core::crypto::keys_initialized()? {
-        Some(Arc::new(rt.block_on(Core::bootstrap(data_dir()))?))
-    } else {
-        None
-    };
-    // Куда показывать уведомления - читаем до старта: позиционирование окна синхронное.
-    let notify_anchor = core
-        .as_ref()
-        .and_then(|core| {
-            rt.block_on(core.db.setting("notify_position"))
-                .ok()
-                .flatten()
-        })
-        .map(|value| commands::NotifyAnchor::parse(&value))
-        .unwrap_or_else(commands::NotifyAnchor::platform_default);
-    let initial_keybindings = core
-        .as_ref()
-        .and_then(|core| rt.block_on(core.db.list_keybindings()).ok())
-        .unwrap_or_else(commands::default_keybindings);
+    // Ядро открываем не здесь, а в setup - после того, как плагин
+    // single-instance завершит лишний процесс. Иначе каждый повторный запуск
+    // (клик по ярлыку, "Отправить" из проводника) открывал бы ту же
+    // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
+    // работающей программой.
     let state = AppState {
-        core: tokio::sync::RwLock::new(core),
-        notify_anchor: Arc::new(std::sync::Mutex::new(notify_anchor)),
+        core: tokio::sync::RwLock::new(None),
+        notify_anchor: Arc::new(std::sync::Mutex::new(
+            commands::NotifyAnchor::platform_default(),
+        )),
         oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -222,12 +268,27 @@ fn run() -> anyhow::Result<()> {
         notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),
+        pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
+        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
         // работающему экземпляру и сразу завершается.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             show_main_window(app);
+            // "Отправить -> truemail" на уже запущенной программе: второй
+            // процесс отдаёт пути файлов сюда и выходит.
+            // Файлы кладём в ту же очередь, что и при холодном старте, а
+            // событие только будит интерфейс: если он ещё не подписался
+            // (второй экземпляр успел раньше), очередь заберётся при загрузке.
+            let files = attachment_args(args);
+            if !files.is_empty() {
+                let state = app.state::<AppState>();
+                if let Ok(mut pending) = state.pending_attachments.lock() {
+                    pending.extend(files);
+                }
+                let _ = app.emit("truemail-attach-files", ());
+            }
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -271,7 +332,46 @@ fn run() -> anyhow::Result<()> {
         ))
         .manage(state)
         .setup(move |app| {
+            // На новой установке ядро создаст визард после сбора пользовательской
+            // энтропии. На настроенной - открываем SQLCipher сразу. Лишний
+            // процесс сюда не доходит: плагин single-instance завершает его на
+            // своей инициализации, до этого хука.
+            //
+            // Ошибку здесь нельзя отдать через `?`: Tauri паникует на неудачном
+            // setup внутри цикла событий, и у пользователя без консоли не
+            // осталось бы никакого сообщения. Показываем тот же диалог, что и
+            // при других сбоях запуска, и выходим.
+            let core = match open_core() {
+                Ok(core) => core,
+                Err(error) => {
+                    show_startup_error(&error);
+                    std::process::exit(1);
+                }
+            };
+            let initial_keybindings = core
+                .as_ref()
+                .and_then(|core| tauri::async_runtime::block_on(core.db.list_keybindings()).ok())
+                .unwrap_or_else(commands::default_keybindings);
+            {
+                let state = app.state::<AppState>();
+                // Куда показывать уведомления - читаем до создания окна:
+                // позиционирование синхронное.
+                if let Some(core) = core.as_ref() {
+                    if let Ok(Some(value)) =
+                        tauri::async_runtime::block_on(core.db.setting("notify_position"))
+                    {
+                        if let Ok(mut anchor) = state.notify_anchor.lock() {
+                            *anchor = commands::NotifyAnchor::parse(&value);
+                        }
+                    }
+                }
+                tauri::async_runtime::block_on(async {
+                    *state.core.write().await = core;
+                });
+            }
             commands::register_global_shortcuts(app.handle(), &initial_keybindings)?;
+            #[cfg(all(windows, not(debug_assertions)))]
+            ensure_sendto_shortcut(app.handle());
 
             // Меню и иконка в системном трее. Приложение продолжает работать в
             // фоне (IMAP IDLE, синхронизация), даже когда окно скрыто.
@@ -312,10 +412,13 @@ fn run() -> anyhow::Result<()> {
             }
             tray.build(app)?;
 
-            // Автозапуск с флагом --hidden: стартуем свёрнутыми в трей.
-            if std::env::args().any(|arg| arg == "--hidden") {
+            // Главное окно создаётся скрытым (visible: false в tauri.conf.json):
+            // открытие SQLCipher выше блокирует поток, и показанное до него окно
+            // висело бы серым "не отвечает". Показываем, когда всё готово, кроме
+            // автозапуска с --hidden - тот стартует сразу свёрнутым в трей.
+            if !std::env::args().any(|arg| arg == "--hidden") {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    let _ = window.show();
                 }
             }
 
@@ -474,6 +577,10 @@ fn run() -> anyhow::Result<()> {
             commands::localization_catalog,
             commands::set_autostart,
             commands::get_autostart,
+            commands::get_sendto_shortcut,
+            commands::set_sendto_shortcut,
+            commands::take_pending_attachments,
+            commands::read_local_file,
             commands::notify_open,
             commands::notify_close,
             commands::open_external_url,

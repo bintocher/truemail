@@ -20,7 +20,10 @@ function validAddress(value){return /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(valu
 function setRecipientFieldVisible(id,visible,focus=false){const field=document.querySelector(`[data-recipient-field="${id}"]`);if(!field)return;field.classList.toggle('hidden',!visible);if(focus&&visible)document.getElementById(id)?.focus();}
 document.querySelectorAll('[data-recipient-toggle]').forEach(button=>button.onclick=()=>setRecipientFieldVisible(button.dataset.recipientToggle,true,true));
 document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=()=>{const id=button.dataset.recipientHide;if(document.getElementById(id).value.trim()&&!confirm(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;document.getElementById(id).value='';setRecipientFieldVisible(id,false);scheduleDraftSave();});
-function resetComposer(){composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+/* Каждый сброс композера - новое письмо: вложение, дочитанное после этого,
+   уже не наше и в новое письмо не попадает. */
+let composerGeneration=0;
+function resetComposer(){composerGeneration++;composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
@@ -53,15 +56,79 @@ document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
 document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await Promise.all(ids.map(id=>window.tm.markSeen(id,true)));clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
-async function addCompFile(file){const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data:Array.from(new Uint8Array(await file.arrayBuffer()))};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+/* Потолок на все вложения письма разом: WebView держит их в памяти массивами
+   чисел и целиком укладывает в автосохраняемый черновик, поэтому набор крупных
+   файлов иначе съедает память интерфейса. */
+const MAX_ATTACHMENTS_BYTES=25*1024*1024;
+function composerAttachmentsBytes(){return composerAttachments.reduce((total,item)=>total+item.data.length,0);}
+function ensureAttachmentFits(size,filename){
+  if(composerAttachmentsBytes()+size<=MAX_ATTACHMENTS_BYTES)return;
+  throw new Error(L(`Не добавлено: ${filename} не помещается, все вложения письма вместе не должны превышать ${formatBytes(MAX_ATTACHMENTS_BYTES)}`,`Not attached: ${filename} does not fit, all attachments together must stay under ${formatBytes(MAX_ATTACHMENTS_BYTES)}`));
+}
+async function addCompFile(file,generation=composerGeneration){if(generation!==composerGeneration)return;ensureAttachmentFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+/* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро.
+   Размер оцениваем по длине base64 - до atob, чтобы слишком большой файл не
+   разворачивался в памяти интерфейса ещё раз. */
+async function addCompFilePath(path,generation=composerGeneration){if(generation!==composerGeneration)return;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+/* Есть ли в композере что терять: открытое письмо или восстановленный при
+   запуске черновик, который лежит в полях ещё до открытия composeView. */
+function composerHasContent(){
+  if(window.pendingComposerDraft)return true;
+  if(composerAttachments.length)return true;
+  if(['compTo','compCc','compBcc'].some(id=>recipientModel[id].length||document.getElementById(id).value.trim()))return true;
+  if(document.getElementById('compSubj').value.trim())return true;
+  const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();
+  return Boolean(body.textContent.trim());
+}
+/* "Отправить -> truemail" в проводнике. Написанное не трогаем: сброс уничтожил
+   бы и открытое письмо, и восстановленный черновик, а следующее автосохранение
+   затёрло бы его в настройках - файлы просто добавляются к тому, что есть.
+   Вызовы выстраиваем в цепочку, иначе два подряд события из проводника
+   перемешают вложения и собьют друг другу композер. */
+async function attachFilesToComposer(paths){
+  const composing=document.getElementById('composeView')?.classList.contains('active');
+  const keep=composing||composerHasContent();
+  // Пока файлы ждали очереди, пользователь мог открыть письмо или ответ:
+  // вложения ложатся туда, но молча это делать нельзя.
+  if(composing)showToast(L('Файлы добавлены к открытому письму','Files added to the open message'));
+  if(!keep){
+    resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');
+    showView('composeView');
+    await applyComposerSignature('new');
+  }else if(!composing)showView('composeView');
+  const generation=composerGeneration;
+  for(const path of paths){
+    if(generation!==composerGeneration)return;
+    try{await addCompFilePath(path,generation);}catch(error){showToast(error.message||String(error));}
+  }
+  if(!composing)document.getElementById('compTo')?.focus();
+}
+/* Все добавления вложений идут одной очередью: параллельные вызовы считали бы
+   общий размер по одному и тому же старому значению и вместе перебирали лимит,
+   а два письма из проводника подряд сбивали бы друг другу композер. */
+let attachChain=Promise.resolve();
+/* Дождаться, пока очередь опустеет целиком: за время ожидания в неё могли
+   добавить ещё файл, и хвост, взятый один раз, этого бы не учёл. */
+async function settleAttachments(){let chain;do{chain=attachChain;try{await chain;}catch(_){}}while(chain!==attachChain);}
+window.composeWithFiles=function(paths){
+  attachChain=attachChain.then(()=>attachFilesToComposer(paths)).catch(console.error);
+  return attachChain;
+};
+function queueCompFiles(files){
+  // Поколение берём в момент выбора файлов, а не когда до них дойдёт очередь:
+  // иначе второй файл дочитался бы уже в другое письмо.
+  const generation=composerGeneration;
+  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file,generation)).catch(error=>showToast(error.message||String(error)));
+  return attachChain;
+}
 composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});
 composeEl.addEventListener('dragleave',e=>{if(!composeEl.contains(e.relatedTarget))composeEl.classList.remove('dragover');});
 composeEl.addEventListener('drop',e=>{e.preventDefault();composeEl.classList.remove('dragover');
-  const files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length){for(const file of files)addCompFile(file).catch(console.error);}});
+  const files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)queueCompFiles([...files]);});
 compEditEl.addEventListener('paste',e=>{const items=e.clipboardData&&e.clipboardData.items;if(!items)return;
-  for(const item of items){if(item.type.indexOf('image')===0){const file=item.getAsFile();if(file){e.preventDefault();addCompFile(new File([file],L('изображение из буфера.png','pasted-image.png'),{type:file.type})).catch(console.error);}}}});
+  for(const item of items){if(item.type.indexOf('image')===0){const file=item.getAsFile();if(file){e.preventDefault();queueCompFiles([new File([file],L('изображение из буфера.png','pasted-image.png'),{type:file.type})]);}}}});
 document.getElementById('compAttach').onclick=()=>document.getElementById('compFile').click();
-document.getElementById('compFile').onchange=e=>{for(const file of e.target.files||[])addCompFile(file).catch(console.error);e.target.value='';};
+document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};
   const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{document.getElementById('compSubj').value=template.subject||'';compEditEl.innerHTML=template.body_html||'';await applyComposerSignature(composerSignatureKind);scheduleDraftSave();close();};const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
   overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error.message||String(error));}};try{await render();}catch(error){close();showToast(error.message||String(error));}}
@@ -104,12 +171,19 @@ function draftPayload(){return {account_id:+document.querySelector('.from-sel').
 function scheduleDraftSave(){clearTimeout(draftSaveTimer);draftSaveTimer=setTimeout(()=>window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload())).catch(console.error),500);}
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
 function composerRequest(){const draft=draftPayload(),to=splitAddresses(draft.to),cc=splitAddresses(draft.cc),bcc=splitAddresses(draft.bcc),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
-document.getElementById('compSend').onclick=async()=>{const request=composerRequest();
+document.getElementById('compSend').onclick=async()=>{
+  // Крупный файл может ещё дочитываться: без ожидания письмо ушло бы без него,
+  // а вложение легло бы в уже очищенный композер. Если за это время открыли
+  // другое письмо, нажатие относилось к прежнему - отправлять нечего.
+  const generation=composerGeneration;
+  await settleAttachments();
+  if(generation!==composerGeneration)return;
+  const request=composerRequest();
   // Окно закрываем сразу, письмо уходит в фоне. Итог показываем коротким toast.
   resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
   try{await window.tm.sendMessage(request);showToast(L('Письмо отправлено','Message sent'));}
   catch(error){showToast(error.message||String(error));}
 };
-document.getElementById('compSendLater').onclick=async()=>{const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};
 

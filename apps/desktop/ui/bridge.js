@@ -51,6 +51,10 @@ window.corePageSize = 100;
     unsubscribeOneClick: (url) => invoke("unsubscribe_one_click", { url }),
     setAutostart: (enabled) => invoke("set_autostart", { enabled }),
     getAutostart: () => invoke("get_autostart"),
+    getSendtoShortcut: () => invoke("get_sendto_shortcut"),
+    setSendtoShortcut: (enabled) => invoke("set_sendto_shortcut", { enabled }),
+    takePendingAttachments: () => invoke("take_pending_attachments"),
+    readLocalFile: (path) => invoke("read_local_file", { path }),
     attachmentContent: (messageId, attachmentId) => invoke("attachment_content", { messageId, attachmentId }),
     saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
@@ -155,6 +159,23 @@ window.corePageSize = 100;
     if (action === "compose") document.getElementById("composeBtn")?.click();
     else if (action === "search") document.getElementById("searchBox")?.click();
   }).catch(console.error);
+
+  // "Отправить -> truemail" в проводнике: пути файлов приходят аргументами
+  // процесса и складываются в очередь ядра. Событие лишь сообщает, что очередь
+  // пополнил второй экземпляр программы.
+  tauri.event?.listen("truemail-attach-files", () => {
+    window.consumePendingAttachments?.();
+  }).catch(console.error);
+
+  // Очередь файлов из аргументов запуска живёт в ядре, пока её не заберут:
+  // пока мастер настройки не завершён или нет ни одного аккаунта, письмо
+  // открывать некуда - файлы ждут в очереди, композер их не выдернет.
+  window.consumePendingAttachments = function () {
+    if (!window.tmComposerReady) return Promise.resolve();
+    return window.tm.takePendingAttachments()
+      .then(paths => { if (paths.length) window.composeWithFiles?.(paths); })
+      .catch(console.error);
+  };
 
   // Открытие письма по клику "Открыть" в своём уведомлении.
   tauri.event?.listen("truemail-open-message", async event => {
@@ -274,6 +295,9 @@ window.corePageSize = 100;
       const settings = await window.tm.allSettings();
       await window.refreshKeybindings?.();
       const onboardingCompleted = settings.onboarding_completed;
+      // Выставляем до загрузки данных: renderCoreAccounts по этому флагу решает,
+      // можно ли открывать композер для файлов из меню "Отправить".
+      window.tmOnboardingDone = onboardingCompleted === "true";
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
@@ -294,6 +318,11 @@ window.corePageSize = 100;
       }
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
+      // Запуск из меню "Отправить": файлы ждали в ядре, пока грузился интерфейс.
+      // Только на настроенной программе - в визарде композер открывать некуда,
+      // поэтому очередь остаётся в ядре, а забирает её finishOnboarding.
+      window.tmComposerReady = onboardingCompleted === "true" && accounts.length > 0;
+      window.consumePendingAttachments();
       if (accounts.length) {
         const releaseSnoozed = async () => {
           const released = await window.tm.releaseDueSnoozes();
