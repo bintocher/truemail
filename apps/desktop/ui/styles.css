@@ -98,7 +98,9 @@
   .winbtn:hover{background:var(--hover);color:var(--text);}
   .winbtn-close:hover{background:var(--danger);color:#fff;}
   /* Полоски захвата по краям окна - там, где раньше была системная рамка. */
-  .resize-edge{position:fixed;z-index:70;}
+  /* Выше полноэкранных оверлеев (80), но ниже кнопок окна (1600): размер
+     окна должен меняться и при открытой галерее или просмотре исходника. */
+  .resize-edge{position:fixed;z-index:1590;}
   .re-n{top:0;left:6px;right:6px;height:4px;cursor:ns-resize;}
   .re-s{bottom:0;left:6px;right:6px;height:4px;cursor:ns-resize;}
   .re-w{left:0;top:6px;bottom:6px;width:4px;cursor:ew-resize;}

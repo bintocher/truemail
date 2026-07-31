@@ -56,7 +56,7 @@
     updateButton.disabled=false;
     updateButton.title=downloaded
       ?L(`truemail ${version} скачан, установить и перезапустить`,`truemail ${version} is downloaded, install and restart`)
-      :L(`Доступен truemail ${version}, скачивается`,`truemail ${version} is available, downloading`);
+      :L(`Доступен truemail ${version} - установить`,`truemail ${version} is available - install`);
     if(updateText)updateText.textContent=L('Обновить','Update');
   };
   // Единственная точка запуска установки: её зовут и кнопка здесь, и кнопка в
