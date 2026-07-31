@@ -33,6 +33,29 @@ fn attachment_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
         .collect()
 }
 
+/// Завести пункт "Отправить -> truemail" один раз за установку.
+///
+/// Установщик добавляет его только при обычной установке: при обновлении
+/// (updater запускает NSIS с /UPDATE) ярлыка ни у кого нет, и иначе фича не
+/// доехала бы до тех, кто уже пользуется программой. Маркер в каталоге данных
+/// гарантирует единственную попытку - удалённый пользователем пункт обратно не
+/// возвращается. В отладочной сборке не трогаем: ярлык указывал бы на
+/// target/debug вместо установленной программы.
+#[cfg(all(windows, not(debug_assertions)))]
+fn ensure_sendto_shortcut(app: &tauri::AppHandle) {
+    let marker = data_dir().join("sendto-initialized");
+    if marker.exists() {
+        return;
+    }
+    match commands::set_sendto_shortcut(app.clone(), true) {
+        Ok(()) => {
+            let _ = std::fs::write(&marker, "1");
+            tracing::info!("добавлен пункт \"Отправить -> truemail\"");
+        }
+        Err(error) => tracing::warn!(error = %error.message, "пункт \"Отправить\" не создан"),
+    }
+}
+
 /// Показать и сфокусировать главное окно (из трея/клика).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -195,31 +218,16 @@ fn run() -> anyhow::Result<()> {
     }
     tracing::info!(log_dir = %log_dir.display(), "логирование инициализировано");
 
-    // На новой установке ядро создаст визард после сбора пользовательской
-    // энтропии. На настроенной — открываем SQLCipher сразу.
-    let rt = tokio::runtime::Runtime::new()?;
-    let core = if truemail_core::crypto::keys_initialized()? {
-        Some(Arc::new(rt.block_on(Core::bootstrap(data_dir()))?))
-    } else {
-        None
-    };
-    // Куда показывать уведомления - читаем до старта: позиционирование окна синхронное.
-    let notify_anchor = core
-        .as_ref()
-        .and_then(|core| {
-            rt.block_on(core.db.setting("notify_position"))
-                .ok()
-                .flatten()
-        })
-        .map(|value| commands::NotifyAnchor::parse(&value))
-        .unwrap_or_else(commands::NotifyAnchor::platform_default);
-    let initial_keybindings = core
-        .as_ref()
-        .and_then(|core| rt.block_on(core.db.list_keybindings()).ok())
-        .unwrap_or_else(commands::default_keybindings);
+    // Ядро открываем не здесь, а в setup - после того, как плагин
+    // single-instance завершит лишний процесс. Иначе каждый повторный запуск
+    // (клик по ярлыку, "Отправить" из проводника) открывал бы ту же
+    // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
+    // работающей программой.
     let state = AppState {
-        core: tokio::sync::RwLock::new(core),
-        notify_anchor: Arc::new(std::sync::Mutex::new(notify_anchor)),
+        core: tokio::sync::RwLock::new(None),
+        notify_anchor: Arc::new(std::sync::Mutex::new(
+            commands::NotifyAnchor::platform_default(),
+        )),
         oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -297,7 +305,41 @@ fn run() -> anyhow::Result<()> {
         ))
         .manage(state)
         .setup(move |app| {
+            // На новой установке ядро создаст визард после сбора пользовательской
+            // энтропии. На настроенной - открываем SQLCipher сразу. Лишний
+            // процесс сюда не доходит: плагин single-instance завершает его на
+            // своей инициализации, до этого хука.
+            let core = if truemail_core::crypto::keys_initialized()? {
+                Some(Arc::new(tauri::async_runtime::block_on(Core::bootstrap(
+                    data_dir(),
+                ))?))
+            } else {
+                None
+            };
+            let initial_keybindings = core
+                .as_ref()
+                .and_then(|core| tauri::async_runtime::block_on(core.db.list_keybindings()).ok())
+                .unwrap_or_else(commands::default_keybindings);
+            {
+                let state = app.state::<AppState>();
+                // Куда показывать уведомления - читаем до создания окна:
+                // позиционирование синхронное.
+                if let Some(core) = core.as_ref() {
+                    if let Ok(Some(value)) =
+                        tauri::async_runtime::block_on(core.db.setting("notify_position"))
+                    {
+                        if let Ok(mut anchor) = state.notify_anchor.lock() {
+                            *anchor = commands::NotifyAnchor::parse(&value);
+                        }
+                    }
+                }
+                tauri::async_runtime::block_on(async {
+                    *state.core.write().await = core;
+                });
+            }
             commands::register_global_shortcuts(app.handle(), &initial_keybindings)?;
+            #[cfg(all(windows, not(debug_assertions)))]
+            ensure_sendto_shortcut(app.handle());
 
             // Меню и иконка в системном трее. Приложение продолжает работать в
             // фоне (IMAP IDLE, синхронизация), даже когда окно скрыто.
