@@ -46,8 +46,12 @@
      версия, и остаётся на виду, в отличие от исчезающего уведомления. */
   const updateButton=document.getElementById('titlebarUpdate');
   const updateText=document.getElementById('titlebarUpdateText');
+  // Пока установка идёт, состояние кнопки не трогаем: ядро шлёт событие о
+  // доступной версии дважды (до и после фоновой загрузки), и второе оживляло
+  // кнопку поверх уже запущенной установки.
+  let installing=false;
   window.showUpdateButton=function(version,downloaded){
-    if(!updateButton)return;
+    if(!updateButton||installing)return;
     updateButton.classList.remove('hidden');
     updateButton.disabled=false;
     updateButton.title=downloaded
@@ -56,11 +60,13 @@
     if(updateText)updateText.textContent=L('Обновить','Update');
   };
   updateButton?.addEventListener('click',async()=>{
+    installing=true;
     updateButton.disabled=true;
     if(updateText)updateText.textContent=L('Обновление…','Updating…');
     try{await window.tm.installUpdate();}
     catch(error){
       showToast(error.message||String(error));
+      installing=false;
       updateButton.disabled=false;
       if(updateText)updateText.textContent=L('Обновить','Update');
     }
