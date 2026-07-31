@@ -61,6 +61,9 @@ pub struct AppState {
     // (сначала перенесли, потом отменили) - ключ по одному event_id стёр бы
     // второе уведомление как "уже показанное".
     pub notified_calendar_changes: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    // Файлы, переданные аргументами при запуске (меню "Отправить" проводника).
+    // Интерфейс забирает их, когда загрузится, и открывает композер с вложениями.
+    pub pending_attachments: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 pub fn default_keybindings() -> Vec<Keybinding> {
@@ -1706,6 +1709,195 @@ pub fn set_autostart(app: AppHandle, enabled: bool) -> CmdResult<()> {
 pub fn get_autostart(app: AppHandle) -> CmdResult<bool> {
     use tauri_plugin_autostart::ManagerExt;
     Ok(app.autolaunch().is_enabled().unwrap_or(false))
+}
+
+/// Имя ярлыка в папке "Отправить" проводника Windows.
+#[cfg(windows)]
+const SENDTO_SHORTCUT_NAME: &str = "truemail.lnk";
+
+/// Путь к ярлыку truemail в папке SendTo текущего пользователя.
+/// Папка всегда пользовательская, даже когда программа поставлена на всю машину.
+#[cfg(windows)]
+fn sendto_shortcut_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|appdata| {
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("SendTo")
+            .join(SENDTO_SHORTCUT_NAME)
+    })
+}
+
+/// Есть ли пункт truemail в меню "Отправить" проводника.
+#[tauri::command]
+pub fn get_sendto_shortcut() -> CmdResult<bool> {
+    #[cfg(windows)]
+    {
+        Ok(sendto_shortcut_path().is_some_and(|path| path.exists()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+/// Создать/удалить пункт truemail в меню "Отправить" проводника.
+///
+/// Ярлык .lnk создаём через WScript.Shell в powershell: свой COM-код ради
+/// одного файла тянул бы зависимость windows-sys, а оболочка есть в любой
+/// поддерживаемой версии Windows.
+#[tauri::command]
+pub fn set_sendto_shortcut(enabled: bool) -> CmdResult<()> {
+    #[cfg(windows)]
+    {
+        let link = sendto_shortcut_path().ok_or_else(|| ApiError {
+            message: "не удалось определить папку \"Отправить\"".to_owned(),
+        })?;
+        if !enabled {
+            if link.exists() {
+                std::fs::remove_file(&link).map_err(|error| ApiError {
+                    message: format!("не удалось удалить пункт \"Отправить\": {error}"),
+                })?;
+            }
+            return Ok(());
+        }
+        let exe = std::env::current_exe().map_err(|error| ApiError {
+            message: format!("не удалось определить путь к программе: {error}"),
+        })?;
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| ApiError {
+                message: format!("не удалось создать папку \"Отправить\": {error}"),
+            })?;
+        }
+        let workdir = exe.parent().unwrap_or(&exe).to_path_buf();
+        // Одинарные кавычки powershell экранируются удвоением.
+        let quote = |value: &std::path::Path| value.display().to_string().replace('\'', "''");
+        let script = format!(
+            "$link=(New-Object -ComObject WScript.Shell).CreateShortcut('{}');\
+             $link.TargetPath='{}';$link.WorkingDirectory='{}';\
+             $link.IconLocation='{},0';$link.Description='Написать письмо в truemail';$link.Save()",
+            quote(&link),
+            quote(&exe),
+            quote(&workdir),
+            quote(&exe),
+        );
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| ApiError {
+                message: format!("не удалось создать ярлык: {error}"),
+            })?;
+        if !output.status.success() || !link.exists() {
+            return Err(ApiError {
+                message: format!(
+                    "не удалось создать пункт \"Отправить\": {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err(ApiError {
+            message: "пункт \"Отправить\" есть только в Windows".to_owned(),
+        })
+    }
+}
+
+/// Пути файлов, переданные приложению аргументами (пункт "Отправить" в
+/// проводнике). Забираем один раз: повторный вызов вернёт пустой список.
+#[tauri::command]
+pub fn take_pending_attachments(state: State<'_, AppState>) -> CmdResult<Vec<String>> {
+    let mut pending = state.pending_attachments.lock().map_err(|_| ApiError {
+        message: "очередь вложений повреждена".to_owned(),
+    })?;
+    Ok(std::mem::take(&mut *pending))
+}
+
+/// Потолок на файл, добавляемый во вложение с диска. Больше почтовые серверы
+/// всё равно не принимают, а base64 в WebView раздувает такой файл втрое.
+const MAX_LOCAL_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Прочитать файл с диска во вложение композера. Путь приходит из аргументов
+/// командной строки (меню "Отправить") - файл выбрал сам пользователь.
+#[tauri::command]
+pub fn read_local_file(path: String) -> CmdResult<AttachmentContent> {
+    use base64::Engine as _;
+    let path = PathBuf::from(path);
+    let meta = std::fs::metadata(&path).map_err(|error| ApiError {
+        message: format!("не удалось открыть файл {}: {error}", path.display()),
+    })?;
+    if !meta.is_file() {
+        return Err(ApiError {
+            message: format!("{} - не файл", path.display()),
+        });
+    }
+    if meta.len() > MAX_LOCAL_ATTACHMENT_BYTES {
+        return Err(ApiError {
+            message: format!(
+                "файл {} больше {} МБ - такое вложение не отправить",
+                path.display(),
+                MAX_LOCAL_ATTACHMENT_BYTES / 1024 / 1024
+            ),
+        });
+    }
+    let bytes = std::fs::read(&path).map_err(|error| ApiError {
+        message: format!("не удалось прочитать файл {}: {error}", path.display()),
+    })?;
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "attachment".to_owned());
+    Ok(AttachmentContent {
+        filename,
+        mime_type: Some(mime_by_extension(&path)),
+        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// Тип содержимого по расширению. Для письма важны только распространённые
+/// типы: всё незнакомое уходит как поток байтов, и почтовые клиенты с этим
+/// справляются - имя файла у вложения есть.
+fn mime_by_extension(path: &std::path::Path) -> String {
+    let ext = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "log" | "md" => "text/plain",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "zip" => "application/zip",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "gz" => "application/gzip",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "eml" => "message/rfc822",
+        "ics" => "text/calendar",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        _ => "application/octet-stream",
+    };
+    mime.to_owned()
 }
 
 #[derive(Serialize)]

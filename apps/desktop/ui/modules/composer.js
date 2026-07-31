@@ -54,6 +54,15 @@ document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
 document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await Promise.all(ids.map(id=>window.tm.markSeen(id,true)));clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
 async function addCompFile(file){const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data:Array.from(new Uint8Array(await file.arrayBuffer()))};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+/* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро */
+async function addCompFilePath(path){const file=await window.tm.readLocalFile(path);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+/* новое письмо с готовыми вложениями: "Отправить -> truemail" в проводнике */
+window.composeWithFiles=async function(paths){
+  resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');
+  await applyComposerSignature('new');
+  for(const path of paths){try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}}
+  document.getElementById('compTo')?.focus();
+};
 composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});
 composeEl.addEventListener('dragleave',e=>{if(!composeEl.contains(e.relatedTarget))composeEl.classList.remove('dragover');});
 composeEl.addEventListener('drop',e=>{e.preventDefault();composeEl.classList.remove('dragover');

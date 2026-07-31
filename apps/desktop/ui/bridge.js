@@ -51,6 +51,10 @@ window.corePageSize = 100;
     unsubscribeOneClick: (url) => invoke("unsubscribe_one_click", { url }),
     setAutostart: (enabled) => invoke("set_autostart", { enabled }),
     getAutostart: () => invoke("get_autostart"),
+    getSendtoShortcut: () => invoke("get_sendto_shortcut"),
+    setSendtoShortcut: (enabled) => invoke("set_sendto_shortcut", { enabled }),
+    takePendingAttachments: () => invoke("take_pending_attachments"),
+    readLocalFile: (path) => invoke("read_local_file", { path }),
     attachmentContent: (messageId, attachmentId) => invoke("attachment_content", { messageId, attachmentId }),
     saveAttachment: (messageId, attachmentId, destPath) => invoke("save_attachment", { messageId, attachmentId, destPath }),
     saveAllAttachments: (messageId, destDir) => invoke("save_all_attachments", { messageId, destDir }),
@@ -154,6 +158,14 @@ window.corePageSize = 100;
     const action = event.payload;
     if (action === "compose") document.getElementById("composeBtn")?.click();
     else if (action === "search") document.getElementById("searchBox")?.click();
+  }).catch(console.error);
+
+  // "Отправить -> truemail" в проводнике: пути файлов приходят аргументами
+  // процесса. При холодном старте они ждут в очереди ядра, на уже запущенной
+  // программе прилетают событием из второго процесса.
+  tauri.event?.listen("truemail-attach-files", event => {
+    const paths = event.payload;
+    if (Array.isArray(paths) && paths.length) window.composeWithFiles?.(paths);
   }).catch(console.error);
 
   // Открытие письма по клику "Открыть" в своём уведомлении.
@@ -294,6 +306,13 @@ window.corePageSize = 100;
       }
       if (onboardingCompleted === "true") showView("mailView");
       else if (window.showWizard) window.showWizard(4);
+      // Запуск из меню "Отправить": файлы ждали в ядре, пока грузился интерфейс.
+      // Только на настроенной программе - в визарде композер открывать некуда.
+      if (onboardingCompleted === "true" && accounts.length) {
+        window.tm.takePendingAttachments()
+          .then(paths => { if (paths.length) window.composeWithFiles?.(paths); })
+          .catch(console.error);
+      }
       if (accounts.length) {
         const releaseSnoozed = async () => {
           const released = await window.tm.releaseDueSnoozes();

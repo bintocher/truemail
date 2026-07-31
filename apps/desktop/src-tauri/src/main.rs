@@ -22,6 +22,17 @@ const WINDOW_STATE_FLAGS: StateFlags = StateFlags::SIZE
 use tauri_plugin_global_shortcut::ShortcutState;
 use truemail_core::Core;
 
+/// Файлы из аргументов командной строки: проводник передаёт пути через пункт
+/// "Отправить". Флаги (--hidden от автозапуска) и несуществующие пути
+/// отбрасываем, первым аргументом идёт сам исполняемый файл.
+fn attachment_args<I: IntoIterator<Item = String>>(args: I) -> Vec<String> {
+    args.into_iter()
+        .skip(1)
+        .filter(|arg| !arg.starts_with('-'))
+        .filter(|arg| std::path::Path::new(arg).is_file())
+        .collect()
+}
+
 /// Показать и сфокусировать главное окно (из трея/клика).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -222,12 +233,19 @@ fn run() -> anyhow::Result<()> {
         notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),
+        pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
         // работающему экземпляру и сразу завершается.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             show_main_window(app);
+            // "Отправить -> truemail" на уже запущенной программе: второй
+            // процесс отдаёт пути файлов сюда и выходит.
+            let files = attachment_args(args);
+            if !files.is_empty() {
+                let _ = app.emit("truemail-attach-files", files);
+            }
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -474,6 +492,10 @@ fn run() -> anyhow::Result<()> {
             commands::localization_catalog,
             commands::set_autostart,
             commands::get_autostart,
+            commands::get_sendto_shortcut,
+            commands::set_sendto_shortcut,
+            commands::take_pending_attachments,
+            commands::read_local_file,
             commands::notify_open,
             commands::notify_close,
             commands::open_external_url,

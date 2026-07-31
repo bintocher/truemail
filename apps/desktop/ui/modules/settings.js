@@ -179,12 +179,27 @@ const previewLinesSel=document.getElementById('previewLines');
 if(previewLinesSel){previewLinesSel.onchange=()=>{const n=previewLinesSel.value;document.documentElement.style.setProperty('--preview-lines',n);window.tm?.setSetting('preview_lines',n).catch(console.error);};}
 const autostartToggle=document.getElementById('autostartToggle');
 if(autostartToggle){
-  window.tm?.getAutostart?.().then(on=>autostartToggle.classList.toggle('on',!!on)).catch(()=>{});
   autostartToggle.addEventListener('click',async()=>{
     const enabled=autostartToggle.classList.contains('on');
     try{await window.tm.setAutostart(enabled);}
     catch(error){autostartToggle.classList.toggle('on');showToast(error.message||String(error));}
   });
+}
+// Пункт truemail в меню "Отправить" проводника (только Windows).
+const sendToToggle=document.getElementById('sendToToggle');
+if(sendToToggle){
+  sendToToggle.addEventListener('click',async()=>{
+    const enabled=sendToToggle.classList.contains('on');
+    try{await window.tm.setSendtoShortcut(enabled);}
+    catch(error){sendToToggle.classList.toggle('on');showToast(error.message||String(error));}
+  });
+}
+// Состояние обеих системных галочек читаем у ядра, а не из настроек: источник
+// правды - реестр и папка SendTo. Вызов идёт после инициализации моста, иначе
+// window.tm ещё не существует и галочки остаются выключенными.
+function refreshSystemIntegrationToggles(){
+  if(autostartToggle)window.tm?.getAutostart?.().then(on=>autostartToggle.classList.toggle('on',!!on)).catch(console.error);
+  if(sendToToggle)window.tm?.getSendtoShortcut?.().then(on=>sendToToggle.classList.toggle('on',!!on)).catch(console.error);
 }
 const checkUpdatesButton=document.getElementById('checkUpdates');
 if(checkUpdatesButton)checkUpdatesButton.onclick=async()=>{const status=document.getElementById('updateStatus');checkUpdatesButton.disabled=true;if(status)status.textContent=L('Проверяю новую версию…','Checking for a new version…');try{const info=await window.tm.checkForUpdate();if(info.available_version){if(status)status.textContent=L(`Доступна версия ${info.available_version}`,`Version ${info.available_version} is available`);showToast(L(`Доступен truemail ${info.available_version}`,`truemail ${info.available_version} is available`),L('Обновить','Update'),async()=>{if(status)status.textContent=L('Скачиваю и устанавливаю обновление…','Downloading and installing the update…');await window.tm.installUpdate();});}else if(status)status.textContent=L(`Установлена актуальная версия ${info.current_version}`,`Version ${info.current_version} is up to date`);}catch(error){if(status)status.textContent=error.message||String(error);}finally{checkUpdatesButton.disabled=false;}};
@@ -202,6 +217,7 @@ const notifyPositionSelect=document.getElementById('notifyPosition');
 if(notifyPositionSelect)notifyPositionSelect.onchange=e=>{window.tm?.setNotifyPosition(e.target.value).catch(console.error);};
 
 window.applyCoreSettings=function(settings){
+  refreshSystemIntegrationToggles();
   try{folderCounterModes=JSON.parse(settings.folder_counters||'{}')||{};}catch(_){folderCounterModes={};}
   if(settings.external_api_port)document.getElementById('apiPort').value=settings.external_api_port;if(settings.external_api_enabled==='1')window.tm?.startExternalApi(Number(settings.external_api_port)||34981).then(refreshApiSettings).catch(console.error);
   // Без сохранённого значения показываем платформенный дефолт (как в NotifyAnchor).

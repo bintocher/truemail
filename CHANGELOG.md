@@ -7,6 +7,21 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-31
+
+### Added
+
+- "Send to -> truemail" in the Windows Explorer context menu: the selected files
+  open as attachments in a new message. The installer adds the entry, and a
+  setting turns it off and back on.
+- A "Today" button in the calendar header: it jumps back to the current date in
+  whichever view is active - month, week or day.
+
+### Fixed
+
+- The "Launch on system startup" switch showed the off state even when autostart
+  was enabled: it read the state before the bridge to the core was up.
+
 ## [0.2.2] - 2026-07-29
 
 ### Added
