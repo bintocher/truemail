@@ -56,6 +56,17 @@ fn ensure_sendto_shortcut(app: &tauri::AppHandle) {
     }
 }
 
+/// Открыть зашифрованное хранилище. Пока ключей нет (первый запуск), ядра тоже
+/// нет: его создаст мастер настройки после сбора энтропии.
+fn open_core() -> anyhow::Result<Option<Arc<Core>>> {
+    if !truemail_core::crypto::keys_initialized()? {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(tauri::async_runtime::block_on(
+        Core::bootstrap(data_dir()),
+    )?)))
+}
+
 /// Показать и сфокусировать главное окно (из трея/клика).
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -100,16 +111,23 @@ fn dirs_data_dir() -> Option<std::path::PathBuf> {
 
 fn main() {
     if let Err(error) = run() {
-        tracing::error!(%error, "truemail failed to start");
-        let _ = rfd::MessageDialog::new()
-            .set_title("truemail — ошибка запуска")
-            .set_description(format!(
-                "Приложение не удалось запустить.\n\n{error}\n\nДанные не были изменены."
-            ))
-            .set_level(rfd::MessageLevel::Error)
-            .set_buttons(rfd::MessageButtons::Ok)
-            .show();
+        show_startup_error(&error);
     }
+}
+
+/// Единственный способ сообщить об ошибке запуска: у релизной сборки нет
+/// консоли (windows_subsystem = "windows"), поэтому без диалога пользователь
+/// увидел бы просто не запустившуюся программу.
+fn show_startup_error(error: &dyn std::fmt::Display) {
+    tracing::error!(%error, "truemail failed to start");
+    let _ = rfd::MessageDialog::new()
+        .set_title("truemail — ошибка запуска")
+        .set_description(format!(
+            "Приложение не удалось запустить.\n\n{error}\n\nДанные не были изменены."
+        ))
+        .set_level(rfd::MessageLevel::Error)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
 }
 
 /// Потолок кучи JavaScript в процессе отрисовки WebView2, МБ. Интерфейс держит
@@ -309,12 +327,17 @@ fn run() -> anyhow::Result<()> {
             // энтропии. На настроенной - открываем SQLCipher сразу. Лишний
             // процесс сюда не доходит: плагин single-instance завершает его на
             // своей инициализации, до этого хука.
-            let core = if truemail_core::crypto::keys_initialized()? {
-                Some(Arc::new(tauri::async_runtime::block_on(Core::bootstrap(
-                    data_dir(),
-                ))?))
-            } else {
-                None
+            //
+            // Ошибку здесь нельзя отдать через `?`: Tauri паникует на неудачном
+            // setup внутри цикла событий, и у пользователя без консоли не
+            // осталось бы никакого сообщения. Показываем тот же диалог, что и
+            // при других сбоях запуска, и выходим.
+            let core = match open_core() {
+                Ok(core) => core,
+                Err(error) => {
+                    show_startup_error(&error);
+                    std::process::exit(1);
+                }
             };
             let initial_keybindings = core
                 .as_ref()
@@ -380,10 +403,13 @@ fn run() -> anyhow::Result<()> {
             }
             tray.build(app)?;
 
-            // Автозапуск с флагом --hidden: стартуем свёрнутыми в трей.
-            if std::env::args().any(|arg| arg == "--hidden") {
+            // Главное окно создаётся скрытым (visible: false в tauri.conf.json):
+            // открытие SQLCipher выше блокирует поток, и показанное до него окно
+            // висело бы серым "не отвечает". Показываем, когда всё готово, кроме
+            // автозапуска с --hidden - тот стартует сразу свёрнутым в трей.
+            if !std::env::args().any(|arg| arg == "--hidden") {
                 if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                    let _ = window.show();
                 }
             }
 
