@@ -93,19 +93,26 @@ async function attachFilesToComposer(paths){
   for(const path of paths){try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}}
   if(!composing)document.getElementById('compTo')?.focus();
 }
-let composeWithFilesChain=Promise.resolve();
+/* Все добавления вложений идут одной очередью: параллельные вызовы считали бы
+   общий размер по одному и тому же старому значению и вместе перебирали лимит,
+   а два письма из проводника подряд сбивали бы друг другу композер. */
+let attachChain=Promise.resolve();
 window.composeWithFiles=function(paths){
-  composeWithFilesChain=composeWithFilesChain.then(()=>attachFilesToComposer(paths)).catch(console.error);
-  return composeWithFilesChain;
+  attachChain=attachChain.then(()=>attachFilesToComposer(paths)).catch(console.error);
+  return attachChain;
 };
+function queueCompFiles(files){
+  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file)).catch(error=>showToast(error.message||String(error)));
+  return attachChain;
+}
 composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});
 composeEl.addEventListener('dragleave',e=>{if(!composeEl.contains(e.relatedTarget))composeEl.classList.remove('dragover');});
 composeEl.addEventListener('drop',e=>{e.preventDefault();composeEl.classList.remove('dragover');
-  const files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length){for(const file of files)addCompFile(file).catch(error=>showToast(error.message||String(error)));}});
+  const files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)queueCompFiles([...files]);});
 compEditEl.addEventListener('paste',e=>{const items=e.clipboardData&&e.clipboardData.items;if(!items)return;
-  for(const item of items){if(item.type.indexOf('image')===0){const file=item.getAsFile();if(file){e.preventDefault();addCompFile(new File([file],L('изображение из буфера.png','pasted-image.png'),{type:file.type})).catch(error=>showToast(error.message||String(error)));}}}});
+  for(const item of items){if(item.type.indexOf('image')===0){const file=item.getAsFile();if(file){e.preventDefault();queueCompFiles([new File([file],L('изображение из буфера.png','pasted-image.png'),{type:file.type})]);}}}});
 document.getElementById('compAttach').onclick=()=>document.getElementById('compFile').click();
-document.getElementById('compFile').onchange=e=>{for(const file of e.target.files||[])addCompFile(file).catch(error=>showToast(error.message||String(error)));e.target.value='';};
+document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};
   const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{document.getElementById('compSubj').value=template.subject||'';compEditEl.innerHTML=template.body_html||'';await applyComposerSignature(composerSignatureKind);scheduleDraftSave();close();};const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
   overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error.message||String(error));}};try{await render();}catch(error){close();showToast(error.message||String(error));}}
