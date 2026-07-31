@@ -65,16 +65,29 @@ function ensureAttachmentFits(size,filename){
 async function addCompFile(file){const data=Array.from(new Uint8Array(await file.arrayBuffer()));ensureAttachmentFits(data.length,file.name||'attachment');const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро */
 async function addCompFilePath(path){const file=await window.tm.readLocalFile(path);const binary=atob(file.base64);ensureAttachmentFits(binary.length,file.filename);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
-/* "Отправить -> truemail" в проводнике. Открытое письмо не трогаем: сброс
-   уничтожил бы написанное и перезаписал автосохранённый черновик - файлы просто
-   добавляются к нему. Вызовы выстраиваем в цепочку, иначе два подряд события
-   из проводника перемешают вложения и собьют друг другу композер. */
+/* Есть ли в композере что терять: открытое письмо или восстановленный при
+   запуске черновик, который лежит в полях ещё до открытия composeView. */
+function composerHasContent(){
+  if(window.pendingComposerDraft)return true;
+  if(composerAttachments.length)return true;
+  if(['compTo','compCc','compBcc'].some(id=>recipientModel[id].length||document.getElementById(id).value.trim()))return true;
+  if(document.getElementById('compSubj').value.trim())return true;
+  const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();
+  return Boolean(body.textContent.trim());
+}
+/* "Отправить -> truemail" в проводнике. Написанное не трогаем: сброс уничтожил
+   бы и открытое письмо, и восстановленный черновик, а следующее автосохранение
+   затёрло бы его в настройках - файлы просто добавляются к тому, что есть.
+   Вызовы выстраиваем в цепочку, иначе два подряд события из проводника
+   перемешают вложения и собьют друг другу композер. */
 async function attachFilesToComposer(paths){
   const composing=document.getElementById('composeView')?.classList.contains('active');
-  if(!composing){
-    resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');
+  const keep=composing||composerHasContent();
+  if(!keep){
+    resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');
+    showView('composeView');
     await applyComposerSignature('new');
-  }
+  }else if(!composing)showView('composeView');
   for(const path of paths){try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}}
   if(!composing)document.getElementById('compTo')?.focus();
 }

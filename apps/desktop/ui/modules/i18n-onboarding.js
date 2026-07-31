@@ -61,7 +61,9 @@ function relocalizeDynamic(){
 }
 function wzGo(n){document.querySelectorAll('.wzstep').forEach(s=>s.classList.remove('active'));document.getElementById('wz'+n).classList.add('active');
   document.querySelectorAll('.wzdot').forEach((d,i)=>d.classList.toggle('on',i<n));}
-function showWizard(step=1){showView('welcomeView');wzGo(step);}
+// Пока открыт мастер, файлы из меню "Отправить" ждут в очереди ядра: композер
+// поверх незаконченной настройки выдёргивал бы пользователя из мастера.
+function showWizard(step=1){window.tmComposerReady=false;showView('welcomeView');wzGo(step);}
 window.showWizard=showWizard;
 document.querySelectorAll('[data-wz]').forEach(b=>b.onclick=()=>wzGo(b.dataset.wz));
 document.querySelectorAll('[data-wlang]').forEach(o=>o.onclick=async()=>{await window.localizationReady;applyWizardLanguage(o.dataset.wlang);});
@@ -71,6 +73,7 @@ document.querySelectorAll('[data-wtheme]').forEach(o=>o.onclick=()=>{document.qu
 async function finishOnboarding(){try{await window.tm?.setSetting('onboarding_completed','true');await window.reloadCoreData?.();}catch(e){console.error(e);}showView('mailView');
   // Программу могли запустить из меню "Отправить" ещё до настройки: файлы всё
   // это время ждали в ядре, теперь есть куда их вложить.
+  window.tmComposerReady=coreAccounts.length>0;
   window.consumePendingAttachments?.();}
 document.getElementById('wzFinish').onclick=finishOnboarding;
 document.getElementById('restartWizard').onclick=()=>showWizard(window.tmStorageReady?5:1);

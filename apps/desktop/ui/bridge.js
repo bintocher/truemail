@@ -168,9 +168,10 @@ window.corePageSize = 100;
   }).catch(console.error);
 
   // Очередь файлов из аргументов запуска живёт в ядре, пока её не заберут:
-  // при запуске из проводника на ненастроенной программе письмо открывать
-  // некуда, и файлы ждут завершения мастера настройки.
+  // пока мастер настройки не завершён или нет ни одного аккаунта, письмо
+  // открывать некуда - файлы ждут в очереди, композер их не выдернет.
   window.consumePendingAttachments = function () {
+    if (!window.tmComposerReady) return Promise.resolve();
     return window.tm.takePendingAttachments()
       .then(paths => { if (paths.length) window.composeWithFiles?.(paths); })
       .catch(console.error);
@@ -317,7 +318,8 @@ window.corePageSize = 100;
       // Запуск из меню "Отправить": файлы ждали в ядре, пока грузился интерфейс.
       // Только на настроенной программе - в визарде композер открывать некуда,
       // поэтому очередь остаётся в ядре, а забирает её finishOnboarding.
-      if (onboardingCompleted === "true" && accounts.length) window.consumePendingAttachments();
+      window.tmComposerReady = onboardingCompleted === "true" && accounts.length > 0;
+      window.consumePendingAttachments();
       if (accounts.length) {
         const releaseSnoozed = async () => {
           const released = await window.tm.releaseDueSnoozes();
