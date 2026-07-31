@@ -7,6 +7,18 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-31
+
+### Added
+
+- A custom title bar replaces the system one: drag the window by it, and next to
+  the minimize/maximize/close buttons an "Update" button appears when a new
+  version is out. Closing still hides the app to the tray.
+- Updates are checked automatically every 6 hours and downloaded ahead of time,
+  so the "Update" button installs right away instead of waiting for a download.
+- Downloaded update packages no longer pile up: once an update is installed the
+  old installers are removed, leaving at most the one still pending.
+
 ## [0.2.3] - 2026-07-31
 
 ### Added

@@ -9,6 +9,25 @@
 </head>
 <body>
 
+<!-- Своя строка заголовка вместо системной (decorations: false в tauri.conf.json).
+     Тянем окно за пустое место, кнопка закрытия прячет программу в трей. -->
+<div class="titlebar" id="titlebar" data-tauri-drag-region>
+  <span class="titlebar-logo" data-tauri-drag-region><svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><clipPath id="titlebar-envelope-shape"><rect width="1024" height="768" rx="128"/></clipPath></defs><g transform="translate(0 128)" clip-path="url(#titlebar-envelope-shape)"><rect width="1024" height="768" rx="128" fill="#5B63D3"/><path fill="#fff" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/></g></svg></span>
+  <span class="titlebar-title" data-tauri-drag-region>truemail</span>
+  <span class="titlebar-drag" data-tauri-drag-region></span>
+  <button type="button" class="titlebar-update hidden" id="titlebarUpdate"><i data-i="sync"></i><span id="titlebarUpdateText" data-i18n="updateAvailableButton">Обновить</span></button>
+  <div class="wincontrols">
+    <button type="button" class="winbtn" id="winMinimize" data-i18n-title="windowMinimize" data-i18n-aria="windowMinimize" title="Свернуть" aria-label="Свернуть"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1 6h10"/></svg></button>
+    <button type="button" class="winbtn" id="winMaximize" data-i18n-title="windowMaximize" data-i18n-aria="windowMaximize" title="Развернуть" aria-label="Развернуть"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="9" rx="1"/></svg></button>
+    <button type="button" class="winbtn winbtn-close" id="winClose" data-i18n-title="windowClose" data-i18n-aria="windowClose" title="Закрыть" aria-label="Закрыть"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 1.5 10.5 10.5M10.5 1.5 1.5 10.5"/></svg></button>
+  </div>
+</div>
+<!-- Рамки для изменения размера: у окна без системного оформления своих нет. -->
+<div class="resize-edge re-n" data-resize="North"></div><div class="resize-edge re-s" data-resize="South"></div>
+<div class="resize-edge re-w" data-resize="West"></div><div class="resize-edge re-e" data-resize="East"></div>
+<div class="resize-edge re-nw" data-resize="NorthWest"></div><div class="resize-edge re-ne" data-resize="NorthEast"></div>
+<div class="resize-edge re-sw" data-resize="SouthWest"></div><div class="resize-edge re-se" data-resize="SouthEast"></div>
+
 <!-- ================= MAIL ================= -->
 <div class="view" id="mailView">
   <div class="app" id="app">
@@ -658,7 +677,8 @@
 <script src="modules/mail.js?v=20260731-1"></script>
 <script src="modules/composer.js?v=20260731-1"></script>
 <script src="modules/settings.js?v=20260731-1"></script>
-<script src="bridge.js?v=20260731-1"></script>
+<script src="modules/window-chrome.js?v=20260731-1"></script>
+<script src="bridge.js?v=20260731-2"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>
