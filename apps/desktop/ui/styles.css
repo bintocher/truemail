@@ -267,7 +267,9 @@
   .gallery-nav{position:fixed;top:50%;transform:translateY(-50%);width:48px;height:64px;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;font-size:34px;line-height:1;cursor:pointer}
   .gallery-nav:hover{background:rgba(255,255,255,.22)}
   .gallery-nav.prev{left:3vw}.gallery-nav.next{right:3vw}
-  .gallery-close{position:fixed;top:18px;right:22px;width:40px;height:40px;border:0;border-radius:8px;background:rgba(255,255,255,.12);color:#fff;font-size:26px;cursor:pointer}
+  /* Ниже полосы заголовка: наверху справа теперь кнопка закрытия окна, и
+     промах по крестику галереи прятал бы программу в трей. */
+  .gallery-close{position:fixed;top:calc(var(--titlebar-h) + 12px);right:22px;width:40px;height:40px;border:0;border-radius:8px;background:rgba(255,255,255,.12);color:#fff;font-size:26px;cursor:pointer}
   .gallery-close:hover{background:rgba(255,255,255,.22)}
   .gallery-cap{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#fff;font-size:13px;background:rgba(0,0,0,.4);padding:6px 14px;border-radius:20px;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .gallery-save{position:fixed;bottom:22px;right:22px;padding:8px 16px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:13px;cursor:pointer}
@@ -548,7 +550,7 @@
   .settings.account-wizard-mode .setnav{display:none;}
   .settings.account-wizard-mode .setbody{width:min(760px,94vw);margin:auto;padding:40px 0;}
   .settings.account-wizard-mode #set-addacct{background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:30px;}
-  .wz-skip{position:fixed;top:16px;right:20px;color:var(--text-3);cursor:pointer;font-size:13px;}
+  .wz-skip{position:fixed;top:calc(var(--titlebar-h) + 12px);right:20px;color:var(--text-3);cursor:pointer;font-size:13px;}
   .wz-skip:hover{color:var(--text);}
   .hidden{display:none!important;}
 
