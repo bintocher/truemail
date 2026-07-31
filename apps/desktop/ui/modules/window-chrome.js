@@ -2,8 +2,12 @@
 /* Своя строка заголовка: перетаскивание, кнопки окна, рамки изменения размера
    и кнопка обновления. Системного оформления у окна нет (decorations: false). */
 (function(){
+  // Без window API окно нечем двигать и закрывать. Полосу заголовка при этом
+  // не прячем: без неё окно выглядело бы вовсе безголовым, а выход остаётся
+  // через меню в трее. Случай возможен только если ядро Tauri не поднялось -
+  // тогда и остальной интерфейс работать не будет.
   const api=window.__TAURI__?.window;
-  if(!api){document.getElementById('titlebar')?.classList.add('hidden');return;}
+  if(!api){console.error('truemail: window API недоступен, кнопки окна выключены');return;}
   const appWindow=api.getCurrentWindow();
 
   const maximizeButton=document.getElementById('winMaximize');

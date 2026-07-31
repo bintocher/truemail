@@ -80,12 +80,14 @@
   .titlebar-title{font-size:12.5px;font-weight:600;color:var(--text-2);white-space:nowrap;}
   /* Пустая тянущаяся зона: за неё окно и таскают, двойной клик разворачивает. */
   .titlebar-drag{flex:1;align-self:stretch;min-width:0;}
-  .titlebar-update{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;margin-right:6px;flex:none;
+  /* Кнопки лежат выше полос захвата размера, иначе верхние пиксели кнопки
+     уводили бы клик в изменение размера окна. */
+  .titlebar-update{position:relative;z-index:75;display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;margin-right:6px;flex:none;
     border:0;border-radius:999px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer;}
   .titlebar-update:hover{filter:brightness(1.08);}
   .titlebar-update[disabled]{opacity:.7;cursor:default;filter:none;}
   .titlebar-update i svg{width:13px;height:13px;}
-  .wincontrols{display:flex;align-self:stretch;flex:none;}
+  .wincontrols{position:relative;z-index:75;display:flex;align-self:stretch;flex:none;}
   .winbtn{width:44px;align-self:stretch;display:grid;place-items:center;border:0;background:transparent;color:var(--text-2);cursor:pointer;}
   .winbtn svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:1.1;stroke-linecap:round;}
   .winbtn:hover{background:var(--hover);color:var(--text);}

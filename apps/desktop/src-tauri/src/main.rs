@@ -271,6 +271,7 @@ fn run() -> anyhow::Result<()> {
         pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
         allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         pending_update: Arc::new(tokio::sync::Mutex::new(None)),
+        installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -372,16 +373,9 @@ fn run() -> anyhow::Result<()> {
             }
             // Уборка скачанных пакетов обновления. После установки программа
             // перезапускается уже новой версией - её инсталлятор здесь и
-            // удаляется, как и всё, что осталось от прошлых версий. Пакет
-            // новее установленного переживает перезапуск и ставится по кнопке
-            // без повторной загрузки.
-            if let Some(pending) = commands::restore_pending_update(app.handle()) {
-                tracing::info!(version = pending.version, "найден скачанный пакет обновления");
-                let state = app.state::<AppState>();
-                tauri::async_runtime::block_on(async {
-                    *state.pending_update.lock().await = Some(pending);
-                });
-            }
+            // удаляется, как и всё, что осталось от прошлых версий и
+            // недокачанных попыток.
+            commands::cleanup_update_files();
 
             commands::register_global_shortcuts(app.handle(), &initial_keybindings)?;
             #[cfg(all(windows, not(debug_assertions)))]
