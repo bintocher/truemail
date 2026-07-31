@@ -144,7 +144,10 @@ window.corePageSize = 100;
     showToast(message, L("Обновить", "Update"), async () => {
       const status = document.getElementById("updateStatus");
       if (status) status.textContent = L("Скачиваю и устанавливаю обновление…", "Downloading and installing the update…");
-      await window.tm.installUpdate();
+      // Через ту же точку, что и кнопка в строке заголовка: обе должны видеть
+      // общее состояние установки.
+      if (window.startUpdateInstall) await window.startUpdateInstall();
+      else await window.tm.installUpdate();
     });
   };
   tauri.event?.listen("truemail-update-available", event => offerUpdate(event.payload)).catch(console.error);

@@ -59,16 +59,23 @@
       :L(`Доступен truemail ${version}, скачивается`,`truemail ${version} is available, downloading`);
     if(updateText)updateText.textContent=L('Обновить','Update');
   };
-  updateButton?.addEventListener('click',async()=>{
+  // Единственная точка запуска установки: её зовут и кнопка здесь, и кнопка в
+  // уведомлении. Иначе состояние знал бы только один путь, и пришедшее следом
+  // событие о доступной версии оживляло бы кнопку поверх идущей установки.
+  window.startUpdateInstall=async function(){
+    if(installing)return;
     installing=true;
-    updateButton.disabled=true;
+    if(updateButton)updateButton.disabled=true;
     if(updateText)updateText.textContent=L('Обновление…','Updating…');
     try{await window.tm.installUpdate();}
     catch(error){
-      showToast(error.message||String(error));
       installing=false;
-      updateButton.disabled=false;
+      if(updateButton)updateButton.disabled=false;
       if(updateText)updateText.textContent=L('Обновить','Update');
+      throw error;
     }
+  };
+  updateButton?.addEventListener('click',()=>{
+    window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
   });
 })();
