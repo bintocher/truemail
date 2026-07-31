@@ -33,6 +33,7 @@ function applyWizardLanguage(locale,persist=true){
   document.querySelectorAll('[data-wlang]').forEach(el=>el.classList.toggle('sel',el.dataset.wlang===locale));
   applyUiCatalog(wizardText[locale]);
   if(typeof relocalizeDynamic==='function')relocalizeDynamic();
+  window.restoreTitlebarState?.();
   document.getElementById('wzLanguageNext').disabled=false;
   const languageSetting=document.getElementById('languageSetting');if(languageSetting)languageSetting.value=locale;
   if(persist&&window.tmStorageReady){window.tm?.setSetting('locale',locale).catch(console.error);}

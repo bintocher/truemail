@@ -50,6 +50,14 @@
   // доступной версии дважды (до и после фоновой загрузки), и второе оживляло
   // кнопку поверх уже запущенной установки.
   let installing=false;
+  // Смена языка переписывает подписи по data-i18n у всех элементов, включая
+  // кнопки окна и кнопку обновления. После неё возвращаем то, что зависит от
+  // состояния: "Восстановить" у развёрнутого окна и "Обновление…" во время
+  // установки.
+  window.restoreTitlebarState=function(){
+    syncMaximizeState();
+    if(installing&&updateText)updateText.textContent=L('Обновление…','Updating…');
+  };
   window.showUpdateButton=function(version,downloaded){
     if(!updateButton||installing)return;
     updateButton.classList.remove('hidden');
