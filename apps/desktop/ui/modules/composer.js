@@ -65,11 +65,11 @@ function ensureAttachmentFits(size,filename){
   if(composerAttachmentsBytes()+size<=MAX_ATTACHMENTS_BYTES)return;
   throw new Error(L(`Не добавлено: ${filename} не помещается, все вложения письма вместе не должны превышать ${formatBytes(MAX_ATTACHMENTS_BYTES)}`,`Not attached: ${filename} does not fit, all attachments together must stay under ${formatBytes(MAX_ATTACHMENTS_BYTES)}`));
 }
-async function addCompFile(file){ensureAttachmentFits(file.size,file.name||'attachment');const generation=composerGeneration;const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFile(file,generation=composerGeneration){if(generation!==composerGeneration)return;ensureAttachmentFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро.
    Размер оцениваем по длине base64 - до atob, чтобы слишком большой файл не
    разворачивался в памяти интерфейса ещё раз. */
-async function addCompFilePath(path){const generation=composerGeneration;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFilePath(path,generation=composerGeneration){if(generation!==composerGeneration)return;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* Есть ли в композере что терять: открытое письмо или восстановленный при
    запуске черновик, который лежит в полях ещё до открытия composeView. */
 function composerHasContent(){
@@ -96,7 +96,7 @@ async function attachFilesToComposer(paths){
   const generation=composerGeneration;
   for(const path of paths){
     if(generation!==composerGeneration)return;
-    try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}
+    try{await addCompFilePath(path,generation);}catch(error){showToast(error.message||String(error));}
   }
   if(!composing)document.getElementById('compTo')?.focus();
 }
@@ -109,7 +109,10 @@ window.composeWithFiles=function(paths){
   return attachChain;
 };
 function queueCompFiles(files){
-  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file)).catch(error=>showToast(error.message||String(error)));
+  // Поколение берём в момент выбора файлов, а не когда до них дойдёт очередь:
+  // иначе второй файл дочитался бы уже в другое письмо.
+  const generation=composerGeneration;
+  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file,generation)).catch(error=>showToast(error.message||String(error)));
   return attachChain;
 }
 composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});
@@ -164,14 +167,17 @@ composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input
 function composerRequest(){const draft=draftPayload(),to=splitAddresses(draft.to),cc=splitAddresses(draft.cc),bcc=splitAddresses(draft.bcc),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
 document.getElementById('compSend').onclick=async()=>{
   // Крупный файл может ещё дочитываться: без ожидания письмо ушло бы без него,
-  // а вложение легло бы в уже очищенный композер.
+  // а вложение легло бы в уже очищенный композер. Если за это время открыли
+  // другое письмо, нажатие относилось к прежнему - отправлять нечего.
+  const generation=composerGeneration;
   await attachChain;
+  if(generation!==composerGeneration)return;
   const request=composerRequest();
   // Окно закрываем сразу, письмо уходит в фоне. Итог показываем коротким toast.
   resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
   try{await window.tm.sendMessage(request);showToast(L('Письмо отправлено','Message sent'));}
   catch(error){showToast(error.message||String(error));}
 };
-document.getElementById('compSendLater').onclick=async()=>{await attachChain;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await attachChain;if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};
 
