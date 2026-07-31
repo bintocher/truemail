@@ -20,7 +20,10 @@ function validAddress(value){return /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(valu
 function setRecipientFieldVisible(id,visible,focus=false){const field=document.querySelector(`[data-recipient-field="${id}"]`);if(!field)return;field.classList.toggle('hidden',!visible);if(focus&&visible)document.getElementById(id)?.focus();}
 document.querySelectorAll('[data-recipient-toggle]').forEach(button=>button.onclick=()=>setRecipientFieldVisible(button.dataset.recipientToggle,true,true));
 document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=()=>{const id=button.dataset.recipientHide;if(document.getElementById(id).value.trim()&&!confirm(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;document.getElementById(id).value='';setRecipientFieldVisible(id,false);scheduleDraftSave();});
-function resetComposer(){composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+/* Каждый сброс композера - новое письмо: вложение, дочитанное после этого,
+   уже не наше и в новое письмо не попадает. */
+let composerGeneration=0;
+function resetComposer(){composerGeneration++;composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
@@ -62,11 +65,11 @@ function ensureAttachmentFits(size,filename){
   if(composerAttachmentsBytes()+size<=MAX_ATTACHMENTS_BYTES)return;
   throw new Error(L(`Не добавлено: ${filename} не помещается, все вложения письма вместе не должны превышать ${formatBytes(MAX_ATTACHMENTS_BYTES)}`,`Not attached: ${filename} does not fit, all attachments together must stay under ${formatBytes(MAX_ATTACHMENTS_BYTES)}`));
 }
-async function addCompFile(file){ensureAttachmentFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFile(file){ensureAttachmentFits(file.size,file.name||'attachment');const generation=composerGeneration;const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро.
    Размер оцениваем по длине base64 - до atob, чтобы слишком большой файл не
    разворачивался в памяти интерфейса ещё раз. */
-async function addCompFilePath(path){const file=await window.tm.readLocalFile(path);ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFilePath(path){const generation=composerGeneration;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* Есть ли в композере что терять: открытое письмо или восстановленный при
    запуске черновик, который лежит в полях ещё до открытия composeView. */
 function composerHasContent(){
@@ -90,7 +93,11 @@ async function attachFilesToComposer(paths){
     showView('composeView');
     await applyComposerSignature('new');
   }else if(!composing)showView('composeView');
-  for(const path of paths){try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}}
+  const generation=composerGeneration;
+  for(const path of paths){
+    if(generation!==composerGeneration)return;
+    try{await addCompFilePath(path);}catch(error){showToast(error.message||String(error));}
+  }
   if(!composing)document.getElementById('compTo')?.focus();
 }
 /* Все добавления вложений идут одной очередью: параллельные вызовы считали бы
