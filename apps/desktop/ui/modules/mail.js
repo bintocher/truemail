@@ -453,6 +453,12 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
   coreAccounts=accounts;coreFolders=foldersByAccount.flat();coreContacts=contacts;coreCalendarData=calendarData;
+  // Готовность композера для файлов из меню "Отправить": аккаунт может
+  // появиться и вне мастера настройки (добавили второй ящик, закрыли мастер
+  // навигацией) - тогда очередь забирается сразу, а не после перезапуска.
+  const composerWasReady=window.tmComposerReady===true;
+  window.tmComposerReady=coreAccounts.length>0&&window.tmOnboardingDone===true&&!document.getElementById('welcomeView')?.classList.contains('active');
+  if(window.tmComposerReady&&!composerWasReady)window.consumePendingAttachments?.();
   // Объединяем догруженные ранее письма со свежей выборкой (свежая версия
   // побеждает по id), иначе перезагрузка данных стирала бы всё, что пользователь
   // подгрузил прокруткой, и список сбрасывался бы на первую страницу.

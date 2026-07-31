@@ -295,6 +295,9 @@ window.corePageSize = 100;
       const settings = await window.tm.allSettings();
       await window.refreshKeybindings?.();
       const onboardingCompleted = settings.onboarding_completed;
+      // Выставляем до загрузки данных: renderCoreAccounts по этому флагу решает,
+      // можно ли открывать композер для файлов из меню "Отправить".
+      window.tmOnboardingDone = onboardingCompleted === "true";
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
       if (window.applyCoreSettings) window.applyCoreSettings(settings);

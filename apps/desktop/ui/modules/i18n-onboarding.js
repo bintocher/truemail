@@ -73,7 +73,7 @@ document.querySelectorAll('[data-wtheme]').forEach(o=>o.onclick=()=>{document.qu
 async function finishOnboarding(){try{await window.tm?.setSetting('onboarding_completed','true');await window.reloadCoreData?.();}catch(e){console.error(e);}showView('mailView');
   // Программу могли запустить из меню "Отправить" ещё до настройки: файлы всё
   // это время ждали в ядре, теперь есть куда их вложить.
-  window.tmComposerReady=coreAccounts.length>0;
+  window.tmOnboardingDone=true;window.tmComposerReady=coreAccounts.length>0;
   window.consumePendingAttachments?.();
   // Пункт "Отправить" программа заводит сама при первом запуске, а автозапуск
   // мог включиться раньше: после мастера показываем настоящее состояние обеих
