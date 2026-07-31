@@ -5,6 +5,12 @@
   "windows": ["main", "notify"],
   "permissions": [
     "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-start-resize-dragging",
     "dialog:default",
     "notification:default",
     "autostart:allow-enable",

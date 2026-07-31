@@ -64,10 +64,22 @@ pub struct AppState {
     // Файлы, переданные аргументами при запуске (меню "Отправить" проводника).
     // Интерфейс забирает их, когда загрузится, и открывает композер с вложениями.
     pub pending_attachments: Arc<std::sync::Mutex<Vec<String>>>,
+    // Скачанный заранее пакет обновления: ставится по кнопке в строке заголовка.
+    pub pending_update: Arc<tokio::sync::Mutex<Option<PendingUpdate>>>,
+    // Установка обновления уже идёт: второй запуск установщика не нужен.
+    pub installing_update: Arc<std::sync::atomic::AtomicBool>,
     // Пути, которые ядро само отдало интерфейсу: только их read_local_file
     // соглашается прочитать. Иначе команда была бы примитивом чтения любого
     // файла пользователя для произвольного кода в окне.
     pub allowed_attachments: Arc<std::sync::Mutex<HashSet<String>>>,
+}
+
+/// Скачанный пакет обновления: версия, файл в каталоге данных и отпечаток
+/// проверенных по подписи байтов.
+pub struct PendingUpdate {
+    pub version: String,
+    pub path: PathBuf,
+    pub sha256: String,
 }
 
 pub fn default_keybindings() -> Vec<Keybinding> {
@@ -266,6 +278,8 @@ pub struct UpdateInfo {
     current_version: String,
     available_version: Option<String>,
     notes: Option<String>,
+    // true, когда пакет уже скачан и установка пройдёт без ожидания сети.
+    downloaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -278,55 +292,239 @@ struct UpdateProgress {
 #[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> CmdResult<UpdateInfo> {
     let update = available_update(&app).await?;
+    let available_version = update.as_ref().map(|value| value.version.clone());
+    let downloaded = match available_version.as_deref() {
+        Some(version) => downloaded_update_matches(&app, version).await,
+        None => false,
+    };
     Ok(UpdateInfo {
         current_version: app.package_info().version.to_string(),
-        available_version: update.as_ref().map(|value| value.version.clone()),
+        available_version,
         notes: update.and_then(|value| value.body),
+        downloaded,
     })
 }
 
+/// Скачан ли уже пакет именно этой версии.
+async fn downloaded_update_matches(app: &AppHandle, version: &str) -> bool {
+    let state = app.state::<AppState>();
+    let pending = state.pending_update.lock().await;
+    pending
+        .as_ref()
+        .is_some_and(|update| update.version == version && update.path.exists())
+}
+
+/// Автопроверка обновлений: нашли новую версию - сразу скачиваем пакет и
+/// сообщаем интерфейсу. Кнопка "Обновить" в строке заголовка тогда ставит уже
+/// готовый файл, без ожидания сети.
 pub async fn announce_available_update(app: AppHandle) -> CmdResult<()> {
-    let info = check_for_update(app.clone()).await?;
-    if info.available_version.is_some() {
-        let _ = app.emit("truemail-update-available", info);
+    let mut info = check_for_update(app.clone()).await?;
+    let Some(version) = info.available_version.clone() else {
+        return Ok(());
+    };
+    let _ = app.emit("truemail-update-available", info.clone());
+    if info.downloaded {
+        return Ok(());
+    }
+    match prefetch_update(&app, &version).await {
+        Ok(()) => {
+            info.downloaded = true;
+            let _ = app.emit("truemail-update-available", info);
+        }
+        // Не смогли скачать заранее - не беда: установка по кнопке скачает сама.
+        Err(error) => tracing::warn!(
+            error = %error.message,
+            version,
+            "обновление не удалось скачать заранее"
+        ),
     }
     Ok(())
 }
 
+/// Скачать пакет обновления в каталог данных. Держать его в памяти нельзя:
+/// установщик Windows весит десятки мегабайт, а программа работает сутками.
+async fn prefetch_update(app: &AppHandle, version: &str) -> CmdResult<()> {
+    let Some(update) = available_update(app).await? else {
+        return Err(api_error("новая версия уже не найдена"));
+    };
+    if update.version != version {
+        return Err(api_error("версия обновления изменилась во время загрузки"));
+    }
+    // download() сверяет подпись пакета, install() - уже нет. Поэтому
+    // запоминаем отпечаток проверенных байтов и сверяем его перед установкой:
+    // иначе подменённый на диске файл ушёл бы в установщик как доверенный.
+    let bytes = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|error| api_error(format!("загрузка обновления: {error}")))?;
+    let digest = sha256_hex(&bytes);
+    let dir = updates_dir();
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| api_error(format!("каталог обновлений: {error}")))?;
+    let path = dir.join(format!("truemail-{version}.update"));
+    // Пишем во временный файл и переименовываем: оборванная запись иначе
+    // оставила бы обрезанный пакет под правильным именем.
+    let partial = dir.join(format!("truemail-{version}.update.part"));
+    tokio::fs::write(&partial, &bytes)
+        .await
+        .map_err(|error| api_error(format!("запись обновления: {error}")))?;
+    tokio::fs::rename(&partial, &path)
+        .await
+        .map_err(|error| api_error(format!("запись обновления: {error}")))?;
+    let state = app.state::<AppState>();
+    // Пакеты прошлых проверок больше не нужны - место на диске не копим.
+    remove_stale_update_files(&dir, Some(&path));
+    let mut pending = state.pending_update.lock().await;
+    *pending = Some(PendingUpdate {
+        version: version.to_owned(),
+        path,
+        sha256: digest,
+    });
+    tracing::info!(version, "обновление скачано и ждёт установки");
+    Ok(())
+}
+
+/// Отпечаток пакета обновления в hex - им сверяем файл перед установкой.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Каталог, куда складываются скачанные заранее пакеты обновления. Всегда
+/// стандартный, а не выбранный пользователем каталог данных: это служебные
+/// файлы, и следующая версия должна находить их на том же месте.
+pub fn updates_dir() -> PathBuf {
+    crate::default_data_dir().join("updates")
+}
+
+/// Снести из каталога всё, кроме указанного файла. Пакеты весят десятки
+/// мегабайт, и без уборки они копились бы с каждой новой версией.
+fn remove_stale_update_files(dir: &std::path::Path, keep: Option<&std::path::Path>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || keep.is_some_and(|keep| keep == path) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file = %path.display(), "удалён старый пакет обновления"),
+            Err(error) => {
+                tracing::warn!(error = %error, file = %path.display(), "пакет обновления не удалён")
+            }
+        }
+    }
+}
+
+/// Вычистить каталог обновлений при запуске: пакет, из которого программа
+/// только что обновилась, уже не нужен, а недокачанные и оставшиеся от прошлых
+/// версий - тем более. Пакет, скачанный до перезапуска, тоже удаляем: его
+/// отпечаток жил в памяти, а без проверки подписи ставить файл с диска нельзя.
+/// Ближайшая автопроверка скачает нужное заново.
+pub fn cleanup_update_files() {
+    remove_stale_update_files(&updates_dir(), None);
+}
+
 #[tauri::command]
 pub async fn install_update(app: AppHandle) -> CmdResult<()> {
+    // Установку запускают и кнопка в заголовке, и уведомление: два NSIS
+    // одновременно ставили бы программу поверх самих себя.
+    let state = app.state::<AppState>();
+    if state
+        .installing_update
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(api_error("обновление уже устанавливается"));
+    }
+    let result = run_update_installation(&app).await;
+    if result.is_err() {
+        state
+            .installing_update
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    result
+}
+
+async fn run_update_installation(app: &AppHandle) -> CmdResult<()> {
+    let app = app.clone();
     let Some(update) = available_update(&app).await? else {
         return Err(api_error("новая версия уже не найдена"));
     };
-    let progress_app = app.clone();
-    let finished_app = app.clone();
-    let mut downloaded = 0_u64;
-    update
-        .download_and_install(
-            move |chunk, total| {
-                downloaded = downloaded.saturating_add(chunk as u64);
-                let _ = progress_app.emit(
-                    "truemail-update-progress",
-                    UpdateProgress {
-                        event: "progress",
-                        downloaded,
-                        total,
+    // Скачанный заранее пакет ставим сразу; иначе качаем с показом прогресса.
+    let prefetched = {
+        let state = app.state::<AppState>();
+        let pending = state.pending_update.lock().await;
+        pending
+            .as_ref()
+            .filter(|value| value.version == update.version)
+            .map(|value| (value.path.clone(), value.sha256.clone()))
+    };
+    let bytes = match prefetched {
+        Some((path, expected)) => match tokio::fs::read(&path).await {
+            // Отпечаток сверяем обязательно: подпись проверялась при загрузке,
+            // а лежащий на диске файл с тех пор могли подменить.
+            Ok(bytes) if sha256_hex(&bytes) == expected => Some(bytes),
+            Ok(_) => {
+                tracing::warn!(file = %path.display(), "пакет обновления не совпал с отпечатком, качаем заново");
+                let _ = tokio::fs::remove_file(&path).await;
+                None
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "скачанный пакет не прочитан, качаем заново");
+                None
+            }
+        },
+        None => None,
+    };
+    match bytes {
+        Some(bytes) => {
+            let _ = app.emit(
+                "truemail-update-progress",
+                UpdateProgress {
+                    event: "finished",
+                    downloaded: 0,
+                    total: None,
+                },
+            );
+            update
+                .install(bytes)
+                .map_err(|error| api_error(format!("установка обновления: {error}")))?;
+        }
+        None => {
+            let progress_app = app.clone();
+            let finished_app = app.clone();
+            let mut downloaded = 0_u64;
+            update
+                .download_and_install(
+                    move |chunk, total| {
+                        downloaded = downloaded.saturating_add(chunk as u64);
+                        let _ = progress_app.emit(
+                            "truemail-update-progress",
+                            UpdateProgress {
+                                event: "progress",
+                                downloaded,
+                                total,
+                            },
+                        );
                     },
-                );
-            },
-            move || {
-                let _ = finished_app.emit(
-                    "truemail-update-progress",
-                    UpdateProgress {
-                        event: "finished",
-                        downloaded: 0,
-                        total: None,
+                    move || {
+                        let _ = finished_app.emit(
+                            "truemail-update-progress",
+                            UpdateProgress {
+                                event: "finished",
+                                downloaded: 0,
+                                total: None,
+                            },
+                        );
                     },
-                );
-            },
-        )
-        .await
-        .map_err(|error| api_error(format!("установка обновления: {error}")))?;
+                )
+                .await
+                .map_err(|error| api_error(format!("установка обновления: {error}")))?;
+        }
+    }
     app.state::<AppState>()
         .quitting
         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4336,6 +4534,43 @@ pub async fn clear_api_audit(state: State<'_, AppState>) -> CmdResult<u64> {
 #[tauri::command]
 pub fn localization_catalog(locale: String) -> HashMap<String, String> {
     truemail_core::i18n::I18n::new(&locale).catalog()
+}
+
+#[cfg(test)]
+mod update_package_tests {
+    use super::*;
+
+    #[test]
+    fn digest_changes_with_content() {
+        // Отпечаток скачанного пакета - единственная защита от подмены файла
+        // между загрузкой (там проверяется подпись) и установкой.
+        assert_eq!(sha256_hex(b"truemail"), sha256_hex(b"truemail"));
+        assert_ne!(sha256_hex(b"truemail"), sha256_hex(b"truemai1"));
+        assert_eq!(sha256_hex(b"").len(), 64);
+    }
+
+    #[test]
+    fn cleanup_removes_every_package_but_the_kept_one() {
+        let dir =
+            std::env::temp_dir().join(format!("truemail-updates-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("каталог создан");
+        let keep = dir.join("truemail-0.3.0.update");
+        let stale = dir.join("truemail-0.2.3.update");
+        let partial = dir.join("truemail-0.3.0.update.part");
+        for file in [&keep, &stale, &partial] {
+            std::fs::write(file, b"package").expect("пакет записан");
+        }
+        remove_stale_update_files(&dir, Some(&keep));
+        assert!(keep.exists());
+        assert!(!stale.exists());
+        assert!(!partial.exists());
+        // Уборка при запуске сносит и последний пакет: проверять его подпись
+        // после перезапуска нечем.
+        remove_stale_update_files(&dir, None);
+        assert!(!keep.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

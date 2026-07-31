@@ -5,7 +5,7 @@
     --good:#2f9e5f; --good-weak:#e6f4ec; --warn:#c98a2b; --warn-weak:#f7eede; --danger:#d1453b;
     --shadow:0 12px 32px -8px rgba(20,22,40,.18), 0 2px 8px -2px rgba(20,22,40,.10);
     --scroll-thumb:#737b88; --scroll-thumb-hover:#515966;
-    --row-py:9px; --message-row-height:76px; --fs:13.5px; --radius:8px; --nav-w:250px; --list-w:392px; --statusbar-h:24px;
+    --row-py:9px; --message-row-height:76px; --fs:13.5px; --radius:8px; --nav-w:250px; --list-w:392px; --statusbar-h:24px; --titlebar-h:34px;
   }
   @media (prefers-color-scheme:dark){ :root{
     --bg:#0d0e11; --panel:#141519; --panel2:#101116; --hover:#1c1e24; --active:#232641;
@@ -69,7 +69,48 @@
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;-webkit-font-smoothing:antialiased;}
   @media (prefers-reduced-motion:no-preference){ .msg,.navitem,.btn,.iconbtn,.cmdrow,.seg button,.dot-accent,.setnav div,.acc-h{transition:background .12s,color .12s,border-color .12s;} }
   i[data-i]{display:inline-flex;} svg{display:block;}
-  .view{display:none;height:100vh;} .view.active{display:block;}
+  .view{display:none;height:calc(100vh - var(--titlebar-h));} .view.active{display:block;}
+
+  /* Своя строка заголовка. Системную убрали (decorations: false), поэтому здесь
+     же живут перетаскивание окна, кнопки управления и кнопка обновления. */
+  .titlebar{display:flex;align-items:center;gap:8px;height:var(--titlebar-h);padding-left:10px;background:var(--panel);
+    border-bottom:1px solid var(--border);user-select:none;-webkit-user-select:none;position:relative;}
+  /* Своего z-index у полосы заголовка нет намеренно: он создавал бы контекст
+     наложения, и кнопки внутри неё не поднимались бы ни над полосами захвата
+     размера, ни над полноэкранными оверлеями (просмотр исходника, галерея).
+     Раньше системная строка заголовка была вне страницы и оставалась доступна
+     всегда - кнопки окна должны вести себя так же. */
+  .titlebar-logo{display:flex;width:16px;height:16px;flex:none;}
+  .titlebar-logo svg{width:16px;height:16px;}
+  .titlebar-title{font-size:12.5px;font-weight:600;color:var(--text-2);white-space:nowrap;}
+  /* Пустая тянущаяся зона: за неё окно и таскают, двойной клик разворачивает. */
+  .titlebar-drag{flex:1;align-self:stretch;min-width:0;}
+  /* Кнопки лежат выше полос захвата размера, иначе верхние пиксели кнопки
+     уводили бы клик в изменение размера окна. */
+  .titlebar-update{position:relative;z-index:1600;display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;margin-right:6px;flex:none;
+    border:0;border-radius:999px;background:var(--accent);color:#fff;font:inherit;font-size:12px;font-weight:600;cursor:pointer;}
+  .titlebar-update:hover{filter:brightness(1.08);}
+  .titlebar-update[disabled]{opacity:.7;cursor:default;filter:none;}
+  .titlebar-update i svg{width:13px;height:13px;}
+  .wincontrols{position:relative;z-index:1600;display:flex;align-self:stretch;flex:none;}
+  .winbtn{width:44px;align-self:stretch;display:grid;place-items:center;border:0;background:transparent;color:var(--text-2);cursor:pointer;}
+  .winbtn svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:1.1;stroke-linecap:round;}
+  .winbtn:hover{background:var(--hover);color:var(--text);}
+  .winbtn-close:hover{background:var(--danger);color:#fff;}
+  /* Полоски захвата по краям окна - там, где раньше была системная рамка. */
+  /* Выше полноэкранных оверлеев (80), но ниже кнопок окна (1600): размер
+     окна должен меняться и при открытой галерее или просмотре исходника. */
+  .resize-edge{position:fixed;z-index:1590;}
+  .re-n{top:0;left:6px;right:6px;height:4px;cursor:ns-resize;}
+  .re-s{bottom:0;left:6px;right:6px;height:4px;cursor:ns-resize;}
+  .re-w{left:0;top:6px;bottom:6px;width:4px;cursor:ew-resize;}
+  .re-e{right:0;top:6px;bottom:6px;width:4px;cursor:ew-resize;}
+  .re-nw{top:0;left:0;width:6px;height:6px;cursor:nwse-resize;}
+  .re-ne{top:0;right:0;width:6px;height:6px;cursor:nesw-resize;}
+  .re-sw{bottom:0;left:0;width:6px;height:6px;cursor:nesw-resize;}
+  .re-se{bottom:0;right:0;width:6px;height:6px;cursor:nwse-resize;}
+  /* Развёрнутому окну рамки не нужны: тянуть его за края нельзя. */
+  body.window-maximized .resize-edge{display:none;}
 
   /* buttons */
   .btn{display:inline-flex;align-items:center;gap:7px;height:34px;padding:0 13px;border-radius:var(--radius);
@@ -94,9 +135,9 @@
   .statusbar-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .statusbar-right{margin-left:auto;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .nav{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;position:relative;user-select:none;-webkit-user-select:none;}
-  .nav-resizer{position:fixed;left:calc(var(--nav-w) - 4px);top:0;width:8px;height:calc(100vh - var(--statusbar-h));cursor:col-resize;z-index:45;}
+  .nav-resizer{position:fixed;left:calc(var(--nav-w) - 4px);top:var(--titlebar-h);width:8px;height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));cursor:col-resize;z-index:45;}
   /* Граница между списком писем и письмом: тянется так же, как левая панель. */
-  .list-resizer{position:fixed;left:calc(var(--nav-w) + var(--list-w) - 4px);top:0;width:8px;height:calc(100vh - var(--statusbar-h));cursor:col-resize;z-index:45;}
+  .list-resizer{position:fixed;left:calc(var(--nav-w) + var(--list-w) - 4px);top:var(--titlebar-h);width:8px;height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));cursor:col-resize;z-index:45;}
   .nav-resizer:hover,.nav-resizer.dragging,.list-resizer:hover,.list-resizer.dragging{background:color-mix(in srgb,var(--accent) 28%,transparent);}
   .brand{display:flex;align-items:center;gap:9px;padding:13px 14px 8px;}
   .brand .logo{width:22px;height:22px;display:grid;place-items:center;flex:none;}
@@ -226,7 +267,9 @@
   .gallery-nav{position:fixed;top:50%;transform:translateY(-50%);width:48px;height:64px;border:0;border-radius:10px;background:rgba(255,255,255,.12);color:#fff;font-size:34px;line-height:1;cursor:pointer}
   .gallery-nav:hover{background:rgba(255,255,255,.22)}
   .gallery-nav.prev{left:3vw}.gallery-nav.next{right:3vw}
-  .gallery-close{position:fixed;top:18px;right:22px;width:40px;height:40px;border:0;border-radius:8px;background:rgba(255,255,255,.12);color:#fff;font-size:26px;cursor:pointer}
+  /* Ниже полосы заголовка: наверху справа теперь кнопка закрытия окна, и
+     промах по крестику галереи прятал бы программу в трей. */
+  .gallery-close{position:fixed;top:calc(var(--titlebar-h) + 12px);right:22px;width:40px;height:40px;border:0;border-radius:8px;background:rgba(255,255,255,.12);color:#fff;font-size:26px;cursor:pointer}
   .gallery-close:hover{background:rgba(255,255,255,.22)}
   .gallery-cap{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#fff;font-size:13px;background:rgba(0,0,0,.4);padding:6px 14px;border-radius:20px;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .gallery-save{position:fixed;bottom:22px;right:22px;padding:8px 16px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:13px;cursor:pointer}
@@ -303,7 +346,7 @@
   .cgrid.table-view .ccard .ce{flex:1;min-width:0;font-size:13px;}
 
   /* settings */
-  .settings{display:grid;grid-template-columns:236px minmax(0,1fr);height:100vh;min-height:0;background:var(--bg);user-select:none;-webkit-user-select:none;}
+  .settings{display:grid;grid-template-columns:236px minmax(0,1fr);height:calc(100vh - var(--titlebar-h));min-height:0;background:var(--bg);user-select:none;-webkit-user-select:none;}
   .settings input,.settings textarea,.settings [contenteditable="true"]{user-select:text;-webkit-user-select:text;}
   #smartOverlay{user-select:none;-webkit-user-select:none;}
   #smartOverlay input,#smartOverlay textarea{user-select:text;-webkit-user-select:text;}
@@ -345,7 +388,7 @@
   .theme-prev .bar{height:8px;border-radius:4px;background:var(--hover);margin-bottom:6px;} .theme-prev .bar.a{background:var(--accent);width:60%;}
 
   /* compose full */
-  .compose{display:none;height:100vh;flex-direction:column;background:var(--bg);}
+  .compose{display:none;height:calc(100vh - var(--titlebar-h));flex-direction:column;background:var(--bg);}
   .view#composeView.active{display:block;} .view#composeView.active .compose{display:flex;}
   .comphead{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--border);}
   .msg .l1{display:flex;align-items:center;gap:6px}
@@ -507,7 +550,7 @@
   .settings.account-wizard-mode .setnav{display:none;}
   .settings.account-wizard-mode .setbody{width:min(760px,94vw);margin:auto;padding:40px 0;}
   .settings.account-wizard-mode #set-addacct{background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:30px;}
-  .wz-skip{position:fixed;top:16px;right:20px;color:var(--text-3);cursor:pointer;font-size:13px;}
+  .wz-skip{position:fixed;top:calc(var(--titlebar-h) + 12px);right:20px;color:var(--text-3);cursor:pointer;font-size:13px;}
   .wz-skip:hover{color:var(--text);}
   .hidden{display:none!important;}
 

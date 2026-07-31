@@ -135,13 +135,19 @@ window.corePageSize = 100;
   let offeredVersion = null;
   const offerUpdate = info => {
     if (!info?.available_version) return;
+    // Кнопка в строке заголовка остаётся на виду, даже когда уведомление уже
+    // пропало: иначе о новой версии узнать можно было только из настроек.
+    window.showUpdateButton?.(info.available_version, info.downloaded);
     if (offeredVersion === info.available_version) return;
     offeredVersion = info.available_version;
     const message = wizardLocale === "en" ? `truemail ${info.available_version} is available` : `Доступен truemail ${info.available_version}`;
     showToast(message, L("Обновить", "Update"), async () => {
       const status = document.getElementById("updateStatus");
       if (status) status.textContent = L("Скачиваю и устанавливаю обновление…", "Downloading and installing the update…");
-      await window.tm.installUpdate();
+      // Через ту же точку, что и кнопка в строке заголовка: обе должны видеть
+      // общее состояние установки.
+      if (window.startUpdateInstall) await window.startUpdateInstall();
+      else await window.tm.installUpdate();
     });
   };
   tauri.event?.listen("truemail-update-available", event => offerUpdate(event.payload)).catch(console.error);

@@ -3,6 +3,7 @@ const S=(p,w=18)=>`<svg width="${w}" height="${w}" viewBox="0 0 24 24" fill="non
 const ic={
   inbox:S('<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>'),
   star:S('<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>'),
+  sync:S('<path d="M21 12a9 9 0 0 1-9 9 9 9 0 0 1-7.35-3.8"/><path d="M3 12a9 9 0 0 1 9-9 9 9 0 0 1 7.35 3.8"/><polyline points="21 4 19.35 7.8 15.5 6.5"/><polyline points="3 20 4.65 16.2 8.5 17.5"/>'),
   send:S('<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'),
   draft:S('<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>'),
   archive:S('<rect x="2" y="4" width="20" height="5" rx="1"/><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/>'),

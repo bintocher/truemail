@@ -6243,7 +6243,7 @@ dependencies = [
 
 [[package]]
 name = "truemail-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -6284,7 +6284,7 @@ dependencies = [
 
 [[package]]
 name = "truemail-desktop"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6292,6 +6292,7 @@ dependencies = [
  "rfd 0.17.2",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tauri",
  "tauri-build",
