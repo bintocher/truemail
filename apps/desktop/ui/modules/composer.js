@@ -88,6 +88,9 @@ function composerHasContent(){
 async function attachFilesToComposer(paths){
   const composing=document.getElementById('composeView')?.classList.contains('active');
   const keep=composing||composerHasContent();
+  // Пока файлы ждали очереди, пользователь мог открыть письмо или ответ:
+  // вложения ложатся туда, но молча это делать нельзя.
+  if(composing)showToast(L('Файлы добавлены к открытому письму','Files added to the open message'));
   if(!keep){
     resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');
     showView('composeView');
@@ -104,6 +107,9 @@ async function attachFilesToComposer(paths){
    общий размер по одному и тому же старому значению и вместе перебирали лимит,
    а два письма из проводника подряд сбивали бы друг другу композер. */
 let attachChain=Promise.resolve();
+/* Дождаться, пока очередь опустеет целиком: за время ожидания в неё могли
+   добавить ещё файл, и хвост, взятый один раз, этого бы не учёл. */
+async function settleAttachments(){let chain;do{chain=attachChain;try{await chain;}catch(_){}}while(chain!==attachChain);}
 window.composeWithFiles=function(paths){
   attachChain=attachChain.then(()=>attachFilesToComposer(paths)).catch(console.error);
   return attachChain;
@@ -170,7 +176,7 @@ document.getElementById('compSend').onclick=async()=>{
   // а вложение легло бы в уже очищенный композер. Если за это время открыли
   // другое письмо, нажатие относилось к прежнему - отправлять нечего.
   const generation=composerGeneration;
-  await attachChain;
+  await settleAttachments();
   if(generation!==composerGeneration)return;
   const request=composerRequest();
   // Окно закрываем сразу, письмо уходит в фоне. Итог показываем коротким toast.
@@ -178,6 +184,6 @@ document.getElementById('compSend').onclick=async()=>{
   try{await window.tm.sendMessage(request);showToast(L('Письмо отправлено','Message sent'));}
   catch(error){showToast(error.message||String(error));}
 };
-document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await attachChain;if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};
 
