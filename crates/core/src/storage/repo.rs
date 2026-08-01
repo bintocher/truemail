@@ -5272,6 +5272,18 @@ mod smart_condition_legacy_tests {
             None,
             None
         ));
+        // Отдельная ветка защиты: произведение не помещается в i64 ещё до того,
+        // как дело дойдёт до длительности.
+        let overflowing_product = SmartCondition {
+            value: i64::MAX.to_string(),
+            ..huge.clone()
+        };
+        assert!(smart_condition_matches(
+            &overflowing_product,
+            &message,
+            None,
+            None
+        ));
         // Обычный период считается как прежде. Берём заведомо старое письмо,
         // чтобы результат не зависел от того, когда гоняются тесты.
         let old_message = MessageMeta {
