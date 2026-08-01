@@ -4036,10 +4036,15 @@ impl Db {
                     });
                 }
                 groups[group_index].logic = condition.group_logic;
+                // Условия ранних версий лежат в базе в старом словаре. Миграция
+                // 0036 переписывает известные варианты, но выборка не должна
+                // зависеть от того, прошла ли она: приводим на чтении.
+                let (field, op, value) =
+                    normalize_smart_condition(condition.field, condition.op, condition.value);
                 groups[group_index].conditions.push(SmartCondition {
-                    field: condition.field,
-                    op: condition.op,
-                    value: condition.value,
+                    field,
+                    op,
+                    value,
                     unit: condition.unit,
                     value2: condition.value2,
                 });
@@ -4510,6 +4515,45 @@ impl Db {
     }
 }
 
+/// Привести условие умной папки к нынешнему словарю полей и значений.
+/// Ранние версии писали в базу русские названия полей ("Статус"), старые
+/// английские ("from", "status") и значения seen/not_seen, yes/no.
+fn normalize_smart_condition(field: String, op: String, value: String) -> (String, String, String) {
+    let field = match field.as_str() {
+        "Отправитель" | "Sender" | "from" => "sender",
+        "Получатель" | "Recipient" | "to" => "recipient",
+        "Тема" | "Subject" => "subject",
+        "Текст письма" | "Message text" => "body",
+        "Аккаунт" | "Account" => "account",
+        "Статус" | "Status" | "status" => "read_state",
+        "Вложение" | "Attachment" => "attachment",
+        "Метка" | "Label" => "label",
+        "Папка" | "Folder" => "folder",
+        "Дата" | "Date" => "date",
+        _ => field.as_str(),
+    }
+    .to_owned();
+    let op = match op.as_str() {
+        "содержит" => "contains",
+        "не содержит" | "does not contain" => "not_contains",
+        "равно" => "equals",
+        "не равно" => "not_equals",
+        _ => op.as_str(),
+    }
+    .to_owned();
+    let value = match (field.as_str(), value.as_str()) {
+        ("read_state", "seen" | "Прочитано" | "Read") => "read",
+        ("read_state", "not_seen" | "Непрочитано" | "Не прочитано" | "Unread") => {
+            "unread"
+        }
+        ("attachment", "yes" | "Есть") => "has",
+        ("attachment", "no" | "Нет") => "none",
+        _ => value.as_str(),
+    }
+    .to_owned();
+    (field, op, value)
+}
+
 fn smart_folder_matches(
     folder: &SmartFolder,
     message: &MessageMeta,
@@ -4558,11 +4602,23 @@ fn smart_condition_matches(
                 "weeks" => 604_800,
                 _ => 3_600,
             };
-            let threshold = chrono::Utc::now() - chrono::Duration::seconds(amount * seconds);
+            // Период приходит из условия, которое пользователь пишет руками:
+            // "20000000 недель" переполняли chrono и роняли выборку писем
+            // паникой. Сравниваем возраст письма с периодом, а не строим
+            // пороговую дату: дата переполняется намного раньше самой
+            // длительности. Непредставимый период считаем бесконечным - в него
+            // попадает любое письмо, и ничего не оказывается старше него.
+            let Some(offset) = amount
+                .checked_mul(seconds)
+                .and_then(chrono::Duration::try_seconds)
+            else {
+                return condition.op == "within_last";
+            };
+            let age = chrono::Utc::now().signed_duration_since(timestamp);
             return if condition.op == "within_last" {
-                timestamp >= threshold
+                age <= offset
             } else {
-                timestamp < threshold
+                age > offset
             };
         }
         let Ok(target) = chrono::NaiveDate::parse_from_str(&condition.value, "%Y-%m-%d") else {
@@ -5118,6 +5174,142 @@ impl From<ContactRow> for Contact {
             is_favorite: r.is_favorite != 0,
             is_local_only: r.remote_url.is_none(),
         }
+    }
+}
+
+#[cfg(test)]
+mod smart_condition_legacy_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_read_state_condition_is_understood() {
+        // Так условие "Непрочитанные (все)" лежит в базах ранних версий: из-за
+        // старого словаря папка оставалась пустой при непрочитанных письмах.
+        let (field, op, value) = normalize_smart_condition(
+            "Статус".to_owned(),
+            "равно".to_owned(),
+            "not_seen".to_owned(),
+        );
+        assert_eq!(
+            (field.as_str(), op.as_str(), value.as_str()),
+            ("read_state", "equals", "unread")
+        );
+    }
+
+    #[test]
+    fn legacy_attachment_and_sender_conditions_are_understood() {
+        let (field, _, value) =
+            normalize_smart_condition("Вложение".to_owned(), "equals".to_owned(), "yes".to_owned());
+        assert_eq!((field.as_str(), value.as_str()), ("attachment", "has"));
+        let (field, op, _) = normalize_smart_condition(
+            "from".to_owned(),
+            "содержит".to_owned(),
+            "boss@example.com".to_owned(),
+        );
+        assert_eq!((field.as_str(), op.as_str()), ("sender", "contains"));
+    }
+
+    #[test]
+    fn absurd_relative_period_does_not_break_the_query() {
+        // Период вводит пользователь: "20000000000 недель" переполняли chrono
+        // и роняли выборку писем паникой вместо результата.
+        let message = MessageMeta {
+            id: 1,
+            account_id: 1,
+            folder_id: 1,
+            thread_id: None,
+            uid: 1,
+            message_id: None,
+            from: Addr {
+                name: None,
+                email: "sender@example.com".to_owned(),
+            },
+            to: Vec::new(),
+            cc: Vec::new(),
+            subject: String::new(),
+            preview: String::new(),
+            // Дата письма считается от текущего момента: с жёстко записанной
+            // датой тест перестал бы проходить на следующий день.
+            date: Some(chrono::Utc::now().to_rfc3339()),
+            size: None,
+            flags: Flags::default(),
+            has_attachments: false,
+            auth: AuthResults::default(),
+            labels: Vec::new(),
+        };
+        let huge = SmartCondition {
+            field: "date".to_owned(),
+            op: "within_last".to_owned(),
+            value: "20000000000".to_owned(),
+            unit: Some("weeks".to_owned()),
+            value2: None,
+        };
+        assert!(smart_condition_matches(&huge, &message, None, None));
+        let older_than = SmartCondition {
+            op: "older_than".to_owned(),
+            ..huge.clone()
+        };
+        assert!(!smart_condition_matches(&older_than, &message, None, None));
+        // Период, который сам по себе представим, но выносит пороговую дату за
+        // границы календаря: раньше падало именно на вычитании.
+        let past_calendar = SmartCondition {
+            value: "20000000".to_owned(),
+            ..huge.clone()
+        };
+        assert!(smart_condition_matches(
+            &past_calendar,
+            &message,
+            None,
+            None
+        ));
+        let past_calendar_older = SmartCondition {
+            op: "older_than".to_owned(),
+            ..past_calendar
+        };
+        assert!(!smart_condition_matches(
+            &past_calendar_older,
+            &message,
+            None,
+            None
+        ));
+        // Отдельная ветка защиты: произведение не помещается в i64 ещё до того,
+        // как дело дойдёт до длительности.
+        let overflowing_product = SmartCondition {
+            value: i64::MAX.to_string(),
+            ..huge.clone()
+        };
+        assert!(smart_condition_matches(
+            &overflowing_product,
+            &message,
+            None,
+            None
+        ));
+        // Обычный период считается как прежде. Берём заведомо старое письмо,
+        // чтобы результат не зависел от того, когда гоняются тесты.
+        let old_message = MessageMeta {
+            date: Some("2000-01-01T10:00:00Z".to_owned()),
+            ..message.clone()
+        };
+        let day = SmartCondition {
+            value: "24".to_owned(),
+            unit: Some("hours".to_owned()),
+            ..huge
+        };
+        assert!(!smart_condition_matches(&day, &old_message, None, None));
+        assert!(smart_condition_matches(&day, &message, None, None));
+    }
+
+    #[test]
+    fn current_conditions_are_left_alone() {
+        let (field, op, value) = normalize_smart_condition(
+            "read_state".to_owned(),
+            "equals".to_owned(),
+            "unread".to_owned(),
+        );
+        assert_eq!(
+            (field.as_str(), op.as_str(), value.as_str()),
+            ("read_state", "equals", "unread")
+        );
     }
 }
 
