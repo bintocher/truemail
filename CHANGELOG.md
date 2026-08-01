@@ -20,6 +20,8 @@ versions use Semantic Versioning.
   by early versions kept the old vocabulary ("Status" instead of "Read state",
   not_seen instead of unread) and the query did not understand them: "Unread
   (all)", for one, stayed empty while the mailbox had unread mail.
+- Smart folders with a date condition no longer break the message query: an
+  absurdly large period (billions of weeks) failed instead of returning results.
 - The window now opens by itself after an update. The installer restarted the
   app with the previous process arguments, so a copy started by autostart hid
   itself in the tray and could only be restored from the tray icon.

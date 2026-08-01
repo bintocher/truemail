@@ -30,7 +30,12 @@
   // Клик до загрузки настроек ждёт их: иначе сохранённое "в панель задач" не
   // действовало бы первые мгновения после запуска.
   document.getElementById('winMinimize')?.addEventListener('click',async()=>{
-    if(window.tmMinimizeToTray===undefined)await window.tmSettingsReady?.catch?.(()=>{});
+    // Ждём настоящее значение настройки, но не дольше секунды: кнопка окна не
+    // должна зависеть от того, дошла ли загрузка настроек до конца.
+    if(window.tmMinimizeToTray===undefined){
+      const waited=window.tmSettingsReady?.catch?.(()=>{})||Promise.resolve();
+      await Promise.race([waited,new Promise(resolve=>setTimeout(resolve,1000))]);
+    }
     const toTray=window.tmMinimizeToTray!==false;
     try{await (toTray?appWindow.hide():appWindow.minimize());}catch(error){console.error(error);}
   });

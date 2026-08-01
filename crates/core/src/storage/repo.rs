@@ -4602,7 +4602,17 @@ fn smart_condition_matches(
                 "weeks" => 604_800,
                 _ => 3_600,
             };
-            let threshold = chrono::Utc::now() - chrono::Duration::seconds(amount * seconds);
+            // Период приходит из условия, которое пользователь пишет руками:
+            // "20000000000 недель" переполняли chrono и роняли выборку писем
+            // паникой. Непредставимый период считаем бесконечным: в него
+            // попадает любое письмо, и ничего не оказывается старше него.
+            let Some(offset) = amount
+                .checked_mul(seconds)
+                .and_then(chrono::Duration::try_seconds)
+            else {
+                return condition.op == "within_last";
+            };
+            let threshold = chrono::Utc::now() - offset;
             return if condition.op == "within_last" {
                 timestamp >= threshold
             } else {
@@ -5195,6 +5205,47 @@ mod smart_condition_legacy_tests {
             "boss@example.com".to_owned(),
         );
         assert_eq!((field.as_str(), op.as_str()), ("sender", "contains"));
+    }
+
+    #[test]
+    fn absurd_relative_period_does_not_break_the_query() {
+        // Период вводит пользователь: "20000000000 недель" переполняли chrono
+        // и роняли выборку писем паникой вместо результата.
+        let message = MessageMeta {
+            id: 1,
+            account_id: 1,
+            folder_id: 1,
+            thread_id: None,
+            uid: 1,
+            message_id: None,
+            from: Addr {
+                name: None,
+                email: "sender@example.com".to_owned(),
+            },
+            to: Vec::new(),
+            cc: Vec::new(),
+            subject: String::new(),
+            preview: String::new(),
+            date: Some("2026-08-01T10:00:00Z".to_owned()),
+            size: None,
+            flags: Flags::default(),
+            has_attachments: false,
+            auth: AuthResults::default(),
+            labels: Vec::new(),
+        };
+        let huge = SmartCondition {
+            field: "date".to_owned(),
+            op: "within_last".to_owned(),
+            value: "20000000000".to_owned(),
+            unit: Some("weeks".to_owned()),
+            value2: None,
+        };
+        assert!(smart_condition_matches(&huge, &message, None, None));
+        let older_than = SmartCondition {
+            op: "older_than".to_owned(),
+            ..huge
+        };
+        assert!(!smart_condition_matches(&older_than, &message, None, None));
     }
 
     #[test]
