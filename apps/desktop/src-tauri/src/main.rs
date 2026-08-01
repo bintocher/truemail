@@ -424,7 +424,11 @@ fn run() -> anyhow::Result<()> {
             // открытие SQLCipher выше блокирует поток, и показанное до него окно
             // висело бы серым "не отвечает". Показываем, когда всё готово, кроме
             // автозапуска с --hidden - тот стартует сразу свёрнутым в трей.
-            if !std::env::args().any(|arg| arg == "--hidden") {
+            // После обновления окно показываем всегда: установщик передаёт
+            // аргументы прежнего процесса, и --hidden от автозапуска прятал бы
+            // обновлённую программу обратно в трей.
+            let after_update = commands::take_show_window_after_update(app.handle());
+            if after_update || !std::env::args().any(|arg| arg == "--hidden") {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();
                 }

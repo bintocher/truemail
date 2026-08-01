@@ -14,6 +14,13 @@ window.corePageSize = 100;
   const invoke = tauri.core.invoke;
   if (window.clearDemoData) window.clearDemoData();
 
+  // Настройки приезжают уже после того, как окно показано: до этого поведение
+  // кнопок, зависящих от них, неизвестно. Промис даёт таким обработчикам
+  // дождаться настоящего значения вместо догадки.
+  let settingsLoaded;
+  window.tmSettingsReady = new Promise(resolve => { settingsLoaded = resolve; });
+  window.markSettingsLoaded = () => settingsLoaded();
+
   // Единая точка доступа к ядру для остального фронтенда.
   window.tm = {
     bootstrapStatus: () => invoke("bootstrap_status"),
@@ -307,6 +314,7 @@ window.corePageSize = 100;
       const savedLocale = settings.locale;
       if (savedLocale && window.applyWizardLanguage) window.applyWizardLanguage(savedLocale, false);
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
+      window.markSettingsLoaded?.();
       await window.reloadMailRules?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();

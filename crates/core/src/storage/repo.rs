@@ -4036,10 +4036,15 @@ impl Db {
                     });
                 }
                 groups[group_index].logic = condition.group_logic;
+                // Условия ранних версий лежат в базе в старом словаре. Миграция
+                // 0036 переписывает известные варианты, но выборка не должна
+                // зависеть от того, прошла ли она: приводим на чтении.
+                let (field, op, value) =
+                    normalize_smart_condition(condition.field, condition.op, condition.value);
                 groups[group_index].conditions.push(SmartCondition {
-                    field: condition.field,
-                    op: condition.op,
-                    value: condition.value,
+                    field,
+                    op,
+                    value,
                     unit: condition.unit,
                     value2: condition.value2,
                 });
@@ -4508,6 +4513,45 @@ impl Db {
         }
         Ok(contacts)
     }
+}
+
+/// Привести условие умной папки к нынешнему словарю полей и значений.
+/// Ранние версии писали в базу русские названия полей ("Статус"), старые
+/// английские ("from", "status") и значения seen/not_seen, yes/no.
+fn normalize_smart_condition(field: String, op: String, value: String) -> (String, String, String) {
+    let field = match field.as_str() {
+        "Отправитель" | "Sender" | "from" => "sender",
+        "Получатель" | "Recipient" | "to" => "recipient",
+        "Тема" | "Subject" => "subject",
+        "Текст письма" | "Message text" => "body",
+        "Аккаунт" | "Account" => "account",
+        "Статус" | "Status" | "status" => "read_state",
+        "Вложение" | "Attachment" => "attachment",
+        "Метка" | "Label" => "label",
+        "Папка" | "Folder" => "folder",
+        "Дата" | "Date" => "date",
+        _ => field.as_str(),
+    }
+    .to_owned();
+    let op = match op.as_str() {
+        "содержит" => "contains",
+        "не содержит" | "does not contain" => "not_contains",
+        "равно" => "equals",
+        "не равно" => "not_equals",
+        _ => op.as_str(),
+    }
+    .to_owned();
+    let value = match (field.as_str(), value.as_str()) {
+        ("read_state", "seen" | "Прочитано" | "Read") => "read",
+        ("read_state", "not_seen" | "Непрочитано" | "Не прочитано" | "Unread") => {
+            "unread"
+        }
+        ("attachment", "yes" | "Есть") => "has",
+        ("attachment", "no" | "Нет") => "none",
+        _ => value.as_str(),
+    }
+    .to_owned();
+    (field, op, value)
 }
 
 fn smart_folder_matches(
@@ -5118,6 +5162,52 @@ impl From<ContactRow> for Contact {
             is_favorite: r.is_favorite != 0,
             is_local_only: r.remote_url.is_none(),
         }
+    }
+}
+
+#[cfg(test)]
+mod smart_condition_legacy_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_read_state_condition_is_understood() {
+        // Так условие "Непрочитанные (все)" лежит в базах ранних версий: из-за
+        // старого словаря папка оставалась пустой при непрочитанных письмах.
+        let (field, op, value) = normalize_smart_condition(
+            "Статус".to_owned(),
+            "равно".to_owned(),
+            "not_seen".to_owned(),
+        );
+        assert_eq!(
+            (field.as_str(), op.as_str(), value.as_str()),
+            ("read_state", "equals", "unread")
+        );
+    }
+
+    #[test]
+    fn legacy_attachment_and_sender_conditions_are_understood() {
+        let (field, _, value) =
+            normalize_smart_condition("Вложение".to_owned(), "equals".to_owned(), "yes".to_owned());
+        assert_eq!((field.as_str(), value.as_str()), ("attachment", "has"));
+        let (field, op, _) = normalize_smart_condition(
+            "from".to_owned(),
+            "содержит".to_owned(),
+            "boss@example.com".to_owned(),
+        );
+        assert_eq!((field.as_str(), op.as_str()), ("sender", "contains"));
+    }
+
+    #[test]
+    fn current_conditions_are_left_alone() {
+        let (field, op, value) = normalize_smart_condition(
+            "read_state".to_owned(),
+            "equals".to_owned(),
+            "unread".to_owned(),
+        );
+        assert_eq!(
+            (field.as_str(), op.as_str(), value.as_str()),
+            ("read_state", "equals", "unread")
+        );
     }
 }
 

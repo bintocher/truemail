@@ -419,6 +419,49 @@ fn remove_stale_update_files(dir: &std::path::Path, keep: Option<&std::path::Pat
     }
 }
 
+/// Файл-признак "показать окно после обновления".
+fn show_window_marker() -> PathBuf {
+    crate::default_data_dir().join("show-window-after-update")
+}
+
+/// Оставить признак для следующего запуска. Внутри лежит версия, ради которой
+/// обновляемся: если установка сорвалась и версия осталась прежней, признак
+/// сработать не должен.
+fn mark_show_window_after_update(version: &str) {
+    let marker = show_window_marker();
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Не смогли записать - обновление всё равно нужнее: окно тогда придётся
+    // достать из трея, о чём и говорит запись в журнале.
+    if let Err(error) = std::fs::write(&marker, version) {
+        tracing::warn!(error = %error, "признак показа окна после обновления не записан");
+    }
+}
+
+/// Показать окно после обновления, даже если программа перезапустилась с
+/// --hidden от автозапуска. Признак оставляет install_update; забираем его при
+/// старте, чтобы следующий обычный запуск снова уважал --hidden. Признак от
+/// сорвавшегося обновления (процесс убили посреди установки) отбрасываем:
+/// в нём записана версия, которой программа так и не стала.
+pub fn take_show_window_after_update(app: &AppHandle) -> bool {
+    let marker = show_window_marker();
+    let Ok(version) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let _ = std::fs::remove_file(&marker);
+    let installed = app.package_info().version.to_string();
+    if version.trim() == installed {
+        return true;
+    }
+    tracing::info!(
+        marker_version = version.trim(),
+        installed,
+        "признак показа окна остался от несостоявшегося обновления"
+    );
+    false
+}
+
 /// Вычистить каталог обновлений при запуске: пакет, из которого программа
 /// только что обновилась, уже не нужен, а недокачанные и оставшиеся от прошлых
 /// версий - тем более. Пакет, скачанный до перезапуска, тоже удаляем: его
@@ -440,6 +483,9 @@ pub async fn install_update(app: AppHandle) -> CmdResult<()> {
         return Err(api_error("обновление уже устанавливается"));
     }
     let result = run_update_installation(&app).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(show_window_marker());
+    }
     if result.is_err() {
         state
             .installing_update
@@ -479,6 +525,9 @@ async fn run_update_installation(app: &AppHandle) -> CmdResult<()> {
         },
         None => None,
     };
+    // Дальше начинается собственно установка: с этого места процесс уже не
+    // вернётся в наше управление, поэтому признак ставим здесь, а не раньше.
+    mark_show_window_after_update(&update.version);
     match bytes {
         Some(bytes) => {
             let _ = app.emit(

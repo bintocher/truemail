@@ -25,7 +25,24 @@
   }
   window.syncWindowMaximizeState=syncMaximizeState;
 
-  document.getElementById('winMinimize')?.addEventListener('click',()=>appWindow.minimize().catch(console.error));
+  // Куда сворачивать - выбирает пользователь в настройках. По умолчанию в трей:
+  // программа и так живёт там, а скрытое окно освобождает память интерфейса.
+  // Клик до загрузки настроек ждёт их: иначе сохранённое "в панель задач" не
+  // действовало бы первые мгновения после запуска.
+  document.getElementById('winMinimize')?.addEventListener('click',async()=>{
+    if(window.tmMinimizeToTray===undefined)await window.tmSettingsReady?.catch?.(()=>{});
+    const toTray=window.tmMinimizeToTray!==false;
+    try{await (toTray?appWindow.hide():appWindow.minimize());}catch(error){console.error(error);}
+  });
+  // Подпись кнопки следует за настройкой: иначе она обещала бы трей тем, кто
+  // выбрал обычное сворачивание.
+  const minimizeButton=document.getElementById('winMinimize');
+  window.updateMinimizeButtonLabel=function(){
+    if(!minimizeButton)return;
+    const toTray=window.tmMinimizeToTray!==false;
+    const label=toTray?L('Свернуть в трей','Minimize to tray'):L('Свернуть','Minimize');
+    minimizeButton.title=label;minimizeButton.setAttribute('aria-label',label);
+  };
   maximizeButton?.addEventListener('click',()=>appWindow.toggleMaximize().then(syncMaximizeState).catch(console.error));
   // Закрытие прячет программу в трей - это решает обработчик CloseRequested в ядре.
   document.getElementById('winClose')?.addEventListener('click',()=>appWindow.close().catch(console.error));
@@ -56,6 +73,7 @@
   // установки.
   window.restoreTitlebarState=function(){
     syncMaximizeState();
+    window.updateMinimizeButtonLabel?.();
     if(installing&&updateText)updateText.textContent=L('Обновление…','Updating…');
   };
   window.showUpdateButton=function(version,downloaded){

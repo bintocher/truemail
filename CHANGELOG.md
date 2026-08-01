@@ -7,6 +7,23 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-08-01
+
+### Added
+
+- A "Minimize to tray" setting: the minimize button hides the window into the
+  tray icon instead of the taskbar. Turn it off for ordinary minimizing.
+
+### Fixed
+
+- Smart folders with legacy conditions show messages again. Conditions created
+  by early versions kept the old vocabulary ("Status" instead of "Read state",
+  not_seen instead of unread) and the query did not understand them: "Unread
+  (all)", for one, stayed empty while the mailbox had unread mail.
+- The window now opens by itself after an update. The installer restarted the
+  app with the previous process arguments, so a copy started by autostart hid
+  itself in the tray and could only be restored from the tray icon.
+
 ## [0.2.4] - 2026-07-31
 
 ### Added

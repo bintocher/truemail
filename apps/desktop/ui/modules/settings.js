@@ -185,6 +185,15 @@ if(autostartToggle){
     catch(error){autostartToggle.classList.toggle('on');showToast(error.message||String(error));}
   });
 }
+// Куда девается окно по кнопке "свернуть": в трей или в панель задач.
+const minimizeTrayToggle=document.getElementById('minimizeTrayToggle');
+if(minimizeTrayToggle){
+  minimizeTrayToggle.addEventListener('click',()=>{
+    window.tmMinimizeToTray=minimizeTrayToggle.classList.contains('on');
+    window.updateMinimizeButtonLabel?.();
+    window.tm?.setSetting('minimize_to_tray',window.tmMinimizeToTray?'1':'0').catch(console.error);
+  });
+}
 // Пункт truemail в меню "Отправить" проводника. Меню есть только в Windows,
 // на остальных системах строку настройки не показываем вовсе.
 const sendToRow=document.getElementById('sendToRow');
@@ -223,6 +232,10 @@ if(notifyPositionSelect)notifyPositionSelect.onchange=e=>{window.tm?.setNotifyPo
 
 window.applyCoreSettings=function(settings){
   refreshSystemIntegrationToggles();
+  // По умолчанию прячем в трей: настройка появилась позже самой кнопки.
+  window.tmMinimizeToTray=settings.minimize_to_tray!=='0';
+  if(minimizeTrayToggle)minimizeTrayToggle.classList.toggle('on',window.tmMinimizeToTray);
+  window.updateMinimizeButtonLabel?.();
   try{folderCounterModes=JSON.parse(settings.folder_counters||'{}')||{};}catch(_){folderCounterModes={};}
   if(settings.external_api_port)document.getElementById('apiPort').value=settings.external_api_port;if(settings.external_api_enabled==='1')window.tm?.startExternalApi(Number(settings.external_api_port)||34981).then(refreshApiSettings).catch(console.error);
   // Без сохранённого значения показываем платформенный дефолт (как в NotifyAnchor).
