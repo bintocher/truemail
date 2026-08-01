@@ -4603,8 +4603,10 @@ fn smart_condition_matches(
                 _ => 3_600,
             };
             // Период приходит из условия, которое пользователь пишет руками:
-            // "20000000000 недель" переполняли chrono и роняли выборку писем
-            // паникой. Непредставимый период считаем бесконечным: в него
+            // "20000000 недель" переполняли chrono и роняли выборку писем
+            // паникой. Сравниваем возраст письма с периодом, а не строим
+            // пороговую дату: дата переполняется намного раньше самой
+            // длительности. Непредставимый период считаем бесконечным - в него
             // попадает любое письмо, и ничего не оказывается старше него.
             let Some(offset) = amount
                 .checked_mul(seconds)
@@ -4612,11 +4614,11 @@ fn smart_condition_matches(
             else {
                 return condition.op == "within_last";
             };
-            let threshold = chrono::Utc::now() - offset;
+            let age = chrono::Utc::now().signed_duration_since(timestamp);
             return if condition.op == "within_last" {
-                timestamp >= threshold
+                age <= offset
             } else {
-                timestamp < threshold
+                age > offset
             };
         }
         let Ok(target) = chrono::NaiveDate::parse_from_str(&condition.value, "%Y-%m-%d") else {
@@ -5226,7 +5228,9 @@ mod smart_condition_legacy_tests {
             cc: Vec::new(),
             subject: String::new(),
             preview: String::new(),
-            date: Some("2026-08-01T10:00:00Z".to_owned()),
+            // Дата письма считается от текущего момента: с жёстко записанной
+            // датой тест перестал бы проходить на следующий день.
+            date: Some(chrono::Utc::now().to_rfc3339()),
             size: None,
             flags: Flags::default(),
             has_attachments: false,
@@ -5243,9 +5247,44 @@ mod smart_condition_legacy_tests {
         assert!(smart_condition_matches(&huge, &message, None, None));
         let older_than = SmartCondition {
             op: "older_than".to_owned(),
-            ..huge
+            ..huge.clone()
         };
         assert!(!smart_condition_matches(&older_than, &message, None, None));
+        // Период, который сам по себе представим, но выносит пороговую дату за
+        // границы календаря: раньше падало именно на вычитании.
+        let past_calendar = SmartCondition {
+            value: "20000000".to_owned(),
+            ..huge.clone()
+        };
+        assert!(smart_condition_matches(
+            &past_calendar,
+            &message,
+            None,
+            None
+        ));
+        let past_calendar_older = SmartCondition {
+            op: "older_than".to_owned(),
+            ..past_calendar
+        };
+        assert!(!smart_condition_matches(
+            &past_calendar_older,
+            &message,
+            None,
+            None
+        ));
+        // Обычный период считается как прежде. Берём заведомо старое письмо,
+        // чтобы результат не зависел от того, когда гоняются тесты.
+        let old_message = MessageMeta {
+            date: Some("2000-01-01T10:00:00Z".to_owned()),
+            ..message.clone()
+        };
+        let day = SmartCondition {
+            value: "24".to_owned(),
+            unit: Some("hours".to_owned()),
+            ..huge
+        };
+        assert!(!smart_condition_matches(&day, &old_message, None, None));
+        assert!(smart_condition_matches(&day, &message, None, None));
     }
 
     #[test]
