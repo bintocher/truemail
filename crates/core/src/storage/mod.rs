@@ -614,6 +614,159 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 
+    /// Встроенная умная папка, которую пользователь не переименовывал, хранит
+    /// пустое имя: подпись даёт локализация интерфейса. Переименованная папка
+    /// своё имя сохраняет - иначе правка имени снова терялась бы по дороге.
+    #[tokio::test]
+    async fn builtin_smart_folders_keep_only_user_given_names() {
+        let root =
+            std::env::temp_dir().join(format!("truemail-smart-names-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("run migrations");
+
+        let names: Vec<(String, String)> =
+            sqlx::query_as("SELECT stable_id, name FROM smart_folders WHERE is_builtin=1")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read builtin smart folders");
+        assert!(!names.is_empty(), "встроенные папки должны быть засеяны");
+        for (stable_id, name) in &names {
+            assert_eq!(name, "", "имя по умолчанию не хранится: {stable_id}");
+        }
+
+        // Английские подписи и короткие формы программа сама никогда не писала,
+        // поэтому такое имя задал пользователь - миграция его не трогает. Текст
+        // миграции выполняем прямо здесь: повторный migrate() ничего не сделал
+        // бы, sqlx помнит уже применённые версии, и проверка была бы пустой.
+        const DEFAULT_NAMES_MIGRATION: &str =
+            include_str!("../../migrations/0037_smart_folder_default_names.sql");
+        for (stable_id, name) in [
+            ("all-important", "All important"),
+            ("all-unread", "Непрочитанные"),
+            ("all-sent", "Все отправленные"),
+        ] {
+            sqlx::query("UPDATE smart_folders SET name=? WHERE stable_id=?")
+                .bind(name)
+                .bind(stable_id)
+                .execute(&db.write_pool)
+                .await
+                .expect("set smart folder name");
+        }
+        sqlx::raw_sql(DEFAULT_NAMES_MIGRATION)
+            .execute(&db.write_pool)
+            .await
+            .expect("apply default name migration");
+        let kept: Vec<(String, String)> = sqlx::query_as(
+            "SELECT stable_id, name FROM smart_folders
+             WHERE stable_id IN ('all-important', 'all-unread', 'all-sent') ORDER BY stable_id",
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read renamed folders");
+        assert_eq!(
+            kept,
+            vec![
+                ("all-important".to_owned(), "All important".to_owned()),
+                // Имя, которое сеяла сама программа, миграция снимает.
+                ("all-sent".to_owned(), String::new()),
+                ("all-unread".to_owned(), "Непрочитанные".to_owned()),
+            ]
+        );
+
+        sqlx::query("UPDATE smart_folders SET name='Моя папка' WHERE stable_id='all-unread'")
+            .execute(&db.write_pool)
+            .await
+            .expect("rename smart folder");
+        let folders = db
+            .list_smart_folders()
+            .await
+            .expect("list smart folders after rename");
+        let renamed = folders
+            .iter()
+            .find(|folder| folder.id == "all-unread")
+            .expect("renamed folder is listed");
+        assert_eq!(renamed.name, "Моя папка");
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
+    /// Пустое имя допустимо только у встроенной папки: у неё подпись даёт
+    /// локализация. Иначе интерфейс, отдающий весь набор целиком, не смог бы
+    /// сохранить ни одной правки умных папок.
+    #[tokio::test]
+    async fn smart_folders_are_saved_with_empty_builtin_names() {
+        let root =
+            std::env::temp_dir().join(format!("truemail-smart-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("run migrations");
+
+        let mut folders = db.list_smart_folders().await.expect("list smart folders");
+        assert!(folders.iter().all(|folder| folder.name.is_empty()));
+        folders.push(crate::model::SmartFolder {
+            id: "custom-1".into(),
+            name: "Счета".into(),
+            icon: Some("star".into()),
+            is_builtin: false,
+            enabled: true,
+            sort_order: folders.len() as i64,
+            groups: vec![crate::model::SmartConditionGroup {
+                logic: "all".into(),
+                conditions: vec![crate::model::SmartCondition {
+                    field: "sender".into(),
+                    op: "contains".into(),
+                    value: "boss@".into(),
+                    unit: None,
+                    value2: None,
+                }],
+            }],
+        });
+        db.save_smart_folders(&folders)
+            .await
+            .expect("набор с пустыми именами встроенных папок сохраняется");
+        let saved = db.list_smart_folders().await.expect("list after save");
+        assert_eq!(saved.len(), folders.len());
+        assert_eq!(
+            saved
+                .iter()
+                .find(|folder| folder.id == "custom-1")
+                .map(|folder| folder.name.as_str()),
+            Some("Счета")
+        );
+        assert!(
+            saved
+                .iter()
+                .filter(|folder| folder.is_builtin)
+                .all(|folder| folder.name.is_empty())
+        );
+
+        // Пользовательская папка без имени остаётся ошибкой, и подделанный
+        // клиентом признак встроенной этого не меняет.
+        let mut nameless = saved.clone();
+        if let Some(folder) = nameless.iter_mut().find(|folder| folder.id == "custom-1") {
+            folder.name = String::new();
+            folder.is_builtin = true;
+        }
+        assert!(db.save_smart_folders(&nameless).await.is_err());
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
     #[tokio::test]
     async fn plaintext_database_is_migrated_without_losing_data() {
         let root =

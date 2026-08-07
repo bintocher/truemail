@@ -7,6 +7,24 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-08-07
+
+### Added
+
+- Message counters for smart folders: the context menu of a smart folder in the
+  sidebar can show unread, total, or both - just like ordinary mailbox folders.
+  The counter is off by default.
+
+### Fixed
+
+- The minimize button minimizes the window again: hiding to the tray was
+  rejected by the permission list, so the click did nothing.
+- A renamed built-in smart folder shows its own name in the sidebar and in the
+  settings list. The default caption used to win there, so the name set in
+  settings was only visible inside the edit dialog. The name field of a built-in
+  folder now shows the default caption as a hint: clear the field to bring it
+  back and have the name follow the interface language again.
+
 ## [0.2.5] - 2026-08-01
 
 ### Added

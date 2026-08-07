@@ -49,7 +49,7 @@
       <button type="button" class="navitem" data-nav="mail" data-smart-id="all-important"><i data-i="star"></i><span class="smart-label" data-i18n="navAllImportant">Все важные</span><span class="count"></span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="all-sent"><i data-i="send"></i><span class="smart-label" data-i18n="navAllSent">Все отправленные</span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="all-drafts"><i data-i="draft"></i><span class="smart-label" data-i18n="navAllDrafts">Все черновики</span><span class="count"></span></button>
-      <button type="button" class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i><span class="smart-label" data-i18n="navToday">Сегодня</span><span class="count"></span></button>
+      <button type="button" class="navitem" data-nav="mail" data-smart-id="last-24-hours"><i data-i="cal"></i><span class="smart-label" data-i18n="navToday">Сегодня (за 24 часа)</span><span class="count"></span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="all-unread"><i data-i="search"></i><span class="smart-label" data-i18n="navUnread">Непрочитанные (все)</span><span class="count"></span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="with-attachments"><i data-i="paperclip"></i><span class="smart-label" data-i18n="navWithAttachments">С вложениями</span></button>
       <button type="button" class="navitem" data-nav="mail" data-smart-id="awaiting-my-reply"><i data-i="flag"></i><span class="smart-label" data-i18n="navWaitingReply">Ждут ответа</span><span class="count"></span></button>
@@ -57,7 +57,7 @@
       <div class="navlabel" data-navlabel="accounts"><span data-i18n="navAccounts">Аккаунты</span> <button type="button" class="add" id="addAcct" data-i18n-title="addAccount" title="Добавить аккаунт"><i data-i="plus"></i></button></div>
 
       <div class="navlabel" data-navlabel="tags"><span data-i18n="navTags">Метки</span> <button type="button" class="add" id="addTag" data-i18n-title="createTag" title="Создать метку"><i data-i="plus"></i></button></div>
-      <div id="tagsNav" class="tags-nav"></div>
+      <div id="tagsNav" class="tags-nav" data-no-i18n></div>
 
       <div class="nav-spacer"></div>
     </aside>
@@ -71,7 +71,7 @@
         <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount" data-i18n="selectedCountZero">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i><span data-i18n="selectAll">Выбрать все</span></button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i><span data-i18n="markRead">Прочитать</span></button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i><span data-i18n="actionArchive">В архив</span></button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i><span data-i18n="actionDelete">Удалить</span></button><button class="iconbtn ml-auto" id="bulkClear" data-i18n-title="tipClearSelection" title="Снять выделение"><i data-i="close"></i></button></div>
         <button type="button" class="search" id="searchBox"><i data-i="search"></i><span class="search-placeholder" data-i18n="searchAllPlaceholder">Поиск по всем ящикам</span><span class="kbd">Ctrl K</span></button>
       </div>
-      <div class="msgs" id="msgs"></div>
+      <div class="msgs" id="msgs" data-no-i18n></div>
       <div class="list-loading hidden" id="listLoading"><span class="spinner"></span></div>
     </section>
 
@@ -96,9 +96,9 @@
             <button type="button" data-thread-action="settings"><i data-i="settings"></i><span data-i18n="configureMailToolbar">Настроить панель письма</span></button>
           </div>
         </div>
-        <div class="labels"><h1 id="tSubject"></h1></div>
+        <div class="labels"><h1 id="tSubject" data-no-i18n></h1></div>
       </div>
-      <div class="tbody" id="tbody"></div>
+      <div class="tbody" id="tbody" data-no-i18n></div>
     </section>
 
     <section class="cal" id="calSection" data-cv="month">
@@ -110,19 +110,19 @@
       <div class="calbody">
         <aside class="cal-sidebar" id="calendarSidebar" data-i18n-aria="setCalendars" aria-label="Календари">
           <div class="cal-sidebar-head"><strong data-i18n="setCalendars">Календари</strong><button type="button" class="iconbtn" id="calSidebarClose" data-i18n-title="close" title="Закрыть"><i data-i="close"></i></button></div>
-          <div class="cal-sidebar-list" id="calendarSidebarList"></div>
+          <div class="cal-sidebar-list" id="calendarSidebarList" data-no-i18n></div>
         </aside>
         <div class="calmain">
-          <div class="calmonth" id="calgrid"></div>
-          <div class="calweek" id="calweek"></div>
-          <div class="calday" id="calday"></div>
+          <div class="calmonth" id="calgrid" data-no-i18n></div>
+          <div class="calweek" id="calweek" data-no-i18n></div>
+          <div class="calday" id="calday" data-no-i18n></div>
         </div>
       </div>
     </section>
 
     <section class="contacts">
       <div class="calhead"><h2 class="ch-title" data-i18n="navContacts">Контакты</h2><div class="search ct-search"><i data-i="search"></i><input data-i18n-placeholder="contactSearchPlaceholder" placeholder="Поиск по контактам"></div><span class="ct-count"></span><div class="seg ml-auto" id="contactViewSwitch"><button type="button" data-cview="cards" class="on" data-i18n-title="viewCards" title="Плашки"><i data-i="grip"></i></button><button type="button" data-cview="table" data-i18n-title="viewTable" title="Таблица"><i data-i="folder"></i></button></div><button class="btn" id="newContactBtn"><i data-i="plus"></i><span data-i18n="newContact">Контакт</span></button></div>
-      <div class="cgrid" id="cgrid"></div>
+      <div class="cgrid" id="cgrid" data-no-i18n></div>
     </section>
   </div>
 
@@ -232,7 +232,7 @@
       <div class="setpage" id="set-tags">
         <h1 data-i18n="navTags">Метки</h1><p class="lead" data-i18n="tagsLead">Цветные метки для писем. Создавайте, переименовывайте, меняйте цвет и удаляйте. Помеченные письма собираются в разделе «Метки» слева.</p>
         <button class="btn primary" id="tagNew2"><i data-i="plus"></i><span data-i18n="createTag">Создать метку</span></button>
-        <div class="card mt-20"><div class="cb" id="tagSettingsList"></div></div>
+        <div class="card mt-20"><div class="cb" id="tagSettingsList" data-no-i18n></div></div>
       </div>
 
       <div class="setpage" id="set-rules">
@@ -371,7 +371,7 @@
       <div class="cfield recipient-field optional-recipient hidden" data-recipient-field="compBcc"><label data-i18n="bcc">Скрытая</label><div class="recipient-input"><span class="recipient-chips"></span><input id="compBcc" data-i18n-placeholder="bccFull" placeholder="Скрытая копия" autocomplete="off"><div class="recipient-suggestions"></div></div><button type="button" class="recipient-close" data-recipient-hide="compBcc" data-i18n-aria="hideBccField" aria-label="Скрыть поле Скрытая копия">×</button></div>
       <div class="cfield"><label data-i18n="subjectLabel">Тема</label><input id="compSubj" data-i18n-placeholder="subjectPlaceholder" placeholder="Тема письма"></div>
       <div class="compedit">
-        <div class="compedit-main" id="compEdit" contenteditable="true" spellcheck="true" data-i18n-ph="bodyPlaceholder" data-ph="Текст письма..."></div>
+        <div class="compedit-main" id="compEdit" contenteditable="true" spellcheck="true" data-no-i18n data-i18n-ph="bodyPlaceholder" data-ph="Текст письма..."></div>
         <div class="sig"></div>
       </div>
       <div class="comp-att" id="compAtt"></div>
@@ -434,7 +434,7 @@
     <div class="mh"><i data-i="search"></i><h3 data-i18n="newSmartFolder">Новая умная папка</h3><button class="iconbtn x" id="smartClose"><i data-i="back"></i></button></div>
     <div class="mb">
       <div class="fld"><label data-i18n="nameAndIcon">Название и значок</label>
-        <div class="name-row"><input class="inp" id="smartName" data-i18n-placeholder="smartNamePlaceholder" placeholder="Например: Важное от коллег">
+        <div class="name-row"><input class="inp" id="smartName">
           <button class="btn" id="smartIconButton" type="button"><i data-i="star"></i><span data-i18n="changeIcon">Изменить значок</span></button></div>
           <div class="icons icon-picker hidden" id="smartIcons"></div>
       </div>
@@ -543,6 +543,9 @@
   <div class="tmi" data-smart-action="open"><i data-i="inbox"></i><span data-i18n="open">Открыть</span></div>
   <div class="tmi" data-smart-action="edit"><i data-i="edit"></i><span data-i18n="editConditions">Изменить условия</span></div>
   <div class="tmi" data-smart-action="settings"><i data-i="settings"></i><span data-i18n="smartFolderSettings">Настройки умных папок</span></div>
+  <div class="tmsep"></div>
+  <div class="tmi tmi-check" data-smart-action="count-unread"><i data-i="inbox"></i><span data-i18n="countUnread">Показывать непрочитанные</span><span class="tmi-mark"></span></div>
+  <div class="tmi tmi-check" data-smart-action="count-total"><i data-i="inbox"></i><span data-i18n="countTotal">Показывать всего писем</span><span class="tmi-mark"></span></div>
 </div>
 
 <div class="ctxmenu" id="ctxfolder">
@@ -670,16 +673,16 @@
   </div>
 </div>
 
-<script src="modules/shell.js?v=20260731-1"></script>
-<script src="modules/calendar-contacts.js?v=20260726-1"></script>
-<script src="modules/commands-accessibility.js?v=20260726-1"></script>
-<script src="modules/smart-rules.js?v=20260731-1"></script>
-<script src="modules/i18n-onboarding.js?v=20260801-1"></script>
-<script src="modules/mail.js?v=20260731-1"></script>
+<script src="modules/shell.js?v=20260807-1"></script>
+<script src="modules/calendar-contacts.js?v=20260807-1"></script>
+<script src="modules/commands-accessibility.js?v=20260807-1"></script>
+<script src="modules/smart-rules.js?v=20260807-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260807-1"></script>
+<script src="modules/mail.js?v=20260807-1"></script>
 <script src="modules/composer.js?v=20260731-1"></script>
-<script src="modules/settings.js?v=20260801-2"></script>
-<script src="modules/window-chrome.js?v=20260801-3"></script>
-<script src="bridge.js?v=20260801-2"></script>
+<script src="modules/settings.js?v=20260807-1"></script>
+<script src="modules/window-chrome.js?v=20260807-1"></script>
+<script src="bridge.js?v=20260807-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

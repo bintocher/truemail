@@ -186,6 +186,14 @@ function forgetSmartFolderState(folderId){
   smartHasMore.delete(folderId);
   smartBackfillVisited.delete(folderId);
   coreSmartRows.delete(folderId);
+  // Режим счётчика тоже принадлежит папке: без этой очистки настройка
+  // smart_counters копила бы ключи давно удалённых папок.
+  if(folderId in smartCounterModes){
+    delete smartCounterModes[folderId];
+    window.tm?.setSetting('smart_counters',JSON.stringify(smartCounterModes)).catch(console.error);
+  }
+  delete smartCounts[folderId];
+  smartCountsRequested.delete(folderId);
 }
 window.forgetSmartFolderState=forgetSmartFolderState;
 // Отдал ли сервер хоть что-то за текущий круг обхода папок-источников. Круг
@@ -221,6 +229,16 @@ let stickyReadIds=new Set();
 // Режим счётчика писем на папку: 'u' непрочитанные, 't' всего, 'ut' оба, 'n'
 // ничего. По умолчанию 'u'. Ключ - id папки. Хранится в настройке folder_counters.
 let folderCounterModes={};
+// То же самое для умных папок, но по умолчанию 'n': умная папка - это проход по
+// всем письмам, поэтому счётчик считается только там, где его включили руками.
+// Ключ - стабильный id умной папки. Хранится в настройке smart_counters.
+let smartCounterModes={};
+// Последние посчитанные ядром числа: {id: {total, unread}}.
+let smartCounts={};
+// Папки, для которых счёт уже заказывали. Нужны, чтобы пауза между проходами
+// не задерживала первое число: настройки применяются раньше загрузки данных, и
+// пользовательские папки попадают в набор только со вторым вызовом.
+const smartCountsRequested=new Set();
 // Теги (метки) и активный тег для фильтра списка писем.
 let coreTags=[];
 let currentTagName=null;

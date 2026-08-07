@@ -43,7 +43,9 @@ window.openMessageById=async function(id){
   }
   const folder=coreFolders.find(item=>item.id===message.folder_id);
   if(folder){
-    currentFolderId=folder.id;currentSmartIndex=null;
+    // Открыт ровно один вид списка: без сброса метки список остался бы
+    // отфильтрованным по ней, а заголовок называл бы папку письма.
+    currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;
     document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));
     const row=document.querySelector(`.folder-row[data-folder-id="${folder.id}"]`);
     if(row){

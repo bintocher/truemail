@@ -294,7 +294,9 @@ function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
   currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(lastSelectedMessageIndex>=rows.length)lastSelectedMessageIndex=-1;if(resetScroll)setMessageScrollTop(0);messageWindowStart=-1;messageWindowEnd=-1;
-  const heading=document.querySelector('.listhead h2');if(heading)heading.textContent=title||messagesTitle();
+  // Заголовок списка - то же пользовательское имя, что и подпись в панели:
+  // без пометки словарь автоперевода подменял бы его переводом фразы.
+  const heading=document.querySelector('.listhead h2');if(heading){heading.dataset.noI18n='1';heading.textContent=title||messagesTitle();}
   // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
   // папок (несколько аккаунтов) - число аккаунтов.
   const sub=document.getElementById('mailAccountCount');
@@ -473,6 +475,11 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
      const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
    const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=trimMessages([...merged.values()],loadedMessages.map(message=>message.id));}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
+  // Счётчики умных папок пересчитываем после каждой перезагрузки данных: письма
+  // могли прийти, уйти или стать прочитанными. Прежние числа возвращаем на
+  // место сразу - clearDemoData стирает подписи счётчиков, а ответ ядра придёт
+  // не мгновенно, и счётчик успел бы мигнуть пустотой.
+  updateSmartBadges();window.refreshSmartCounts?.();
   // Список правил ждёт загрузки меток: правило с действием "поставить метку"
   // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
   // проверяем открытую метку - её могли удалить, и тогда уходим в умную папку.
@@ -491,12 +498,14 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   let anchor=accountsLabel;
   accounts.forEach((account,index)=>{
     const accountOpen=accountNavIsOpen(account.id);
-    const header=document.createElement('button');header.type='button';header.className='acc-h'+(accountOpen?' open':'');header.dataset.accountId=account.id;
+    const header=document.createElement('button');header.type='button';header.className='acc-h'+(accountOpen?' open':'');header.dataset.accountId=account.id;header.dataset.noI18n='1';
     const initial=(account.display_name||account.email||'?').trim()[0].toUpperCase();
     header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)}"></span><span class="em"></span><span class="chev"><i data-i="chevR"></i></span>`;
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
     anchor.after(header);anchor=header;
-    const sub=document.createElement('div');sub.className='acc-sub'+(accountOpen?' open':'');
+    // Имена папок ящика приходят с сервера: словарь автоперевода не должен их
+    // трогать, иначе папка "Календарь" переводилась бы вместе с интерфейсом.
+    const sub=document.createElement('div');sub.className='acc-sub'+(accountOpen?' open':'');sub.dataset.noI18n='1';
     folderTreeRows(foldersByAccount[index]||[]).forEach(({folder,depth})=>{const row=document.createElement('button');row.type='button';row.className='navitem folder-row';row.dataset.folderId=folder.id;
       const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;

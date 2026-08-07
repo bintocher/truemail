@@ -85,15 +85,36 @@ function conditionGroup(source={conditions:[{}]}){const state=normalizeSmartGrou
 function readSmartGroups(){return [...document.querySelectorAll('#conds .cond-group')].map(group=>({logic:group.dataset.logic==='any'?'any':'all',conditions:[...group.querySelectorAll('.cond')].map(readConditionRow)})).filter(group=>group.conditions.length);}
 function editorSmartFolder(){return {groups:readSmartGroups()};}
 function updateSmartPreview(){const preview=document.getElementById('smartPreview');if(!preview)return;try{preview.textContent=String(smartRowsForFolder(editorSmartFolder()).length);}catch(_){preview.textContent='0';}}
-function openSmart(index=null){editingSmartIndex=index;const c=document.getElementById('conds');c.innerHTML='';const item=index===null?null:smartFolders[index];document.querySelector('#smartOverlay .mh h3').textContent=item?L('Изменить умную папку','Edit smart folder'):L('Новая умная папка','New smart folder');document.getElementById('smartCreate').lastChild.textContent=item?L(' Сохранить',' Save'):L(' Создать умную папку',' Create smart folder');document.getElementById('smartDelete').classList.toggle('hidden',!item||item.builtin);document.getElementById('smartName').value=item?.t||'';selectedSmartIcon=item?.i||'star';updateSmartIconButton();(item?.groups?.length?item.groups:[{conditions:[{}]}]).forEach(group=>c.appendChild(conditionGroup(group)));renumberConditionGroups();smartOverlay.classList.add('open');updateSmartPreview();if(index!==null)loadSmartCoveragePage(index);}
+function openSmart(index=null){editingSmartIndex=index;const c=document.getElementById('conds');c.innerHTML='';const item=index===null?null:smartFolders[index];document.querySelector('#smartOverlay .mh h3').textContent=item?L('Изменить умную папку','Edit smart folder'):L('Новая умная папка','New smart folder');document.getElementById('smartCreate').lastChild.textContent=item?L(' Сохранить',' Save'):L(' Создать умную папку',' Create smart folder');document.getElementById('smartDelete').classList.toggle('hidden',!item||item.builtin);const nameInput=document.getElementById('smartName');
+  // У встроенной папки поле показывает подпись по умолчанию подсказкой, а не
+  // значением: пустое поле однозначно значит "подпись даёт локализация", и это
+  // единственный способ вернуть её после переименования. Предзаполнение
+  // значением такой разницы не давало - имя, набранное вручную и совпавшее с
+  // подписью текущего языка, было не отличить от нетронутого поля.
+  nameInput.value=item?.t||'';
+  // Подсказку для обычной папки берём из каталога локализации, а не из литерала:
+  // ключ smartNamePlaceholder остаётся живым, и правка каталога на неё влияет.
+  updateSmartNamePlaceholder();selectedSmartIcon=item?.i||'star';updateSmartIconButton();(item?.groups?.length?item.groups:[{conditions:[{}]}]).forEach(group=>c.appendChild(conditionGroup(group)));renumberConditionGroups();smartOverlay.classList.add('open');updateSmartPreview();if(index!==null)loadSmartCoveragePage(index);}
+// Подсказку поля имени переставляем и при смене языка: окно правки может быть
+// открыто, и тогда она осталась бы на прежнем языке. Для обычной папки текст
+// берём из каталога локализации, для встроенной - её подпись по умолчанию.
+function updateSmartNamePlaceholder(){
+  const input=document.getElementById('smartName');if(!input)return;
+  const item=editingSmartIndex===null?null:smartFolders[editingSmartIndex];
+  input.placeholder=item?.builtin?smartFolderTitle({...item,t:''}):(wizardText[wizardLocale]?.smartNamePlaceholder||L('Например: Важное от коллег','For example: Important from colleagues'));
+}
+window.updateSmartNamePlaceholder=updateSmartNamePlaceholder;
 function closeSmart(){smartOverlay.classList.remove('open');}
 document.getElementById('addSmart').onclick=(e)=>{e.stopPropagation();openSmart();};
 document.getElementById('addCond').onclick=()=>{document.querySelector('#conds .cond-group:last-child')?.appendChild(condRow());updateSmartPreview();};
 document.getElementById('addCondGroup').onclick=()=>{document.getElementById('conds').appendChild(conditionGroup());renumberConditionGroups();updateSmartPreview();};
 document.getElementById('smartClose').onclick=closeSmart;
 document.getElementById('smartCancel').onclick=closeSmart;
-document.getElementById('smartCreate').onclick=()=>{const name=document.getElementById('smartName').value.trim(),groups=readSmartGroups();if(!name){showToast(L('Введите название умной папки','Enter a smart folder name'));return;}if(!groups.length||groups.some(group=>!group.conditions.length||group.conditions.some(condition=>!validSmartCondition(condition)))){showToast(L('Заполните все условия умной папки','Fill in all smart folder conditions'));return;}const previous=editingSmartIndex===null?null:smartFolders[editingSmartIndex],item={...(previous||{}),id:previous?.id||`custom-${Date.now()}`,builtin:Boolean(previous?.builtin),i:selectedSmartIcon,t:name,on:previous?.on??true,groups};if(editingSmartIndex===null)smartFolders.push(item);else smartFolders[editingSmartIndex]=item;renderSmartManagement();bindSmartNavigation();persistSmartFolders().then(()=>{if(currentSmartIndex===editingSmartIndex)filterSmart(editingSmartIndex);}).catch(error=>showToast(error.message||String(error)));closeSmart();};
-document.getElementById('smartDelete').onclick=async()=>{const folder=editingSmartIndex===null?null:smartFolders[editingSmartIndex];if(!folder||folder.builtin||!await confirmAction(L(`Удалить умную папку «${folder.t}»?`,`Delete the smart folder "${folder.t}"?`)))return;const activeId=smartFolders[currentSmartIndex]?.id;forgetSmartFolderState(folder.id);smartFolders.splice(editingSmartIndex,1);renderSmartManagement();bindSmartNavigation();persistSmartFolders().catch(error=>showToast(error.message||String(error)));closeSmart();if(activeId===folder.id)filterSmart(0);};
+document.getElementById('smartCreate').onclick=()=>{const name=document.getElementById('smartName').value.trim(),groups=readSmartGroups();const editing=editingSmartIndex===null?null:smartFolders[editingSmartIndex];
+  // Пустое имя разрешено только встроенной папке - там его заменит локализация.
+  if(!name&&!editing?.builtin){showToast(L('Введите название умной папки','Enter a smart folder name'));return;}if(!groups.length||groups.some(group=>!group.conditions.length||group.conditions.some(condition=>!validSmartCondition(condition)))){showToast(L('Заполните все условия умной папки','Fill in all smart folder conditions'));return;}const previous=editing;
+  const item={...(previous||{}),id:previous?.id||`custom-${Date.now()}`,builtin:Boolean(previous?.builtin),i:selectedSmartIcon,t:name,on:previous?.on??true,groups};if(editingSmartIndex===null)smartFolders.push(item);else smartFolders[editingSmartIndex]=item;renderSmartManagement();bindSmartNavigation();persistSmartFolders().then(()=>{if(currentSmartIndex===editingSmartIndex)filterSmart(editingSmartIndex);}).catch(error=>showToast(error.message||String(error)));closeSmart();};
+document.getElementById('smartDelete').onclick=async()=>{const folder=editingSmartIndex===null?null:smartFolders[editingSmartIndex];if(!folder||folder.builtin||!await confirmAction(L(`Удалить умную папку «${smartFolderTitle(folder)}»?`,`Delete the smart folder "${smartFolderTitle(folder)}"?`)))return;const activeId=smartFolders[currentSmartIndex]?.id;forgetSmartFolderState(folder.id);smartFolders.splice(editingSmartIndex,1);renderSmartManagement();bindSmartNavigation();persistSmartFolders().catch(error=>showToast(error.message||String(error)));closeSmart();if(activeId===folder.id)filterSmart(0);};
 smartOverlay.onclick=e=>{if(e.target===smartOverlay)closeSmart();};
 const smartIconKeys=Object.keys(ic).filter(key=>!['chevR','chevL','up','down','back','dots','grip'].includes(key)).slice(0,50);
 const smartIconsEl=document.getElementById('smartIcons');smartIconsEl.innerHTML=smartIconKeys.map(key=>`<span class="ic-pick" data-sel="${key}" title="${key}"><i data-i="${key}"></i></span>`).join('');renderIcons(smartIconsEl);
@@ -189,7 +210,8 @@ function ruleDescription(rule){
   const en=smartIsEnglish(),fields=en?{sender:'Sender',subject:'Subject'}:{sender:'Отправитель',subject:'Тема'},operators=en?{contains:'contains',equals:'equals'}:{contains:'содержит',equals:'равно'},actions=en?{archive:'archive',spam:'move to spam',trash:'delete'}:{archive:'в архив',spam:'в спам',trash:'удалить'};const account=rule.account_id?coreAccounts.find(item=>item.id===rule.account_id)?.email:L('все аккаунты','all accounts');let action=actions[rule.action];if(rule.action==='move')action=L(`в папку «${folderTitle(coreFolders.find(folder=>folder.id===rule.folder_id))}»`,`to folder "${folderTitle(coreFolders.find(folder=>folder.id===rule.folder_id))}"`);if(rule.action==='label'){const tag=(coreTags||[]).find(item=>item.id===rule.label_id);action=L(`метка «${tag?.name||'?'}»`,`tag "${tag?.name||'?'}"`);}return `${fields[rule.field]} ${operators[rule.operator]} «${rule.value}» → ${action||L('действие не настроено','action not set')} · ${account||L('аккаунт удалён','account removed')}`;
 }
 function renderRulesList(){
-  const list=document.getElementById('rulesList');list.innerHTML='';if(!mailRules.length){list.innerHTML=`<p class="rule-empty">${L('Правил пока нет.','No rules yet.')}</p>`;return;}
+  // Имена правил задаёт пользователь: словарь автоперевода их не трогает.
+  const list=document.getElementById('rulesList');list.dataset.noI18n='1';list.innerHTML='';if(!mailRules.length){list.innerHTML=`<p class="rule-empty">${L('Правил пока нет.','No rules yet.')}</p>`;return;}
   mailRules.forEach(rule=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div><div class="rule-row-title"></div><div class="rule-row-description"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${L('Изменить','Edit')}</button>`;row.querySelector('.rule-row-title').textContent=rule.name;row.querySelector('.rule-row-description').textContent=ruleDescription(rule);row.querySelector('.toggle').onclick=async()=>{try{await window.tm.setMailRuleEnabled(rule.id,!rule.enabled);await reloadMailRules();}catch(error){showToast(error.message||String(error));}};row.querySelector('button').onclick=()=>openRuleEditor(null,rule);list.appendChild(row);});renderIcons(list);
 }
 async function reloadMailRules(){mailRules=await window.tm.listMailRules();renderRulesList();}
@@ -200,20 +222,55 @@ document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.fin
 
 /* smart folders management list */
 const builtinSmartDefaults=[
-  {id:'all-inbox',builtin:true,i:'inbox',t:'Все входящие',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'inbox'}]}]},
-  {id:'all-important',builtin:true,i:'star',t:'Все важные',on:true,groups:[{logic:'all',conditions:[{f:'importance',o:'equals',v:'flagged'}]}]},
-  {id:'all-sent',builtin:true,i:'send',t:'Все отправленные',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'sent'}]}]},
-  {id:'all-drafts',builtin:true,i:'draft',t:'Все черновики',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'drafts'}]},{logic:'all',conditions:[{f:'draft_state',o:'equals',v:'draft'}]}]},
-  {id:'last-24-hours',builtin:true,i:'cal',t:'Сегодня (за 24 часа)',on:true,groups:[{logic:'all',conditions:[{f:'date',o:'within_last',v:'24',u:'hours'}]}]},
-  {id:'all-unread',builtin:true,i:'search',t:'Непрочитанные (все)',on:true,groups:[{logic:'all',conditions:[{f:'read_state',o:'equals',v:'unread'}]}]},
-  {id:'with-attachments',builtin:true,i:'paperclip',t:'С вложениями',on:true,groups:[{logic:'all',conditions:[{f:'attachment',o:'equals',v:'has'}]}]},
-  {id:'awaiting-my-reply',builtin:true,i:'flag',t:'Ждут ответа',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'inbox'},{f:'reply_state',o:'equals',v:'unanswered'}]}]},
+  {id:'all-inbox',builtin:true,i:'inbox',t:'',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'inbox'}]}]},
+  {id:'all-important',builtin:true,i:'star',t:'',on:true,groups:[{logic:'all',conditions:[{f:'importance',o:'equals',v:'flagged'}]}]},
+  {id:'all-sent',builtin:true,i:'send',t:'',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'sent'}]}]},
+  {id:'all-drafts',builtin:true,i:'draft',t:'',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'drafts'}]},{logic:'all',conditions:[{f:'draft_state',o:'equals',v:'draft'}]}]},
+  {id:'last-24-hours',builtin:true,i:'cal',t:'',on:true,groups:[{logic:'all',conditions:[{f:'date',o:'within_last',v:'24',u:'hours'}]}]},
+  {id:'all-unread',builtin:true,i:'search',t:'',on:true,groups:[{logic:'all',conditions:[{f:'read_state',o:'equals',v:'unread'}]}]},
+  {id:'with-attachments',builtin:true,i:'paperclip',t:'',on:true,groups:[{logic:'all',conditions:[{f:'attachment',o:'equals',v:'has'}]}]},
+  {id:'awaiting-my-reply',builtin:true,i:'flag',t:'',on:true,groups:[{logic:'all',conditions:[{f:'folder_role',o:'equals',v:'inbox'},{f:'reply_state',o:'equals',v:'unanswered'}]}]},
 ];
+// Имена, под которыми встроенные папки приходили из прежних сборок и старых
+// баз: текущие ru/en и то, что стояло в первой миграции. Пустое имя у встроенной
+// папки означает "пользователь его не менял" - тогда подпись берётся из
+// локализации и следует за языком. Известные имена по умолчанию приводим к
+// пустому один раз, при загрузке, а не при каждой отрисовке: иначе имя,
+// набранное пользователем и случайно совпавшее с подписью другого языка,
+// навсегда считалось бы подписью по умолчанию.
+// Только те имена, которые программа записывала сама: подписи по умолчанию
+// прежних сборок. Английских подписей и коротких форм здесь нет - в набор они
+// могли попасть лишь через переименование, а чужое имя стирать нельзя.
+const builtinSmartDefaultNames={
+  'all-inbox':['Все входящие'],
+  'all-important':['Все важные'],
+  'all-sent':['Все отправленные'],
+  'all-drafts':['Все черновики'],
+  'last-24-hours':['Сегодня','Сегодня (за 24 часа)'],
+  'all-unread':['Непрочитанные (все)'],
+  'with-attachments':['С вложениями'],
+  'awaiting-my-reply':['Ждут ответа'],
+};
+function isBuiltinDefaultName(id,name){return (builtinSmartDefaultNames[id]||[]).includes(String(name||'').trim());}
 const cloneSmart=value=>JSON.parse(JSON.stringify(value));
-function normalizedSmartFolders(saved){
+// legacy=true - разбор набора из настройки smart_folders_ui, оставшейся от
+// сборок без стабильных идентификаторов: там встроенную папку узнать можно
+// только по имени, иконке и месту в списке. Данные из ядра приходят со
+// стабильным id, и угадывать по имени для них нельзя: пользовательская папка,
+// названная "Сегодня", получила бы чужой идентификатор и слилась бы со
+// встроенной, а имя, набранное вручную, стёрлось бы как подпись по умолчанию.
+function normalizedSmartFolders(saved,legacy=false){
   if(!Array.isArray(saved))return cloneSmart(builtinSmartDefaults);const unused=new Map(builtinSmartDefaults.map(folder=>[folder.id,folder])),result=[];
-  saved.forEach((raw,index)=>{if(!raw||typeof raw!=='object')return;let base=builtinSmartDefaults.find(folder=>folder.id===raw.id||folder.t===raw.t);if(!base&&index<8)base=builtinSmartDefaults.find(folder=>unused.has(folder.id)&&folder.i===raw.i);if(!base&&index<8)base=builtinSmartDefaults.find(folder=>unused.has(folder.id));if(base)unused.delete(base.id);
-    const groups=Array.isArray(raw.groups)&&raw.groups.some(group=>(Array.isArray(group)?group:group?.conditions)?.length)?raw.groups.map(normalizeSmartGroup):cloneSmart(base?.groups||[]);result.push({...cloneSmart(base||{}),...raw,id:base?.id||raw.id||`custom-${Date.now()}-${index}`,builtin:Boolean(base||raw.builtin),on:raw.on!==false,groups});});
+  saved.forEach((raw,index)=>{if(!raw||typeof raw!=='object')return;let base=builtinSmartDefaults.find(folder=>folder.id===raw.id);
+    if(!base&&legacy)base=builtinSmartDefaults.find(folder=>unused.has(folder.id)&&isBuiltinDefaultName(folder.id,raw.t));
+    if(!base&&legacy&&index<8)base=builtinSmartDefaults.find(folder=>unused.has(folder.id)&&folder.i===raw.i);
+    if(!base&&legacy&&index<8)base=builtinSmartDefaults.find(folder=>unused.has(folder.id));
+    if(base)unused.delete(base.id);
+    const groups=Array.isArray(raw.groups)&&raw.groups.some(group=>(Array.isArray(group)?group:group?.conditions)?.length)?raw.groups.map(normalizeSmartGroup):cloneSmart(base?.groups||[]);const item={...cloneSmart(base||{}),...raw,id:base?.id||raw.id||`custom-${Date.now()}-${index}`,builtin:Boolean(base||raw.builtin),on:raw.on!==false,groups};
+    // Имена по умолчанию из старого набора приводим к пустому здесь: в базе то
+    // же самое один раз делает миграция 0037.
+    if(base&&legacy&&isBuiltinDefaultName(base.id,item.t))item.t='';
+    result.push(item);});
   unused.forEach(folder=>result.push(cloneSmart(folder)));return result;
 }
 const smartFolders=cloneSmart(builtinSmartDefaults);
@@ -233,15 +290,83 @@ const builtinSmartTitles={
   'with-attachments':{ru:'С вложениями',en:'With attachments'},
   'awaiting-my-reply':{ru:'Ждут ответа',en:'Awaiting reply'},
 };
-function smartFolderTitle(folder){if(folder&&folder.builtin&&builtinSmartTitles[folder.id])return builtinSmartTitles[folder.id][smartIsEnglish()?'en':'ru'];return folder?.t||'';}
+// Пустое имя у встроенной папки означает "пользователь его не менял": подпись
+// берётся из локализации и следует за языком. Всё остальное - имя, заданное
+// пользователем, и подменять его локализацией нельзя, иначе переименование
+// встроенной папки не доходит до боковой панели и списка настроек. Известные
+// имена по умолчанию приводит к пустому normalizedSmartFolders при загрузке.
+function smartFolderTitle(folder){if(folder&&folder.builtin&&builtinSmartTitles[folder.id]&&!String(folder.t||'').trim())return builtinSmartTitles[folder.id][smartIsEnglish()?'en':'ru'];return folder?.t||'';}
+/* Счётчик писем умной папки в боковой панели: режим на папку ('u', 't', 'ut',
+   'n'), сами числа считает ядро - локально в памяти лежит лишь часть писем. */
+function smartCounterMode(folder){return smartCounterModes[folder?.id]||'n';}
+function smartCountBadge(folder){const mode=smartCounterMode(folder),showU=mode.includes('u'),showT=mode.includes('t');if(!showU&&!showT)return '';const counts=smartCounts[folder?.id];if(!counts)return '';const unread=counts.unread||0,total=counts.total||0;if(showU&&showT)return `${unread}/${total}`;if(showT)return String(total);return unread>0?String(unread):'';}
+function smartNavRow(folder){return [...document.querySelectorAll('.nav [data-smart-id]')].find(row=>row.dataset.smartId===folder?.id)||null;}
+function updateSmartBadge(row,folder){if(!row)return;let badge=row.querySelector('.count');const text=smartCountBadge(folder);if(text){if(!badge){badge=document.createElement('span');badge.className='count';row.appendChild(badge);}badge.textContent=text;}else if(badge)badge.remove();}
+function updateSmartBadges(){smartFolders.forEach(folder=>updateSmartBadge(smartNavRow(folder),folder));}
+// Один пересчёт - это проход ядра по всей базе писем: своей таблицы у умной
+// папки нет, число берётся перебором. Синхронизация шлёт "данные изменились"
+// пачками, поэтому фоновые проходы разводим во времени - не чаще одного раза в
+// SMART_COUNTS_MIN_INTERVAL и никогда параллельно. Полминуты выбраны по цене
+// прохода: на большом ящике он читает всю таблицу писем, а счётчик в панели -
+// подсказка, которой точность до секунды не нужна. Действия пользователя
+// (включил счётчик, изменил условия папки) ждать этой паузы не должны и идут с
+// immediate.
+const SMART_COUNTS_MIN_INTERVAL=30000;
+let smartCountsRunning=false,smartCountsQueued=false,smartCountsQueuedImmediate=false,smartCountsLastRun=0,smartCountsTimer=null;
+async function runSmartCounts(ids){
+  smartCountsRunning=true;
+  // Помечаем заказанными, а не посчитанными: папку, которой ядро не вернуло
+  // число, иначе считали бы новой на каждом заходе, и пауза не действовала бы.
+  ids.forEach(id=>smartCountsRequested.add(id));
+  try{const rows=await window.tm?.countSmartFolderMessages(ids)||[];const next={};rows.forEach(row=>{next[row.id]={total:row.total,unread:row.unread};});smartCounts=next;updateSmartBadges();}
+  catch(error){console.error('smart folder counts',error);}
+  // Очередь помнит, была ли она набрана действием пользователя: иначе запрос,
+  // пришедший во время идущего прохода, терял бы своё право на обход паузы и
+  // ждал бы её целиком - ровно тогда, когда пользователь смотрит на счётчик.
+  finally{smartCountsRunning=false;smartCountsLastRun=Date.now();if(smartCountsQueued){const wasImmediate=smartCountsQueuedImmediate;smartCountsQueued=false;smartCountsQueuedImmediate=false;refreshSmartCounts(wasImmediate);}}
+}
+function refreshSmartCounts(immediate=false){
+  const ids=smartFolders.filter(folder=>folder.on!==false&&smartCounterMode(folder)!=='n').map(folder=>folder.id);
+  // Счётчиков не осталось - убирать подписи надо сразу, ждать тут нечего.
+  if(!ids.length){if(smartCountsTimer){clearTimeout(smartCountsTimer);smartCountsTimer=null;}smartCountsQueued=false;smartCountsQueuedImmediate=false;smartCounts={};updateSmartBadges();return;}
+  if(smartCountsRunning){smartCountsQueued=true;smartCountsQueuedImmediate=smartCountsQueuedImmediate||immediate;return;}
+  // Пауза бережёт от повторного счёта одного и того же набора. Папку, для
+  // которой числа ещё не заказывали, она задерживать не должна: иначе счётчик
+  // пользовательской папки пустует полминуты после каждого запуска.
+  const awaited=ids.some(id=>!smartCountsRequested.has(id));
+  const wait=immediate||awaited?0:SMART_COUNTS_MIN_INTERVAL-(Date.now()-smartCountsLastRun);
+  if(wait>0){if(!smartCountsTimer)smartCountsTimer=setTimeout(()=>{smartCountsTimer=null;refreshSmartCounts();},wait);return;}
+  if(smartCountsTimer){clearTimeout(smartCountsTimer);smartCountsTimer=null;}
+  runSmartCounts(ids);
+}
+window.refreshSmartCounts=refreshSmartCounts;
+// Галочки в контекстном меню умной папки ставим при его открытии: режим мог
+// смениться в другом меню или прийти из настроек.
+window.syncSmartContextMenu=function(index){
+  const folder=smartFolders[index];if(!folder)return;const mode=smartCounterMode(folder);
+  ctxsmart.querySelector('[data-smart-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));
+  ctxsmart.querySelector('[data-smart-action="count-total"]')?.classList.toggle('on',mode.includes('t'));
+};
 function messagesTitle(){return smartIsEnglish()?'Messages':'Письма';}
 function smartFolderToCore(folder,index){return {id:String(folder.id),name:folder.t||'',icon:folder.i||null,is_builtin:Boolean(folder.builtin),enabled:folder.on!==false,sort_order:index,groups:(folder.groups||[]).map(group=>{const normalized=normalizeSmartGroup(group);return {logic:normalized.logic,conditions:normalized.conditions.map(condition=>({field:condition.f,op:condition.o,value:String(condition.v??''),unit:condition.u||null,value2:condition.v2||null}))};})};}
 function smartFolderFromCore(folder){return {id:String(folder.id),builtin:Boolean(folder.is_builtin),i:folder.icon||'star',t:folder.name||'',on:folder.enabled!==false,groups:(folder.groups||[]).map(group=>({logic:group.logic==='any'?'any':'all',conditions:(group.conditions||[]).map(condition=>({f:condition.field,o:condition.op,v:String(condition.value??''),...(condition.unit?{u:condition.unit}:{}),...(condition.value2!=null?{v2:String(condition.value2)}:{})}))}))};}
-function persistSmartFolders(){return window.tm?.saveSmartFolders(smartFolders.map(smartFolderToCore))||Promise.resolve();}
+// Любая правка набора меняет и то, что описывают счётчики: условия папки, её
+// видимость, состав списка. Пересчёт висит здесь, а не на каждой ветке правки -
+// иначе следующая мутация снова забыла бы его позвать, и в панели осталось бы
+// число, посчитанное по прежним условиям.
+function persistSmartFolders(){
+  const saved=window.tm?.saveSmartFolders(smartFolders.map(smartFolderToCore))||Promise.resolve();
+  // Подписи по уже известным числам поправляем сразу (выключенная папка теряет
+  // счётчик мгновенно), а пересчёт просим после записи: условия читает ядро из
+  // базы, и проход до сохранения посчитал бы прежние.
+  updateSmartBadges();
+  saved.then(()=>refreshSmartCounts(true)).catch(()=>{});
+  return saved;
+}
 function moveSmartFolder(from,to){if(to<0||to>=smartFolders.length)return;const activeId=smartFolders[currentSmartIndex]?.id;[smartFolders[from],smartFolders[to]]=[smartFolders[to],smartFolders[from]];if(activeId)currentSmartIndex=smartFolders.findIndex(folder=>folder.id===activeId);renderSmartManagement();bindSmartNavigation();persistSmartFolders().catch(error=>showToast(error.message||String(error)));}
 function renderSmartManagement(){smartListEl.innerHTML='';smartFolders.forEach((a,index)=>{const r=document.createElement('div');r.className='tbrow smart-list-row'+(a.on?'':' off');
   r.innerHTML=`<span class="grip"><i data-i="grip"></i></span><i data-i="${a.i}"></i><span class="smart-name"><span class="nm"></span><span class="smart-summary"></span></span><button class="btn sm edit-sf">${smartIsEnglish()?'Edit':'Изменить'}</button><span class="ord"><button class="iconbtn" data-dir="up"><i data-i="up"></i></button><button class="iconbtn" data-dir="down"><i data-i="down"></i></button></span><div class="toggle${a.on?' on':''}"></div>`;
-  r.querySelector('.nm').textContent=smartFolderTitle(a);r.querySelector('.smart-summary').textContent=smartFolderDescription(a);renderIcons(r);
+  r.querySelector('.nm').dataset.noI18n='1';r.querySelector('.nm').textContent=smartFolderTitle(a);r.querySelector('.smart-summary').textContent=smartFolderDescription(a);renderIcons(r);
   r.querySelector('[data-dir="up"]').onclick=()=>moveSmartFolder(index,index-1);
   r.querySelector('[data-dir="down"]').onclick=()=>moveSmartFolder(index,index+1);
   r.querySelector('.edit-sf').onclick=()=>openSmart(index);
@@ -250,11 +375,23 @@ function renderSmartManagement(){smartListEl.innerHTML='';smartFolders.forEach((
 renderSmartManagement();
 document.getElementById('smartNew2').onclick=()=>openSmart();
 function bindSmartNavigation(){document.querySelectorAll('.custom-smart').forEach(row=>row.remove());const nav=document.querySelector('.nav'),accountLabel=nav.querySelector('[data-navlabel="accounts"]')||[...nav.querySelectorAll('.navlabel')].find(label=>label.textContent.includes('Аккаунты'));smartFolders.forEach((folder,index)=>{let row=folder.builtin?nav.querySelector(`[data-smart-id="${folder.id}"]`):null;if(!row){row=document.createElement('button');row.type='button';row.className='navitem custom-smart';row.dataset.nav='mail';row.innerHTML='<i></i><span class="smart-label"></span>';}
-    row.dataset.smartIndex=index;row.dataset.smartId=folder.id;const icon=row.querySelector('i');icon.dataset.i=folder.i;icon.innerHTML=ic[folder.i]||ic.star;const label=row.querySelector('.smart-label');label.textContent=smartFolderTitle(folder);row.style.display=folder.on?'':'none';row.onclick=()=>{clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');filterSmart(index);};accountLabel.before(row);});}
+    row.dataset.smartIndex=index;row.dataset.smartId=folder.id;const icon=row.querySelector('i');icon.dataset.i=folder.i;icon.innerHTML=ic[folder.i]||ic.star;const label=row.querySelector('.smart-label');label.dataset.noI18n='1';label.textContent=smartFolderTitle(folder);updateSmartBadge(row,folder);row.style.display=folder.on?'':'none';row.onclick=()=>{clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');filterSmart(index);};accountLabel.before(row);});}
 bindSmartNavigation();
 ctxsmart.querySelector('[data-smart-action="open"]').onclick=()=>filterSmart(+ctxsmart.dataset.index);
 ctxsmart.querySelector('[data-smart-action="edit"]').onclick=()=>openSmart(+ctxsmart.dataset.index);
 ctxsmart.querySelector('[data-smart-action="settings"]').onclick=()=>{showView('settingsView');setSection('smart');};
+ctxsmart.querySelectorAll('[data-smart-action="count-unread"],[data-smart-action="count-total"]').forEach(item=>item.onclick=()=>{
+  const folder=smartFolders[+ctxsmart.dataset.index];if(!folder)return;
+  const key=item.dataset.smartAction==='count-total'?'t':'u',modes=new Set(smartCounterMode(folder).split('').filter(part=>part==='u'||part==='t'));
+  modes.has(key)?modes.delete(key):modes.add(key);
+  smartCounterModes[folder.id]=['u','t'].filter(part=>modes.has(part)).join('')||'n';
+  window.tm?.setSetting('smart_counters',JSON.stringify(smartCounterModes)).catch(console.error);
+  item.classList.toggle('on',modes.has(key));
+  // Сначала показываем то, что уже посчитано (или убираем подпись), потом
+  // просим ядро пересчитать: иначе снятая галочка убирала бы счётчик лишь
+  // через паузу между проходами.
+  updateSmartBadges();refreshSmartCounts(true);
+});
 
 const auxOverlay=document.getElementById('auxOverlay'),eventForm=document.getElementById('eventForm'),contactForm=document.getElementById('contactForm');
 let editingEvent=null,editingContact=null;

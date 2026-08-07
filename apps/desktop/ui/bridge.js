@@ -68,6 +68,7 @@ window.corePageSize = 100;
     listSmartFolders: () => invoke("list_smart_folders"),
     saveSmartFolders: (folders) => invoke("save_smart_folders", { folders }),
     listSmartFolderMessages: (smartFolderId, beforeDate = null, beforeId = null, limit = 500) => invoke("list_smart_folder_messages", { smartFolderId, beforeDate, beforeId, limit }),
+    countSmartFolderMessages: (smartFolderIds) => invoke("count_smart_folder_messages", { smartFolderIds }),
     listUnifiedSources: () => invoke("list_unified_sources"),
     setUnifiedSource: (folderId, included) => invoke("set_unified_source", { folderId, included }),
     listMailRules: () => invoke("list_mail_rules"),

@@ -1,22 +1,26 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260801-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260807-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
 let uiCatalog={};
 const uiKeyByRussian={
   'Умные папки':'navSmartFolders','Аккаунты':'navAccounts','Календарь':'navCalendar','Контакты':'navContacts',
-  'Все входящие':'navAllInbox','Все важные':'navAllImportant','Все отправленные':'navAllSent','Все черновики':'navAllDrafts',
-  'Сегодня':'navToday','Непрочитанные (все)':'navUnread','С вложениями':'navWithAttachments','Ждут ответа':'navWaitingReply',
+  // Имён умных папок здесь нет намеренно: подписи ставит bindSmartNavigation по
+  // данным папки, а словарь подменял бы по ним любой совпавший текст - метку или
+  // тему письма с названием "Сегодня" превращал в "Сегодня (за 24 часа)".
   'Ответить':'actionReply','Ответить всем':'actionReplyAll','Переслать':'actionForward','В архив':'actionArchive','Удалить':'actionDelete','Написать':'actionCompose','Отправить':'send',
   'Настройки':'settingsTitle','Общие':'setGeneral','Панель письма':'setToolbar','Сквозные папки':'setUnified','Сопоставление папок':'setFolders','Календари':'setCalendars','Хранилище':'setStorage','Темы и оформление':'setThemes','Приватность':'setPrivacy','Горячие клавиши':'setKeys'
 };
 function applyUiCatalog(catalog){
   uiCatalog=catalog||{};
   const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);const nodes=[];while(walker.nextNode())nodes.push(walker.currentNode);
-  nodes.forEach(node=>{const raw=node.nodeValue||'',trimmed=raw.trim(),key=node.__truemailI18nKey||uiKeyByRussian[trimmed];if(key&&uiCatalog[key]){node.__truemailI18nKey=key;node.nodeValue=raw.replace(trimmed,uiCatalog[key]);}});
+  // Внутрь [data-no-i18n] не заходим: там подписи из пользовательских данных, и
+  // словарь русских фраз подменял бы их переводом. Имя умной папки "Сегодня"
+  // иначе превращалось бы в "Сегодня (за 24 часа)" на первой же перерисовке.
+  nodes.forEach(node=>{if(node.parentElement?.closest('[data-no-i18n]'))return;const raw=node.nodeValue||'',trimmed=raw.trim(),key=node.__truemailI18nKey||uiKeyByRussian[trimmed];if(key&&uiCatalog[key]){node.__truemailI18nKey=key;node.nodeValue=raw.replace(trimmed,uiCatalog[key]);}});
   const palette=document.getElementById('cmdInput');if(palette&&uiCatalog.commandPlaceholder)palette.placeholder=uiCatalog.commandPlaceholder;
   const actionKeys={reply:'actionReply',replyall:'actionReplyAll',forward:'actionForward',archive:'actionArchive',trash:'actionDelete'};
   document.querySelectorAll('.tbrow').forEach(row=>{const key=actionKeys[row.dataset.action];const label=row.querySelector('.nm');if(label&&uiCatalog[key])label.textContent=uiCatalog[key];});
@@ -51,9 +55,18 @@ function relocalizeDynamic(){
     // Подсказка активного фильтра собрана из подписей чекбоксов - после смены
     // языка её надо пересобрать, иначе она осталась бы на прежнем языке.
     if(typeof updateFilterIndicator==='function')updateFilterIndicator();
+    window.updateSmartNamePlaceholder?.();
+    // Заголовок несёт data-i18n ради первого запуска, поэтому смена языка
+    // затирает его подписью "Все входящие". Возвращаем то, что открыто на
+    // самом деле - включая имя метки: без этой ветки список метки после смены
+    // языка оказывался подписан чужим заголовком.
     const heading=document.querySelector('.listhead h2');
     if(heading){
-      if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=folderTitle(folder);}
+      // Метка только тогда "открыта", когда не открыты папка и умная папка:
+      // переход по уведомлению ставит currentFolderId, но currentTagName от
+      // прошлого просмотра не сбрасывает.
+      if(currentTagName!=null&&currentFolderId===null&&currentSmartIndex==null)heading.textContent=currentTagName;
+      else if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=folderTitle(folder);}
       else if(currentSmartIndex!=null&&smartFolders[currentSmartIndex])heading.textContent=smartFolderTitle(smartFolders[currentSmartIndex])||messagesTitle();
     }
     const accountCount=document.getElementById('mailAccountCount');

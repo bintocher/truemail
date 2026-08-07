@@ -170,7 +170,7 @@ function posMenu(menu,e){menu.classList.add('open');const w=menu.offsetWidth,h=m
 document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;e.preventDefault();
   closeAllCtxMenus();
   const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
-  if(msg){const id=Number(msg.dataset.messageId);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag)posMenu(ctxtag,e);}else if(smart){ctxsmart.dataset.index=smart.dataset.smartIndex;posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}} });
+  if(msg){const id=Number(msg.dataset.messageId);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag)posMenu(ctxtag,e);}else if(smart){ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}} });
 document.addEventListener('click',closeAllCtxMenus);
 // Esc закрывает верхнее открытое окно: сначала контекстные меню, затем модалки.
 document.addEventListener('keydown',e=>{
@@ -197,7 +197,8 @@ async function openFlagMenu(message,event){
   let labels=[],active=[];
   try{[labels,active]=await Promise.all([window.tm.listLabels(),window.tm.messageLabelIds(message.id)]);}catch(error){showToast(error.message||String(error));return;}
   const activeSet=new Set(active);
-  const menu=document.createElement('div');menu.className='att-menu flag-menu';
+  // Имена меток - пользовательские данные: словарь автоперевода их не трогает.
+  const menu=document.createElement('div');menu.className='att-menu flag-menu';menu.dataset.noI18n='1';
   labels.forEach(label=>{
     const item=document.createElement('button');item.type='button';item.className='flag-item';
     item.innerHTML='<span class="flag-dot"></span><span class="flag-name"></span><span class="flag-check"></span>';
