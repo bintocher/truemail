@@ -25,7 +25,7 @@ use truemail_core::api::{
 use truemail_core::model::{
     Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, Keybinding, MailRule,
     MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
-    ServerConfig, Signature, SmartFolder, resolve_my_attendance,
+    ServerConfig, Signature, SmartFolder, SmartFolderCount, resolve_my_attendance,
 };
 use truemail_core::storage::repo::{CalendarChange, CalendarChangeKind, CalendarSummary};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -2374,6 +2374,20 @@ pub async fn save_smart_folders(
     folders: Vec<SmartFolder>,
 ) -> CmdResult<()> {
     Ok(core(&state).await?.db.save_smart_folders(&folders).await?)
+}
+
+/// Счётчики писем умных папок: боковая панель показывает их для тех папок,
+/// где пользователь включил счётчик.
+#[tauri::command]
+pub async fn count_smart_folder_messages(
+    state: State<'_, AppState>,
+    smart_folder_ids: Vec<String>,
+) -> CmdResult<Vec<SmartFolderCount>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .count_smart_folder_messages(&smart_folder_ids)
+        .await?)
 }
 
 #[tauri::command]

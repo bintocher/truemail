@@ -524,6 +524,7 @@ fn run() -> anyhow::Result<()> {
             commands::list_smart_folders,
             commands::save_smart_folders,
             commands::list_smart_folder_messages,
+            commands::count_smart_folder_messages,
             commands::list_unified_sources,
             commands::set_unified_source,
             commands::list_mail_rules,

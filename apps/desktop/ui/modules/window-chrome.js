@@ -37,7 +37,13 @@
       await Promise.race([waited,new Promise(resolve=>setTimeout(resolve,1000))]);
     }
     const toTray=window.tmMinimizeToTray!==false;
-    try{await (toTray?appWindow.hide():appWindow.minimize());}catch(error){console.error(error);}
+    try{await (toTray?appWindow.hide():appWindow.minimize());}
+    catch(error){
+      console.error(error);
+      // Если спрятать окно не вышло, сворачиваем обычным способом: мёртвая
+      // кнопка хуже, чем сворачивание не туда, куда просил пользователь.
+      if(toTray)try{await appWindow.minimize();}catch(fallbackError){console.error(fallbackError);}
+    }
   });
   // Подпись кнопки следует за настройкой: иначе она обещала бы трей тем, кто
   // выбрал обычное сворачивание.

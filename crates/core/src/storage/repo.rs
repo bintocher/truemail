@@ -3,6 +3,7 @@
 use super::Db;
 use crate::Result;
 use crate::model::*;
+use futures::TryStreamExt;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueuedAction {
@@ -4076,17 +4077,23 @@ impl Db {
                     "некорректный идентификатор умной папки".into(),
                 ));
             }
-            if folder.name.trim().is_empty() {
-                return Err(crate::Error::AccountConfig(
-                    "название умной папки не указано".into(),
-                ));
-            }
             stable_ids.push(stable_id.to_owned());
             let existing: Option<(i64, i64)> =
                 sqlx::query_as("SELECT id, is_builtin FROM smart_folders WHERE stable_id=?")
                     .bind(stable_id)
                     .fetch_optional(&mut *tx)
                     .await?;
+            // Пустое имя допустимо только для встроенной папки: там оно значит
+            // "подпись даёт локализация интерфейса". Встроенность берём из базы,
+            // а не из присланного флага - иначе безымянной можно было бы
+            // объявить любую папку. Для пользовательской папки и для незнакомого
+            // идентификатора имя по-прежнему обязательно.
+            let is_builtin = matches!(existing, Some((_, builtin)) if builtin != 0);
+            if folder.name.trim().is_empty() && !is_builtin {
+                return Err(crate::Error::AccountConfig(
+                    "название умной папки не указано".into(),
+                ));
+            }
             let database_id = if let Some((id, _)) = existing {
                 sqlx::query(
                     "UPDATE smart_folders SET name=?, icon=?, enabled=?, sort_order=? WHERE id=?",
@@ -4320,6 +4327,120 @@ impl Db {
             cursor = Some(next_cursor);
         }
         Ok(result)
+    }
+
+    /// Счётчики писем умных папок для боковой панели. Считаем сразу пачкой:
+    /// у умной папки нет своей таблицы, каждое число - это проход по всем
+    /// письмам, и отдельный запрос на папку означал бы столько же полных
+    /// сканов, сколько включено счётчиков.
+    pub async fn count_smart_folder_messages(
+        &self,
+        stable_ids: &[String],
+    ) -> Result<Vec<SmartFolderCount>> {
+        if stable_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wanted = self
+            .list_smart_folders()
+            .await?
+            .into_iter()
+            .filter(|folder| stable_ids.iter().any(|id| id == &folder.id))
+            .collect::<Vec<_>>();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let included = sqlx::query_as::<_, (i64,)>(
+            "SELECT f.id FROM folders f
+             LEFT JOIN unified_sources us ON us.folder_id=f.id
+               AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
+             WHERE COALESCE(us.included, 1)=1",
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| row.0)
+        .collect::<std::collections::HashSet<_>>();
+        let accounts = self
+            .list_accounts()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.email))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut folders = std::collections::HashMap::new();
+        for account_id in accounts.keys() {
+            for folder in self.list_folders(*account_id).await? {
+                folders.insert(folder.id, folder);
+            }
+        }
+        // Метки читаем, только если хоть одна папка по ним отбирает: иначе это
+        // лишний проход по всей таблице связей ради данных, которые никто не
+        // спросит.
+        let needs_labels = wanted.iter().any(|folder| {
+            folder.groups.iter().any(|group| {
+                group
+                    .conditions
+                    .iter()
+                    .any(|condition| condition.field == "label")
+            })
+        });
+        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
+        if needs_labels {
+            let label_rows: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for (message_id, name) in label_rows {
+                labels.entry(message_id).or_default().push(name);
+            }
+        }
+        // Читаем таблицу одним потоковым проходом. Постраничный курсор, как в
+        // выборке писем, здесь дал бы квадратичную работу: условие по
+        // COALESCE(date, '') под индекс не подводится, и каждая следующая
+        // страница заново перебирала бы все предыдущие. Строки обрабатываются по
+        // мере поступления, поэтому в памяти не накапливаются.
+        let mut counts = vec![(0_i64, 0_i64); wanted.len()];
+        let mut rows = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                    from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                    seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+             FROM messages
+             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (
+                 SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                   AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+               )",
+        )
+        .fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
+            let mut message = MessageMeta::from(row);
+            if !included.contains(&message.folder_id) {
+                continue;
+            }
+            if needs_labels {
+                message.labels = labels.remove(&message.id).unwrap_or_default();
+            }
+            let account = accounts.get(&message.account_id).map(String::as_str);
+            let source_folder = folders.get(&message.folder_id);
+            for (index, folder) in wanted.iter().enumerate() {
+                if smart_folder_matches(folder, &message, account, source_folder) {
+                    counts[index].0 += 1;
+                    if !message.flags.seen {
+                        counts[index].1 += 1;
+                    }
+                }
+            }
+        }
+        drop(rows);
+        Ok(wanted
+            .into_iter()
+            .zip(counts)
+            .map(|(folder, (total, unread))| SmartFolderCount {
+                id: folder.id,
+                total,
+                unread,
+            })
+            .collect())
     }
 
     // ---------- Контакты ----------
@@ -5311,6 +5432,78 @@ mod smart_condition_legacy_tests {
             ("read_state", "equals", "unread")
         );
     }
+
+    /// Счётчик умных папок читает метки только тогда, когда хоть одно условие
+    /// стоит на поле "label" - иначе он не тратил бы проход по всей таблице
+    /// связей. Договор держится на том, что других полей, зависящих от меток,
+    /// нет: появится такое поле - счётчик молча разойдётся со списком писем.
+    #[test]
+    fn only_the_label_field_depends_on_message_labels() {
+        let base = MessageMeta {
+            id: 1,
+            account_id: 1,
+            folder_id: 1,
+            thread_id: None,
+            uid: 1,
+            message_id: None,
+            from: Addr {
+                name: None,
+                email: "sender@example.com".to_owned(),
+            },
+            to: Vec::new(),
+            cc: Vec::new(),
+            subject: "важное".to_owned(),
+            preview: "текст".to_owned(),
+            date: Some(chrono::Utc::now().to_rfc3339()),
+            size: Some(1024),
+            flags: Flags::default(),
+            has_attachments: false,
+            auth: AuthResults::default(),
+            labels: Vec::new(),
+        };
+        let labelled = MessageMeta {
+            labels: vec!["важное".to_owned()],
+            ..base.clone()
+        };
+        for field in [
+            "sender",
+            "recipient",
+            "subject",
+            "body",
+            "account",
+            "folder",
+            "folder_role",
+            "read_state",
+            "importance",
+            "reply_state",
+            "draft_state",
+            "attachment",
+            "size",
+            "date",
+        ] {
+            let condition = SmartCondition {
+                field: field.to_owned(),
+                op: "contains".to_owned(),
+                value: "важное".to_owned(),
+                unit: None,
+                value2: None,
+            };
+            assert_eq!(
+                smart_condition_matches(&condition, &base, None, None),
+                smart_condition_matches(&condition, &labelled, None, None),
+                "поле {field} не должно зависеть от меток письма"
+            );
+        }
+        let by_label = SmartCondition {
+            field: "label".to_owned(),
+            op: "contains".to_owned(),
+            value: "важное".to_owned(),
+            unit: None,
+            value2: None,
+        };
+        assert!(!smart_condition_matches(&by_label, &base, None, None));
+        assert!(smart_condition_matches(&by_label, &labelled, None, None));
+    }
 }
 
 #[cfg(test)]
@@ -5611,5 +5804,131 @@ mod notification_lookup_tests {
                 .expect("query message flags");
         assert_eq!(seen, 0);
         assert_eq!(flagged, 1);
+    }
+
+    /// Счётчик умной папки и её список писем описывают одно и то же множество.
+    /// Пути разные (потоковый подсчёт против постраничной выборки), поэтому
+    /// расхождение фильтров - самый вероятный способ показать в панели число,
+    /// которого в списке нет.
+    #[tokio::test]
+    async fn smart_folder_count_matches_the_message_list() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let archive_id = seed_folder(&db, account_id, "Archive", Some("archive")).await;
+        for uid in 0..7 {
+            seed_message(&db, account_id, inbox_id, uid, &format!("inbox-{uid}")).await;
+        }
+        for uid in 0..3 {
+            seed_message(
+                &db,
+                account_id,
+                archive_id,
+                100 + uid,
+                &format!("arch-{uid}"),
+            )
+            .await;
+        }
+        // Часть писем прочитана, одно отложено, одно ждёт переноса: все три
+        // условия счётчик и выборка обязаны трактовать одинаково.
+        sqlx::query("UPDATE messages SET seen=1 WHERE folder_id=? AND uid < 3")
+            .bind(inbox_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark seen");
+        sqlx::query(
+            "UPDATE messages SET snoozed_until=datetime('now', '+1 day') WHERE folder_id=? AND uid=6",
+        )
+        .bind(inbox_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("snooze message");
+        // Письмо с незавершённым переносом оба пути обязаны прятать одинаково.
+        let (moving_id,): (i64,) =
+            sqlx::query_as("SELECT id FROM messages WHERE folder_id=? AND uid=5")
+                .bind(inbox_id)
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("find message to move");
+        sqlx::query(
+            "INSERT INTO outbox_ops(account_id, op_kind, payload, status, message_id)
+             VALUES (?, 'move', '{}', 'pending', ?)",
+        )
+        .bind(account_id)
+        .bind(moving_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("queue move");
+
+        let counts = db
+            .count_smart_folder_messages(&["all-inbox".to_owned()])
+            .await
+            .expect("count smart folder");
+        let listed = db
+            .list_smart_folder_messages("all-inbox", 500)
+            .await
+            .expect("list smart folder");
+        let unread = listed.iter().filter(|message| !message.flags.seen).count() as i64;
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].total, listed.len() as i64);
+        assert_eq!(counts[0].unread, unread);
+        // Письма архива под условие "тип папки равно Входящие" не подходят,
+        // отложенное и ожидающее переноса скрыты обоими путями.
+        assert_eq!(counts[0].total, 5);
+        assert_eq!(counts[0].unread, 2);
+    }
+
+    /// Счётчик идёт по таблице одним потоком, а список - страницами курсора.
+    /// Сверяем их за границей страницы: именно там пути расходятся легче всего.
+    #[tokio::test]
+    async fn smart_folder_count_matches_a_multi_page_list() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        // Больше одной страницы скана (SCAN_PAGE_SIZE = 1000) и больше одной
+        // страницы выдачи (limit ограничен 500).
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, subject, date, seen)
+             SELECT ?, ?, value, 'тест', datetime('now', '-' || value || ' minutes'), value % 2
+             FROM (WITH RECURSIVE seq(value) AS (
+                     SELECT 1 UNION ALL SELECT value + 1 FROM seq WHERE value < 1200
+                   ) SELECT value FROM seq)",
+        )
+        .bind(account_id)
+        .bind(inbox_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("seed messages");
+
+        let counts = db
+            .count_smart_folder_messages(&["all-inbox".to_owned()])
+            .await
+            .expect("count smart folder");
+        let mut listed = 0_i64;
+        let mut unread = 0_i64;
+        let mut cursor: Option<(String, i64)> = None;
+        loop {
+            let page = db
+                .list_smart_folder_messages_page(
+                    "all-inbox",
+                    cursor.as_ref().map(|(date, _)| date.as_str()),
+                    cursor.as_ref().map(|(_, id)| *id),
+                    500,
+                )
+                .await
+                .expect("list smart folder page");
+            let Some(last) = page.last() else {
+                break;
+            };
+            cursor = Some((last.date.clone().unwrap_or_default(), last.id));
+            listed += page.len() as i64;
+            unread += page.iter().filter(|message| !message.flags.seen).count() as i64;
+            if page.len() < 500 {
+                break;
+            }
+        }
+        assert_eq!(listed, 1200);
+        assert_eq!(counts[0].total, listed);
+        assert_eq!(counts[0].unread, unread);
     }
 }

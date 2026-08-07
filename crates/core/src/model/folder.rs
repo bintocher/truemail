@@ -136,6 +136,14 @@ pub struct SmartFolder {
     pub groups: Vec<SmartConditionGroup>,
 }
 
+/// Счётчик писем умной папки для боковой панели.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartFolderCount {
+    pub id: String,
+    pub total: i64,
+    pub unread: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnifiedSource {
     pub folder_id: i64,
