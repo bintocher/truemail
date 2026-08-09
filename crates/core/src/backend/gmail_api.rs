@@ -965,6 +965,31 @@ pub async fn discover(
     })
 }
 
+/// Какие метки поставить и снять при переносе письма между папками Gmail.
+///
+/// Одну и ту же метку Gmail не даёт одновременно поставить и снять - отвечает
+/// 400 "Cannot both add and remove the same label", и операция висит в очереди,
+/// повторяясь до исчерпания попыток. Так выходит на переносе из "Всей почты" во
+/// "Входящие": source=ALL снимает INBOX, а target=INBOX его ставит. Пересечение
+/// убираем. Пустого результата при нынешних правилах не выходит (пустой add
+/// бывает только у цели "Вся почта", а там remove непустой), но вызывающая
+/// сторона это проверяет: правило переноса ещё будет меняться, а запрос без
+/// единой метки Gmail тоже не примет.
+fn move_label_changes<'a>(source: &'a str, target: &'a str) -> (Vec<&'a str>, Vec<&'a str>) {
+    let add: Vec<&str> = if target == "ALL" {
+        Vec::new()
+    } else {
+        vec![target]
+    };
+    let mut remove: Vec<&str> = if source == "ALL" {
+        vec!["INBOX"]
+    } else {
+        vec![source]
+    };
+    remove.retain(|label| !add.contains(label));
+    (add, remove)
+}
+
 pub async fn apply_operation(access_token: &str, op_kind: &str, payload: &str) -> Result<()> {
     let payload: serde_json::Value = serde_json::from_str(payload)?;
     let id = payload["remote_id"]
@@ -1014,24 +1039,17 @@ pub async fn apply_operation(access_token: &str, op_kind: &str, payload: &str) -
                 )
                 .await?;
             } else {
-                let add: Vec<&str> = if target == "ALL" {
-                    vec![]
-                } else {
-                    vec![target]
-                };
-                let remove: Vec<&str> = if source == "ALL" {
-                    vec!["INBOX"]
-                } else {
-                    vec![source]
-                };
-                request(
-                    &client,
-                    Method::POST,
-                    url(&["messages", id, "modify"])?,
-                    access_token,
-                    Some(json!({"addLabelIds":add,"removeLabelIds":remove})),
-                )
-                .await?;
+                let (add, remove) = move_label_changes(source, target);
+                if !add.is_empty() || !remove.is_empty() {
+                    request(
+                        &client,
+                        Method::POST,
+                        url(&["messages", id, "modify"])?,
+                        access_token,
+                        Some(json!({"addLabelIds":add,"removeLabelIds":remove})),
+                    )
+                    .await?;
+                }
             }
         }
         "delete" => {
@@ -1132,6 +1150,32 @@ pub async fn delete_label(access_token: &str, label_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::move_label_changes;
+
+    /// Перенос из "Всей почты" во "Входящие" не должен просить Gmail снять и
+    /// поставить одну метку: такой запрос он отвергает с 400, а операция висит
+    /// в очереди и повторяется до исчерпания попыток.
+    #[test]
+    fn move_never_adds_and_removes_the_same_label() {
+        let (add, remove) = move_label_changes("ALL", "INBOX");
+        assert_eq!(add, vec!["INBOX"]);
+        assert!(remove.is_empty(), "INBOX не должен одновременно сниматься");
+
+        let (add, remove) = move_label_changes("INBOX", "INBOX");
+        assert_eq!(add, vec!["INBOX"]);
+        assert!(remove.is_empty());
+
+        // Обычный перенос между разными папками не меняется.
+        let (add, remove) = move_label_changes("INBOX", "Label_42");
+        assert_eq!(add, vec!["Label_42"]);
+        assert_eq!(remove, vec!["INBOX"]);
+
+        // Архивация: цель "Вся почта" только снимает INBOX.
+        let (add, remove) = move_label_changes("INBOX", "ALL");
+        assert!(add.is_empty());
+        assert_eq!(remove, vec!["INBOX"]);
+    }
+
     use super::*;
 
     fn history_message(id: &str) -> HistoryMessage {

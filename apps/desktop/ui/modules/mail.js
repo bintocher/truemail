@@ -336,7 +336,13 @@ async function showMessage(message){
       render(false);head.appendChild(line);
     }
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
-    article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){message.flags.seen=true;stickyReadIds.add(message.id);document.querySelector(`.msg[data-message-id="${message.id}"]`)?.classList.remove('unread');window.tm?.markSeen(message.id,true).catch(console.error);}
+    article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){
+      // Признак и счётчики проставляет markMessagesSeen - вызываем её до того,
+      // как трогать flags.seen, иначе она сочтёт письмо уже прочитанным и
+      // дельта счётчика потеряется.
+      stickyReadIds.add(message.id);document.querySelector(`.msg[data-message-id="${message.id}"]`)?.classList.remove('unread');
+      window.markMessagesSeen?.(message,true).catch(console.error);
+    }
   }catch(error){body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=error.message||String(error);body.appendChild(err);}
 }
 function smartMessageValue(message,field){const folder=coreFolders.find(item=>item.id===message.folder_id);switch(field){
@@ -344,6 +350,86 @@ function smartMessageValue(message,field){const folder=coreFolders.find(item=>it
 function smartConditionMatches(message,source){const condition=normalizeSmartCondition(source);if(!validSmartCondition(condition))return false;const field=smartField(condition.f),raw=smartMessageValue(message,field.id);if(field.type==='date'){const timestamp=new Date(raw).getTime();if(!Number.isFinite(timestamp))return false;if(['within_last','older_than'].includes(condition.o)){const amount=Number(condition.v),multipliers={minutes:60000,hours:3600000,days:86400000,weeks:604800000},threshold=Date.now()-amount*(multipliers[condition.u]||multipliers.hours);return condition.o==='within_last'?timestamp>=threshold:timestamp<threshold;}const target=new Date(`${condition.v}T00:00:00`).getTime();if(!Number.isFinite(target))return false;const next=target+86400000;if(condition.o==='before')return timestamp<target;if(condition.o==='after')return timestamp>=next;return timestamp>=target&&timestamp<next;}
   if(field.type==='size'){const bytes=Number(raw);if(!Number.isFinite(bytes))return false;const multipliers={kb:1024,mb:1048576,gb:1073741824},factor=multipliers[condition.u]||multipliers.mb,min=Number(condition.v)*factor,max=Number(condition.v2)*factor;if(condition.o==='greater_than')return bytes>min;if(condition.o==='greater_or_equal')return bytes>=min;if(condition.o==='less_than')return bytes<min;if(condition.o==='less_or_equal')return bytes<=min;if(condition.o==='between')return bytes>=min&&bytes<=max;return bytes===min;}
   const left=String(raw).toLocaleLowerCase(),right=String(condition.v).toLocaleLowerCase();if(condition.o==='not_contains')return !left.includes(right);if(condition.o==='equals')return left===right;if(condition.o==='not_equals')return left!==right;if(condition.o==='starts_with')return left.startsWith(right);if(condition.o==='ends_with')return left.endsWith(right);return left.includes(right);}
+// Подходит ли письмо под условия умной папки. Тот же разбор, что и в
+// smartRowsForFolder, но для одного письма: нужен, чтобы поправить счётчики
+// сразу после прочтения, не гоняя ядро по всей базе.
+function smartFolderMatchesMessage(folder,message){
+  const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);
+  if(!groups.length||window.coreUnifiedSettings?.[message.folder_id]==='0')return false;
+  return groups.some(group=>group.logic==='any'
+    ?group.conditions.some(condition=>smartConditionMatches(message,condition))
+    :group.conditions.every(condition=>smartConditionMatches(message,condition)));
+}
+// Пометки прочтения, ещё не подтверждённые ядром: id -> ожидаемое значение.
+// Как только данные из ядра приносят то же значение, ожидание снимается.
+const pendingSeen=new Map();
+function applyPendingSeen(message){
+  if(!pendingSeen.has(message.id))return message;
+  const expected=pendingSeen.get(message.id);
+  if(Boolean(message.flags?.seen)===expected){pendingSeen.delete(message.id);return message;}
+  return {...message,flags:{...message.flags,seen:expected}};
+}
+// Единственная точка смены признака прочтения. Дельту счётчиков применяем
+// сразу, а при отказе записи откатываем ровно то письмо, которое не прошло:
+// иначе ожидание в pendingSeen осталось бы навсегда и подменяло бы верные
+// данные ядра на устаревшие при каждой перезагрузке.
+window.markMessagesSeen=function(list,seen){
+  const items=(Array.isArray(list)?list:[list]).filter(Boolean);
+  if(!items.length)return Promise.resolve();
+  // Откатываем только те письма, которые правка действительно затронула: в
+  // групповом действии часть писем уже в нужном состоянии, и обратная дельта
+  // сделала бы их неверными.
+  const changed=window.applySmartCountsSeenChange(items,seen);
+  const changedIds=new Set(changed.map(message=>message.id));
+  return Promise.all(items.map(message=>window.tm?.markSeen(message.id,seen)
+    // Ядро записало значение в базу, ожидание больше не нужно: следующая
+    // перезагрузка прочитает уже новое состояние.
+    .then(()=>pendingSeen.delete(message.id))
+    .catch(error=>{
+      pendingSeen.delete(message.id);
+      if(changedIds.has(message.id))window.applySmartCountsSeenChange(message,!seen);
+      throw error;
+    })));
+};
+// Письма меняют признак "прочитано" - правим числа счётчиков на месте. Проход
+// ядра по всей базе придёт позже и уточнит их, но ждать его нельзя: в умной
+// папке "Непрочитанные" счётчик и есть смысл списка, и он должен уменьшаться в
+// тот же миг, когда письмо открыто. Вызывать до изменения флага у письма.
+window.applySmartCountsSeenChange=function(list,seen){
+  const changing=(Array.isArray(list)?list:[list]).filter(message=>message&&Boolean(message.flags?.seen)!==seen);
+  if(!changing.length)return [];
+  let touched=false;
+  smartFolders.forEach(folder=>{
+    if(folder.on===false||smartCounterMode(folder)==='n')return;
+    const counts=smartCounts[folder.id];if(!counts)return;
+    changing.forEach(message=>{
+      const before={...message,flags:{...message.flags,seen:Boolean(message.flags?.seen)}};
+      const after={...message,flags:{...message.flags,seen}};
+      const matchedBefore=smartFolderMatchesMessage(folder,before);
+      const matchedAfter=smartFolderMatchesMessage(folder,after);
+      if(!matchedBefore&&!matchedAfter)return;
+      counts.total=Math.max(0,counts.total+(matchedAfter?1:0)-(matchedBefore?1:0));
+      counts.unread=Math.max(0,counts.unread+(matchedAfter&&!seen?1:0)-(matchedBefore&&!before.flags.seen?1:0));
+      touched=true;
+    });
+  });
+  // Признак проставляем здесь же и во всех представлениях письма: часть путей
+  // меняет его только после ответа ядра, а одно письмо живёт разными объектами
+  // в общем списке и в страницах умных папок. Правка одного объекта оставила бы
+  // соседний непрочитанным, и следующее действие над ним засчиталось бы второй
+  // раз - счётчик уехал бы вниз без единого письма.
+  const changed=new Set(changing.map(message=>message.id));
+  // Запись в ядро идёт без ожидания, а фоновая перезагрузка может прочитать
+  // письмо раньше, чем пометка туда доедет, и вернуть его непрочитанным. Держим
+  // ожидаемое значение до подтверждения: слияние данных сверяется с ним, иначе
+  // список снова показал бы письмо непрочитанным, а счётчик остался бы
+  // уменьшенным - и разошёлся бы с содержимым папки.
+  changed.forEach(id=>pendingSeen.set(id,seen));
+  const mark=message=>{if(changed.has(message.id)){if(!message.flags)message.flags={};message.flags.seen=seen;}};
+  changing.forEach(mark);messages.forEach(mark);coreSmartRows.forEach(rows=>rows.forEach(mark));
+  if(touched)updateSmartBadges();
+  return changing;
+};
 function smartRowsForFolder(folder){const groups=(folder?.groups||[]).map(normalizeSmartGroup).filter(group=>group.conditions.length);if(!groups.length)return [];return messages.filter(message=>window.coreUnifiedSettings?.[message.folder_id]!=='0'&&groups.some(group=>group.logic==='any'?group.conditions.some(condition=>smartConditionMatches(message,condition)):group.conditions.every(condition=>smartConditionMatches(message,condition))));}
 const coreSmartRows=new Map();
 // Папки-источники, уже обойдённые догрузкой в текущем круге, по умным папкам.
@@ -437,13 +523,18 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
       // фильтру не подошли, совпадения могут быть глубже - прокрутка должна
       // продолжать копать, а не упираться в потолок.
       if(circleClosed&&!fetchedAny&&smartCircleFetched.get(folder.id)!==true)smartServerExhausted.set(folder.id,true);}
+    // Страница за страницей умная папка может набрать больше писем, чем
+    // интерфейс вообще способен показать, и все они удерживаются в памяти -
+    // и здесь, и через пиннинг в trimMessages. Держим потолок: список
+    // отсортирован от новых к старым, поэтому лишнее отрезаем с конца.
+    fresh=fresh.map(applyPendingSeen);rows=rows.map(applyPendingSeen);
     const combined=[...existing,...fresh];coreSmartRows.set(folder.id,combined);
     // Умная папка кончилась, только когда сервер обойден полностью и больше
     // ничего не отдаёт. Пустая страница сама по себе концом не считается:
     // локально совпадений нет, но следующий проход по другим папкам-источникам
     // ещё может их принести, и прокрутка не должна вставать.
     if(fresh.length||smartServerExhausted.get(folder.id)===true)smartHasMore.set(folder.id,fresh.length>0);
-    const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,message));messages=trimMessages([...byId.values()],rows.map(message=>message.id));
+    const byId=new Map(messages.map(message=>[message.id,message]));rows.forEach(message=>byId.set(message.id,applyPendingSeen(message)));messages=trimMessages([...byId.values()],rows.map(message=>message.id));
   }catch(error){console.error('smart folder coverage',error);}finally{loadingSmartCoverage=false;window.setListLoading?.(false);if(currentSmartIndex===index&&currentFolderId===null){applyListOptions(false);window.ensureListFilled?.(serverBackfill);}if(smartOverlay.classList.contains('open'))updateSmartPreview();const queued=queuedSmartCoverage;queuedSmartCoverage=null;if(queued)loadSmartCoveragePage(queued.index,queued.reset,queued.serverBackfill);}
 }
 // resetScroll=true - пользователь сам открыл умную папку: разрешаем ей снова
@@ -473,13 +564,21 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
    const survived=messages.filter(message=>{if(freshById.has(message.id))return true;
      const edge=edges.get(message.folder_id);if(!edge||(counts.get(message.folder_id)||0)<page)return false;
      const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
-   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,message));messages=trimMessages([...merged.values()],loadedMessages.map(message=>message.id));}
+   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,applyPendingSeen(message)));messages=trimMessages([...merged.values()],loadedMessages.map(message=>message.id));}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Счётчики умных папок пересчитываем после каждой перезагрузки данных: письма
   // могли прийти, уйти или стать прочитанными. Прежние числа возвращаем на
   // место сразу - clearDemoData стирает подписи счётчиков, а ответ ядра придёт
   // не мгновенно, и счётчик успел бы мигнуть пустотой.
   updateSmartBadges();window.refreshSmartCounts?.();
+  // Раз в сотню перезагрузок пишем в журнал, сколько писем держит интерфейс и
+  // сколько занято памяти. WebView при исчерпании памяти падает молча, и без
+  // этих чисел причину роста потом не восстановить.
+  if((coreReloadCount=(coreReloadCount||0)+1)%100===1){
+    const heap=performance?.memory?.usedJSHeapSize;
+    const smartRows=[...coreSmartRows.values()].reduce((sum,rows)=>sum+rows.length,0);
+    window.tm?.uiLog?.(`память интерфейса: писем ${messages.length}, строк умных папок ${smartRows}, событий ${(coreCalendarData.events||[]).length}${heap?`, куча ${Math.round(heap/1048576)} МБ`:''}`);
+  }
   // Список правил ждёт загрузки меток: правило с действием "поставить метку"
   // без них показывало метку как "?". Заодно, когда свежий список меток пришёл,
   // проверяем открытую метку - её могли удалить, и тогда уходим в умную папку.

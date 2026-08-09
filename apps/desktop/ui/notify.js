@@ -103,7 +103,13 @@
     } else {
       const open = mkBtn("Открыть", true, () => { invoke("notify_open", { messageId: data.message_id ?? null, eventId: null }).catch(() => {}); dismiss(card); });
       const read = mkBtn("Прочитано", false, () => {
-        if (data.message_id != null) invoke("mark_seen", { messageId: data.message_id, seen: true }).catch(() => {});
+        // Окно уведомлений - отдельный документ, и правки счётчиков из главного
+        // окна ему недоступны. После пометки шлём общее событие: главное окно
+        // слушает его и перечитывает данные, иначе счётчик умной папки и бейдж
+        // непрочитанных остались бы прежними до ближайшей синхронизации.
+        if (data.message_id != null) invoke("mark_seen", { messageId: data.message_id, seen: true })
+          .then(() => window.__TAURI__?.event?.emit("truemail-data-changed", null))
+          .catch(() => {});
         dismiss(card);
       });
       actions.append(open, read);

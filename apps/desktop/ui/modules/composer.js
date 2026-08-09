@@ -54,7 +54,7 @@ document.getElementById('bulkSelectAll').onclick=selectAllCurrentMessages;
 document.getElementById('bulkClear').onclick=clearMessageSelection;
 document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
-document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await Promise.all(ids.map(id=>window.tm.markSeen(id,true)));clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
+document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),true);clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
 /* Потолок на все вложения письма разом: WebView держит их в памяти массивами
    чисел и целиком укладывает в автосохраняемый черновик, поэтому набор крупных
