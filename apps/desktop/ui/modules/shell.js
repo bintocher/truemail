@@ -99,6 +99,8 @@ window.forgetMessages=forgetMessages;
 // разрастался до десятков тысяч записей вместе со всеми копиями, которые
 // делают перерисовка и слияние при перезагрузке данных.
 const MESSAGE_MEMORY_LIMIT=8000;
+// Счётчик перезагрузок данных: по нему раз в сотню пишем замер памяти в журнал.
+let coreReloadCount=0;
 // Потолок мягкий и вытесняет только то, чего сейчас нет на экране: строки
 // текущего показа, открытое письмо, выделение, страницы открытой умной папки и
 // только что загруженную страницу сохраняем всегда. Иначе обрезка выбрасывала бы
@@ -110,8 +112,10 @@ function trimMessages(list,keepIds=null){
   if(activeMessage)pinned.add(activeMessage.id);
   selectedMessageIds.forEach(id=>pinned.add(id));
   if(keepIds)keepIds.forEach(id=>pinned.add(id));
+  // Письма открытой умной папки удерживаем, но не больше общего потолка:
+  // иначе одна разросшаяся папка отменяла бы ограничение памяти целиком.
   const smartFolder=currentSmartIndex!==null?smartFolders[currentSmartIndex]:null;
-  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).forEach(message=>pinned.add(message.id));
+  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).slice(0,MESSAGE_MEMORY_LIMIT).forEach(message=>pinned.add(message.id));
   const kept=list.filter(message=>pinned.has(message.id));
   const rest=list.filter(message=>!pinned.has(message.id)).sort(byDateDesc);
   return kept.concat(rest.slice(0,Math.max(0,MESSAGE_MEMORY_LIMIT-kept.length)));

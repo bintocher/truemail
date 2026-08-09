@@ -117,7 +117,7 @@ document.addEventListener('keydown',e=>{
     const actions={compose:()=>document.getElementById('composeBtn').click(),reply:()=>openComposerForMessage('reply'),reply_all:()=>openComposerForMessage('replyall'),forward:()=>openComposerForMessage('forward'),archive:()=>performMessageAction('archive'),delete:()=>performMessageAction('trash'),snooze:()=>document.querySelector('[data-act="snooze"]')?.click()};
     const matched=Object.keys(actions).find(action=>bindingMatches(action,e));if(matched){e.preventDefault();actions[matched]();}
     const forward=bindingMatches('next_message',e)||e.code==='ArrowDown',backward=bindingMatches('prev_message',e)||e.code==='ArrowUp';if(forward||backward){e.preventDefault();const active=currentMessageRows.findIndex(message=>message.id===activeMessage?.id),next=forward?Math.min(currentMessageRows.length-1,active+1):Math.max(0,active<0?0:active-1);focusMessageAt(next);}
-    if(e.code==='KeyU'&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();activeMessage&&window.tm?.markSeen(activeMessage.id,false).then(()=>window.reloadCoreData());}
+    if(e.code==='KeyU'&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();if(activeMessage)window.markMessagesSeen?.(activeMessage,false).then(()=>window.reloadCoreData()).catch(console.error);}
     if(e.code==='Enter'&&activeMessage){e.preventDefault();const row=document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`);row?.click();}
   }
   if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyA'&&document.getElementById('mailView').classList.contains('active')&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){e.preventDefault();selectAllCurrentMessages();}

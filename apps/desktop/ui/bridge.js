@@ -378,3 +378,39 @@ window.corePageSize = 100;
     }
   })();
 })();
+
+/* Диагностика интерфейса. WebView при исчерпании памяти закрывает страницу
+   молча: в журнале ядра не остаётся ни строки, и после падения не по чем
+   искать причину. Поэтому пишем сами - ошибки страницы сразу, а замер памяти
+   регулярно, чтобы последняя строка перед обрывом показывала, до чего дошло. */
+(() => {
+  const log = message => window.tm?.uiLog?.(message);
+  const short = value => String(value ?? "").slice(0, 300);
+  window.addEventListener("error", event => {
+    log(`ошибка интерфейса: ${short(event.message)} (${short(event.filename)}:${event.lineno||0})`);
+  });
+  window.addEventListener("unhandledrejection", event => {
+    log(`необработанный отказ: ${short(event.reason?.message || event.reason)}`);
+  });
+  const MEGABYTE = 1048576;
+  let lastReported = 0;
+  const measure = (reason) => {
+    const memory = performance?.memory;
+    const rows = document.querySelectorAll(".msg").length;
+    if (!memory) { log(`память интерфейса (${reason}): строк списка ${rows}, замер кучи недоступен`); return; }
+    const used = Math.round(memory.usedJSHeapSize / MEGABYTE);
+    const limit = Math.round(memory.jsHeapSizeLimit / MEGABYTE);
+    // Пишем каждый десятый замер (раз в 10 минут) и всякий раз, когда куча
+    // подросла на 64 МБ с прошлой записи или подошла к потолку - у падения
+    // из-за памяти в журнале останется нарастающий след, а не ровная строка.
+    const grew = used - lastReported >= 64;
+    const nearLimit = limit > 0 && used > limit * 0.8;
+    if (reason !== "периодический" || grew || nearLimit || lastReported === 0) {
+      lastReported = used;
+      log(`память интерфейса (${reason}): куча ${used} из ${limit} МБ, строк списка ${rows}${nearLimit ? " - близко к потолку" : ""}`);
+    }
+  };
+  let ticks = 0;
+  setInterval(() => { ticks += 1; measure(ticks % 10 === 0 ? "каждые 10 минут" : "периодический"); }, 60000);
+  setTimeout(() => measure("старт"), 5000);
+})();
