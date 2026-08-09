@@ -7,6 +7,24 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-08-09
+
+### Fixed
+
+- A smart folder counter changes the moment a message is read. The sidebar
+  number used to wait for the next background reload, so in the "Unread" folder
+  it disagreed with the list for up to half a minute.
+- Moving messages in Gmail between "All mail" and "Inbox" is no longer rejected
+  by the server. The request asked to both add and remove the same label, so the
+  operations got stuck in the queue and retried for nothing.
+- The message list memory limit applies again while a smart folder is open.
+
+### Added
+
+- Interface journal: page errors and memory usage are written to the common log.
+  A window that dies from memory exhaustion now leaves a trail - previously the
+  journal stayed empty.
+
 ## [0.2.6] - 2026-08-07
 
 ### Added
