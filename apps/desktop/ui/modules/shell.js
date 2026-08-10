@@ -209,11 +209,30 @@ let coreFolders=[];
 let coreAccounts=[];
 // 16 нейтральных цветов аккаунта, читаемых в светлой и тёмной теме.
 /* Палитра цветов аккаунта: сетка 5x5 в выпадающей панели. */
+// Контрастная подпись поверх произвольного цвета. Фон метки и аватара приходит
+// из данных, а не из темы: на тёмном цвете нужен белый текст, на светлом -
+// тёмный, иначе подпись пропадает. Считаем по яркости в линейном пространстве
+// (WCAG), а не по сумме составляющих - иначе жёлтый и синий одной "суммы"
+// получили бы одинаковый вердикт.
+const ON_DARK='#fff',ON_LIGHT='#17181c';
+function contrastOn(color){
+  const hex=String(color||'').replace('#','').trim();
+  if(!/^[0-9a-fA-F]{6}$/.test(hex))return ON_DARK;
+  const channel=value=>{const part=parseInt(value,16)/255;return part<=0.03928?part/12.92:Math.pow((part+0.055)/1.055,2.4);};
+  const luminance=0.2126*channel(hex.slice(0,2))+0.7152*channel(hex.slice(2,4))+0.0722*channel(hex.slice(4,6));
+  // Берём тот из двух цветов, что даёт больший контраст, а не порог яркости:
+  // порог ошибается у цветов, лежащих близко к нему, - на янтарном белый текст
+  // давал 2.3:1 против 7.7:1 у тёмного. Тем же правилом посчитаны --on-accent
+  // в палитрах тем, поэтому подписи из данных и из темы решают одинаково.
+  const contrast=(a,b)=>{const hi=Math.max(a,b),lo=Math.min(a,b);return (hi+0.05)/(lo+0.05);};
+  return contrast(luminance,1)>=contrast(luminance,0.0105)?ON_DARK:ON_LIGHT;
+}
+window.contrastOn=contrastOn;
 const ACCOUNT_COLORS=[
-  '#d64545','#d9773b','#c9a227','#7a9e3a','#3f9d54',
-  '#2fa39a','#3b8ed0','#5a63d8','#8158d6','#b355c0',
-  '#c65a8e','#8a6d4b','#6b7280','#4f7a6a','#9c6b52',
-  '#5f6b7a','#a33a3a','#b8622a','#5d8a2f','#2f7d6b',
+  '#d24444','#d9773b','#c9a227','#7a9e3a','#3f9d54',
+  '#2fa39a','#3b8ed0','#5a63d8','#8158d6','#ac52b8',
+  '#b85484','#8a6d4b','#6b7280','#4f7a6a','#9c6b52',
+  '#5f6b7a','#a33a3a','#b46029','#57822c','#2f7d6b',
   '#2b6ca3','#43489e','#6b3fa0','#96407d','#7a5230',
 ];
 function accountColorById(accountId){const account=coreAccounts.find(item=>item.id===accountId);if(account&&account.color)return account.color;const index=coreAccounts.findIndex(item=>item.id===accountId);return ACCOUNT_COLORS[((index<0?Number(accountId)||0:index)%ACCOUNT_COLORS.length+ACCOUNT_COLORS.length)%ACCOUNT_COLORS.length];}
