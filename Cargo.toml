@@ -7,7 +7,7 @@ members = [
 exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["chernov <bintocher@yandex.com>"]
@@ -37,7 +37,9 @@ axum = "0.8.8"
 # почтовые протоколы и парсинг (см. docs/04-tech-stack.md)
 async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
 imap-proto = "0.16.7"
-mail-parser = "0.11.5"
+# full_encoding подключает encoding_rs: без него многобайтовые кодировки
+# (iso-2022-jp, shift_jis, big5, gbk, euc-jp/kr) отдавались как сырые байты.
+mail-parser = { version = "0.11.5", features = ["full_encoding"] }
 lettre = { version = "0.11.22", default-features = false, features = ["smtp-transport", "pool", "builder", "hostname", "tokio1-rustls", "rustls-native-certs", "aws-lc-rs"] }
 futures = "0.3.32"
 tokio-rustls = "0.26.4"

@@ -367,9 +367,18 @@ fn run() -> anyhow::Result<()> {
                         }
                     }
                 }
+                // Разовая фоновая починка кодировок уже сохранённой почты
+                // (issue #41, docs/specs/message-charset-decoding.md, S-009).
+                // Не через Core::bootstrap: ядро в приложении создаётся и на
+                // пробу при переносе каталога данных, а такие экземпляры
+                // отбрасываются вместе с закрытием пулов.
+                let repair_core = core.clone();
                 tauri::async_runtime::block_on(async {
                     *state.core.write().await = core;
                 });
+                if let Some(repair_core) = repair_core {
+                    commands::spawn_charset_repair(repair_core);
+                }
             }
             // Уборка скачанных пакетов обновления. После установки программа
             // перезапускается уже новой версией - её инсталлятор здесь и

@@ -7,6 +7,20 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-03
+
+### Fixed
+
+- Messages in iso-2022-jp, shift_jis, big5, gbk and euc-jp/kr are readable:
+  subject and body used to appear as a run of control characters. Exchange
+  newsletters carrying Cyrillic inside iso-2022-jp now open correctly.
+  Already downloaded messages repair themselves after the update: subject,
+  sender, preview, attachment names, address book names and full-text search
+  are restored from the stored source, with no re-download from the server.
+  The repair runs in the background and does not delay startup.
+- Folder names are readable in sync error messages: instead of "Spam" the text
+  used to show a raw IMAP string like "&BCEEPwQwBDw-".
+
 ## [0.2.9] - 2026-09-02
 
 ### Added

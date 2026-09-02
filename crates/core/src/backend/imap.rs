@@ -980,7 +980,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             .await
             .map_err(|e| Error::Backend {
                 backend: "imap-status".into(),
-                message: format!("{remote_path}: {e}"),
+                message: format!("{}: {e}", folder_label(&remote_path)),
             })?;
         let encoded_name = remote_path
             .rsplit(['/', '|'])
@@ -1098,7 +1098,7 @@ async fn fetch_incremental_messages(
         }
         .map_err(|error| Error::Backend {
             backend: "imap-select".into(),
-            message: format!("{}: {error}", folder.remote_path),
+            message: format!("{}: {error}", folder_label(&folder.remote_path)),
         })?;
         (mailbox, Vec::new(), Vec::new())
     };
@@ -1124,7 +1124,7 @@ async fn fetch_incremental_messages(
             .await
             .map_err(|error| Error::Backend {
                 backend: "imap-search".into(),
-                message: format!("{}: {error}", folder.remote_path),
+                message: format!("{}: {error}", folder_label(&folder.remote_path)),
             })?
             .into_iter()
             .collect()
@@ -1141,7 +1141,7 @@ async fn fetch_incremental_messages(
                 .await
                 .map_err(|error| Error::Backend {
                     backend: "imap-search".into(),
-                    message: format!("{}: {error}", folder.remote_path),
+                    message: format!("{}: {error}", folder_label(&folder.remote_path)),
                 })?
                 .into_iter()
                 .collect()
@@ -1171,13 +1171,13 @@ async fn fetch_incremental_messages(
             .await
             .map_err(|error| Error::Backend {
                 backend: "imap-condstore".into(),
-                message: format!("{}: {error}", folder.remote_path),
+                message: format!("{}: {error}", folder_label(&folder.remote_path)),
             })?
             .try_collect::<Vec<_>>()
             .await
             .map_err(|error| Error::Backend {
                 backend: "imap-condstore".into(),
-                message: format!("{}: {error}", folder.remote_path),
+                message: format!("{}: {error}", folder_label(&folder.remote_path)),
             })?;
         for fetch in fetched {
             let Some(uid) = fetch.uid else { continue };
@@ -1216,7 +1216,7 @@ async fn fetch_incremental_messages(
                 .await
                 .map_err(|error| Error::Backend {
                     backend: "imap-search".into(),
-                    message: format!("{}: {error}", folder.remote_path),
+                    message: format!("{}: {error}", folder_label(&folder.remote_path)),
                 })?
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1718,7 +1718,7 @@ async fn fetch_header_dates(
 ) -> Result<Vec<async_imap::types::Fetch>> {
     let failed = |error: async_imap::error::Error| Error::Backend {
         backend: "imap-older".into(),
-        message: format!("{folder_path}: {error}"),
+        message: format!("{}: {error}", folder_label(folder_path)),
     };
     session
         .uid_fetch(uid_set(uids), items)
@@ -1820,7 +1820,7 @@ async fn fetch_older_messages(
         .await
         .map_err(|error| Error::Backend {
             backend: "imap-select".into(),
-            message: format!("{folder_path}: {error}"),
+            message: format!("{}: {error}", folder_label(folder_path)),
         })?;
     // Курсор приходит с точным временем самого старого показанного письма, а
     // SEARCH сравнивает даты только по дню. Поэтому ищем с запасом - по день
@@ -1844,7 +1844,7 @@ async fn fetch_older_messages(
             .await
             .map_err(|error| Error::Backend {
                 backend: "imap-search".into(),
-                message: format!("{folder_path}: {error}"),
+                message: format!("{}: {error}", folder_label(folder_path)),
             })?,
     };
     let mut uids = found.into_iter().collect::<Vec<u32>>();
@@ -1934,7 +1934,7 @@ async fn fetch_message_raw(
         .await
         .map_err(|error| Error::Backend {
             backend: "imap-select".into(),
-            message: format!("{folder_path}: {error}"),
+            message: format!("{}: {error}", folder_label(folder_path)),
         })?;
     let fetched = session
         .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
@@ -1963,6 +1963,14 @@ async fn fetch_message_raw(
 
 /// IMAP использует modified UTF-7 для имён папок (RFC 3501, раздел 5.1.3).
 /// Декодер оставлен локальным, чтобы не тащить устаревшую кодировочную библиотеку.
+/// Читаемое имя папки для сообщений об ошибке. IMAP отдаёт пути в
+/// модифицированном UTF-7 ("&BCEEPwQwBDw-" вместо "Спам"), и без декодирования
+/// пользователь видит в тексте ошибки набор служебных символов.
+fn folder_label(path: &str) -> String {
+    let decoded = decode_modified_utf7(path).unwrap_or_else(|| path.to_owned());
+    format!("папка \"{decoded}\"")
+}
+
 fn decode_modified_utf7(value: &str) -> Option<String> {
     use base64::Engine;
     let mut out = String::new();
@@ -2032,9 +2040,9 @@ fn encode_modified_utf7(value: &str) -> String {
 #[cfg(test)]
 mod utf7_tests {
     use super::{
-        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, imap_store_commands,
-        mime_message_id, parse_cursor_datetime, parse_header_date, sent_mailbox_candidate, uid_set,
-        validate_folder_name,
+        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, folder_label,
+        imap_store_commands, mime_message_id, parse_cursor_datetime, parse_header_date,
+        sent_mailbox_candidate, uid_set, validate_folder_name,
     };
 
     #[test]
@@ -2120,6 +2128,16 @@ mod utf7_tests {
             Some("Отправленные")
         );
         assert_eq!(decode_modified_utf7("A&-B").as_deref(), Some("A&B"));
+    }
+
+    #[test]
+    fn folder_label_is_readable_in_error_text() {
+        // Пользователь видел "&BCEEPwQwBDw-" вместо имени папки: путь IMAP
+        // подставлялся в текст ошибки как есть.
+        assert_eq!(folder_label("&BCEEPwQwBDw-"), "папка \"Спам\"");
+        assert_eq!(folder_label("INBOX"), "папка \"INBOX\"");
+        // Нераспознанный путь показываем как есть, а не теряем.
+        assert_eq!(folder_label("&broken"), "папка \"&broken\"");
     }
 
     #[test]
