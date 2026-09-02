@@ -7,6 +7,8 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-03
+
 ### Fixed
 
 - Messages in iso-2022-jp, shift_jis, big5, gbk and euc-jp/kr are readable:

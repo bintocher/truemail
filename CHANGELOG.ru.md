@@ -7,6 +7,8 @@ Changelog; версии — Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-09-03
+
 ### Исправлено
 
 - Письма в кодировках iso-2022-jp, shift_jis, big5, gbk и euc-jp/kr читаются:
