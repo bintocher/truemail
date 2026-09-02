@@ -4634,6 +4634,313 @@ impl Db {
         }
         Ok(contacts)
     }
+
+    // ---------- Починка кодировок (issue #41, docs/specs/message-charset-decoding.md) ----------
+
+    /// Разовая фоновая починка уже сохранённой почты, испорченной парсером без
+    /// фичи `mail-parser/full_encoding`. Возвращает число исправленных писем
+    /// за проход.
+    ///
+    /// Флаг `charset_repair_v1` в `storage_meta` защищает от повторного
+    /// полного скана (S-008): при уже выставленном флаге функция сразу
+    /// возвращает 0, не трогая `messages`. Ошибка на отдельном письме не
+    /// прерывает проход и не пробрасывается наружу (S-007): письмо
+    /// пропускается, в журнал уходит предупреждение с его id. Ошибка выборки
+    /// страницы, фазы починки контактов или записи флага, наоборот,
+    /// останавливает весь проход без выставления флага - починка повторится
+    /// при следующем запуске (S-011).
+    pub async fn repair_broken_charset_messages(&self) -> Result<usize> {
+        let already_done: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = 'charset_repair_v1'")
+                .fetch_optional(&self.pool)
+                .await?;
+        if already_done.is_some() {
+            return Ok(0);
+        }
+
+        tracing::info!("починка кодировок писем: старт прохода");
+
+        const PAGE_SIZE: i64 = 200;
+        let mut fixed = 0_usize;
+        let mut skipped = 0_usize;
+        let mut after_id = 0_i64;
+        loop {
+            let page = self
+                .broken_charset_message_page(after_id, PAGE_SIZE)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+            after_id = page.last().map(|(id, _)| *id).unwrap_or(after_id);
+            for (message_id, raw_blob_ref) in page {
+                match self
+                    .repair_one_charset_message(message_id, &raw_blob_ref)
+                    .await
+                {
+                    Ok(true) => fixed += 1,
+                    Ok(false) => skipped += 1,
+                    Err(error) => {
+                        tracing::warn!(
+                            message_id,
+                            error = %error,
+                            "починка кодировок писем: письмо пропущено"
+                        );
+                        skipped += 1;
+                    }
+                }
+            }
+            if page_len < PAGE_SIZE as usize {
+                break;
+            }
+            // Между письмами и страницами блокировка записи не удерживается -
+            // список, поиск и синхронизация продолжают работать (S-010).
+            tokio::task::yield_now().await;
+        }
+
+        // Фаза контактов - после починки писем: иначе кандидатов с чистым
+        // именем ещё не будет и испорченные имена останутся навсегда (S-006).
+        self.repair_contact_names_from_messages().await?;
+
+        sqlx::query(
+            "INSERT INTO storage_meta(key, value) VALUES('charset_repair_v1', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(&self.write_pool)
+        .await?;
+
+        tracing::info!(fixed, skipped, "починка кодировок писем: проход завершён");
+        Ok(fixed)
+    }
+
+    /// Страница id битых писем и их `raw_blob_ref` на момент выборки, по
+    /// возрастанию id (keyset, не OFFSET - иначе исправленные письма сдвигали
+    /// бы окно и часть писем терялась бы навсегда, S-010). Источники битости
+    /// сведены через UNION по различным id письма (S-003): письмо, испорченное
+    /// сразу в нескольких местах, попадёт в страницу один раз.
+    async fn broken_charset_message_page(
+        &self,
+        after_id: i64,
+        page_size: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        Ok(sqlx::query_as(
+            "WITH broken AS (
+                SELECT id FROM messages
+                 WHERE id > ? AND raw_blob_ref IS NOT NULL
+                   AND (
+                        subject LIKE '%' || char(0x1B) || '%' OR subject LIKE '%' || char(0xFFFD) || '%'
+                     OR coalesce(from_name,'') LIKE '%' || char(0x1B) || '%' OR coalesce(from_name,'') LIKE '%' || char(0xFFFD) || '%'
+                     OR coalesce(from_addr,'') LIKE '%' || char(0x1B) || '%' OR coalesce(from_addr,'') LIKE '%' || char(0xFFFD) || '%'
+                     OR preview LIKE '%' || char(0x1B) || '%' OR preview LIKE '%' || char(0xFFFD) || '%'
+                     OR coalesce(to_addrs,'') LIKE '%' || char(0x1B) || '%' OR coalesce(to_addrs,'') LIKE '%' || char(0xFFFD) || '%'
+                     OR coalesce(cc_addrs,'') LIKE '%' || char(0x1B) || '%' OR coalesce(cc_addrs,'') LIKE '%' || char(0xFFFD) || '%'
+                   )
+                UNION
+                SELECT m.id FROM messages m
+                 JOIN attachments a ON a.message_id = m.id
+                 WHERE m.id > ? AND m.raw_blob_ref IS NOT NULL
+                   AND (a.filename LIKE '%' || char(0x1B) || '%' OR a.filename LIKE '%' || char(0xFFFD) || '%')
+                UNION
+                SELECT m.id FROM messages m
+                 JOIN message_content_cache c ON c.message_id = m.id
+                 WHERE m.id > ? AND m.raw_blob_ref IS NOT NULL
+                   AND (
+                        coalesce(c.body_text,'') LIKE '%' || char(0x1B) || '%' OR coalesce(c.body_text,'') LIKE '%' || char(0xFFFD) || '%'
+                     OR coalesce(c.body_html,'') LIKE '%' || char(0x1B) || '%' OR coalesce(c.body_html,'') LIKE '%' || char(0xFFFD) || '%'
+                   )
+                UNION
+                SELECT m.id FROM messages m
+                 JOIN messages_fts f ON f.rowid = m.id
+                 WHERE m.id > ? AND m.raw_blob_ref IS NOT NULL
+                   AND (coalesce(f.body,'') LIKE '%' || char(0x1B) || '%' OR coalesce(f.body,'') LIKE '%' || char(0xFFFD) || '%')
+             )
+             SELECT b.id, m.raw_blob_ref FROM broken b
+              JOIN messages m ON m.id = b.id
+              ORDER BY b.id ASC LIMIT ?",
+        )
+        .bind(after_id)
+        .bind(after_id)
+        .bind(after_id)
+        .bind(after_id)
+        .bind(page_size)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Починить одно письмо повторным разбором исходника. `true` - письмо
+    /// исправлено, `false` - пропущено, потому что `raw_blob_ref` уже сменился
+    /// с момента выборки (S-014, гонка с докачкой тела или пересинхронизацией):
+    /// в этом случае поля, кэш и индекс не трогаются вовсе. Ошибка (недоступен
+    /// blob, не разобрался MIME, не сериализовались адреса) уходит наружу -
+    /// вызывающий код превращает её в пропуск с предупреждением (S-007).
+    async fn repair_one_charset_message(
+        &self,
+        message_id: i64,
+        raw_blob_ref: &str,
+    ) -> Result<bool> {
+        use mail_parser::{MessageParser, MimeHeaders};
+        let raw = self.blobs.get(raw_blob_ref)?;
+        let message = MessageParser::default()
+            .parse(&raw)
+            .ok_or_else(|| crate::Error::Other("не удалось разобрать письмо повторно".into()))?;
+        let from = message.from().and_then(|value| value.first());
+        let addresses = |value: Option<&mail_parser::Address<'_>>| {
+            value
+                .map(|value| {
+                    value
+                        .iter()
+                        .map(|addr| Addr {
+                            name: addr.name.as_deref().map(str::to_owned),
+                            email: addr.address.as_deref().unwrap_or_default().to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let to_json = serde_json::to_string(&addresses(message.to()))?;
+        let cc_json = serde_json::to_string(&addresses(message.cc()))?;
+        let subject = message.subject().unwrap_or_default().to_owned();
+        let from_name = from.and_then(|a| a.name.as_deref()).map(str::to_owned);
+        let from_addr = from.and_then(|a| a.address.as_deref()).map(str::to_owned);
+        let preview: String = message
+            .body_text(0)
+            .map(|body| body.chars().take(240).collect())
+            .unwrap_or_default();
+        let body_text = message
+            .body_text(0)
+            .map(|body| body.into_owned())
+            .unwrap_or_default();
+        // Тот же порядок разбора, что при первичном сохранении письма
+        // (save_discovered_messages) - имена вложений совпадут построчно со
+        // строками attachments, вставленными в том же порядке.
+        let attachment_names: Vec<String> = message
+            .attachments()
+            .enumerate()
+            .map(|(index, part)| {
+                part.attachment_name()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("attachment-{}", index + 1))
+            })
+            .collect();
+
+        let mut tx = self.begin_write().await?;
+        let updated = sqlx::query(
+            "UPDATE messages SET subject=?, from_name=?, from_addr=?, to_addrs=?, cc_addrs=?, preview=?
+              WHERE id=? AND raw_blob_ref=?",
+        )
+        .bind(&subject)
+        .bind(&from_name)
+        .bind(&from_addr)
+        .bind(&to_json)
+        .bind(&cc_json)
+        .bind(&preview)
+        .bind(message_id)
+        .bind(raw_blob_ref)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            // Исходник сменился между выборкой и записью: поля уже разобраны
+            // новым парсером, транзакция просто не коммитится (S-014).
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM message_content_cache WHERE message_id = ?")
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        let attachment_ids: Vec<(i64,)> =
+            sqlx::query_as("SELECT id FROM attachments WHERE message_id = ? ORDER BY id ASC")
+                .bind(message_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        if attachment_ids.len() != attachment_names.len() {
+            // Строки вложений разошлись с разбором исходника: имена ставим
+            // только там, где соответствие однозначно, остальные не трогаем.
+            tracing::warn!(
+                message_id,
+                in_database = attachment_ids.len(),
+                in_source = attachment_names.len(),
+                "починка кодировок: число вложений не совпало с разбором"
+            );
+        }
+        for ((attachment_id,), filename) in attachment_ids.into_iter().zip(attachment_names) {
+            sqlx::query("UPDATE attachments SET filename = ? WHERE id = ?")
+                .bind(filename)
+                .bind(attachment_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // Тело - прямым запросом в этой же транзакции, а не вызовом
+        // SearchIndex::index_body: тот пишет отдельным соединением write_pool,
+        // а busy_timeout в проекте нулевой - вызов из открытой транзакции
+        // немедленно упёрся бы в занятую базу (S-004).
+        sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
+            .bind(&body_text)
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Починить имена контактов, заведённых из писем (S-006). Только контакты
+    /// с `uid` вида `mail:<адрес>` и известным `account_id` - контакты CardDAV
+    /// не трогаем, их имя принадлежит серверу. Кандидат на новое имя - самое
+    /// свежее письмо того же аккаунта с совпадающим (без учёта регистра и
+    /// крайних пробелов) `from_addr` и непустым `from_name` без маркера порчи;
+    /// если такого письма нет, имя контакта остаётся прежним.
+    async fn repair_contact_names_from_messages(&self) -> Result<()> {
+        let broken: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, account_id FROM contacts
+              WHERE account_id IS NOT NULL AND uid LIKE 'mail:%'
+                AND (display_name LIKE '%' || char(0x1B) || '%'
+                     OR display_name LIKE '%' || char(0xFFFD) || '%')",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (contact_id, account_id) in broken {
+            let emails: Vec<(String,)> = sqlx::query_as(
+                "SELECT lower(trim(email)) FROM contact_emails WHERE contact_id = ?",
+            )
+            .bind(contact_id)
+            .fetch_all(&self.pool)
+            .await?;
+            if emails.is_empty() {
+                continue;
+            }
+            // Порядок кандидатов (S-006): сначала письма с непустой датой по
+            // убыванию даты, письма без даты считаются самыми старыми; при
+            // равных датах побеждает письмо с наибольшим id.
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT from_name FROM messages WHERE account_id = ",
+            );
+            query.push_bind(account_id);
+            query.push(" AND lower(trim(from_addr)) IN (");
+            let mut separated = query.separated(",");
+            for (email,) in &emails {
+                separated.push_bind(email);
+            }
+            separated.push_unseparated(")");
+            query.push(
+                " AND from_name IS NOT NULL AND trim(from_name) <> ''
+                   AND from_name NOT LIKE '%' || char(0x1B) || '%'
+                   AND from_name NOT LIKE '%' || char(0xFFFD) || '%'
+                 ORDER BY CASE WHEN date IS NULL OR date = '' THEN 0 ELSE 1 END DESC, date DESC, id DESC
+                 LIMIT 1",
+            );
+            let candidate: Option<(String,)> = query
+                .build_query_as::<(String,)>()
+                .fetch_optional(&self.pool)
+                .await?;
+            if let Some((from_name,)) = candidate {
+                sqlx::query("UPDATE contacts SET display_name = ? WHERE id = ?")
+                    .bind(clean_contact_name(&from_name))
+                    .bind(contact_id)
+                    .execute(&self.write_pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Привести условие умной папки к нынешнему словарю полей и значений.
@@ -5933,13 +6240,1239 @@ mod notification_lookup_tests {
     }
 }
 
+/// Тесты `Db::repair_broken_charset_messages` (issue #41,
+/// docs/specs/message-charset-decoding.md). Раскодирование само по себе (фича
+/// `mail-parser/full_encoding`) вне границ этой задачи, поэтому письма ниже
+/// собраны на чистом ASCII/UTF-8 без легаси-кодировок: заголовки с не-ASCII
+/// текстом кодируются RFC 2047 (`=?UTF-8?B?...?=`) - base64+UTF-8 декодируются
+/// mail-parser всегда, независимо от фичи. Маркер порчи в тестах имитирует
+/// результат старого парсера: он вставляется в столбцы БД руками, а не через
+/// реальное декодирование.
+#[cfg(test)]
+mod charset_repair_tests {
+    use super::*;
+    use crate::crypto::{DatabaseKey, StorageCrypto};
+    use rand::Rng as _;
+    use std::sync::Arc;
+
+    const ESC: char = '\u{1B}';
+    const FFFD: char = '\u{FFFD}';
+
+    fn random_key() -> [u8; 32] {
+        let mut key = [0_u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        key
+    }
+
+    /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в
+    /// notification_lookup_tests (repo.rs) и storage::tests (storage/mod.rs).
+    async fn test_db() -> Db {
+        let root =
+            std::env::temp_dir().join(format!("truemail-repo-charset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let database_key = DatabaseKey::from_key(random_key());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+        db
+    }
+
+    async fn seed_account(db: &Db) -> i64 {
+        let (account_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind) \
+                 VALUES (?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(format!("{}@example.test", uuid::Uuid::new_v4()))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert account");
+        account_id
+    }
+
+    async fn seed_folder(db: &Db, account_id: i64, remote_path: &str, role: Option<&str>) -> i64 {
+        let (folder_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO folders(account_id, remote_path, display_name, role) \
+                 VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(remote_path)
+        .bind(remote_path)
+        .bind(role)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert folder");
+        folder_id
+    }
+
+    /// Заголовок в кодировке RFC 2047 (base64, UTF-8). Не зависит от фичи
+    /// `full_encoding`: base64 + UTF-8 декодируются mail-parser всегда.
+    fn encoded_word(text: &str) -> String {
+        use base64::Engine as _;
+        format!(
+            "=?UTF-8?B?{}?=",
+            base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+        )
+    }
+
+    /// Простое письмо text/plain, без вложений.
+    fn build_raw_message(subject: &str, from_name: &str, from_addr: &str, body: &str) -> Vec<u8> {
+        // Без завершающего "\r\n" после тела: письмо не multipart, границы
+        // MIME нет, и любой хвостовой перевод строки стал бы частью тела -
+        // тесты сверяют body_text с телом побайтово.
+        format!(
+            "From: {} <{}>\r\n\
+             Subject: {}\r\n\
+             Date: Wed, 02 Sep 2026 10:00:00 +0000\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             {}",
+            encoded_word(from_name),
+            from_addr,
+            encoded_word(subject),
+            body,
+        )
+        .into_bytes()
+    }
+
+    /// Письмо только с HTML-частью, без text/plain - `body_text` при разборе
+    /// пуст, ровно случай S-003 "письмо без текстовой части".
+    fn build_raw_message_html_only(
+        subject: &str,
+        from_name: &str,
+        from_addr: &str,
+        html_body: &str,
+    ) -> Vec<u8> {
+        format!(
+            "From: {} <{}>\r\n\
+             Subject: {}\r\n\
+             Date: Wed, 02 Sep 2026 10:00:00 +0000\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             \r\n\
+             {}\r\n",
+            encoded_word(from_name),
+            from_addr,
+            encoded_word(subject),
+            html_body,
+        )
+        .into_bytes()
+    }
+
+    /// Письмо с одним вложением (multipart/mixed). Имя вложения - обычный
+    /// ASCII: раскодирование легаси-кодировок вне границ этой задачи, важен
+    /// только сам факт починки записи `attachments.filename`.
+    fn build_raw_message_with_attachment(
+        subject: &str,
+        from_name: &str,
+        from_addr: &str,
+        body: &str,
+        attachment_name: &str,
+        attachment_body: &str,
+    ) -> Vec<u8> {
+        let boundary = "boundary-truemail-test";
+        format!(
+            "From: {} <{}>\r\n\
+             Subject: {}\r\n\
+             Date: Wed, 02 Sep 2026 10:00:00 +0000\r\n\
+             Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+             \r\n\
+             --{boundary}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             {body}\r\n\
+             --{boundary}\r\n\
+             Content-Type: text/plain; name=\"{attachment_name}\"\r\n\
+             Content-Disposition: attachment; filename=\"{attachment_name}\"\r\n\
+             \r\n\
+             {attachment_body}\r\n\
+             --{boundary}--\r\n",
+            encoded_word(from_name),
+            from_addr,
+            encoded_word(subject),
+        )
+        .into_bytes()
+    }
+
+    /// Прямая вставка письма нужным набором полей - тесты чинки собирают
+    /// повреждённые строки руками, а не через `save_discovered_messages`.
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_message(
+        db: &Db,
+        account_id: i64,
+        folder_id: i64,
+        uid: i64,
+        subject: &str,
+        from_name: Option<&str>,
+        from_addr: Option<&str>,
+        to_addrs: &str,
+        cc_addrs: &str,
+        preview: &str,
+        date: Option<&str>,
+        raw_blob_ref: Option<&str>,
+    ) -> i64 {
+        let (id,): (i64,) = sqlx::query_as(
+            "INSERT INTO messages(account_id, folder_id, uid, subject, from_name, from_addr,
+                                   to_addrs, cc_addrs, preview, date, raw_blob_ref)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(folder_id)
+        .bind(uid)
+        .bind(subject)
+        .bind(from_name)
+        .bind(from_addr)
+        .bind(to_addrs)
+        .bind(cc_addrs)
+        .bind(preview)
+        .bind(date)
+        .bind(raw_blob_ref)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert message");
+        id
+    }
+
+    async fn charset_repair_flag_is_set(db: &Db) -> bool {
+        sqlx::query_as::<_, (String,)>(
+            "SELECT value FROM storage_meta WHERE key = 'charset_repair_v1'",
+        )
+        .fetch_optional(&db.pool)
+        .await
+        .expect("read storage_meta")
+        .is_some()
+    }
+
+    /// from_name с U+FFFD при чистых теме и превью (S-003) - должен найтись и
+    /// починиться сам по себе.
+    #[tokio::test]
+    async fn detects_and_repairs_broken_from_name_alone() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            Some(&format!("Иван{FFFD}Петров")),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1);
+
+        let (from_name,): (Option<String>,) =
+            sqlx::query_as("SELECT from_name FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read from_name");
+        assert_eq!(from_name.as_deref(), Some("Иван Петров"));
+    }
+
+    /// Маркер только в `to_addrs` при остальных чистых полях (S-003).
+    #[tokio::test]
+    async fn detects_and_repairs_broken_to_addrs_alone() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            &format!("[{{\"name\":\"Мари{FFFD}\",\"email\":\"maria@example.test\"}}]"),
+            "[]",
+            "Текст письма",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1);
+
+        let (to_addrs,): (String,) =
+            sqlx::query_as("SELECT coalesce(to_addrs, '[]') FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read to_addrs");
+        assert_eq!(to_addrs, "[]", "у письма без To починка обязана дать []");
+    }
+
+    /// Письмо без текстовой части: превью и поля `messages` чистые, маркер -
+    /// только в `message_content_cache.body_html` (S-003, главный найденный
+    /// в ревью пробел детекта).
+    #[tokio::test]
+    async fn detects_broken_cache_when_message_fields_are_clean() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message_html_only(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "<p>Привет</p>",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO message_content_cache(message_id, raw_blob_ref, body_html, body_text, attachments_json)
+             VALUES (?, ?, ?, NULL, '[]')",
+        )
+        .bind(message_id)
+        .bind(&raw_ref)
+        .bind(format!("<p>Привет{FFFD}</p>"))
+        .execute(&db.write_pool)
+        .await
+        .expect("insert broken cache");
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1);
+
+        let cached: Option<(i64,)> =
+            sqlx::query_as("SELECT message_id FROM message_content_cache WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_optional(&db.pool)
+                .await
+                .expect("query cache");
+        assert!(
+            cached.is_none(),
+            "устаревший кэш обязан удаляться при починке (S-004)"
+        );
+    }
+
+    /// Маркер только в `attachments.filename` (S-003, S-005).
+    #[tokio::test]
+    async fn detects_and_repairs_broken_attachment_filename() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message_with_attachment(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+            "report.txt",
+            "содержимое",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO attachments(message_id, filename, is_inline, fetched) VALUES (?, ?, 0, 0)",
+        )
+        .bind(message_id)
+        .bind(format!("report{FFFD}.txt"))
+        .execute(&db.write_pool)
+        .await
+        .expect("insert broken attachment");
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1);
+
+        let (filename,): (String,) =
+            sqlx::query_as("SELECT filename FROM attachments WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read filename");
+        assert_eq!(filename, "report.txt");
+    }
+
+    /// Маркер только в `messages_fts.body`, остальное чистое (S-003, S-004).
+    #[tokio::test]
+    async fn detects_and_repairs_broken_fts_body() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Уникальноеслово",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Уникальноеслово",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+        sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
+            .bind(format!("Уник{FFFD}льноеслово"))
+            .bind(message_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("corrupt fts body");
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1);
+
+        let (body,): (String,) = sqlx::query_as("SELECT body FROM messages_fts WHERE rowid = ?")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read fts body");
+        assert_eq!(body, "Уникальноеслово");
+    }
+
+    /// Письмо испорчено сразу в нескольких источниках (тема, имя, кэш,
+    /// вложение, FTS) - обрабатывается один раз (S-003) и полностью
+    /// починяется по всем направлениям разом (S-004, S-005).
+    #[tokio::test]
+    async fn message_broken_in_several_sources_is_fixed_once_and_completely() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message_with_attachment(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+            "report.txt",
+            "содержимое",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            &format!("Тема{ESC} письма"),
+            Some(&format!("Иван{FFFD}Петров")),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            &format!("Текст{FFFD} письма"),
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO message_content_cache(message_id, raw_blob_ref, body_html, body_text, attachments_json)
+             VALUES (?, ?, NULL, ?, '[]')",
+        )
+        .bind(message_id)
+        .bind(&raw_ref)
+        .bind(format!("Текст{FFFD} письма"))
+        .execute(&db.write_pool)
+        .await
+        .expect("insert broken cache");
+        sqlx::query(
+            "INSERT INTO attachments(message_id, filename, is_inline, fetched) VALUES (?, ?, 0, 0)",
+        )
+        .bind(message_id)
+        .bind(format!("report{FFFD}.txt"))
+        .execute(&db.write_pool)
+        .await
+        .expect("insert broken attachment");
+        sqlx::query("UPDATE messages_fts SET body = ? WHERE rowid = ?")
+            .bind(format!("Текст{FFFD} письма"))
+            .bind(message_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("corrupt fts body");
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(
+            fixed, 1,
+            "письмо, испорченное в нескольких источниках, чинится один раз"
+        );
+
+        let (subject, from_name, preview): (String, Option<String>, String) =
+            sqlx::query_as("SELECT subject, from_name, preview FROM messages WHERE id = ?")
+                .bind(message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read message fields");
+        assert_eq!(subject, "Тема письма");
+        assert_eq!(from_name.as_deref(), Some("Иван Петров"));
+        assert_eq!(preview, "Текст письма");
+
+        let cached: Option<(i64,)> =
+            sqlx::query_as("SELECT message_id FROM message_content_cache WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_optional(&db.pool)
+                .await
+                .expect("query cache");
+        assert!(cached.is_none());
+
+        let (filename,): (String,) =
+            sqlx::query_as("SELECT filename FROM attachments WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read filename");
+        assert_eq!(filename, "report.txt");
+
+        let (body,): (String,) = sqlx::query_as("SELECT body FROM messages_fts WHERE rowid = ?")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read fts body");
+        assert_eq!(body, "Текст письма");
+    }
+
+    /// Имя контакта чинится по самому свежему по дате письму (S-006).
+    #[tokio::test]
+    async fn contact_name_is_repaired_from_the_most_recent_message() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "старое письмо",
+            Some("Старое Имя"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "",
+            Some("2020-01-01T00:00:00+00:00"),
+            None,
+        )
+        .await;
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            2,
+            "новое письмо",
+            Some("Новое Имя"),
+            // Регистр и пробелы отличаются от email контакта - сравнение
+            // должно быть нечувствительным к ним.
+            Some(" IVAN@EXAMPLE.TEST "),
+            "[]",
+            "[]",
+            "",
+            Some("2026-01-01T00:00:00+00:00"),
+            None,
+        )
+        .await;
+        let (contact_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO contacts(account_id, uid, display_name) VALUES (?, 'mail:ivan@example.test', ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("Ив{FFFD}н"))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert contact");
+        sqlx::query("INSERT INTO contact_emails(contact_id, email, kind) VALUES (?, 'ivan@example.test', 'mail')")
+            .bind(contact_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert contact email");
+
+        db.repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+
+        let (display_name,): (String,) =
+            sqlx::query_as("SELECT display_name FROM contacts WHERE id = ?")
+                .bind(contact_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read display_name");
+        assert_eq!(display_name, "Новое Имя");
+    }
+
+    /// Контакту без подходящего письма имя не трогаем (S-006).
+    #[tokio::test]
+    async fn contact_without_matching_message_is_left_untouched() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let broken_name = format!("Ив{FFFD}н");
+        let (contact_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO contacts(account_id, uid, display_name) VALUES (?, 'mail:ivan@example.test', ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(&broken_name)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert contact");
+        sqlx::query("INSERT INTO contact_emails(contact_id, email, kind) VALUES (?, 'ivan@example.test', 'mail')")
+            .bind(contact_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert contact email");
+
+        db.repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+
+        let (display_name,): (String,) =
+            sqlx::query_as("SELECT display_name FROM contacts WHERE id = ?")
+                .bind(contact_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read display_name");
+        assert_eq!(display_name, broken_name);
+    }
+
+    /// Фаза контактов идёт после починки писем (S-006): кандидат сам был
+    /// испорчен в `messages.from_name` и годится в кандидаты только после
+    /// того, как первая фаза его почистит.
+    #[tokio::test]
+    async fn contact_repair_uses_message_field_fixed_by_the_earlier_phase() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "Тема письма",
+            // from_name испорчен - без починки первой фазой не прошёл бы
+            // условие "чистое имя" во второй.
+            Some(&format!("Иван{FFFD}Петров")),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            Some("2026-01-01T00:00:00+00:00"),
+            Some(&raw_ref),
+        )
+        .await;
+        let (contact_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO contacts(account_id, uid, display_name) VALUES (?, 'mail:ivan@example.test', ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("Конт{FFFD}кт"))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert contact");
+        sqlx::query("INSERT INTO contact_emails(contact_id, email, kind) VALUES (?, 'ivan@example.test', 'mail')")
+            .bind(contact_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert contact email");
+
+        db.repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+
+        let (display_name,): (String,) =
+            sqlx::query_as("SELECT display_name FROM contacts WHERE id = ?")
+                .bind(contact_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read display_name");
+        assert_eq!(display_name, "Иван Петров");
+    }
+
+    /// Смена `raw_blob_ref` между выборкой и записью (S-014): письмо
+    /// пропускается целиком, ничего не меняется.
+    #[tokio::test]
+    async fn stale_raw_blob_ref_skips_message_without_side_effects() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        // Два реальных blob - "снимок" (что видела выборка) и "текущий" (что
+        // успела записать докачка тела/пересинхронизация до вызова починки).
+        // Оба валидны, чтобы Ok(false) наступил из-за несовпадения ссылки в
+        // UPDATE, а не из-за ошибки чтения blob.
+        let raw_snapshot = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+        );
+        let snapshot_ref = db.blobs.put(&raw_snapshot).expect("put snapshot blob");
+        let raw_current = build_raw_message(
+            "Новая тема",
+            "Иван Петров",
+            "ivan@example.test",
+            "Новый текст",
+        );
+        let current_ref = db.blobs.put(&raw_current).expect("put current blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            &format!("Тема{FFFD} письма"),
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            None,
+            Some(&current_ref),
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO message_content_cache(message_id, raw_blob_ref, body_html, body_text, attachments_json)
+             VALUES (?, ?, NULL, 'старое тело', '[]')",
+        )
+        .bind(message_id)
+        .bind(&current_ref)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert cache");
+
+        // Вызываем приватный шаг починки одного письма напрямую со "снимком"
+        // raw_blob_ref, который уже не совпадает с текущим значением в
+        // messages - имитация докачки тела/пересинхронизации между выборкой
+        // и записью (S-014).
+        let fixed = db
+            .repair_one_charset_message(message_id, &snapshot_ref)
+            .await
+            .expect("repair one message");
+        assert!(!fixed, "письмо со сменившимся raw_blob_ref пропускается");
+
+        let (subject,): (String,) = sqlx::query_as("SELECT subject FROM messages WHERE id = ?")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read subject");
+        assert_eq!(
+            subject,
+            format!("Тема{FFFD} письма"),
+            "поля письма не должны меняться при пропуске"
+        );
+        let cached: Option<(String,)> =
+            sqlx::query_as("SELECT body_text FROM message_content_cache WHERE message_id = ?")
+                .bind(message_id)
+                .fetch_optional(&db.pool)
+                .await
+                .expect("query cache");
+        assert_eq!(
+            cached.map(|(body,)| body),
+            Some("старое тело".to_owned()),
+            "кэш не должен удаляться при пропуске"
+        );
+    }
+
+    /// Недоступный blob (S-007): письмо пропускается с предупреждением,
+    /// остальные письма прохода чинятся, флаг всё равно выставляется.
+    #[tokio::test]
+    async fn message_with_missing_blob_is_skipped_others_fixed_and_flag_set() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+
+        // Письмо без реального blob - ссылка ни разу не создавалась через
+        // BlobStore::put.
+        let broken_message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            &format!("Тема{FFFD} письма"),
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "",
+            None,
+            Some("missing/never-written"),
+        )
+        .await;
+
+        let raw = build_raw_message(
+            "Другая тема",
+            "Мария Иванова",
+            "maria@example.test",
+            "Текст письма",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let good_message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            2,
+            &format!("Друг{FFFD}я тема"),
+            Some("Мария Иванова"),
+            Some("maria@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, 1, "починиться должно только письмо с доступным blob");
+
+        let (broken_subject,): (String,) =
+            sqlx::query_as("SELECT subject FROM messages WHERE id = ?")
+                .bind(broken_message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read broken subject");
+        assert_eq!(broken_subject, format!("Тема{FFFD} письма"));
+
+        let (good_subject,): (String,) =
+            sqlx::query_as("SELECT subject FROM messages WHERE id = ?")
+                .bind(good_message_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read good subject");
+        assert_eq!(good_subject, "Другая тема");
+
+        assert!(
+            charset_repair_flag_is_set(&db).await,
+            "флаг ставится, даже если часть писем пропущена (S-008)"
+        );
+    }
+
+    /// Флаг защищает от повторного полного скана (S-008): второй вызов ничего
+    /// не делает и не трогает уже починенные поля.
+    #[tokio::test]
+    async fn second_call_is_a_noop_because_of_the_flag() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Тема письма",
+            "Иван Петров",
+            "ivan@example.test",
+            "Текст письма",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            &format!("Тема{FFFD} письма"),
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "Текст письма",
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+
+        let first = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("first pass");
+        assert_eq!(first, 1);
+        assert!(charset_repair_flag_is_set(&db).await);
+
+        // Ещё одно битое письмо, заведённое уже после первого прохода -
+        // второй вызов не должен увидеть даже его: флаг останавливает
+        // функцию до всякого обращения к messages.
+        let raw2 = build_raw_message("Вторая тема", "Пётр Иванов", "petr@example.test", "Текст");
+        let raw_ref2 = db.blobs.put(&raw2).expect("put blob");
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            2,
+            &format!("Втор{FFFD}я тема"),
+            Some("Пётр Иванов"),
+            Some("petr@example.test"),
+            "[]",
+            "[]",
+            "Текст",
+            None,
+            Some(&raw_ref2),
+        )
+        .await;
+
+        let second = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("second pass");
+        assert_eq!(second, 0, "второй проход обязан быть no-op");
+    }
+
+    /// Битых писем больше внутреннего размера страницы (S-010) - постраничная
+    /// keyset-выборка обязана дойти до конца и починить все.
+    #[tokio::test]
+    async fn fixes_every_message_when_there_are_more_than_one_page() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        const TOTAL: i64 = 250; // больше PAGE_SIZE (200) внутри repair_broken_charset_messages
+
+        for uid in 0..TOTAL {
+            let subject = format!("Тема {uid}");
+            let raw = build_raw_message(&subject, "Иван Петров", "ivan@example.test", "Текст");
+            let raw_ref = db.blobs.put(&raw).expect("put blob");
+            insert_message(
+                &db,
+                account_id,
+                folder_id,
+                uid,
+                &format!("Тема {uid}{FFFD}"),
+                Some("Иван Петров"),
+                Some("ivan@example.test"),
+                "[]",
+                "[]",
+                "Текст",
+                None,
+                Some(&raw_ref),
+            )
+            .await;
+        }
+
+        let fixed = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(fixed, TOTAL as usize);
+
+        let remaining = db
+            .broken_charset_message_page(0, 10_000)
+            .await
+            .expect("scan for leftovers");
+        assert!(
+            remaining.is_empty(),
+            "после прохода битых писем оставаться не должно"
+        );
+    }
+
+    /// Прерванный проход продолжается со следующего запуска: уже исправленные
+    /// письма выпадают из выборки по отсутствию маркера, флаг при незавершённом
+    /// проходе не выставлен (S-011).
+    #[tokio::test]
+    async fn interrupted_pass_continues_with_remaining_messages() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let mut ids = Vec::new();
+        let mut refs = Vec::new();
+        for uid in 1..=2_i64 {
+            let subject = format!("Тема {uid}");
+            let raw = build_raw_message(&subject, "Иван Петров", "ivan@example.test", "Текст");
+            let raw_ref = db.blobs.put(&raw).expect("put blob");
+            let id = insert_message(
+                &db,
+                account_id,
+                folder_id,
+                uid,
+                &format!("Тема {uid}{ESC}"),
+                Some("Иван Петров"),
+                Some("ivan@example.test"),
+                "[]",
+                "[]",
+                "Текст",
+                None,
+                Some(&raw_ref),
+            )
+            .await;
+            ids.push(id);
+            refs.push(raw_ref);
+        }
+
+        // Первое письмо чинится "до аварии": флага нет, проход прерван.
+        let fixed = db
+            .repair_one_charset_message(ids[0], &refs[0])
+            .await
+            .expect("repair one message");
+        assert!(fixed);
+        assert!(
+            !charset_repair_flag_is_set(&db).await,
+            "флаг ставится только после полного прохода"
+        );
+
+        // Следующий запуск видит только оставшееся письмо.
+        let repaired = db
+            .repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+        assert_eq!(repaired, 1, "повторно чинится только оставшееся письмо");
+        for id in ids {
+            let (subject,): (String,) = sqlx::query_as("SELECT subject FROM messages WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read subject");
+            assert!(!subject.contains(ESC), "маркер порчи не остался");
+        }
+        assert!(charset_repair_flag_is_set(&db).await);
+    }
+
+    /// После починки письмо находится поиском по слову из декодированной темы:
+    /// проверяем не колонку, а сам поисковый путь через MATCH (S-004).
+    #[tokio::test]
+    async fn repaired_message_is_found_by_search() {
+        use crate::search::{Fts5Index, SearchIndex};
+
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = build_raw_message(
+            "Отчёт квартальный",
+            "Иван Петров",
+            "ivan@example.test",
+            "Показатели уточнены",
+        );
+        let raw_ref = db.blobs.put(&raw).expect("put blob");
+        let message_id = insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            &format!("Отч{FFFD}т квартальный"),
+            Some("Иван Петров"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            &format!("Показ{FFFD}тели уточнены"),
+            None,
+            Some(&raw_ref),
+        )
+        .await;
+
+        db.repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+
+        let index = Fts5Index::new(db.clone());
+        let by_subject = index
+            .search("квартальный", 10)
+            .await
+            .expect("search subject");
+        assert!(
+            by_subject.contains(&message_id),
+            "письмо должно находиться по слову из темы"
+        );
+        let by_body = index.search("уточнены", 10).await.expect("search body");
+        assert!(
+            by_body.contains(&message_id),
+            "письмо должно находиться по слову из тела"
+        );
+    }
+
+    /// У контакта несколько адресов, а даты писем равны: побеждает письмо с
+    /// наибольшим идентификатором, результат воспроизводим (S-006).
+    #[tokio::test]
+    async fn contact_with_several_emails_prefers_the_last_message_on_equal_dates() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let same_date = Some("2026-01-01T00:00:00+00:00");
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            1,
+            "первое",
+            Some("Имя По Первому Адресу"),
+            Some("ivan@example.test"),
+            "[]",
+            "[]",
+            "",
+            same_date,
+            None,
+        )
+        .await;
+        insert_message(
+            &db,
+            account_id,
+            folder_id,
+            2,
+            "второе",
+            Some("Имя По Второму Адресу"),
+            Some("i.petrov@example.test"),
+            "[]",
+            "[]",
+            "",
+            same_date,
+            None,
+        )
+        .await;
+        let (contact_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO contacts(account_id, uid, display_name) VALUES (?, 'mail:ivan@example.test', ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(format!("Ив{ESC}н"))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert contact");
+        for email in ["ivan@example.test", "i.petrov@example.test"] {
+            sqlx::query(
+                "INSERT INTO contact_emails(contact_id, email, kind) VALUES (?, ?, 'mail')",
+            )
+            .bind(contact_id)
+            .bind(email)
+            .execute(&db.write_pool)
+            .await
+            .expect("insert contact email");
+        }
+
+        db.repair_broken_charset_messages()
+            .await
+            .expect("repair pass");
+
+        let (display_name,): (String,) =
+            sqlx::query_as("SELECT display_name FROM contacts WHERE id = ?")
+                .bind(contact_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read display_name");
+        assert_eq!(display_name, "Имя По Второму Адресу");
+    }
+
+    /// Письмо в iso-2022-jp, прошедшее обычным путём синхронизации, попадает в
+    /// базу уже разобранным: это связывает фичу full_encoding с тем, что видит
+    /// пользователь в списке писем (S-001).
+    #[tokio::test]
+    async fn sync_saves_iso_2022_jp_message_decoded() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let raw = concat!(
+            "From: =?iso-2022-jp?B?GyRCJyMnbSdqJ1YnXRsoQg==?= <marketing@example.test>
+",
+            "To: user@example.test
+",
+            "Subject: =?iso-2022-jp?B?GyRCJyMnbSdqJ1YnXRsoQiAbJEInXydgJ1MnbSdbGyhC?=
+",
+            "Date: Wed, 02 Sep 2026 10:00:00 +0000
+",
+            "MIME-Version: 1.0
+",
+            "Content-Type: text/plain; charset=\"iso-2022-jp\"
+",
+            "Content-Transfer-Encoding: quoted-printable
+",
+            "
+",
+            "=1B$B'#'m'j'V']=1B(B =1B$B'_'`'S'm'[=1B(B"
+        )
+        .as_bytes()
+        .to_vec();
+        db.save_discovered_messages(
+            account_id,
+            &[crate::backend::DiscoveredMessage {
+                folder_path: "INBOX".into(),
+                uid: 1,
+                remote_id: Some("iso-2022-jp-1".into()),
+                size: Some(raw.len() as u32),
+                seen: false,
+                flagged: false,
+                answered: false,
+                draft: false,
+                raw,
+                body_fetched: true,
+            }],
+            false,
+        )
+        .await
+        .expect("save message");
+
+        let (subject, from_name, preview): (String, Option<String>, String) =
+            sqlx::query_as("SELECT subject, from_name, preview FROM messages WHERE account_id = ?")
+                .bind(account_id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read saved message");
+        assert_eq!(subject, "Вышел новый");
+        assert_eq!(from_name.as_deref(), Some("Вышел"));
+        assert_eq!(preview, "Вышел новый");
+    }
+}
+
 #[cfg(test)]
 mod charset_decoding_tests {
     use mail_parser::MessageParser;
 
     /// Outlook Exchange рассылает кириллицу в iso-2022-jp: русские буквы лежат
     /// в 7-м ряду JIS X 0208. Без фичи full_encoding у mail-parser такие письма
-    /// доходили до интерфейса сырыми байтами с ESC-последовательностями.
+    /// доходили до интерфейса сырыми байтами с ESC-последовательностями (S-001).
     #[test]
     fn iso_2022_jp_cyrillic_is_decoded() {
         let raw = concat!(
@@ -5956,5 +7489,34 @@ mod charset_decoding_tests {
             .expect("письмо разобрано");
         assert_eq!(message.subject(), Some("Вышел новый"));
         assert_eq!(message.body_text(0).as_deref(), Some("Вышел новый\r\n"));
+    }
+
+    /// iso-2022-kr и hz-gb-2312 библиотека разбора сознательно не поддерживает
+    /// (решение WHATWG): результат - символы замены, но не сырые байты с ESC.
+    /// Пользователю такие кодировки читаемыми не обещаны (S-002).
+    #[test]
+    fn unsupported_legacy_charsets_do_not_leak_escape_bytes() {
+        for charset in ["iso-2022-kr", "hz-gb-2312"] {
+            let raw = format!(
+                concat!(
+                    "From: sender@example.test\r\n",
+                    "Subject: legacy\r\n",
+                    "MIME-Version: 1.0\r\n",
+                    "Content-Type: text/plain; charset=\"{}\"\r\n",
+                    "Content-Transfer-Encoding: quoted-printable\r\n",
+                    "\r\n",
+                    "=1B$B'#'m'j'V']=1B(B\r\n"
+                ),
+                charset
+            );
+            let message = MessageParser::default()
+                .parse(raw.as_bytes())
+                .expect("письмо разобрано");
+            let body = message.body_text(0).expect("тело письма").into_owned();
+            assert!(
+                !body.contains('\u{1B}'),
+                "{charset}: в тексте не должно оставаться управляющих байтов"
+            );
+        }
     }
 }

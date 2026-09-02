@@ -14,6 +14,10 @@ truemail состоит из Rust-ядра и тонкого Tauri-интерф�
 заменяет запуск `Db::migrate`. Этот контракт проверяет тест
 `sqlx_migrations_are_completed_by_the_application_contract`.
 
+Разовая фоновая починка уже сохранённых данных (например, `Db::repair_broken_charset_messages`,
+см. `docs/specs/message-charset-decoding.md`) в этот контракт не входит: `Db::migrate`
+её не запускает и не ждёт, запуск такой задачи - ответственность слоя приложения.
+
 Raw RFC 5322/MIME хранится в зашифрованном blob-store. Разобранное тело и
 нормализованные метаданные вложений кэшируются в `message_content_cache`; ключом
 версии служит `raw_blob_ref`, а raw остаётся источником истины.

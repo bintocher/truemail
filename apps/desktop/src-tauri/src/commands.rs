@@ -1421,6 +1421,20 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
     }
 }
 
+/// Запустить разовую фоновую починку кодировок уже сохранённой почты (issue
+/// #41, docs/specs/message-charset-decoding.md, S-009) и не ждать её: ошибка
+/// задачи логируется и не роняет приложение. Вызывается во всех трёх точках,
+/// где ядро становится рабочим на всю сессию - при старте приложения
+/// (main.rs), при создании хранилища мастером настройки и после
+/// восстановления ключей из резервной копии.
+pub(crate) fn spawn_charset_repair(core: Arc<Core>) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = core.db.repair_broken_charset_messages().await {
+            tracing::warn!(%error, "фоновая починка кодировок писем не выполнена");
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn bootstrap_status(state: State<'_, AppState>) -> CmdResult<BootstrapStatus> {
     let ready = state.core.read().await.is_some();
@@ -1500,7 +1514,8 @@ pub async fn initialize_storage(
             return Err(error.into());
         }
     };
-    *state.core.write().await = Some(initialized);
+    *state.core.write().await = Some(initialized.clone());
+    spawn_charset_repair(initialized);
     Ok(())
 }
 
@@ -1592,7 +1607,8 @@ pub async fn restore_key_backup(
             });
         }
     };
-    *state.core.write().await = Some(opened);
+    *state.core.write().await = Some(opened.clone());
+    spawn_charset_repair(opened);
     Ok(())
 }
 
