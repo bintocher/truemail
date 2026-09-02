@@ -16,6 +16,8 @@ versions use Semantic Versioning.
   sender, preview, attachment names, address book names and full-text search
   are restored from the stored source, with no re-download from the server.
   The repair runs in the background and does not delay startup.
+- Folder names are readable in sync error messages: instead of "Spam" the text
+  used to show a raw IMAP string like "&BCEEPwQwBDw-".
 
 ## [0.2.9] - 2026-09-02
 
