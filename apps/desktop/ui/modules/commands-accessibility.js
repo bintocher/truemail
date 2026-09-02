@@ -136,6 +136,24 @@ document.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyA'&&document.getElementById('mailView').classList.contains('active')&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){e.preventDefault();selectAllCurrentMessages();}
   if(e.key==='Escape'){closeCmd();pop.classList.remove('open');closeSmart();ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');filterMenu?.classList.add('hidden');sortMenu?.classList.add('hidden');}});
 
+/* Клик в тело HTML-письма уводит фокус внутрь рамки, и нажатия оттуда до общего
+   обработчика не доходят. Пересылаем закрытый список действий: переход к
+   следующему и предыдущему письму и Escape. Клавиша определяется действующей
+   привязкой, а не буквой: привязки настраиваются. Сочетания с модификаторами и
+   стрелки остаются письму - копирование, выделение текста и прокрутка внутри
+   письма нужнее перехода к соседнему (S-008). Событие пересобираем на списке:
+   общий обработчик спрашивает у target.matches, а у document такого метода нет. */
+function bindFrameNavigationKeys(doc){
+  if(!doc)return;
+  doc.addEventListener('keydown',event=>{
+    if(event.ctrlKey||event.altKey||event.metaKey||event.shiftKey)return;
+    const forwarded=bindingMatches('next_message',event)||bindingMatches('prev_message',event)||event.key==='Escape';
+    if(!forwarded)return;
+    event.preventDefault();
+    document.getElementById('msgs')?.dispatchEvent(new KeyboardEvent('keydown',{key:event.key,code:event.code,bubbles:true}));
+  });
+}
+
 /* Keyboard and screen-reader semantics for code-generated controls. */
 function enhanceAccessibility(scope=document){scope.querySelectorAll('.acc-h,.tmi,.ccard,.swatch,.wtheme,.wlang').forEach(element=>{if(!element.hasAttribute('role'))element.setAttribute('role','button');if(!element.hasAttribute('tabindex'))element.tabIndex=0;});scope.querySelectorAll('.toggle').forEach(toggle=>{toggle.setAttribute('role','switch');toggle.tabIndex=0;toggle.setAttribute('aria-checked',String(toggle.classList.contains('on')));});scope.querySelectorAll('.help[data-tip]').forEach(help=>{help.tabIndex=0;help.setAttribute('role','note');help.setAttribute('aria-label',help.dataset.tip);});}
 enhanceAccessibility();

@@ -7,6 +7,43 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-09-02
+
+### Added
+
+- Account cards in settings collapse: only one stays expanded, so the section no
+  longer requires long scrolling with several mailboxes. The state is remembered
+  between runs.
+- Password mailboxes get a "Change password" button. It verifies the new
+  password against the server and changes only that: the account name and
+  settings stay, and mail is not downloaded again. The previous password is kept
+  if the new one does not work.
+
+### Changed
+
+- The "Unified folders" section shows plain folder names with their nesting
+  instead of encoded strings and long identifiers.
+- Recipient suggestions, quick search and the contacts section understand
+  transliteration: typing "коннова" finds "Valentina Konnova" and the other way
+  round.
+- The "To" and "Cc" lines in the message header show the address next to the
+  name, just like the "From" line.
+
+### Fixed
+
+- Clicking a message always shows the message you picked. Previously, if the
+  earlier message took longer to load, its content was drawn over the selected
+  one.
+- Focus stays on the list row after a click, so keys keep working with the list.
+  List rows are now reachable from the keyboard and exposed to screen readers.
+- The keys for the next and previous message work after a click inside the
+  message body as well.
+- The list no longer shifts under the pointer when new mail arrives during work:
+  the position is restored by message instead of by pixel count.
+- Shift selection takes the range you actually see, even if the list was rebuilt
+  in the meantime.
+
+
 ## [0.2.8] - 2026-09-02
 
 ### Changed

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260902-2">
+  <link rel="stylesheet" href="styles.css?v=20260902-3">
 </head>
 <body>
 
@@ -71,7 +71,7 @@
         <div class="selection-bar hidden" id="selectionBar"><span id="selectionCount" data-i18n="selectedCountZero">0 выбрано</span><button class="btn sm" id="bulkSelectAll"><i data-i="check"></i><span data-i18n="selectAll">Выбрать все</span></button><button class="btn sm" id="bulkRead"><i data-i="inbox"></i><span data-i18n="markRead">Прочитать</span></button><button class="btn sm" id="bulkArchive"><i data-i="archive"></i><span data-i18n="actionArchive">В архив</span></button><button class="btn sm danger-btn" id="bulkTrash"><i data-i="trash"></i><span data-i18n="actionDelete">Удалить</span></button><button class="iconbtn ml-auto" id="bulkClear" data-i18n-title="tipClearSelection" title="Снять выделение"><i data-i="close"></i></button></div>
         <button type="button" class="search" id="searchBox"><i data-i="search"></i><span class="search-placeholder" data-i18n="searchAllPlaceholder">Поиск по всем ящикам</span><span class="kbd">Ctrl K</span></button>
       </div>
-      <div class="msgs" id="msgs" data-no-i18n></div>
+      <div class="msgs" id="msgs" data-no-i18n role="listbox" aria-multiselectable="true" tabindex="-1"></div>
       <div class="list-loading hidden" id="listLoading"><span class="spinner"></span></div>
     </section>
 
@@ -686,15 +686,16 @@
   </div>
 </div>
 
-<script src="modules/shell.js?v=20260902-1"></script>
+<script src="modules/message-view.js?v=20260902-1"></script>
+<script src="modules/shell.js?v=20260902-2"></script>
 <script src="modules/calendar-contacts.js?v=20260807-1"></script>
 <script src="modules/person-search.js?v=20260902-1"></script>
-<script src="modules/commands-accessibility.js?v=20260902-1"></script>
+<script src="modules/commands-accessibility.js?v=20260902-2"></script>
 <script src="modules/smart-rules.js?v=20260808-2"></script>
 <script src="modules/i18n-onboarding.js?v=20260902-1"></script>
 <script src="modules/folder-names.js?v=20260902-1"></script>
 <script src="modules/mail-addresses.js?v=20260902-2"></script>
-<script src="modules/mail.js?v=20260902-2"></script>
+<script src="modules/mail.js?v=20260902-3"></script>
 <script src="modules/composer.js?v=20260902-1"></script>
 <script src="modules/account-cards.js?v=20260902-1"></script>
 <script src="modules/settings.js?v=20260902-1"></script>

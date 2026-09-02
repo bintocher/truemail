@@ -140,10 +140,13 @@ function releaseHiddenMemory(){
   // перезагрузки список приходит из базы заново, высота у него другая, и прежний
   // scrollTop указал бы на чужое место. Берём именно видимое письмо, а не начало
   // окна отрисовки - оно начинается выше видимой области на запас строк.
-  const scrollTop=list?list.scrollTop:0,anchorIndex=Math.min(Math.max(0,Math.floor(scrollTop/messageRowHeight)),Math.max(0,currentMessageRows.length-1));
-  hiddenAnchorId=currentMessageRows[anchorIndex]?.id??null;
-  hiddenAnchorOffset=Math.max(0,scrollTop-anchorIndex*messageRowHeight);
+  const scrollTop=list?list.scrollTop:0,anchor=messageView.listAnchorAt(currentMessageRows,scrollTop,messageRowHeight);
+  hiddenAnchorId=anchor.id;
+  hiddenAnchorOffset=anchor.offset;
   hiddenAnchorView=listViewKey();
+  // Разметку сейчас снесём, и фокус уйдёт на документ - к возврату окна узнать
+  // по нему, что пользователь работал со списком, будет уже нельзя (S-006).
+  rememberListFocus();
   if(list)list.replaceChildren();
   messageWindowStart=-1;messageWindowEnd=-1;
 }
@@ -154,6 +157,9 @@ window.releaseHiddenMemory=releaseHiddenMemory;
 function restoreAfterHidden(){
   applyListOptions(false);
   restoreHiddenAnchor(false);
+  // Фокус возвращаем после прокрутки: до неё строка нужного письма ещё за
+  // пределами окна виртуализации, и фокус ушёл бы на сам список.
+  applyPendingListFocus();
   // Пока окно было скрыто, автодобор не работал: если список короче экрана, он
   // должен продолжиться теперь.
   ensureListFilled();
@@ -175,6 +181,28 @@ function restoreHiddenAnchor(final=true){
 }
 window.restoreAfterHidden=restoreAfterHidden;
 window.restoreHiddenAnchor=restoreHiddenAnchor;
+// Фокус строки списка переживает пересоздание строк (S-006, S-007). Ищем именно
+// ближайшую строку от элемента с фокусом: кликнуть могли по счётчику беседы -
+// вложенной кнопке, которая при перестроении исчезает вместе со строкой.
+function listFocusMessageId(){const row=document.activeElement?.closest?.('.msg');const id=row?Number(row.dataset.messageId):null;return Number.isFinite(id)?id:null;}
+// Строки нужного письма в разметке нет (письмо ушло из списка или осталось за
+// окном виртуализации) - фокус отдаём самому списку, чтобы он не потерялся.
+// preventScroll обязателен: окно пересоздаётся на каждый кадр прокрутки, и
+// автопрокрутка к элементу боролась бы с жестом пользователя.
+function focusMessageRow(id){const list=document.getElementById('msgs');if(!list)return;(list.querySelector(`.msg[data-message-id="${id}"]`)||list).focus({preventScroll:true});}
+// Разметку списка сносят целиком (releaseHiddenMemory, clearDemoData) - к моменту
+// перестройки фокус уже на документе. Признак запоминаем заранее и применяем,
+// когда список отрисован и прокручен на своё место.
+let pendingListFocusId=null;
+// Пустой фокус запомненный признак не затирает: пока окно скрыто, разметки уже
+// нет, а фоновая перезагрузка успевает пройти по списку не один раз.
+function rememberListFocus(){const id=listFocusMessageId();if(id!=null)pendingListFocusId=id;}
+// Пока список перестраивался, пользователь мог начать печатать в фильтре или в
+// поиске - тогда фокус у него не отбираем. При скрытом окне признак сохраняем:
+// разметки списка нет, и применить его можно будет только при возврате окна.
+function applyPendingListFocus(){if(pendingListFocusId==null||document.hidden)return;const id=pendingListFocusId;pendingListFocusId=null;if(document.activeElement?.matches?.('input,textarea,select,[contenteditable="true"]'))return;focusMessageRow(id);}
+window.rememberListFocus=rememberListFocus;
+window.applyPendingListFocus=applyPendingListFocus;
 
 // Умные папки, для которых догрузка с сервера уже не даёт совпадений. Признак
 // снимается только когда пользователь сам открывает папку.
@@ -295,14 +323,27 @@ let messageWindowStart=-1;
 let messageWindowEnd=-1;
 let messageWindowFrame=0;
 const selectedMessageIds=new Set();
-let lastSelectedMessageIndex=-1;
+// Опора выделения с Shift - id письма, а не номер строки: список пересоздаётся
+// фоновой перезагрузкой и разворотом беседы, и номер после этого указывал бы на
+// чужое письмо (S-010).
+let selectionAnchorId=null;
 let selectionDragMode=null;
 function updateSelectionUi(){
   document.querySelectorAll('.msg').forEach(row=>row.classList.toggle('selected',selectedMessageIds.has(Number(row.dataset.messageId))));
   const count=selectedMessageIds.size,bar=document.getElementById('selectionBar');bar.classList.toggle('hidden',count===0);document.getElementById('selectionCount').textContent=L(`${count} выбрано`,`${count} selected`);
 }
-function clearMessageSelection(){selectedMessageIds.clear();lastSelectedMessageIndex=-1;updateSelectionUi();}
-function selectMessageRange(index,preserve=false){if(lastSelectedMessageIndex<0){selectedMessageIds.add(currentMessageRows[index].id);lastSelectedMessageIndex=index;updateSelectionUi();return;}if(!preserve)selectedMessageIds.clear();const from=Math.min(index,lastSelectedMessageIndex),to=Math.max(index,lastSelectedMessageIndex);for(let i=from;i<=to;i++)selectedMessageIds.add(currentMessageRows[i].id);updateSelectionUi();}
+function clearMessageSelection(){selectedMessageIds.clear();selectionAnchorId=null;updateSelectionUi();}
+// Опору пересчитываем в номер строки прямо здесь: диапазон должен совпасть с
+// тем, что видит пользователь. Опорного письма в списке нет - берём кликнутую
+// строку и забываем прежний якорь, иначе диапазон прошёл бы через невидимые строки.
+function selectMessageRange(index,preserve=false){
+  const anchor=messageView.selectionAnchorIndex(currentMessageRows,selectionAnchorId,-1);
+  if(anchor<0){selectedMessageIds.add(currentMessageRows[index].id);selectionAnchorId=currentMessageRows[index].id;updateSelectionUi();return;}
+  if(!preserve)selectedMessageIds.clear();
+  const from=Math.min(index,anchor),to=Math.max(index,anchor);
+  for(let i=from;i<=to;i++)selectedMessageIds.add(currentMessageRows[i].id);
+  updateSelectionUi();
+}
 document.addEventListener('pointerup',()=>{selectionDragMode=null;});
 function renderIcons(root){root.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i];if(s)e.innerHTML=s;});}
 
