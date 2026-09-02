@@ -767,6 +767,57 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 
+    /// Затемнённые цвета палитры подтягиваются и в уже сохранённых данных:
+    /// иначе у тех, кто выбрал оттенок раньше, подпись на аватаре осталась бы
+    /// ниже порога контраста. Цвет, заданный помимо палитры, не трогаем.
+    #[tokio::test]
+    async fn palette_colors_are_pulled_up_to_contrast_safe_values() {
+        let root = std::env::temp_dir().join(format!("truemail-palette-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .expect("open database");
+        db.migrate().await.expect("run migrations");
+
+        for (name, color) in [("старый", "#d64545"), ("свой", "#123456")] {
+            sqlx::query("INSERT INTO labels(name, color) VALUES (?, ?)")
+                .bind(name)
+                .bind(color)
+                .execute(&db.write_pool)
+                .await
+                .expect("insert label");
+        }
+        // Миграция уже применена, поэтому проигрываем её текст заново над
+        // подготовленным состоянием: sqlx повторно применённую версию не
+        // запускает.
+        const PALETTE_MIGRATION: &str =
+            include_str!("../../migrations/0038_contrast_palette_colors.sql");
+        sqlx::raw_sql(PALETTE_MIGRATION)
+            .execute(&db.write_pool)
+            .await
+            .expect("apply palette migration");
+
+        let colors: Vec<(String, String)> =
+            sqlx::query_as("SELECT name, color FROM labels ORDER BY name")
+                .fetch_all(&db.pool)
+                .await
+                .expect("read labels");
+        assert_eq!(
+            colors,
+            vec![
+                ("свой".to_owned(), "#123456".to_owned()),
+                ("старый".to_owned(), "#d24444".to_owned()),
+            ]
+        );
+
+        db.close().await;
+        std::fs::remove_dir_all(root).expect("remove temp data dir");
+    }
+
     #[tokio::test]
     async fn plaintext_database_is_migrated_without_losing_data() {
         let root =

@@ -8,12 +8,14 @@ DEV_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
 DEV_CHECK_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -Check
 BUILD_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-perl.ps1 -WorkingDirectory apps/desktop/src-tauri cargo tauri build
 TEST_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-perl.ps1 cargo test --workspace --all-targets
+JS_TEST_CMD = node --test apps/desktop/tests/js/mail-addresses.test.js
 SETUP_PERL = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-perl.ps1
 else
 DEV_CMD = sh scripts/dev.sh
 DEV_CHECK_CMD = sh scripts/dev.sh --check
 BUILD_CMD = cd apps/desktop/src-tauri && cargo tauri build
 TEST_CMD = cargo test --workspace --all-targets
+JS_TEST_CMD = node --test apps/desktop/tests/js/mail-addresses.test.js
 SETUP_PERL = perl -v >/dev/null
 endif
 
@@ -57,6 +59,7 @@ lint:
 
 test:
 	@$(TEST_CMD)
+	@$(JS_TEST_CMD)
 
 clean:
 	cargo clean
