@@ -39,7 +39,8 @@ function addressLineModel(addresses,expanded,maxShown){
   const list=(addresses||[]).filter(isDisplayableAddr);
   if(!list.length)return null;
   const cut=!expanded&&list.length>maxShown?list.slice(0,maxShown):list;
-  return {shown:cut.map(addr=>({text:displayName(addr),title:addressTitle(addr)})),hidden:cut.length<list.length?list.length-cut.length:0};
+  // S-008: в тексте строки "Имя (email)", как и в подсказке - тот же полный вид.
+  return {shown:cut.map(addr=>({text:addressTitle(addr),title:addressTitle(addr)})),hidden:cut.length<list.length?list.length-cut.length:0};
 }
 
 const mailAddresses={rowPresentation,addressLineModel,displayName};

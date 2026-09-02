@@ -28,6 +28,9 @@ function applyUiCatalog(catalog){
 window.applyUiCatalog=applyUiCatalog;
 function applyWizardLanguage(locale,persist=true){
   wizardLocale=locale;document.documentElement.lang=locale;
+  // Кэш ключей контактов палитры включает локализованное название группы
+  // (person-search-translit.md, S-012) - при смене языка он устаревает.
+  window.invalidatePaletteContactCache?.();
   document.querySelectorAll('[data-i18n]').forEach(el=>{const value=wizardText[locale][el.dataset.i18n];if(value)el.textContent=value;});
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el=>{const value=wizardText[locale][el.dataset.i18nPlaceholder];if(value)el.placeholder=value;});
   document.querySelectorAll('[data-i18n-title]').forEach(el=>{const value=wizardText[locale][el.dataset.i18nTitle];if(value)el.title=value;});

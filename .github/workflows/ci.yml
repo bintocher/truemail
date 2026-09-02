@@ -40,9 +40,11 @@ jobs:
         run: cargo test --workspace --locked
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # Не ниже 22: раскрытие маски в node --test появилось там. На Node 20
+          # шаг молча прогонял бы ноль файлов и всегда был бы зелёным.
+          node-version: '24'
       - name: JS tests
-        run: node --test apps/desktop/tests/js/mail-addresses.test.js
+        run: node --test "apps/desktop/tests/js/*.test.js"
 
   windows:
     # Нативная Windows: Tauri/NSIS и WebView2 нельзя проверить в Linux.

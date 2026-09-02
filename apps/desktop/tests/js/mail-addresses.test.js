@@ -135,12 +135,16 @@ test('S-006: представитель и дочернее письмо фор�
   assert.equal(sentChild.kind,'recipient');assert.equal(sentChild.text,'Боря');
 });
 
-// S-008: форматтер адресной строки шапки - подпись и полная подсказка.
-test('S-008: displayName и подсказка сохраняют порядок и не удаляют дубли',()=>{
+// S-008: форматтер адресной строки шапки - подпись "Имя (email)" и такая же подсказка.
+test('S-008: текст и подсказка дают "Имя (email)", порядок сохранен, дубли не удалены',()=>{
   const list=[addr('','a@example.com'),addr('Аня','a@example.com'),addr('Аня','b@example.com')];
   const model=addressLineModel(list,true,2);
-  assert.deepEqual(model.shown.map(item=>item.text),['a@example.com','Аня','Аня']);
+  assert.deepEqual(model.shown.map(item=>item.text),['a@example.com','Аня (a@example.com)','Аня (b@example.com)']);
   assert.deepEqual(model.shown.map(item=>item.title),['a@example.com','Аня (a@example.com)','Аня (b@example.com)']);
+});
+test('S-008: только email без имени, только имя без email',()=>{
+  assert.equal(addressLineModel([addr('','a@example.com')],false,2).shown[0].text,'a@example.com');
+  assert.equal(addressLineModel([addr('Аня','')],false,2).shown[0].text,'Аня');
 });
 test('displayName: подпись адреса, name после trim, иначе email, иначе пусто',()=>{
   assert.equal(displayName(addr('Аня','a@example.com')),'Аня');

@@ -78,6 +78,12 @@ function getStaticCmds(){const en=smartIsEnglish(),gAct=en?'Actions':'Дейст
   {g:gSet,i:'palette',t:en?'Themes and appearance':'Темы и оформление',a:S2('themes')},{g:gSet,i:'shield',t:en?'Privacy':'Приватность',a:S2('privacy')},{g:gSet,i:'keyboard',t:en?'Keyboard shortcuts':'Горячие клавиши',a:S2('keys')},
   {g:gSet,i:'sun',t:en?'Toggle theme':'Переключить тему',a:()=>setTheme(root.getAttribute('data-theme')==='dark'?'light':'dark')},
 ];}
+// Ключи транслитерации контактов палитры (S-012 person-search-translit.md):
+// строка палитры включает имя, email и локализованное название группы, поэтому
+// кэш свой (не путать с кэшем подсказки адресата). Сброс - вместе с
+// coreContacts (mail.js) и со сменой языка (i18n-onboarding.js).
+const paletteContactKeysCache=personSearch.createPersonSearchCache();
+window.invalidatePaletteContactCache=()=>paletteContactKeysCache.invalidate();
 let sel=0,currentCommands=[],searchHistory=[];
 function searchTerms(q){return q.split(/\s+/).filter(token=>token&&!/^from:/i.test(token)&&!/^has:attachments?$/i.test(token)).join(' ').trim();}
 function highlightMatch(value,q){const text=String(value||''),needle=searchTerms(q);if(!needle)return escapeHtml(text);const candidates=[needle,conv(needle.toLocaleLowerCase(),RU,EN),conv(needle.toLocaleLowerCase(),EN,RU)];let found=-1,length=0;for(const candidate of candidates){const index=text.toLocaleLowerCase().indexOf(candidate);if(index>=0){found=index;length=candidate.length;break;}}return found<0?escapeHtml(text):`${escapeHtml(text.slice(0,found))}<mark>${escapeHtml(text.slice(found,found+length))}</mark>${escapeHtml(text.slice(found+length))}`;}
@@ -85,9 +91,16 @@ function buildResults(q,coreResults=[]){const base=[...getStaticCmds()];
   if(!q.trim())searchHistory.forEach(value=>base.unshift({g:wizardLocale==='en'?'Recent searches':'Недавние запросы',i:'search',t:value,a:()=>{openCmd();cmdInput.value=value;cmdInput.dispatchEvent(new Event('input'));}}));
   if(q.trim()){
     coreResults.forEach(m=>base.push({g:smartIsEnglish()?'Messages':'Письма',i:'inbox',t:m.subject||(smartIsEnglish()?'(no subject)':'(без темы)'),sub:(m.from?.name||m.from?.email||'')+' · '+(m.preview||'').slice(0,80),searchHit:true,a:()=>{goMail();showMessage(m);}}));
-    coreContacts.forEach(c=>base.push({g:smartIsEnglish()?'Contacts':'Контакты',i:'people',t:c.display_name,sub:c.emails?.[0]?.email||'',a:goContacts}));
+    coreContacts.forEach(c=>{const g=smartIsEnglish()?'Contacts':'Контакты';base.push({g,i:'people',t:c.display_name,sub:c.emails?.[0]?.email||'',a:goContacts,
+      // Ключи транслитерации контакта считаются один раз и переиспользуются между
+      // нажатиями клавиш (S-012); строка совпадает с той, что раньше шла в matchQ.
+      personKeys:paletteContactKeysCache.get(c.id,()=>`${c.display_name||''} ${c.emails?.[0]?.email||''} ${g}`)});});
   }
-  const terms=searchTerms(q);return q.trim()?base.filter(c=>c.searchHit||(terms&&matchQ(c.t+' '+(c.sub||'')+' '+c.g,terms))):base;}
+  const terms=searchTerms(q),termVariants=terms?personSearch.personSearchVariants(terms):[];
+  // Подбор людей по транслиту (person-search-translit.md): у контактов - по
+  // кэшированным ключам, у остальных команд - обычный personMatches (S-013a:
+  // совпадение только через транслит не подсвечивается - см. highlightMatch).
+  return q.trim()?base.filter(c=>c.searchHit||(terms&&(c.personKeys?termVariants.some(variant=>c.personKeys.some(key=>key.includes(variant))):personSearch.personMatches(c.t+' '+(c.sub||'')+' '+c.g,terms)))):base;}
 function renderCmd(q='',coreResults=[]){const f=buildResults(q,coreResults);currentCommands=f;sel=0;let html='',lg='';
   f.forEach((c,idx)=>{if(c.g!==lg){html+=`<div class="cmdgrp">${escapeHtml(c.g)}</div>`;lg=c.g;}const icon=Object.hasOwn(ic,c.i)?c.i:'inbox';
     html+=`<div class="cmdrow${idx===0?' sel':''}" data-idx="${idx}"><i data-i="${icon}"></i><span class="ctitle">${highlightMatch(c.t,q)}</span>${c.sub?`<span class="csub">${highlightMatch(c.sub,q)}</span>`:''}<span class="ck">${(c.k||[]).map(k=>`<span class="kbd">${escapeHtml(k)}</span>`).join('')}</span></div>`;});
@@ -122,6 +135,24 @@ document.addEventListener('keydown',e=>{
   }
   if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyA'&&document.getElementById('mailView').classList.contains('active')&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){e.preventDefault();selectAllCurrentMessages();}
   if(e.key==='Escape'){closeCmd();pop.classList.remove('open');closeSmart();ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');filterMenu?.classList.add('hidden');sortMenu?.classList.add('hidden');}});
+
+/* Клик в тело HTML-письма уводит фокус внутрь рамки, и нажатия оттуда до общего
+   обработчика не доходят. Пересылаем закрытый список действий: переход к
+   следующему и предыдущему письму и Escape. Клавиша определяется действующей
+   привязкой, а не буквой: привязки настраиваются. Сочетания с модификаторами и
+   стрелки остаются письму - копирование, выделение текста и прокрутка внутри
+   письма нужнее перехода к соседнему (S-008). Событие пересобираем на списке:
+   общий обработчик спрашивает у target.matches, а у document такого метода нет. */
+function bindFrameNavigationKeys(doc){
+  if(!doc)return;
+  doc.addEventListener('keydown',event=>{
+    if(event.ctrlKey||event.altKey||event.metaKey||event.shiftKey)return;
+    const forwarded=bindingMatches('next_message',event)||bindingMatches('prev_message',event)||event.key==='Escape';
+    if(!forwarded)return;
+    event.preventDefault();
+    document.getElementById('msgs')?.dispatchEvent(new KeyboardEvent('keydown',{key:event.key,code:event.code,bubbles:true}));
+  });
+}
 
 /* Keyboard and screen-reader semantics for code-generated controls. */
 function enhanceAccessibility(scope=document){scope.querySelectorAll('.acc-h,.tmi,.ccard,.swatch,.wtheme,.wlang').forEach(element=>{if(!element.hasAttribute('role'))element.setAttribute('role','button');if(!element.hasAttribute('tabindex'))element.tabIndex=0;});scope.querySelectorAll('.toggle').forEach(toggle=>{toggle.setAttribute('role','switch');toggle.tabIndex=0;toggle.setAttribute('aria-checked',String(toggle.classList.contains('on')));});scope.querySelectorAll('.help[data-tip]').forEach(help=>{help.tabIndex=0;help.setAttribute('role','note');help.setAttribute('aria-label',help.dataset.tip);});}
