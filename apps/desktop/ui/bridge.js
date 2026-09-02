@@ -35,6 +35,7 @@ window.corePageSize = 100;
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
     setAccountRetention: (accountId, days) => invoke("set_account_retention", { accountId, days }),
+    changeAccountPassword: (accountId, password) => invoke("change_account_password", { accountId, password }),
     listLabels: () => invoke("list_labels"),
     createLabel: (name, color) => invoke("create_label", { name, color }),
     updateLabel: (id, name, color) => invoke("update_label", { id, name, color }),

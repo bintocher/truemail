@@ -1708,6 +1708,70 @@ pub async fn set_account_retention(
         .await?)
 }
 
+/// Ошибка тихой смены пароля (accounts-accordion-password.md, S-010): свой
+/// тип с полем `code` - интерфейс различает случаи по нему, а не по тексту
+/// сообщения. Общий `ApiError` кода не несёт и не меняется.
+#[derive(Serialize)]
+pub struct ChangePasswordApiError {
+    code: &'static str,
+    message: String,
+}
+
+impl From<truemail_core::account::ChangePasswordError> for ChangePasswordApiError {
+    fn from(error: truemail_core::account::ChangePasswordError) -> Self {
+        ChangePasswordApiError {
+            code: error.code(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl From<ApiError> for ChangePasswordApiError {
+    fn from(error: ApiError) -> Self {
+        ChangePasswordApiError {
+            code: "backend_unavailable",
+            message: error.message,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ChangePasswordResult {
+    account_id: i64,
+    changed: bool,
+}
+
+/// Тихая смена пароля почтового ящика (S-009, S-010): проверяет новый пароль
+/// на сервере и заменяет только значение в keyring, без переподключения и без
+/// синхронизации. В запросе нет ничего, кроме id и пароля - остальное ядро
+/// берёт из сохранённого аккаунта.
+#[tauri::command]
+pub async fn change_account_password(
+    state: State<'_, AppState>,
+    account_id: i64,
+    mut password: String,
+) -> Result<ChangePasswordResult, ChangePasswordApiError> {
+    // Пароль затираем на каждом пути выхода - тот же приём, что у команд резервной
+    // копии ключа: значение не должно оставаться в памяти после ответа.
+    let app_core = match core(&state).await {
+        Ok(value) => value,
+        Err(error) => {
+            password.zeroize();
+            return Err(error.into());
+        }
+    };
+    let result = app_core
+        .accounts
+        .change_account_password(account_id, &password)
+        .await;
+    password.zeroize();
+    result?;
+    Ok(ChangePasswordResult {
+        account_id,
+        changed: true,
+    })
+}
+
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>, account_id: i64) -> CmdResult<Vec<Folder>> {
     Ok(core(&state).await?.db.list_folders(account_id).await?)

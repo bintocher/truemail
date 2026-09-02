@@ -497,6 +497,7 @@ fn run() -> anyhow::Result<()> {
             commands::rename_account,
             commands::set_account_color,
             commands::set_account_retention,
+            commands::change_account_password,
             commands::list_labels,
             commands::create_label,
             commands::update_label,

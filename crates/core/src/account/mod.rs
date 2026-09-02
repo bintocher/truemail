@@ -305,6 +305,143 @@ impl SyncRegistry {
     }
 }
 
+/// Абстракция системного хранилища секретов (OS keychain) для смены пароля
+/// (accounts-accordion-password.md). Отдельно от прямых вызовов `keyring::Entry`
+/// в остальном файле - только эта операция допускает подмену хранилища в
+/// тестах (S-014): CI-раннер не всегда имеет системный keychain.
+pub trait SecretStore: Send + Sync {
+    /// `None` - записи нет или чтение не удалось; смене пароля это не мешает (S-016a).
+    fn read(&self, secret_ref: &str) -> Option<String>;
+    /// Возвращает `true`, если `keyring` подтвердил запись без ошибки транспорта.
+    /// Итог смены пароля определяется контрольным чтением (S-014), а не этим
+    /// значением - оно только для журнала.
+    fn write(&self, secret_ref: &str, value: &str) -> bool;
+}
+
+/// Боевая реализация - системный keychain через уже используемый в файле `keyring`.
+pub struct SystemSecretStore;
+
+impl SecretStore for SystemSecretStore {
+    fn read(&self, secret_ref: &str) -> Option<String> {
+        keyring::Entry::new("truemail", secret_ref)
+            .ok()?
+            .get_password()
+            .ok()
+    }
+
+    fn write(&self, secret_ref: &str, value: &str) -> bool {
+        match keyring::Entry::new("truemail", secret_ref) {
+            Ok(entry) => entry.set_password(value).is_ok(),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Коды ошибок тихой смены пароля (S-010, accounts-accordion-password.md).
+/// Отдельный тип, а не `crate::Error`: интерфейс различает случаи по коду, а
+/// общий `Error` кода не несёт.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChangePasswordError {
+    #[error("неверные учётные данные: {0}")]
+    InvalidCredentials(String),
+    #[error("для этого способа входа пароль не меняется")]
+    UnsupportedAuthKind,
+    #[error("аккаунт не найден")]
+    AccountNotFound,
+    #[error("у аккаунта нет сохранённой ссылки на пароль")]
+    MissingSecretRef,
+    #[error("запись в хранилище секретов не удалась")]
+    SecretStoreWriteFailed,
+    #[error("состояние хранилища секретов не определено")]
+    SecretStoreStateUnknown,
+    #[error("смена пароля для этого аккаунта уже выполняется")]
+    ChangeInProgress,
+    #[error("конфигурация аккаунта изменилась во время проверки")]
+    AccountChanged,
+    #[error("сервер недоступен: {0}")]
+    BackendUnavailable(String),
+}
+
+impl ChangePasswordError {
+    /// Машиночитаемый код для интерфейса (S-010): UI различает случаи по нему,
+    /// а не по тексту сообщения.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidCredentials(_) => "invalid_credentials",
+            Self::UnsupportedAuthKind => "unsupported_auth_kind",
+            Self::AccountNotFound => "account_not_found",
+            Self::MissingSecretRef => "missing_secret_ref",
+            Self::SecretStoreWriteFailed => "secret_store_write_failed",
+            Self::SecretStoreStateUnknown => "secret_store_state_unknown",
+            Self::ChangeInProgress => "change_in_progress",
+            Self::AccountChanged => "account_changed",
+            Self::BackendUnavailable(_) => "backend_unavailable",
+        }
+    }
+}
+
+/// Отказ входа при проверке нового пароля классифицируется по тексту
+/// транспортной ошибки (`Error::Backend` кода не несёт). Консервативно: если
+/// признаков отказа авторизации нет, считаем сервер недоступным - ложное
+/// "неверный пароль" хуже честного "сервер недоступен" (S-010).
+fn classify_validation_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    const AUTH_MARKERS: [&str; 9] = [
+        "401",
+        "unauthorized",
+        "authenticationfailed",
+        "authentication failed",
+        "invalid credentials",
+        "invalid login",
+        "login failed",
+        "access denied",
+        "неверн", // "неверный пароль/логин" в локализованных ответах некоторых серверов
+    ];
+    AUTH_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
+/// Сравнение параметров подключения между двумя снимками одного аккаунта
+/// (S-016b, accounts-accordion-password.md): `secret_ref` и все поля, которые
+/// `mail_backend` использует для построения соединения. Цвет, глубина кэша и
+/// название аккаунта к подключению отношения не имеют и не считаются сменой.
+fn connection_config_matches(before: &Account, after: &Account) -> bool {
+    fn server_matches(a: &Option<ServerConfig>, b: &Option<ServerConfig>) -> bool {
+        match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.host == b.host && a.port == b.port && a.security == b.security,
+            _ => false,
+        }
+    }
+    before.secret_ref == after.secret_ref
+        && before.email == after.email
+        && before.username == after.username
+        && before.provider == after.provider
+        && before.backend_kind == after.backend_kind
+        && before.auth_kind == after.auth_kind
+        && before.ews_url == after.ews_url
+        && before.jmap_url == after.jmap_url
+        && server_matches(&before.imap, &after.imap)
+        && server_matches(&before.smtp, &after.smtp)
+}
+
+/// Блокировка на аккаунт для смены пароля (S-017 accounts-accordion-password.md).
+/// Отдельный набор, а не `AppState.syncing` из Tauri-слоя: иначе смена пароля
+/// во время фоновой синхронизации ошибочно отклонялась бы (S-016).
+#[derive(Default)]
+struct PasswordChangeLocks {
+    active: tokio::sync::Mutex<std::collections::HashSet<i64>>,
+}
+
+impl PasswordChangeLocks {
+    async fn try_lock(&self, account_id: i64) -> bool {
+        self.active.lock().await.insert(account_id)
+    }
+
+    async fn unlock(&self, account_id: i64) {
+        self.active.lock().await.remove(&account_id);
+    }
+}
+
 pub struct AccountManager {
     db: Db,
     // Сериализует обновление OAuth-токена: параллельные mail/aux-sync иначе
@@ -312,6 +449,7 @@ pub struct AccountManager {
     refresh_lock: tokio::sync::Mutex<()>,
     sync_registry: SyncRegistry,
     exchange_outbox_repaired: tokio::sync::Mutex<std::collections::HashSet<i64>>,
+    password_change_locks: PasswordChangeLocks,
 }
 
 #[derive(Debug)]
@@ -331,6 +469,7 @@ impl AccountManager {
             refresh_lock: tokio::sync::Mutex::new(()),
             sync_registry: SyncRegistry::default(),
             exchange_outbox_repaired: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            password_change_locks: PasswordChangeLocks::default(),
         }
     }
 
@@ -2044,6 +2183,137 @@ impl AccountManager {
         })
     }
 
+    /// Тихая смена пароля (accounts-accordion-password.md): проверяет новый
+    /// пароль на сервере тем же способом, что и подключение, и заменяет
+    /// только значение в keyring - без upsert строки аккаунта и без
+    /// синхронизации (S-013, S-015). Контракт минимален (S-010): адрес,
+    /// `secret_ref` и серверные настройки берутся из сохранённого аккаунта.
+    pub async fn change_account_password(
+        &self,
+        account_id: i64,
+        new_password: &str,
+    ) -> std::result::Result<(), ChangePasswordError> {
+        self.change_account_password_with_store(account_id, new_password, &SystemSecretStore)
+            .await
+    }
+
+    /// То же самое, но с подменяемым хранилищем секретов - используется в
+    /// тестах на подменённом хранилище (S-014) без обращения к реальному OS
+    /// keychain, которого может не быть на CI-раннере.
+    pub async fn change_account_password_with_store(
+        &self,
+        account_id: i64,
+        new_password: &str,
+        store: &dyn SecretStore,
+    ) -> std::result::Result<(), ChangePasswordError> {
+        if !self.password_change_locks.try_lock(account_id).await {
+            return Err(ChangePasswordError::ChangeInProgress);
+        }
+        let result = self
+            .change_account_password_inner(account_id, new_password, store)
+            .await;
+        self.password_change_locks.unlock(account_id).await;
+        result
+    }
+
+    async fn change_account_password_inner(
+        &self,
+        account_id: i64,
+        new_password: &str,
+        store: &dyn SecretStore,
+    ) -> std::result::Result<(), ChangePasswordError> {
+        let accounts_before = self
+            .db
+            .list_accounts()
+            .await
+            .map_err(|error| ChangePasswordError::BackendUnavailable(error.to_string()))?;
+        let account = accounts_before
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or(ChangePasswordError::AccountNotFound)?;
+        if !matches!(
+            account.auth_kind,
+            AuthKind::Password | AuthKind::AppPassword | AuthKind::Ntlm
+        ) {
+            return Err(ChangePasswordError::UnsupportedAuthKind);
+        }
+        let secret_ref = account
+            .secret_ref
+            .clone()
+            .ok_or(ChangePasswordError::MissingSecretRef)?;
+
+        // Проверка на сервере тем же способом, что и при подключении (S-011):
+        // IMAP - вход и NOOP, EWS - GetFolder входящих, JMAP - Session.
+        let backend = Self::mail_backend(&account)
+            .map_err(|error| ChangePasswordError::BackendUnavailable(error.to_string()))?;
+        if let Err(error) = backend.validate(&account.email, new_password).await {
+            let message = error.to_string();
+            tracing::info!(
+                account = %crate::logging::mask_email(&account.email),
+                "смена пароля: сервер отклонил новый пароль"
+            );
+            return Err(if classify_validation_error(&message) {
+                ChangePasswordError::InvalidCredentials(message)
+            } else {
+                ChangePasswordError::BackendUnavailable(message)
+            });
+        }
+
+        // Между проверкой и записью пользователь мог переподключить аккаунт
+        // через мастер (S-016b) - конфигурация перечитывается перед записью.
+        let accounts_now = self
+            .db
+            .list_accounts()
+            .await
+            .map_err(|error| ChangePasswordError::BackendUnavailable(error.to_string()))?;
+        let current = accounts_now
+            .into_iter()
+            .find(|item| item.id == account_id)
+            .ok_or(ChangePasswordError::AccountNotFound)?;
+        if !connection_config_matches(&account, &current) {
+            return Err(ChangePasswordError::AccountChanged);
+        }
+
+        // Старое значение - только для сравнения при контрольном чтении;
+        // отсутствие записи или нечитаемый секрет смене не мешают (S-016a).
+        let old_value = store.read(&secret_ref);
+        let wrote = store.write(&secret_ref, new_password);
+        if !wrote {
+            tracing::warn!(
+                account = %crate::logging::mask_email(&account.email),
+                "хранилище секретов сообщило об ошибке записи, решает контрольное чтение"
+            );
+        }
+        let read_back = store.read(&secret_ref);
+
+        // Итог определяется контрольным чтением, а не тем, что вернул сам
+        // write() (S-014): keyring на некоторых платформах сообщает об
+        // ошибке уже после фактически состоявшейся записи.
+        match read_back {
+            Some(value) if value == new_password => {
+                tracing::info!(
+                    account = %crate::logging::mask_email(&account.email),
+                    "пароль аккаунта заменён в хранилище секретов"
+                );
+                Ok(())
+            }
+            Some(ref value) if Some(value) == old_value.as_ref() => {
+                tracing::warn!(
+                    account = %crate::logging::mask_email(&account.email),
+                    "смена пароля: запись в хранилище секретов не удалась"
+                );
+                Err(ChangePasswordError::SecretStoreWriteFailed)
+            }
+            _ => {
+                tracing::warn!(
+                    account = %crate::logging::mask_email(&account.email),
+                    "смена пароля: состояние хранилища секретов не определено"
+                );
+                Err(ChangePasswordError::SecretStoreStateUnknown)
+            }
+        }
+    }
+
     /// Полная синхронизация уже сохранённого аккаунта; предназначена для фоновой задачи.
     pub async fn sync_mail_account(&self, account: &Account) -> Result<ConnectedAccountSync> {
         self.sync_registry
@@ -2191,5 +2461,688 @@ impl AccountManager {
             contacts: 0,
             warnings,
         })
+    }
+}
+
+#[cfg(test)]
+mod change_password_tests {
+    //! Проверки тихой смены пароля (accounts-accordion-password.md). Сервер
+    //! мокается локальным JMAP-эндпоинтом (тот же приём, что и в
+    //! backend/jmap.rs), хранилище секретов - MockSecretStore (S-014):
+    //! CI-раннер не всегда имеет системный keychain.
+    use super::*;
+    use axum::{
+        Json, Router,
+        extract::State,
+        http::{HeaderMap, StatusCode},
+        response::{IntoResponse, Response},
+        routing::get,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadAfterWrite {
+        NewValue,
+        OldValue,
+        Unreadable,
+        Other,
+    }
+
+    /// Хранилище секретов, полностью управляемое тестом: что вернуть на
+    /// write() и что вернуть на read() после записи - независимые ручки, как
+    /// того требует таблица исходов S-014.
+    struct MockSecretStore {
+        initial: std::collections::HashMap<String, String>,
+        write_returns: bool,
+        read_after_write: ReadAfterWrite,
+        wrote: AtomicBool,
+        writes: Mutex<Vec<(String, String)>>,
+    }
+    impl MockSecretStore {
+        fn new(
+            initial: &[(&str, &str)],
+            write_returns: bool,
+            read_after_write: ReadAfterWrite,
+        ) -> Self {
+            Self {
+                initial: initial
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+                write_returns,
+                read_after_write,
+                wrote: AtomicBool::new(false),
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+        fn write_count(&self) -> usize {
+            self.writes.lock().unwrap().len()
+        }
+    }
+    impl SecretStore for MockSecretStore {
+        fn read(&self, secret_ref: &str) -> Option<String> {
+            if self.wrote.load(Ordering::SeqCst) {
+                match self.read_after_write {
+                    ReadAfterWrite::NewValue => {
+                        self.writes.lock().unwrap().last().map(|(_, v)| v.clone())
+                    }
+                    ReadAfterWrite::OldValue => self.initial.get(secret_ref).cloned(),
+                    ReadAfterWrite::Unreadable => None,
+                    ReadAfterWrite::Other => Some("garbage-value-neither-old-nor-new".into()),
+                }
+            } else {
+                self.initial.get(secret_ref).cloned()
+            }
+        }
+        fn write(&self, secret_ref: &str, value: &str) -> bool {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((secret_ref.to_owned(), value.to_owned()));
+            self.wrote.store(true, Ordering::SeqCst);
+            self.write_returns
+        }
+    }
+
+    fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
+        let value = headers
+            .get(axum::http::header::AUTHORIZATION)?
+            .to_str()
+            .ok()?;
+        let encoded = value.strip_prefix("Basic ")?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        text.split_once(':')
+            .map(|(_, password)| password.to_owned())
+    }
+
+    fn jmap_session_body(base: &str) -> serde_json::Value {
+        serde_json::json!({
+            "capabilities": {"urn:ietf:params:jmap:core": {}, "urn:ietf:params:jmap:mail": {}},
+            "accounts": {"a1": {"name": "Test", "isPersonal": true, "isReadOnly": false, "accountCapabilities": {"urn:ietf:params:jmap:mail": {}}}},
+            "primaryAccounts": {"urn:ietf:params:jmap:mail": "a1"},
+            "username": "user@example.test",
+            "apiUrl": format!("{base}/api"),
+            "downloadUrl": format!("{base}/download/{{accountId}}/{{blobId}}/{{name}}?accept={{type}}"),
+            "uploadUrl": format!("{base}/upload/{{accountId}}"),
+            "state": "session-1"
+        })
+    }
+
+    #[derive(Clone)]
+    struct JmapAuthState {
+        base: String,
+        expected_password: String,
+    }
+
+    /// Обычный мок: Session отдаётся только с верным паролем, иначе 401 -
+    /// именно так `JmapBackend::validate` отличает верный пароль от неверного.
+    async fn mock_jmap_session(State(state): State<JmapAuthState>, headers: HeaderMap) -> Response {
+        if basic_auth_password(&headers).as_deref() != Some(state.expected_password.as_str()) {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        Json(jmap_session_body(&state.base)).into_response()
+    }
+
+    async fn spawn_mock_jmap(expected_password: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = JmapAuthState {
+            base: base.clone(),
+            expected_password: expected_password.to_owned(),
+        };
+        let app = Router::new()
+            .route("/.well-known/jmap", get(mock_jmap_session))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, server)
+    }
+
+    /// Мок для S-016b: в момент, когда сервер отвечает на проверку пароля, он
+    /// же меняет secret_ref строки аккаунта в базе напрямую - имитирует
+    /// пользователя, успевшего переподключить ящик через мастер, пока
+    /// проверка нового пароля ещё шла по сети.
+    #[derive(Clone)]
+    struct RaceState {
+        base: String,
+        expected_password: String,
+        db: Db,
+        account_id: i64,
+        new_secret_ref: String,
+    }
+    async fn mock_jmap_session_racing(
+        State(state): State<RaceState>,
+        headers: HeaderMap,
+    ) -> Response {
+        if basic_auth_password(&headers).as_deref() != Some(state.expected_password.as_str()) {
+            return (StatusCode::UNAUTHORIZED, "invalid credentials").into_response();
+        }
+        sqlx::query("UPDATE accounts SET secret_ref = ? WHERE id = ?")
+            .bind(&state.new_secret_ref)
+            .bind(state.account_id)
+            .execute(&state.db.write_pool)
+            .await
+            .unwrap();
+        Json(jmap_session_body(&state.base)).into_response()
+    }
+    /// Порт слушается заранее (без запуска сервера), чтобы аккаунт можно было
+    /// сохранить с настоящим jmap_url ДО того, как обработчику станет известен
+    /// account_id, который тоже нужен в состоянии сервера.
+    async fn bind_local() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        (listener, base)
+    }
+
+    async fn serve_racing_mock_jmap(
+        listener: tokio::net::TcpListener,
+        base: String,
+        expected_password: &str,
+        db: Db,
+        account_id: i64,
+        new_secret_ref: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = RaceState {
+            base,
+            expected_password: expected_password.to_owned(),
+            db,
+            account_id,
+            new_secret_ref: new_secret_ref.to_owned(),
+        };
+        let app = Router::new()
+            .route("/.well-known/jmap", get(mock_jmap_session_racing))
+            .with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        })
+    }
+
+    async fn temp_db(label: &str) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "truemail-change-password-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let crypto = std::sync::Arc::new(crate::crypto::StorageCrypto::from_key(rand::random()));
+        let database_key = crate::crypto::DatabaseKey::from_key(rand::random());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        (db, root)
+    }
+
+    async fn save_jmap_account(
+        db: &Db,
+        base: &str,
+        secret_ref: &str,
+        auth_kind: AuthKind,
+    ) -> Account {
+        db.save_account(&NewAccount {
+            email: "user@example.test".into(),
+            display_name: "JMAP test".into(),
+            provider: Provider::Generic,
+            backend_kind: BackendKind::Jmap,
+            auth_kind,
+            imap: None,
+            smtp: None,
+            ews_url: None,
+            caldav_url: None,
+            carddav_url: None,
+            jmap_url: Some(format!("{base}/.well-known/jmap")),
+            username: Some("user@example.test".into()),
+            secret_ref: secret_ref.into(),
+            color: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn cleanup(db: Db, root: std::path::PathBuf, server: tokio::task::JoinHandle<()>) {
+        server.abort();
+        db.close().await;
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // ---------- классификация ошибок (без сети) ----------
+
+    #[test]
+    fn classifies_auth_failures_conservatively() {
+        assert!(classify_validation_error("HTTP 401: Unauthorized"));
+        assert!(classify_validation_error("Invalid credentials"));
+        assert!(classify_validation_error("AUTHENTICATIONFAILED"));
+        assert!(classify_validation_error("неверный пароль"));
+        // Сетевые и прочие отказы не должны выдаваться за отказ авторизации:
+        // ложное "неверный пароль" хуже честного "сервер недоступен".
+        assert!(!classify_validation_error("connection refused"));
+        assert!(!classify_validation_error("HTTP 503: Service Unavailable"));
+        assert!(!classify_validation_error("timed out waiting for response"));
+    }
+
+    #[test]
+    fn error_codes_match_contract() {
+        assert_eq!(
+            ChangePasswordError::InvalidCredentials("x".into()).code(),
+            "invalid_credentials"
+        );
+        assert_eq!(
+            ChangePasswordError::UnsupportedAuthKind.code(),
+            "unsupported_auth_kind"
+        );
+        assert_eq!(
+            ChangePasswordError::AccountNotFound.code(),
+            "account_not_found"
+        );
+        assert_eq!(
+            ChangePasswordError::MissingSecretRef.code(),
+            "missing_secret_ref"
+        );
+        assert_eq!(
+            ChangePasswordError::SecretStoreWriteFailed.code(),
+            "secret_store_write_failed"
+        );
+        assert_eq!(
+            ChangePasswordError::SecretStoreStateUnknown.code(),
+            "secret_store_state_unknown"
+        );
+        assert_eq!(
+            ChangePasswordError::ChangeInProgress.code(),
+            "change_in_progress"
+        );
+        assert_eq!(
+            ChangePasswordError::AccountChanged.code(),
+            "account_changed"
+        );
+        assert_eq!(
+            ChangePasswordError::BackendUnavailable("x".into()).code(),
+            "backend_unavailable"
+        );
+    }
+
+    // ---------- S-017: блокировка на аккаунт ----------
+
+    #[tokio::test]
+    async fn password_change_lock_rejects_same_account_but_not_others() {
+        let locks = PasswordChangeLocks::default();
+        assert!(locks.try_lock(1).await);
+        assert!(
+            !locks.try_lock(1).await,
+            "повторный запрос по тому же аккаунту должен получить отказ"
+        );
+        assert!(
+            locks.try_lock(2).await,
+            "другой аккаунт не должен блокироваться"
+        );
+        locks.unlock(1).await;
+        assert!(
+            locks.try_lock(1).await,
+            "после unlock аккаунт снова доступен"
+        );
+    }
+
+    #[tokio::test]
+    async fn change_in_progress_rejects_concurrent_request_on_same_account() {
+        let (db, root) = temp_db("in-progress").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-1", AuthKind::AppPassword).await;
+        let manager = std::sync::Arc::new(AccountManager::new(db.clone()));
+        // Занимаем блокировку напрямую - без реального сетевого вызова -
+        // чтобы детерминированно смоделировать "смена уже идёт".
+        assert!(manager.password_change_locks.try_lock(account.id).await);
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::ChangeInProgress));
+        assert_eq!(store.write_count(), 0);
+        manager.password_change_locks.unlock(account.id).await;
+        cleanup(db, root, server).await;
+    }
+
+    // ---------- контракт и повреждённые состояния (S-010, S-016a) ----------
+
+    #[tokio::test]
+    async fn unsupported_auth_kind_for_oauth2_account() {
+        let (db, root) = temp_db("oauth").await;
+        let (base, server) = spawn_mock_jmap("irrelevant").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-oauth", AuthKind::Oauth2).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::UnsupportedAuthKind));
+        assert_eq!(store.write_count(), 0);
+        cleanup(db, root, server).await;
+    }
+
+    #[tokio::test]
+    async fn account_not_found_for_unknown_id() {
+        let (db, root) = temp_db("not-found").await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(999_999, "new-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::AccountNotFound));
+        db.close().await;
+        drop(db);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn missing_secret_ref_is_rejected_before_any_network_or_store_access() {
+        let (db, root) = temp_db("missing-secret-ref").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-x", AuthKind::AppPassword).await;
+        sqlx::query("UPDATE accounts SET secret_ref = NULL WHERE id = ?")
+            .bind(account.id)
+            .execute(&db.write_pool)
+            .await
+            .unwrap();
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::MissingSecretRef));
+        assert_eq!(store.write_count(), 0);
+        cleanup(db, root, server).await;
+    }
+
+    #[tokio::test]
+    async fn backend_unavailable_when_stored_config_is_incomplete() {
+        let (db, root) = temp_db("incomplete-config").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-y", AuthKind::AppPassword).await;
+        // jmap_url потерян - mail_backend не может построить подключение.
+        sqlx::query("UPDATE accounts SET jmap_url = NULL WHERE id = ?")
+            .bind(account.id)
+            .execute(&db.write_pool)
+            .await
+            .unwrap();
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert!(matches!(
+            result,
+            Err(ChangePasswordError::BackendUnavailable(_))
+        ));
+        assert_eq!(store.write_count(), 0);
+        cleanup(db, root, server).await;
+    }
+
+    // ---------- S-011, S-012, S-013: проверка пароля перед записью ----------
+
+    #[tokio::test]
+    async fn wrong_password_is_rejected_and_secret_store_is_never_touched() {
+        let (db, root) = temp_db("wrong-password").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account =
+            save_jmap_account(&db, &base, "secret-ref-wrong", AuthKind::AppPassword).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(
+            &[("secret-ref-wrong", "correct-password")],
+            true,
+            ReadAfterWrite::NewValue,
+        );
+        let result = manager
+            .change_account_password_with_store(account.id, "totally-wrong-password", &store)
+            .await;
+        assert_eq!(
+            result,
+            Err(ChangePasswordError::InvalidCredentials(
+                "транспорт (jmap-session): HTTP 401 Unauthorized: invalid credentials".into()
+            ))
+        );
+        assert_eq!(
+            store.write_count(),
+            0,
+            "неверный пароль не должен трогать хранилище секретов (S-012)"
+        );
+        // S-018: сообщение об ошибке приходит от сервера, а не строится из
+        // отправленного пароля - сам пароль в нём появиться не может.
+        assert!(!format!("{result:?}").contains("totally-wrong-password"));
+        // Строка аккаунта в базе не изменилась (S-013): читаем заново и сверяем secret_ref.
+        let reread = db
+            .list_accounts()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|a| a.id == account.id)
+            .unwrap();
+        assert_eq!(reread.secret_ref.as_deref(), Some("secret-ref-wrong"));
+        cleanup(db, root, server).await;
+    }
+
+    // ---------- S-014: таблица исходов записи ----------
+
+    #[tokio::test]
+    async fn success_when_readback_matches_new_value() {
+        let (db, root) = temp_db("ok-new").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-ok", AuthKind::Password).await;
+        let manager = AccountManager::new(db.clone());
+        for write_returns in [true, false] {
+            let store = MockSecretStore::new(
+                &[("secret-ref-ok", "old-password")],
+                write_returns,
+                ReadAfterWrite::NewValue,
+            );
+            let result = manager
+                .change_account_password_with_store(account.id, "correct-password", &store)
+                .await;
+            assert_eq!(
+                result,
+                Ok(()),
+                "write_returns={write_returns}: контрольное чтение важнее сырого результата write()"
+            );
+        }
+        cleanup(db, root, server).await;
+    }
+
+    #[tokio::test]
+    async fn write_failed_when_readback_still_shows_old_value() {
+        let (db, root) = temp_db("write-failed").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-wf", AuthKind::Password).await;
+        let manager = AccountManager::new(db.clone());
+        for write_returns in [true, false] {
+            let store = MockSecretStore::new(
+                &[("secret-ref-wf", "old-password")],
+                write_returns,
+                ReadAfterWrite::OldValue,
+            );
+            let result = manager
+                .change_account_password_with_store(account.id, "correct-password", &store)
+                .await;
+            assert_eq!(result, Err(ChangePasswordError::SecretStoreWriteFailed));
+        }
+        cleanup(db, root, server).await;
+    }
+
+    #[tokio::test]
+    async fn state_unknown_when_readback_fails_or_matches_neither_value() {
+        let (db, root) = temp_db("state-unknown").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-su", AuthKind::Password).await;
+        let manager = AccountManager::new(db.clone());
+        // Обе ветки результата записи: итог определяет только контрольное чтение,
+        // поэтому неизвестное состояние остаётся неизвестным в любом случае (S-014).
+        for wrote in [true, false] {
+            for outcome in [ReadAfterWrite::Unreadable, ReadAfterWrite::Other] {
+                let store =
+                    MockSecretStore::new(&[("secret-ref-su", "old-password")], wrote, outcome);
+                let result = manager
+                    .change_account_password_with_store(account.id, "correct-password", &store)
+                    .await;
+                assert_eq!(result, Err(ChangePasswordError::SecretStoreStateUnknown));
+            }
+        }
+        cleanup(db, root, server).await;
+    }
+
+    #[tokio::test]
+    async fn missing_old_secret_does_not_block_change_and_compares_only_to_new_value() {
+        // S-016a: записи в keyring нет (initial пуст) - смене это не мешает.
+        let (db, root) = temp_db("no-old-secret").await;
+        let (base, server) = spawn_mock_jmap("correct-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-none", AuthKind::Password).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        let result = manager
+            .change_account_password_with_store(account.id, "correct-password", &store)
+            .await;
+        assert_eq!(result, Ok(()));
+        cleanup(db, root, server).await;
+    }
+
+    // ---------- S-016b: конфигурация перечитывается перед записью ----------
+
+    #[tokio::test]
+    async fn account_changed_between_validation_and_write_aborts_without_writing() {
+        let (db, root) = temp_db("account-changed").await;
+        let (listener, base) = bind_local().await;
+        let account = save_jmap_account(&db, &base, "secret-ref-race", AuthKind::Password).await;
+        let server = serve_racing_mock_jmap(
+            listener,
+            base,
+            "correct-password",
+            db.clone(),
+            account.id,
+            "secret-ref-race-NEW",
+        )
+        .await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(
+            &[
+                ("secret-ref-race", "old-password"),
+                ("secret-ref-race-NEW", "old-password"),
+            ],
+            true,
+            ReadAfterWrite::NewValue,
+        );
+        let result = manager
+            .change_account_password_with_store(account.id, "correct-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::AccountChanged));
+        assert_eq!(
+            store.write_count(),
+            0,
+            "secret_ref поменялся во время проверки - запись не должна выполняться (S-016b)"
+        );
+        cleanup(db, root, server).await;
+    }
+
+    /// S-016: операция, взявшая секрет до смены, работает со своим снимком, а
+    /// следующее обращение получает уже новое значение. Идущая синхронизация не
+    /// отменяется - она просто дочитывает свой старый секрет.
+    #[tokio::test]
+    async fn running_operation_keeps_its_snapshot_and_next_read_sees_new_secret() {
+        let (db, root) = temp_db("secret-snapshot").await;
+        let (base, server) = spawn_mock_jmap("new-password").await;
+        let account =
+            save_jmap_account(&db, &base, "secret-ref-snapshot", AuthKind::AppPassword).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(
+            &[("secret-ref-snapshot", "old-password")],
+            true,
+            ReadAfterWrite::NewValue,
+        );
+        // Снимок, который держит уже запущенная операция.
+        let snapshot = store.read("secret-ref-snapshot").expect("старый секрет");
+        manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await
+            .expect("смена пароля проходит");
+        assert_eq!(
+            snapshot, "old-password",
+            "снимок старой операции не меняется"
+        );
+        assert_eq!(
+            store.read("secret-ref-snapshot").as_deref(),
+            Some("new-password"),
+            "следующее обращение за секретом получает новое значение"
+        );
+        cleanup(db, root, server).await;
+    }
+
+    /// S-014: хранилище сообщило об ошибке записи, но значение фактически
+    /// записалось - контрольное чтение видит новый пароль, операция успешна.
+    #[tokio::test]
+    async fn failed_write_report_with_new_value_read_back_is_success() {
+        let (db, root) = temp_db("write-error-but-written").await;
+        let (base, server) = spawn_mock_jmap("new-password").await;
+        let account = save_jmap_account(&db, &base, "secret-ref-werr", AuthKind::AppPassword).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(
+            &[("secret-ref-werr", "old-password")],
+            false,
+            ReadAfterWrite::NewValue,
+        );
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert_eq!(
+            result,
+            Ok(()),
+            "запись фактически прошла - это успех (S-014)"
+        );
+        cleanup(db, root, server).await;
+    }
+
+    /// S-014: ошибка записи и старое значение при контрольном чтении - отказ.
+    #[tokio::test]
+    async fn failed_write_report_with_old_value_read_back_is_write_failed() {
+        let (db, root) = temp_db("write-error-old-value").await;
+        let (base, server) = spawn_mock_jmap("new-password").await;
+        let account =
+            save_jmap_account(&db, &base, "secret-ref-werr2", AuthKind::AppPassword).await;
+        let manager = AccountManager::new(db.clone());
+        let store = MockSecretStore::new(
+            &[("secret-ref-werr2", "old-password")],
+            false,
+            ReadAfterWrite::OldValue,
+        );
+        let result = manager
+            .change_account_password_with_store(account.id, "new-password", &store)
+            .await;
+        assert_eq!(result, Err(ChangePasswordError::SecretStoreWriteFailed));
+        cleanup(db, root, server).await;
+    }
+
+    /// S-018: ни успешный ответ, ни ошибка не несут пароль в сериализованном виде.
+    #[test]
+    fn serialized_error_never_contains_password() {
+        let password = "sup3r-secret-value";
+        for error in [
+            ChangePasswordError::InvalidCredentials("сервер отклонил вход".into()),
+            ChangePasswordError::BackendUnavailable("нет соединения".into()),
+            ChangePasswordError::SecretStoreWriteFailed,
+            ChangePasswordError::SecretStoreStateUnknown,
+            ChangePasswordError::MissingSecretRef,
+            ChangePasswordError::AccountNotFound,
+            ChangePasswordError::AccountChanged,
+            ChangePasswordError::ChangeInProgress,
+            ChangePasswordError::UnsupportedAuthKind,
+        ] {
+            let text = format!("{error} {error:?} {}", error.code());
+            assert!(
+                !text.contains(password),
+                "текст и код ошибки не должны содержать пароль: {text}"
+            );
+        }
     }
 }

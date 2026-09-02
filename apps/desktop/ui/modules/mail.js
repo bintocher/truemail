@@ -146,7 +146,12 @@ function contactPhoneLabel(phone){return phone?`${phone.number||''}${phone.exten
 // Одна строка адреса для поиска и подписи карточки: пустые компоненты просто
 // выпадают, чтобы не оставалось висящих запятых.
 function contactAddressLabel(address){return address?[address.street,address.city,address.region,address.postal_code,address.country].filter(Boolean).join(', '):'';}
-function renderContacts(contacts=coreContacts){const query=(document.querySelector('.ct-search input')?.value||'').trim(),filtered=contacts.filter(contact=>matchQ(`${contact.display_name||''} ${(contact.emails||[]).map(item=>item.email).join(' ')} ${(contact.phones||[]).map(contactPhoneLabel).join(' ')} ${(contact.addresses||[]).map(contactAddressLabel).join(' ')}`,query)),grid=document.getElementById('cgrid');grid.innerHTML='';filtered.forEach((contact,index)=>{const primary=contact.emails?.[0]?.email||contactPhoneLabel(contact.phones?.[0])||contactAddressLabel(contact.addresses?.[0]),card=document.createElement('button');card.type='button';card.className='ccard';card.dataset.contactId=contact.id;card.innerHTML=`<span class="ava ava-c${index%8}"></span><div><div class="cn"></div><div class="ce"></div></div>`;card.querySelector('.ava').textContent=(contact.display_name||primary||'?').split(/\s+/).map(word=>word[0]).join('').slice(0,2).toUpperCase();card.querySelector('.cn').textContent=contact.display_name||primary||'';card.querySelector('.ce').textContent=primary||'';
+// Ключи транслитерации раздела контактов (S-012 person-search-translit.md):
+// имя, адреса, телефоны и почтовые адреса - свой состав полей, свой кэш.
+// Сброс - вместе с coreContacts (renderCoreAccounts, ниже по файлу).
+const contactsSearchCache=personSearch.createPersonSearchCache();
+function contactSearchText(contact){return `${contact.display_name||''} ${(contact.emails||[]).map(item=>item.email).join(' ')} ${(contact.phones||[]).map(contactPhoneLabel).join(' ')} ${(contact.addresses||[]).map(contactAddressLabel).join(' ')}`;}
+function renderContacts(contacts=coreContacts){const query=(document.querySelector('.ct-search input')?.value||'').trim(),queryVariants=query?personSearch.personSearchVariants(query):[],filtered=contacts.filter(contact=>!query||contactsSearchCache.get(contact.id,()=>contactSearchText(contact)).some(key=>queryVariants.some(variant=>key.includes(variant)))),grid=document.getElementById('cgrid');grid.innerHTML='';filtered.forEach((contact,index)=>{const primary=contact.emails?.[0]?.email||contactPhoneLabel(contact.phones?.[0])||contactAddressLabel(contact.addresses?.[0]),card=document.createElement('button');card.type='button';card.className='ccard';card.dataset.contactId=contact.id;card.innerHTML=`<span class="ava ava-c${index%8}"></span><div><div class="cn"></div><div class="ce"></div></div>`;card.querySelector('.ava').textContent=(contact.display_name||primary||'?').split(/\s+/).map(word=>word[0]).join('').slice(0,2).toUpperCase();card.querySelector('.cn').textContent=contact.display_name||primary||'';card.querySelector('.ce').textContent=primary||'';
   // Почтовый адрес показываем отдельной строкой, если он не занял место
   // основной подписи (у контакта без почты и телефона).
   const addressLabel=contactAddressLabel(contact.addresses?.[0]);if(addressLabel&&addressLabel!==primary){const line=document.createElement('div');line.className='ce ca';line.textContent=addressLabel;card.querySelector('div').appendChild(line);}
@@ -557,6 +562,10 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
   coreAccounts=accounts;setCoreFolders(foldersByAccount.flat());coreContacts=contacts;coreCalendarData=calendarData;
+  // coreContacts обновился - кэши ключей транслитерации по всем поверхностям
+  // устарели (person-search-translit.md, S-012): раздел контактов (эта же
+  // область видимости), подсказка адресата и палитра команд (другие модули).
+  contactsSearchCache.invalidate();window.invalidateComposerContactCache?.();window.invalidatePaletteContactCache?.();
   // Готовность композера для файлов из меню "Отправить": аккаунт может
   // появиться и вне мастера настройки (добавили второй ящик, закрыли мастер
   // навигацией) - тогда очередь забирается сразу, а не после перезапуска.
