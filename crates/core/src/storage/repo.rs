@@ -5932,3 +5932,29 @@ mod notification_lookup_tests {
         assert_eq!(counts[0].unread, unread);
     }
 }
+
+#[cfg(test)]
+mod charset_decoding_tests {
+    use mail_parser::MessageParser;
+
+    /// Outlook Exchange рассылает кириллицу в iso-2022-jp: русские буквы лежат
+    /// в 7-м ряду JIS X 0208. Без фичи full_encoding у mail-parser такие письма
+    /// доходили до интерфейса сырыми байтами с ESC-последовательностями.
+    #[test]
+    fn iso_2022_jp_cyrillic_is_decoded() {
+        let raw = concat!(
+            "From: =?iso-2022-jp?B?GyRCJyMnbSdqJ1YnXRsoQg==?= <marketing@example.test>\r\n",
+            "Subject: =?iso-2022-jp?B?GyRCJyMnbSdqJ1YnXRsoQiAbJEInXydgJ1MnbSdbGyhC?=\r\n",
+            "MIME-Version: 1.0\r\n",
+            "Content-Type: text/plain; charset=\"iso-2022-jp\"\r\n",
+            "Content-Transfer-Encoding: quoted-printable\r\n",
+            "\r\n",
+            "=1B$B'#'m'j'V']=1B(B =1B$B'_'`'S'm'[=1B(B\r\n"
+        );
+        let message = MessageParser::default()
+            .parse(raw.as_bytes())
+            .expect("письмо разобрано");
+        assert_eq!(message.subject(), Some("Вышел новый"));
+        assert_eq!(message.body_text(0).as_deref(), Some("Вышел новый\r\n"));
+    }
+}

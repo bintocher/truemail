@@ -7,6 +7,12 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Messages in iso-2022-jp, shift_jis, big5, gbk and euc-jp/kr are readable:
+  subject and body used to appear as a run of control characters. Exchange
+  newsletters carrying Cyrillic inside iso-2022-jp now open correctly.
+
 ## [0.2.9] - 2026-09-02
 
 ### Added
