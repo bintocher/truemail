@@ -206,6 +206,11 @@ window.forgetSmartFolderState=forgetSmartFolderState;
 // истории нельзя. Ключ - id умной папки.
 const smartCircleFetched=new Map();
 let coreFolders=[];
+// folder_id -> role. Меняется только вместе с coreFolders, через setCoreFolders:
+// createMessageRow вызывается на каждый сдвиг окна прокрутки, и поиск по папкам
+// там недопустим. До первой загрузки данных карта пуста - роль неизвестна.
+let coreFolderRoles=new Map();
+function setCoreFolders(folders){coreFolders=folders;coreFolderRoles=new Map(folders.map(folder=>[folder.id,folder.role]));}
 let coreAccounts=[];
 // 16 нейтральных цветов аккаунта, читаемых в светлой и тёмной теме.
 /* Палитра цветов аккаунта: сетка 5x5 в выпадающей панели. */

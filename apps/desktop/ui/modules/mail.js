@@ -266,9 +266,16 @@ function toggleConversation(key){if(expandedConversations.has(key))expandedConve
 async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
 function createMessageRow(message,index){
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
-  const initial=(message.from?.name||message.from?.email||'?').trim()[0].toUpperCase();
+  // Сторона строки - роль папки самого письма: в Отправленных и Черновиках
+  // показываем получателя. Роль берём из готовой карты, поиск по coreFolders в
+  // горячем пути прокрутки запрещён.
+  const presentation=mailAddresses.rowPresentation(message,coreFolderRoles);
   row.innerHTML=`<div class="avawrap"><span class="ava" style="background:${accountColorById(message.account_id)};color:${contrastOn(accountColorById(message.account_id))}"></span></div><div class="body"><div class="l1"><span class="from"></span></div><div class="subj"></div><div class="prev"></div></div><div class="meta"><span class="time"></span><span class="time-hm"></span></div>`;
-  row.querySelector('.ava').textContent=initial;row.querySelector('.from').textContent=message.from?.name||message.from?.email||'';
+  row.querySelector('.ava').textContent=presentation.initial;
+  row.querySelector('.from').textContent=presentation.kind==='empty'?L('Без получателя','No recipient'):presentation.text;
+  // Счётчик остальных получателей - отдельный элемент вне обрезки подписи:
+  // иначе многоточие длинного имени съедало бы суффикс "+N".
+  if(presentation.extra>0){const extra=document.createElement('span');extra.className='from-extra';extra.textContent=`+${presentation.extra}`;row.querySelector('.l1').appendChild(extra);}
   if(message._convCount>1){const expanded=expandedConversations.has(message._convKey);const badge=document.createElement('button');badge.type='button';badge.className='conv-count'+(expanded?' on':'');badge.textContent=message._convCount;badge.title=expanded?L('Свернуть беседу','Collapse conversation'):L(`Показать письма беседы (${message._convCount})`,`Show conversation messages (${message._convCount})`);badge.onclick=event=>{event.stopPropagation();toggleConversation(message._convKey);};row.querySelector('.l1').appendChild(badge);}
   row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
   row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
@@ -305,6 +312,24 @@ function renderMessageList(rows,title,resetScroll=false){
   if(!rows.length)document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;
   else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id))document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;
 }
+// Общий строитель строк "Кому"/"Копия" шапки письма: тот же отбор адресов, та же
+// свёртка и независимое состояние раскрытия у каждой строки. Возвращает null,
+// когда показывать нечего - тогда шапка не получает ни строки, ни отступа.
+function buildAddressLine(className,labelText,addresses){
+  const maxShown=2,full=mailAddresses.addressLineModel(addresses,true,maxShown);if(!full)return null;
+  const line=document.createElement('div');line.className=className;
+  const render=expanded=>{
+    const model=mailAddresses.addressLineModel(addresses,expanded,maxShown);
+    line.innerHTML='';line.classList.toggle('expanded',expanded);
+    const label=document.createElement('span');label.className='mail-address-label';label.textContent=labelText;line.appendChild(label);
+    const names=document.createElement('span');names.className='mail-address-names';line.appendChild(names);
+    model.shown.forEach((item,index)=>{if(index)names.appendChild(document.createTextNode(', '));const span=document.createElement('span');span.className='mail-address-item';span.textContent=item.text;span.title=item.title;names.appendChild(span);});
+    if(!expanded&&model.hidden>0){const more=document.createElement('button');more.type='button';more.className='mail-address-toggle';more.textContent=`+${model.hidden}`;more.title=L('Показать всех','Show all');more.onclick=()=>render(true);line.appendChild(more);}
+    else if(expanded&&full.shown.length>maxShown){const less=document.createElement('button');less.type='button';less.className='mail-address-toggle';less.textContent=L('Свернуть','Collapse');less.onclick=()=>render(false);line.appendChild(less);}
+  };
+  render(false);
+  return line;
+}
 async function showMessage(message){
   activeMessage=message;
   document.getElementById('tSubject').textContent=message.subject||'';const body=document.getElementById('tbody');
@@ -316,25 +341,11 @@ async function showMessage(message){
     const fromName=full.meta.from?.name||'',fromEmail=full.meta.from?.email||'';
     head.querySelector('.mail-from').textContent=fromName||fromEmail;
     head.querySelector('.mail-address').textContent=fromName&&fromEmail?`(${fromEmail})`:'';
-    const ccList=(full.meta.cc||[]).map(address=>address.name||address.email).filter(Boolean);
-    if(ccList.length){
-      const line=document.createElement('div');line.className='mail-ccline';
-      // <=2 - показываем всех; иначе первые двое и "+X", клик раскрывает полный
-      // список в несколько строк с кнопкой "Свернуть".
-      const render=expanded=>{
-        line.innerHTML='';line.classList.toggle('expanded',expanded);
-        const label=document.createElement('span');label.className='mail-cc-label';label.textContent=L('Копия: ','Cc: ');line.appendChild(label);
-        const names=document.createElement('span');names.className='mail-cc-names';line.appendChild(names);
-        if(ccList.length>2&&!expanded){
-          names.textContent=ccList.slice(0,2).join(', ')+' ';
-          const more=document.createElement('button');more.type='button';more.className='mail-cc-toggle';more.textContent=`+${ccList.length-2}`;more.title=L('Показать всех','Show all');more.onclick=()=>render(true);line.appendChild(more);
-        }else{
-          names.textContent=ccList.join(', ');
-          if(ccList.length>2){const less=document.createElement('button');less.type='button';less.className='mail-cc-toggle';less.textContent=L('Свернуть','Collapse');less.onclick=()=>render(false);line.appendChild(less);}
-        }
-      };
-      render(false);head.appendChild(line);
-    }
+    // "Кому" и "Копия" строит одна функция: <=2 адресов - показываем всех без
+    // кнопки; 3+ - первые двое и "+N", раскрытие даёт полный список и кнопку
+    // "Свернуть". Состояния строк независимы.
+    const toLine=buildAddressLine('mail-toline',L('Кому: ','To: '),full.meta.to);if(toLine)head.appendChild(toLine);
+    const ccLine=buildAddressLine('mail-ccline',L('Копия: ','Cc: '),full.meta.cc);if(ccLine)head.appendChild(ccLine);
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
     article.append(head);if(full.attachments?.length){article.appendChild(buildAttachmentBar(full,message.id));}article.appendChild(content);body.appendChild(article);if(!message.flags?.seen){
       // Признак и счётчики проставляет markMessagesSeen - вызываем её до того,
@@ -545,7 +556,7 @@ function filterSmart(index,resetScroll=true){window.setListLoading?.(false);curr
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   window.clearDemoData(true);
-  coreAccounts=accounts;coreFolders=foldersByAccount.flat();coreContacts=contacts;coreCalendarData=calendarData;
+  coreAccounts=accounts;setCoreFolders(foldersByAccount.flat());coreContacts=contacts;coreCalendarData=calendarData;
   // Готовность композера для файлов из меню "Отправить": аккаунт может
   // появиться и вне мастера настройки (добавили второй ящик, закрыли мастер
   // навигацией) - тогда очередь забирается сразу, а не после перезапуска.
