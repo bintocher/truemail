@@ -7,6 +7,27 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-09-02
+
+### Changed
+
+- In "Sent" and "Drafts" the message list shows the recipient instead of the
+  sender. It used to show the user's own name, so the list looked like a column
+  of the same name. With several recipients the first one and a counter of the
+  rest are shown. The rule follows the role of the message's own folder, so it
+  also applies in smart folders, tag views and conversations.
+- The message header shows every available address: "From", "To" and "Cc". The
+  "To" line did not exist before. Empty lines are not rendered, and each address
+  has a tooltip with the full "Name (email)" form.
+
+### Fixed
+
+- Selected weekday and reminder buttons in the event window are readable again:
+  the caption colour on an accent fill now comes from a dedicated variable
+  instead of the accent text colour meant for a plain background.
+- A recipient name made of spaces no longer breaks the avatar initial - the
+  address is shown instead.
+
 ## [0.2.7] - 2026-08-09
 
 ### Fixed
