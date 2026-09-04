@@ -61,29 +61,32 @@ document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
 document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),true);clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
-/* Потолок на все вложения письма разом: WebView держит их в памяти массивами
-   чисел и целиком укладывает в автосохраняемый черновик, поэтому набор крупных
-   файлов иначе съедает память интерфейса. */
-const MAX_ATTACHMENTS_BYTES=25*1024*1024;
-function composerAttachmentsBytes(){return composerAttachments.reduce((total,item)=>total+item.data.length,0);}
-function ensureAttachmentFits(size,filename){
-  if(composerAttachmentsBytes()+size<=MAX_ATTACHMENTS_BYTES)return;
-  throw new Error(L(`Не добавлено: ${filename} не помещается, все вложения письма вместе не должны превышать ${formatBytes(MAX_ATTACHMENTS_BYTES)}`,`Not attached: ${filename} does not fit, all attachments together must stay under ${formatBytes(MAX_ATTACHMENTS_BYTES)}`));
+/* Потолок на всё письмо разом - вложения и байты встроенных картинок в теле
+   вместе (S-007, S-018, S-038; тот же предел, что и при сборке письма в ядре):
+   WebView держит их в памяти массивами чисел и целиком укладывает в
+   автосохраняемый черновик, поэтому крупное содержимое иначе съедает память
+   интерфейса. */
+function composerBodyImageSources(){return [...compEditEl.querySelectorAll('img')].map(img=>img.getAttribute('src')||'');}
+function composerTotalBytes(){return composerBody.totalMessageBytes(composerAttachments.map(item=>item.data.length),composerBodyImageSources());}
+function ensureMessageFits(size,filename){
+  if(composerBody.fitsMessageLimit(composerTotalBytes(),size))return;
+  throw new Error(L(`Не добавлено: ${filename} не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,`Not attached: ${filename} does not fit, the whole message together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`));
 }
-async function addCompFile(file,generation=composerGeneration){if(generation!==composerGeneration)return;ensureAttachmentFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFile(file,generation=composerGeneration){if(generation!==composerGeneration)return;ensureMessageFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро.
    Размер оцениваем по длине base64 - до atob, чтобы слишком большой файл не
    разворачивался в памяти интерфейса ещё раз. */
-async function addCompFilePath(path,generation=composerGeneration){if(generation!==composerGeneration)return;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureAttachmentFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFilePath(path,generation=composerGeneration){if(generation!==composerGeneration)return;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureMessageFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
 /* Есть ли в композере что терять: открытое письмо или восстановленный при
-   запуске черновик, который лежит в полях ещё до открытия composeView. */
+   запуске черновик, который лежит в полях ещё до открытия composeView.
+   Тело из одних картинок без текста тоже считается непустым (S-012). */
 function composerHasContent(){
   if(window.pendingComposerDraft)return true;
   if(composerAttachments.length)return true;
   if(['compTo','compCc','compBcc'].some(id=>recipientModel[id].length||document.getElementById(id).value.trim()))return true;
   if(document.getElementById('compSubj').value.trim())return true;
   const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();
-  return Boolean(body.textContent.trim());
+  return Boolean(body.textContent.trim())||composerBody.htmlHasImageTag(body.innerHTML);
 }
 /* "Отправить -> truemail" в проводнике. Написанное не трогаем: сброс уничтожил
    бы и открытое письмо, и восстановленный черновик, а следующее автосохранение
@@ -126,12 +129,182 @@ function queueCompFiles(files){
   for(const file of files)attachChain=attachChain.then(()=>addCompFile(file,generation)).catch(error=>showToast(error.message||String(error)));
   return attachChain;
 }
-composeEl.addEventListener('dragover',e=>{e.preventDefault();composeEl.classList.add('dragover');});
-composeEl.addEventListener('dragleave',e=>{if(!composeEl.contains(e.relatedTarget))composeEl.classList.remove('dragover');});
-composeEl.addEventListener('drop',e=>{e.preventDefault();composeEl.classList.remove('dragover');
-  const files=e.dataTransfer&&e.dataTransfer.files;if(files&&files.length)queueCompFiles([...files]);});
-compEditEl.addEventListener('paste',e=>{const items=e.clipboardData&&e.clipboardData.items;if(!items)return;
-  for(const item of items){if(item.type.indexOf('image')===0){const file=item.getAsFile();if(file){e.preventDefault();queueCompFiles([new File([file],L('изображение из буфера.png','pasted-image.png'),{type:file.type})]);}}}});
+/* Файлы, брошенные в окно (S-015, S-016): то же поведение, что и у "Отправить"
+   из проводника (attachFilesToComposer), но содержимое уже готовые File из
+   данных переноса, а не путь на диске (S-026). */
+async function attachDroppedFiles(files){
+  const composing=document.getElementById('composeView')?.classList.contains('active');
+  // S-019: письмо открываем, только когда есть чему в нём лечь - хотя бы один
+  // файл должен помещаться в предел письма. Иначе пользователь получил бы
+  // пустое новое письмо вместо одного сообщения об отказе.
+  const fitting=composing?files:files.filter(file=>composerBody.fitsMessageLimit(composerTotalBytes(),file.size));
+  if(!composing&&!fitting.length){
+    files.forEach(file=>showToast(L(`Не добавлено: ${file.name||'файл'} не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,`Not attached: ${file.name||'file'} does not fit, the whole message together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`)));
+    return;
+  }
+  const keep=composing||composerHasContent();
+  if(!keep){
+    resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');
+    showView('composeView');
+    await applyComposerSignature('new');
+  }else if(!composing)showView('composeView');
+  const generation=composerGeneration;
+  let added=0;
+  for(const file of files){
+    if(generation!==composerGeneration)return;
+    try{await addCompFile(file,generation);added++;}catch(error){showToast(error.message||String(error));}
+  }
+  // Сообщение после цикла, а не до него: раньше оно обещало добавление даже
+  // тогда, когда все файлы отклонены по пределу.
+  if(composing&&added)showToast(L('Файлы добавлены к открытому письму','Files added to the open message'));
+  // Файл мог не прочитаться уже после того, как письмо открылось: молчать об
+  // этом нельзя, иначе пустое новое письмо выглядит сбоем.
+  if(!composing&&!added)showToast(L('Письмо открыто, но ни один файл не приложился','The message is open, but no file was attached'));
+  if(!composing)document.getElementById('compTo')?.focus();
+}
+window.dropFilesToComposer=function(files){
+  attachChain=attachChain.then(()=>attachDroppedFiles(files)).catch(console.error);
+  return attachChain;
+};
+/* Разбор данных файлового переноса (S-013, S-019, S-023, S-026, S-027):
+   содержимое файлов берём из dataTransfer, путь на диске интерфейсу не нужен
+   и команда чтения файла по пути не вызывается. Папка в переносе отклоняется
+   отдельным сообщением, остальные файлы приложить не мешает (S-019). */
+function handleWindowFileDrop(dataTransfer){
+  // S-044: до конца мастера настройки или без единого ящика композер не открыть.
+  if(!window.tmComposerReady){
+    showToast(L('Файлы не приложены: сначала завершите настройку программы','Files were not attached: finish the setup wizard first'));
+    return;
+  }
+  const items=Array.from(dataTransfer?.items||[]).filter(item=>item&&item.kind==='file');
+  let folderRejected=false;
+  const files=[];
+  for(const item of items){
+    const entry=item.webkitGetAsEntry?item.webkitGetAsEntry():null;
+    if(entry&&entry.isDirectory){folderRejected=true;continue;}
+    const file=item.getAsFile();
+    if(!file)continue;
+    // Там, где признака каталога нет вовсе, папка приходит пустым файлом без
+    // типа. Проверяем это только в таком случае: настоящий пустой файл иначе
+    // получил бы отказ как папка.
+    if(!entry&&!file.size&&!file.type){folderRejected=true;continue;}
+    files.push(file);
+  }
+  if(folderRejected)showToast(L('Папка не приложена к письму: приложены только файлы','A folder was not attached: only files were attached'));
+  if(!files.length)return;
+  window.dropFilesToComposer(files);
+}
+/* Обработчики файлового переноса живут на уровне окна, а не области композера
+   (S-013): при закрытом письме область скрыта, и события до неё не доходят.
+   Подписка в фазе захвата и остановка события при файловом переносе (S-022,
+   S-043) - иначе обработчики папок, календаря и перечня кнопок настроек,
+   висящие на своих строках без проверки типа переноса, подсветят цель первыми.
+   Перенос без Files в данных (внутренний перенос письма/события/строки
+   настроек) обработчики окна пропускают дальше без изменений (S-014). */
+window.addEventListener('dragover',e=>{
+  // S-046: стандартное действие отменяем для любого переноса, включая ссылку
+  // и текст из браузера. Без отмены именно здесь событие drop не возникает
+  // вовсе, и окно уходит по брошенной ссылке вместо интерфейса программы.
+  e.preventDefault();
+  if(!composerBody.isFileTransfer(e.dataTransfer?.types))return;
+  e.stopPropagation();
+  // S-020, S-045: подсветка только пока написание письма открыто.
+  if(document.getElementById('composeView')?.classList.contains('active'))composeEl.classList.add('dragover');
+},true);
+window.addEventListener('dragleave',e=>{
+  if(!composerBody.isFileTransfer(e.dataTransfer?.types))return;
+  e.stopPropagation();
+  // relatedTarget пуст, когда перенос покинул окно целиком, а не просто перешёл
+  // на соседний элемент страницы (S-021).
+  if(!e.relatedTarget)composeEl.classList.remove('dragover');
+},true);
+window.addEventListener('drop',e=>{
+  // S-046: чужая ссылка, текст или картинка со страницы браузера не должны
+  // увести окно с интерфейса программы - отменяем стандартное действие всегда,
+  // а не только для файлового переноса.
+  e.preventDefault();
+  if(!composerBody.isFileTransfer(e.dataTransfer?.types))return;
+  e.stopPropagation();
+  composeEl.classList.remove('dragover');
+  handleWindowFileDrop(e.dataTransfer);
+},true);
+compEditEl.addEventListener('paste',e=>{
+  const items=e.clipboardData&&e.clipboardData.items;
+  if(!items)return;
+  const {images,rejectedTypes}=composerBody.clipboardImageItems(items);
+  if(!images.length&&!rejectedTypes.length)return;
+  // S-001, S-004: буфер с картинкой вставляется картинкой, а не стандартной
+  // вставкой текста и разметки того же буфера. Отменяем стандартную вставку и
+  // когда поддерживаемых картинок нет: иначе редактор сам вставил бы картинку
+  // неподдерживаемого типа в тело письма молча.
+  e.preventDefault();
+  rejectedTypes.forEach(type=>showToast(L(`Не вставлено: неподдерживаемый тип картинки (${type})`,`Not inserted: unsupported image type (${type})`)));
+  if(!images.length)return;
+  // Курсор, поколение композера и сами файлы берём в момент вставки, а не
+  // когда до них дойдёт очередь (S-005, S-006, S-009): к этому моменту фокус
+  // или письмо могли смениться, а элементы буфера вне своего события файл уже
+  // не отдают.
+  const generation=composerGeneration;
+  const files=images.map(item=>item.getAsFile()).filter(Boolean);
+  if(!files.length)return;
+  const sel=window.getSelection();
+  const range=sel&&sel.rangeCount&&compEditEl.contains(sel.anchorNode)?sel.getRangeAt(0).cloneRange():null;
+  attachChain=attachChain.then(()=>insertClipboardImages(files,range,generation)).catch(console.error);
+});
+/* Читает содержимое картинки из буфера как строку data: (S-001): FileReader,
+   а не Tauri API - файл уже есть в памяти, путь на диске не нужен. */
+function fileToDataUrl(file){
+  return new Promise((resolve,reject)=>{
+    const reader=new FileReader();
+    reader.onload=()=>resolve(String(reader.result||''));
+    reader.onerror=()=>reject(reader.error||new Error('read failed'));
+    reader.readAsDataURL(file);
+  });
+}
+/* Вставка в Range с возвратом позиции сразу после вставленного узла - следующая
+   картинка той же вставки встаёт сразу за предыдущей, а не поверх неё (S-003). */
+/* Вставляем через тот же механизм, каким вставляет сам редактор: тогда
+   картинку снимает обычная отмена (Ctrl+Z), как любую другую правку текста.
+   Выделение перед этим возвращаем на сохранённое место: пока картинка
+   читалась, фокус мог уйти в другое поле. */
+function insertImageAtRange(range,html){
+  const target=range||defaultInsertRange();
+  compEditEl.focus();
+  const sel=window.getSelection();
+  sel.removeAllRanges();sel.addRange(target);
+  document.execCommand('insertHTML',false,html);
+  const after=sel.rangeCount?sel.getRangeAt(0).cloneRange():defaultInsertRange();
+  after.collapse(false);
+  return after;
+}
+/* Курсора в теле письма может не быть (например, только что открыто новое
+   письмо и поле тела ещё не в фокусе) - вставляем в конец тела (S-006: для
+   пустого тела конец совпадает с началом). */
+function defaultInsertRange(){
+  const r=document.createRange();r.selectNodeContents(compEditEl);r.collapse(false);return r;
+}
+async function insertClipboardImages(files,initialRange,generation){
+  if(generation!==composerGeneration)return;
+  let range=initialRange,inserted=false;
+  for(const file of files){
+    if(generation!==composerGeneration)return;
+    let dataUrl;
+    try{dataUrl=await fileToDataUrl(file);}catch(error){showToast(error.message||String(error));continue;}
+    if(generation!==composerGeneration)return;
+    const parsed=composerBody.parseDataUrl(dataUrl);
+    if(!parsed)continue; // тип не разобрался как поддерживаемая картинка - пропускаем без сообщения, отбор уже прошёл clipboardImageItems
+    if(!composerBody.fitsMessageLimit(composerTotalBytes(),parsed.byteLength)){
+      // S-007, S-003: эта картинка не вставляется, следующие проверяются на общих основаниях.
+      showToast(L(`Не вставлено: картинка не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,`Not inserted: the image does not fit, the whole message together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`));
+      continue;
+    }
+    range=insertImageAtRange(range,composerBody.buildImageTag(parsed.mimeType,dataUrl.slice(dataUrl.indexOf(',')+1)));
+    inserted=true;
+  }
+  // S-010: сохранение черновика запускается сразу после вставки, не дожидаясь
+  // следующего нажатия клавиши - программная вставка события ввода не порождает.
+  if(inserted)scheduleDraftSave();
+}
 document.getElementById('compAttach').onclick=()=>document.getElementById('compFile').click();
 document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};

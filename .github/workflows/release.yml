@@ -134,8 +134,8 @@ jobs:
           Push-Location apps\desktop\src-tauri
           try { cargo tauri build --bundles nsis } finally { Pop-Location }
       - name: Залить ассеты
-        # GitHub принимает .exe ассетом напрямую - zip-обёртка времён GitVerse
-        # не нужна, updater ставит NSIS-инсталлятор по его же .sig.
+        # GitHub принимает .exe ассетом напрямую: zip-обёртка не нужна,
+        # updater ставит NSIS-инсталлятор по его же .sig.
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
