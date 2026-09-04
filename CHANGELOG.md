@@ -7,6 +7,23 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-09-04
+
+### Added
+
+- A pasted screenshot or an image copied from a browser lands right in the
+  message body at the cursor instead of silently becoming a file attachment.
+  The image is sent as a proper inline part with a Content-ID inside
+  multipart/related, so recipients see it in every mail client. The same now
+  holds for forwarded messages and signatures with inline images: they used to
+  arrive as a raw data string in the body and stayed invisible. A normal undo
+  removes the pasted image, and the image survives the saved draft.
+- Files dragged from Explorer onto the program window attach to the open
+  message; when no message is open, one opens on its own and nothing already
+  typed is lost. Dragging used to do nothing at all: file events never reached
+  the interface. Bytes of images in the body count toward the same 25 MB
+  per-message limit as attachments.
+
 ## [0.2.10] - 2026-09-03
 
 ### Fixed
