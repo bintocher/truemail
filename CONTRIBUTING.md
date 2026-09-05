@@ -1,13 +1,15 @@
-**English** · [Русский](CONTRIBUTING.ru.md)
+**Русский** · [English](CONTRIBUTING.en.md)
 
-# Contributing to truemail
+# Участие в разработке truemail
 
-1. Discuss substantial changes in an issue before implementation.
-2. Do not commit tokens, passwords, `.env` files or local databases.
-3. Run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`
-   and `cargo test --workspace` before opening a pull request.
-4. Add tests for protocol, storage and security behavior changed by the patch.
-5. Include `I have read and agree to CLA.md` in the pull request description.
+1. Обсуждайте существенные изменения в issue до начала реализации.
+2. Не коммитьте токены, пароли, файлы `.env` или локальные базы данных.
+3. Перед открытием pull request запустите `cargo fmt --all -- --check`,
+   `cargo clippy --workspace --all-targets -- -D warnings` и
+   `cargo test --workspace`.
+4. Добавляйте тесты на изменения в поведении протоколов, хранилища и
+   безопасности.
+5. Укажите в описании pull request фразу `I have read and agree to CLA.md`.
 
-Bug reports must remove personal mail contents, OAuth tokens and local paths
-before attaching logs.
+Перед прикреплением логов к багрепорту удалите из них содержимое личной почты,
+OAuth-токены и локальные пути.

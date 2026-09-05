@@ -23,7 +23,7 @@
 - Новый модуль чистых функций `apps/desktop/ui/modules/composer-body.js` и проверки к нему в `apps/desktop/tests/js/`, подключение и метка версии в `apps/desktop/ui/index.html`.
 - `apps/desktop/ui/styles.css`: подсветка области, на которую перетаскивают файлы.
 - `crates/core/src/backend/smtp.rs`: вынос встроенных картинок из текста письма в отдельные части с `Content-ID`, сборка `multipart/related`, учёт их байтов в пределе размера, проверки.
-- `CHANGELOG.md`, `CHANGELOG.ru.md`.
+- `CHANGELOG.md` (русский), `CHANGELOG.en.md` (английский).
 
 ## Что не входит в задачу
 

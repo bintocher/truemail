@@ -26,6 +26,9 @@ jobs:
       OPENSSL_NO_VENDOR: 1
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Проверке меток версий нужен доступ к состоянию базовой ветки.
+          fetch-depth: 0
       - name: Системные зависимости Tauri
         run: |
           sudo apt-get update
@@ -45,6 +48,14 @@ jobs:
           node-version: '24'
       - name: JS tests
         run: node --test "apps/desktop/tests/js/*.test.js"
+      # Изменённый файл интерфейса без поднятой метки ?v= означает, что после
+      # обновления пользователь продолжит выполнять старую копию файла из кэша
+      # (specs/ui-cache-tag-check.md).
+      - name: Метки версий файлов интерфейса
+        env:
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: node scripts/check-ui-cache-tags.js
 
   windows:
     # Нативная Windows: Tauri/NSIS и WebView2 нельзя проверить в Linux.

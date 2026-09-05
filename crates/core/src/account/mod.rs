@@ -73,6 +73,54 @@ pub struct InboxSyncResult {
     pub changed: bool,
 }
 
+/// Сколько тел писем догружаем за один проход синхронизации
+/// (gmail-local-body-prefetch.md, S-005).
+const BODY_PREFETCH_PER_PASS: i64 = 50;
+/// Письма крупнее этого размера в фоне не качаем: они тянут вложения целиком,
+/// а нужны редко. Их тело скачивается при открытии письма (S-006).
+const BODY_PREFETCH_MAX_SIZE: i64 = 5 * 1024 * 1024;
+
+/// Итог фоновой догрузки тел писем за один проход.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyPrefetch {
+    /// Скачано тел писем.
+    pub fetched: usize,
+    /// Письма, тело которых скачать не удалось.
+    pub failed: usize,
+    /// Осталось писем без тела в этом окне отбора.
+    pub remaining: usize,
+}
+
+/// Чем закончился проход, в котором часть папок пропущена из-за обрыва связи
+/// (imap-reconnect-resilience.md, S-007 и S-008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkippedFolders {
+    /// Пропусков не было.
+    None,
+    /// Часть папок пропущена: письма из остальных сохраняются, пользователь
+    /// видит предупреждение.
+    Warn(String),
+    /// Не прочитана ни одна папка: пустой результат нельзя выдавать за успех.
+    Failed(String),
+}
+
+/// Решение по пропущенным папкам. Вынесено отдельно, чтобы проверять правило
+/// без сети и без базы.
+pub fn skipped_folders_outcome(skipped: &[String], total_folders: usize) -> SkippedFolders {
+    let Some(first) = skipped.first() else {
+        return SkippedFolders::None;
+    };
+    let count = skipped.len();
+    if count >= total_folders {
+        return SkippedFolders::Failed(format!(
+            "связь обрывалась, ни одна папка не прочитана (пропущено {count}, первая: {first})"
+        ));
+    }
+    SkippedFolders::Warn(format!(
+        "Из-за обрыва связи пропущено папок: {count} (первая: {first})"
+    ))
+}
+
 /// Результат догрузки старых писем папки: сколько пришло с сервера и какая
 /// теперь самая старая дата в папке локально. Дату фронтенд использует курсором
 /// следующего прохода - по своему списку писем он её вычислить не может, если
@@ -87,6 +135,43 @@ pub struct BackfillPage {
 enum SyncKind {
     Mail,
     Auxiliary,
+}
+
+#[cfg(test)]
+mod skipped_folders_tests {
+    //! imap-reconnect-resilience.md, S-006 - S-008.
+    use super::{SkippedFolders, skipped_folders_outcome};
+
+    #[test]
+    fn a_pass_without_skips_reports_nothing() {
+        assert_eq!(skipped_folders_outcome(&[], 5), SkippedFolders::None);
+    }
+
+    #[test]
+    fn a_partial_pass_warns_and_names_the_first_folder() {
+        let skipped = vec!["INBOX".to_string(), "Archive".to_string()];
+        match skipped_folders_outcome(&skipped, 7) {
+            SkippedFolders::Warn(text) => {
+                assert!(
+                    text.contains('2'),
+                    "в предупреждении нет числа папок: {text}"
+                );
+                assert!(text.contains("INBOX"), "в предупреждении нет имени: {text}");
+            }
+            other => panic!("ожидалось предупреждение, получено {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pass_without_a_single_readable_folder_fails() {
+        let skipped = vec!["INBOX".to_string(), "Sent".to_string()];
+        match skipped_folders_outcome(&skipped, 2) {
+            SkippedFolders::Failed(text) => {
+                assert!(text.contains("ни одна папка"), "неожиданный текст: {text}");
+            }
+            other => panic!("ожидалась ошибка прохода, получено {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1031,6 +1116,76 @@ impl AccountManager {
         self.db.store_fetched_raw(message_id, &raw).await?;
         tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
+    }
+
+    /// Фоновая догрузка тел писем аккаунта (gmail-local-body-prefetch.md).
+    /// Письма Gmail приходят при синхронизации без тела, поэтому без этой
+    /// догрузки первое открытие каждого письма упирается в сеть.
+    /// Возвращает, сколько тел скачано, сколько писем не удалось скачать и
+    /// сколько писем без тела осталось в этом окне отбора.
+    pub async fn prefetch_missing_bodies(&self, account: &Account) -> Result<BodyPrefetch> {
+        let pending = self
+            .db
+            .messages_missing_body(
+                account.id,
+                account.retention_days,
+                BODY_PREFETCH_MAX_SIZE,
+                BODY_PREFETCH_PER_PASS,
+            )
+            .await?;
+        if pending.is_empty() {
+            return Ok(BodyPrefetch::default());
+        }
+        let access_token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
+        let mut result = BodyPrefetch {
+            remaining: pending.len(),
+            ..BodyPrefetch::default()
+        };
+        // Запросы идут по одному (S-007): фоновая догрузка не должна вытеснять
+        // обычную синхронизацию из квоты почтового сервиса.
+        for (message_id, folder_path, uid, remote_id) in pending {
+            match backend
+                .fetch_message_raw(
+                    &account.email,
+                    &access_token,
+                    &folder_path,
+                    uid as u32,
+                    remote_id.as_deref(),
+                )
+                .await
+            {
+                Ok(raw) => {
+                    self.db.store_fetched_raw(message_id, &raw).await?;
+                    result.fetched += 1;
+                    result.remaining -= 1;
+                }
+                Err(error) => {
+                    // Ограничение частоты обращений: прекращаем до следующего
+                    // прохода, иначе квота уйдёт на повторные отказы (S-009).
+                    let rate_limited = matches!(error, crate::Error::RateLimited { .. });
+                    self.remember_gmail_rate_limit(account, &error).await;
+                    tracing::warn!(
+                        message_id,
+                        account = %crate::logging::mask_email(&account.email),
+                        %error,
+                        "фоновая догрузка тела письма не удалась"
+                    );
+                    result.failed += 1;
+                    if rate_limited {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            account = %crate::logging::mask_email(&account.email),
+            fetched = result.fetched,
+            failed = result.failed,
+            remaining = result.remaining,
+            "фоновая догрузка тел писем завершена"
+        );
+        Ok(result)
     }
 
     /// Догрузить с сервера письма папки старше даты `before` и сохранить в базу.
@@ -2349,6 +2504,17 @@ impl AccountManager {
             .await;
         let mail_folders = match imap_result {
             Ok(imap) => {
+                // Обрыв связи посреди обхода папок (imap-reconnect-resilience.md).
+                match skipped_folders_outcome(&imap.skipped_folders, imap.folders.len()) {
+                    SkippedFolders::None => {}
+                    SkippedFolders::Warn(text) => warnings.push(text),
+                    SkippedFolders::Failed(text) => {
+                        return Err(crate::Error::Backend {
+                            backend: "imap-sync".into(),
+                            message: text,
+                        });
+                    }
+                }
                 let saved = match self
                     .db
                     .save_discovered_folders(account.id, &imap.folders)

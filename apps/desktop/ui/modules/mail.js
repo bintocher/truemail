@@ -134,6 +134,52 @@ function updateFolderBadge(row,folder){if(!row)return;let badge=row.querySelecto
 // заниженное число, пока пользователь не прокрутит все папки.
 let coreTagCounts=new Map();
 function tagMessageCount(name){return coreTagCounts.has(name)?coreTagCounts.get(name):messages.reduce((total,message)=>total+((message.labels||[]).includes(name)?1:0),0);}
+// Подзаголовок списка: для папки и метки - число загруженных писем, для
+// сводных представлений - число подключённых ящиков. Правило одно на обычную
+// отрисовку и на перерисовку после смены языка, иначе переключение языка
+// меняло бы смысл подписи (ui-language-switch.md, S-009).
+window.renderListSubtitle=function(rowCount){
+  const sub=document.getElementById('mailAccountCount');
+  if(!sub)return;
+  const en=wizardLocale==='en';
+  if(currentFolderId!==null||currentTagName!=null){
+    const n=rowCount??currentMessageRows.length;
+    const word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');
+    sub.textContent=`${n} ${word}`;
+    return;
+  }
+  const n=coreAccounts.length;
+  const word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');
+  sub.textContent=`${n} ${word}`;
+};
+// Подписи системных папок собраны по языку в момент отрисовки, поэтому после
+// смены языка их надо переписать (ui-language-switch.md, S-005, S-006). Дерево
+// целиком не пересобираем: пропало бы состояние раскрытия и выделение.
+window.relocalizeFolderTree=function(){
+  document.querySelectorAll('.folder-row[data-folder-id]').forEach(row=>{
+    const folder=coreFolders.find(item=>item.id===Number(row.dataset.folderId));
+    if(!folder)return;
+    const name=row.querySelector('.folder-name');
+    if(name)name.textContent=folderTitle(folder);
+  });
+  // Заголовок открытой папки собран той же функцией.
+  if(currentFolderId!==null){
+    const folder=coreFolders.find(item=>item.id===currentFolderId);
+    const heading=document.querySelector('.listhead h2');
+    // Папка могла исчезнуть (удалена на сервере, а просмотр ещё на неё
+    // ссылается) - тогда ставим общий заголовок, а не оставляем прежний язык.
+    if(heading)heading.textContent=folder?folderTitle(folder):messagesTitle();
+  }
+  // Строки списка собраны в коде: подпись ящика и подпись "без получателя"
+  // остались бы на прежнем языке до следующей прокрутки.
+  renderMessageWindow(true);
+  // Пустое состояние области письма тоже собрано в коде (S-009). Карточку
+  // "нет подключённых аккаунтов" не трогаем: её ставит и переводит мастер.
+  const empty=document.querySelector('#tbody .mail-empty h2');
+  if(empty&&!document.querySelector('#tbody .mail-content')&&!document.querySelector('#tbody .wz-logo')){
+    empty.textContent=currentMessageRows.length?L('Выберите письмо','Select a message'):L('Писем нет','No messages');
+  }
+};
 function renderTagsNav(){const host=document.getElementById('tagsNav');if(!host)return;host.innerHTML='';coreTags.forEach(tag=>{const row=document.createElement('button');row.type='button';row.className='navitem tag-row'+(currentTagName===tag.name?' active':'');row.dataset.tagId=tag.id;row.innerHTML='<span class="tag-dot"></span><span class="tag-name"></span><span class="count"></span>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);if(count)row.querySelector('.count').textContent=count;row.onclick=()=>filterTag(tag);host.appendChild(row);});}
 function renderTagSettings(){const host=document.getElementById('tagSettingsList');if(!host)return;host.innerHTML='';if(!coreTags.length){host.innerHTML=`<div class="note-muted">${L('Меток пока нет','No tags yet')}</div>`;return;}coreTags.forEach(tag=>{const row=document.createElement('div');row.className='tag-settings-row';row.innerHTML='<span class="tag-dot"></span><span class="tag-name grow"></span><span class="count"></span><button type="button" class="btn sm tag-edit"></button>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);row.querySelector('.count').textContent=count?`${count}`:'';row.querySelector('.tag-edit').textContent=L('Изменить','Edit');row.querySelector('.tag-edit').onclick=()=>openLabelEditor(tag);host.appendChild(row);});}
 async function refreshTagsNav(){try{coreTags=await window.tm.listLabels();}catch(_){coreTags=[];}
@@ -299,6 +345,11 @@ function createMessageRow(message,index){
   row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
   row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
   row.querySelector('.time-hm').textContent=message.date?new Date(message.date).toLocaleTimeString(document.documentElement.lang,{hour:'2-digit',minute:'2-digit'}):'';
+  // Ящик письма (message-mailbox-owner.md, S-004): в объединённых списках одно
+  // и то же письмо из двух ящиков выглядит двумя одинаковыми строками, и
+  // отличить их можно только подписью.
+  const mailbox=mailAddresses.listMailboxLabel(message.account_id,coreAccounts,currentFolderId===null,L('ящик удалён','mailbox removed'));
+  if(mailbox){const box=document.createElement('span');box.className='mbox';box.textContent=mailbox;box.title=mailbox;row.querySelector('.meta').appendChild(box);}
   if(message.labels?.length){const meta=row.querySelector('.meta');message.labels.forEach(name=>{const tag=coreTags.find(item=>item.name===name);const badge=document.createElement('span');badge.className='msg-tag';badge.textContent=name;const tagColor=tag?.color||'#888';badge.style.setProperty('--tag-color',tagColor);badge.style.setProperty('--tag-text',contrastOn(tagColor));meta.appendChild(badge);});}
   row.ondragstart=event=>{if(!selectedMessageIds.has(message.id)){selectedMessageIds.clear();selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();}row.classList.add('mail-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-truemail-messages',JSON.stringify([...selectedMessageIds]));};row.ondragend=()=>{row.classList.remove('mail-dragging');document.querySelectorAll('.folder-row.drop-hi').forEach(item=>item.classList.remove('drop-hi'));};
   let swipe=null,suppressClick=false;row.onpointerdown=event=>{if(event.pointerType==='mouse'||event.button!==0)return;swipe={id:event.pointerId,x:event.clientX,y:event.clientY,dx:0};};row.onpointermove=event=>{if(!swipe||event.pointerId!==swipe.id)return;const dx=event.clientX-swipe.x,dy=event.clientY-swipe.y;if(Math.abs(dy)>Math.abs(dx)&&Math.abs(dy)>10){swipe=null;row.style.transform='';return;}if(Math.abs(dx)<8)return;event.preventDefault();swipe.dx=dx;row.classList.add('swiping');row.classList.toggle('swipe-archive',dx>0);row.classList.toggle('swipe-trash',dx<0);row.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`;};const finishSwipe=event=>{if(!swipe||event.pointerId!==swipe.id)return;const action=Math.abs(swipe.dx)>=80?(swipe.dx>0?'archive':'trash'):null;swipe=null;row.classList.remove('swiping','swipe-archive','swipe-trash');row.style.transform='';if(action){suppressClick=true;setTimeout(()=>{suppressClick=false;},250);window.performMessageActionForIds?.(action,[message.id]);}};row.onpointerup=finishSwipe;row.onpointercancel=finishSwipe;
@@ -337,10 +388,7 @@ function renderMessageList(rows,title,resetScroll=false){
   // Заголовок списка - то же пользовательское имя, что и подпись в панели:
   // без пометки словарь автоперевода подменял бы его переводом фразы.
   const heading=document.querySelector('.listhead h2');if(heading){heading.dataset.noI18n='1';heading.textContent=title||messagesTitle();}
-  // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
-  // папок (несколько аккаунтов) - число аккаунтов.
-  const sub=document.getElementById('mailAccountCount');
-  if(sub){if(currentFolderId!==null||currentTagName!=null){const n=rows.length,en=wizardLocale==='en',word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');sub.textContent=`${n} ${word}`;}else{const n=coreAccounts.length,en=wizardLocale==='en',word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');sub.textContent=`${n} ${word}`;}}
+  renderListSubtitle(rows.length);
   renderMessageWindow(true);updateSelectionUi();
   // Панель письма очищена - поколение показа растёт вместе с ней: ответ на
   // запрос, начатый до очистки, рисовать уже некуда (S-001).
@@ -365,6 +413,27 @@ function buildAddressLine(className,labelText,addresses){
   render(false);
   return line;
 }
+// Строка "Ящик" шапки письма (message-mailbox-owner.md, S-001, S-002, S-006).
+// null - подключён один ящик, показывать нечего.
+function buildMailboxLine(accountId){
+  const text=mailAddresses.mailboxLabel(accountId,coreAccounts,L('ящик удалён','mailbox removed'));
+  if(!text)return null;
+  const line=document.createElement('div');line.className='mail-boxline';line.dataset.accountId=String(accountId??'');
+  const label=document.createElement('span');label.className='mail-address-label';label.textContent=L('Ящик: ','Mailbox: ');line.appendChild(label);
+  const value=document.createElement('span');value.className='mail-address-item';value.textContent=text;value.title=text;line.appendChild(value);
+  return line;
+}
+// Смена языка не перерисовывает открытое письмо целиком (тело пришлось бы
+// собирать заново), поэтому подпись строки "Ящик" обновляем отдельно (S-008).
+window.relocalizeMailboxLine=function(){
+  const line=document.querySelector('.mail-boxline');
+  if(!line)return;
+  const accountId=line.dataset.accountId===''?null:Number(line.dataset.accountId);
+  const text=mailAddresses.mailboxLabel(accountId,coreAccounts,L('ящик удалён','mailbox removed'));
+  if(!text){line.remove();return;}
+  line.querySelector('.mail-address-label').textContent=L('Ящик: ','Mailbox: ');
+  const value=line.querySelector('.mail-address-item');value.textContent=text;value.title=text;
+};
 // Поколение показа письма. Ядро при необходимости докачивает письмо с сервера,
 // поэтому ответы приходят вразнобой: без сверки поколения ответ на первый клик
 // дорисовывал бы своё письмо поверх выбранного вторым (S-001..S-004).
@@ -401,6 +470,10 @@ async function showMessage(message){
     // "Свернуть". Состояния строк независимы.
     const toLine=buildAddressLine('mail-toline',L('Кому: ','To: '),full.meta.to);if(toLine)head.appendChild(toLine);
     const ccLine=buildAddressLine('mail-ccline',L('Копия: ','Cc: '),full.meta.cc);if(ccLine)head.appendChild(ccLine);
+    // Ящик, в который пришло письмо (message-mailbox-owner.md, S-001, S-003).
+    // Это не заголовок письма: у копии, забранной другим ящиком по POP3,
+    // строка "Кому" остаётся исходной, и без этой строки два ящика неразличимы.
+    const mailboxLine=buildMailboxLine(full.meta.account_id);if(mailboxLine)head.appendChild(mailboxLine);
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
     // Отрисовка тела тоже ждёт (проверка доверия отправителю для картинок), и за
     // это время выбор мог смениться - к панели и к отметке прочтения переходим

@@ -1,142 +1,142 @@
-**English** · [Русский](README.ru.md)
+**Русский** · [English](README.en.md)
 
 <p align="center">
   <img src="assets/brand/truemail-logo.svg" alt="truemail" width="380">
 </p>
 
 <p align="center">
-  An open-source desktop mail client written in Rust.
+  Почтовый клиент для компьютера с открытым исходным кодом, написанный на Rust.
 </p>
 
 ---
 
-The program runs on your own computer: mail, calendars and contacts are stored
-locally in an encrypted database. Yandex and Gmail are supported.
+Программа работает на вашем компьютере: письма, календари и контакты хранятся
+локально в зашифрованной базе. Поддерживаются Яндекс и Gmail.
 
-## What it does
+## Что умеет
 
-Mail:
+Почта:
 
-- Connects Yandex, Gmail and Outlook/Microsoft 365 over OAuth, without entering
-  your mailbox password.
-- Connects standard JMAP mail servers through RFC autodiscovery or a Session URL.
-- Receives IMAP mail through a persistent server connection; Gmail uses a light
-  25-second API check and incremental `historyId` synchronization.
-- Sends over SMTP, with drafts, attachments and scheduled sending.
-- Sending queue: with no network, a message goes out on the next connection.
-- Groups a thread into a conversation.
-- Smart folders by conditions, folders spanning every mailbox, processing rules, labels.
-- Search across mail, including text typed in the wrong keyboard layout.
+- Подключение Яндекса, Gmail и Outlook/Microsoft 365 по OAuth, без ввода пароля
+  от ящика.
+- Подключение стандартных JMAP-серверов через автообнаружение RFC или Session URL.
+- Получение писем по IMAP через постоянное соединение; Gmail использует лёгкую
+  проверку API раз в 25 секунд и дельта-синхронизацию по `historyId`.
+- Отправка через SMTP, черновики, вложения, отправка по расписанию.
+- Очередь отправки: если сети нет, письмо уйдёт при следующем подключении.
+- Группировка переписки в беседы.
+- Умные папки по условиям, сквозные папки по всем ящикам, правила обработки, метки.
+- Поиск по письмам, в том числе если текст набран не в той раскладке.
 
-Calendars and contacts:
+Календари и контакты:
 
-- Yandex: calendars and contacts over CalDAV and CardDAV.
-- Gmail: calendars, contacts and tasks through Google services.
-- Meeting reminders.
+- Яндекс: календари и контакты по CalDAV и CardDAV.
+- Gmail: календари, контакты и задачи через сервисы Google.
+- Напоминания о встречах.
 
-Interface:
+Интерфейс:
 
-- Russian and English.
-- Light and dark themes, accent colour, three list densities.
-- Two modes: normal and expert, the latter with additional settings.
-- Built-in new-mail notifications, a system tray icon, start on system startup.
-- "Send to -> truemail" in Windows Explorer: the files become attachments in a new message.
+- Русский и английский языки.
+- Светлая и тёмная темы, выбор цвета оформления, три плотности списка.
+- Два режима: обычный и режим эксперта с дополнительными настройками.
+- Свои уведомления о новых письмах, значок в системном трее, запуск при старте системы.
+- Пункт "Отправить -> truemail" в проводнике Windows: файлы уходят вложениями в новое письмо.
 
-## Build and run
+## Сборка и запуск
 
 ```sh
-make setup     # install tauri-cli and sqlx-cli (once)
-make dev       # run the program
+make setup     # установить tauri-cli и sqlx-cli (один раз)
+make dev       # запустить программу
 ```
 
-The database schema updates automatically on startup. On Windows the first build
-downloads a verified portable Strawberry Perl into `temp/` if a full Perl is not
-on `PATH` — it is only needed while building.
+Схема базы обновляется автоматически при запуске. На Windows при первой сборке
+скачивается проверенная переносимая сборка Strawberry Perl в папку `temp/`,
+если полного Perl нет в `PATH` — он нужен только во время сборки.
 
-After `make dev` stops, only build files unused for 30 days are removed. To see
-the list beforehand: `make sweep-preview`.
+После остановки `make dev` удаляются только те файлы сборки, которыми не
+пользовались 30 дней. Посмотреть список заранее: `make sweep-preview`.
 
-## Connecting mail
+## Подключение почты
 
-A released build connects mailboxes on its own. If you build from source, you
-need to register your own application with Yandex, Google and Microsoft and
-provide the identifiers they issue: the repository does not contain them.
+Готовая программа подключает ящики сама. Если вы собираете её из исходников,
+нужно зарегистрировать своё приложение у Яндекса, Google и Microsoft и указать
+выданные идентификаторы: в репозитории их нет.
 
-Copy `.env.example` to `.env` and fill in the values. `.env` stays out of Git,
-and `make dev` reads it while building.
+Скопируйте `.env.example` в `.env` и заполните значения. Файл `.env` в Git не
+попадает, `make dev` читает его при сборке.
 
 ```dotenv
-TRUEMAIL_YANDEX_CLIENT_ID=your_yandex_application_id
+TRUEMAIL_YANDEX_CLIENT_ID=идентификатор_приложения_яндекса
 TRUEMAIL_YANDEX_REDIRECT_URI=http://127.0.0.1:34982/oauth/yandex/callback
-TRUEMAIL_GOOGLE_CLIENT_ID=your_google_application_id
-TRUEMAIL_GOOGLE_CLIENT_SECRET=the_string_google_issues
-TRUEMAIL_MICROSOFT_CLIENT_ID=your_entra_application_id
+TRUEMAIL_GOOGLE_CLIENT_ID=идентификатор_приложения_google
+TRUEMAIL_GOOGLE_CLIENT_SECRET=строка_выданная_google
+TRUEMAIL_MICROSOFT_CLIENT_ID=идентификатор_приложения_entra
 TRUEMAIL_MICROSOFT_TENANT=common
 ```
 
-Yandex needs no application password. Google issues one even for programs on a
-computer and requires it when connecting, so it is listed here.
+Яндексу пароль приложения не нужен. Google выдаёт его даже для программ на
+компьютере и требует при подключении, поэтому он указывается здесь.
 
-Yandex: an application of type `Web services`, exact callback URL
-`http://127.0.0.1:34982/oauth/yandex/callback`, permissions `mail:imap_full`,
+Яндекс: приложение с типом `Веб-сервисы`, точный адрес для ответа
+`http://127.0.0.1:34982/oauth/yandex/callback`, права `mail:imap_full`,
 `mail:smtp`, `calendar:all`, `directory:read_external_contacts`,
 `directory:write_external_contacts`.
 
-Google: a project in [Google Cloud Console](https://console.cloud.google.com/),
-with `Gmail API` enabled, access permission `https://mail.google.com/` and an
-application of type `Desktop app`. No callback URL is needed: the program
-receives the answer on a temporary `http://127.0.0.1` address on a random port.
+Google: проект в [Google Cloud Console](https://console.cloud.google.com/),
+включённый `Gmail API`, право доступа `https://mail.google.com/` и приложение
+с типом `Desktop app`. Адрес для ответа указывать не нужно: программа принимает
+ответ на временный адрес `http://127.0.0.1` со случайным портом.
 
-Microsoft: a Microsoft Entra application for personal and organizational
-accounts, platform `Mobile and desktop applications`, public client flow
-enabled, and delegated permissions `IMAP.AccessAsUser.All` and `SMTP.Send`.
-Register the loopback path `/oauth/microsoft/callback`; truemail chooses its
-port at run time and requests `offline_access` for token refresh.
+Microsoft: приложение Microsoft Entra для личных и рабочих аккаунтов, платформа
+`Mobile and desktop applications`, разрешённый public client flow и
+делегированные права `IMAP.AccessAsUser.All`, `SMTP.Send`. Зарегистрируйте
+loopback-путь `/oauth/microsoft/callback`; порт truemail выбирает при запуске и
+запрашивает `offline_access` для обновления токена.
 
-## How data is stored
+## Хранение данных
 
-On first run you choose a language, review the setup process, choose a folder for the data, and create the
-encryption keys by moving the mouse. Those random movements are mixed with
-random numbers from the operating system, so the key cannot be predicted. Keys
-are kept in the system password store.
+При первом запуске вы выбираете язык, знакомитесь с процессом, выбираете папку для данных и создаёте ключи
+шифрования, двигая мышью. Случайные движения смешиваются со случайными числами
+операционной системы — так ключ нельзя предсказать. Ключи хранятся в системном
+хранилище паролей.
 
-The whole database is encrypted, including internal data and the search index.
-Message texts and attachments are encrypted separately. OAuth providers do not
-share mailbox passwords. Passwords for app-password IMAP and self-hosted
-Exchange are kept only in the operating system credential store.
+Зашифрована вся база целиком, включая служебные данные и поисковый индекс.
+Тексты писем и вложения шифруются отдельно. OAuth-провайдеры не передают
+программе пароль от ящика. Пароли приложений IMAP и self-hosted Exchange
+хранятся только в системном хранилище учётных данных.
 
-## Structure
+## Структура
 
 ```
-crates/core/            core: models, transport, storage, search, encryption
-  migrations/           database schema
-  src/model/              shared model (message, event, contact, account, folder)
-  src/backend/             IMAP and SMTP for Yandex and Gmail
-  src/storage/             encrypted database and attachment store
-  src/crypto/              data encryption, keys in the system store
-  src/search/               search aware of the keyboard layout
-  src/account/              accounts and automatic setup
-  src/i18n/                  translations
-apps/desktop/            desktop program
-  src-tauri/                link between the interface and the core
-  ui/                       interface, modules and RU/EN JSON catalogs
+crates/core/            ядро: модели, транспорт, хранилище, поиск, шифрование
+  migrations/           схема базы данных
+  src/model/              общая модель (письмо, событие, контакт, аккаунт, папка)
+  src/backend/             работа с IMAP и SMTP Яндекса и Gmail
+  src/storage/             зашифрованная база и хранилище вложений
+  src/crypto/              шифрование данных, ключи в системном хранилище
+  src/search/               поиск с учётом раскладки клавиатуры
+  src/account/              аккаунты и автоматическая настройка
+  src/i18n/                  переводы
+apps/desktop/            программа для компьютера
+  src-tauri/                связь интерфейса с ядром
+  ui/                       интерфейс, модули и JSON-каталоги RU/EN
 ```
 
-## License
+## Лицензия
 
-Dual licensing: [AGPL-3.0](LICENSE) (open) plus a commercial license for those
-who do not want to open their own code. See [LICENSING.md](LICENSING.md) for
-details. For commercial inquiries: bintocher@yandex.com.
+Двойное лицензирование: [AGPL-3.0](LICENSE) (открытая) + коммерческая лицензия для
+тех, кто не хочет открывать свой код. Подробности — в [LICENSING.md](LICENSING.md).
+По коммерческим вопросам: bintocher@yandex.com.
 
-## Contributing
+## Участие в разработке
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Contributions are accepted under
+См. [CONTRIBUTING.md](CONTRIBUTING.md). Вклад принимается на условиях
 [CLA.md](CLA.md).
 
-## Security
+## Безопасность
 
-See [SECURITY.md](SECURITY.md) for how to report vulnerabilities.
+О том, как сообщить об уязвимости, см. [SECURITY.md](SECURITY.md).
 
-## Support
+## Поддержать
 
-The project is free and open source. [Support development](DONATE.md).
+Проект бесплатный и открытый. [Поддержать разработку](DONATE.md).

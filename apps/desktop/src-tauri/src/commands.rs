@@ -1422,7 +1422,7 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
 }
 
 /// Запустить разовую фоновую починку кодировок уже сохранённой почты (issue
-/// #41, docs/specs/message-charset-decoding.md, S-009) и не ждать её: ошибка
+/// #41, specs/message-charset-decoding.md, S-009) и не ждать её: ошибка
 /// задачи логируется и не роняет приложение. Вызывается во всех трёх точках,
 /// где ядро становится рабочим на всю сессию - при старте приложения
 /// (main.rs), при создании хранилища мастером настройки и после
@@ -3286,6 +3286,15 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             } else {
                 Ok(truemail_core::storage::repo::AuxiliarySaveResult::default())
             };
+            // Тела писем, пришедших без содержимого (Gmail отдаёт при
+            // синхронизации только заголовки), догружаем сразу после успешной
+            // синхронизации - иначе первое открытие каждого письма упирается в
+            // сеть (gmail-local-body-prefetch.md, S-001).
+            if mail.is_ok()
+                && let Err(error) = sync_core.accounts.prefetch_missing_bodies(&account).await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая догрузка тел писем отложена");
+            }
             let state = match (mail, auxiliary) {
                 (Ok(result), Ok(aux)) => {
                     if !aux.changes.is_empty() {

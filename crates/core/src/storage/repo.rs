@@ -2078,7 +2078,11 @@ impl Db {
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
-                .bind(source.draft as i64).bind(!attachments.is_empty() as i64).bind(dkim).bind(spf)
+                .bind(source.draft as i64)
+                // Признак вложений от сервера важнее разбора: у лёгкой проекции
+                // сырого письма нет, и по нему вложения не видны
+                // (ews-lightweight-message-fetch.md, S-007).
+                .bind(source.has_attachments.unwrap_or(!attachments.is_empty()) as i64).bind(dkim).bind(spf)
                 .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64)
                 .bind(backfilled as i64).execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
@@ -2688,6 +2692,36 @@ impl Db {
         Ok(row.map(|(account_id, path, uid, remote_id, body_fetched)| {
             (account_id, path, uid, remote_id, body_fetched != 0)
         }))
+    }
+
+    /// Письма аккаунта, у которых нет тела: их надо докачать заранее, чтобы
+    /// письмо открывалось локально (gmail-local-body-prefetch.md, S-002 - S-006).
+    /// `retention_days` = 0 - без ограничения по времени. Письма больше
+    /// `max_size_bytes` пропускаем: их качают по открытию.
+    /// Порядок - от новых к старым.
+    pub async fn messages_missing_body(
+        &self,
+        account_id: i64,
+        retention_days: i64,
+        max_size_bytes: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, i64, Option<String>)>> {
+        let cutoff = if retention_days > 0 {
+            Some(format!("-{retention_days} days"))
+        } else {
+            None
+        };
+        let rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, f.remote_path, m.uid, m.remote_id              FROM messages m JOIN folders f ON f.id = m.folder_id              WHERE m.account_id = ? AND m.body_fetched = 0                AND (m.size IS NULL OR m.size <= ?)                AND (? IS NULL OR (m.date IS NOT NULL AND m.date >= datetime('now', ?)))              ORDER BY m.date DESC, m.id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(max_size_bytes)
+        .bind(cutoff.as_deref())
+        .bind(cutoff.as_deref())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Сохранить докачанный с сервера сырой MIME и пометить тело загруженным.
@@ -4209,6 +4243,48 @@ impl Db {
             .await
     }
 
+    /// Окружение отбора писем умной папки: набор включённых папок, аккаунты,
+    /// папки и (по требованию) метки. Одно на список и на счётчик, чтобы
+    /// правило вхождения письма не разъезжалось по двум копиям
+    /// (smart-folder-selection-shared.md, S-001).
+    async fn smart_selection_context(&self, with_labels: bool) -> Result<SmartSelectionContext> {
+        let included = sqlx::query_as::<_, (i64,)>(SMART_INCLUDED_FOLDERS_SQL)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| row.0)
+            .collect::<std::collections::HashSet<_>>();
+        let accounts = self
+            .list_accounts()
+            .await?
+            .into_iter()
+            .map(|account| (account.id, account.email))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut folders = std::collections::HashMap::new();
+        for account_id in accounts.keys() {
+            for folder in self.list_folders(*account_id).await? {
+                folders.insert(folder.id, folder);
+            }
+        }
+        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
+        if with_labels {
+            let label_rows: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
+            )
+            .fetch_all(&self.pool)
+            .await?;
+            for (message_id, name) in label_rows {
+                labels.entry(message_id).or_default().push(name);
+            }
+        }
+        Ok(SmartSelectionContext {
+            included,
+            accounts,
+            folders,
+            labels,
+        })
+    }
+
     pub async fn list_smart_folder_messages_page(
         &self,
         stable_id: &str,
@@ -4222,38 +4298,7 @@ impl Db {
             .into_iter()
             .find(|folder| folder.id == stable_id)
             .ok_or_else(|| crate::Error::Other("умная папка не найдена".into()))?;
-        let included = sqlx::query_as::<_, (i64,)>(
-            "SELECT f.id FROM folders f
-             LEFT JOIN unified_sources us ON us.folder_id=f.id
-               AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
-             WHERE COALESCE(us.included, 1)=1",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.0)
-        .collect::<std::collections::HashSet<_>>();
-        let accounts = self
-            .list_accounts()
-            .await?
-            .into_iter()
-            .map(|account| (account.id, account.email))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut folders = std::collections::HashMap::new();
-        for account_id in accounts.keys() {
-            for folder in self.list_folders(*account_id).await? {
-                folders.insert(folder.id, folder);
-            }
-        }
-        let label_rows: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
-        for (message_id, name) in label_rows {
-            labels.entry(message_id).or_default().push(name);
-        }
+        let mut context = self.smart_selection_context(true).await?;
         const SCAN_PAGE_SIZE: i64 = 1_000;
         let page_size = limit.clamp(1, 500);
         let mut cursor = before_date
@@ -4262,41 +4307,18 @@ impl Db {
         let mut result = Vec::new();
         loop {
             let rows = if let Some((date, id)) = &cursor {
-                sqlx::query_as::<_, MessageRow>(
-                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
-                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
-                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
-                     FROM messages
-                     WHERE (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?))
-                       AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
-                       AND NOT EXISTS (
-                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
-                       )
-                     ORDER BY date DESC, id DESC LIMIT ?",
-                )
-                .bind(date)
-                .bind(date)
-                .bind(id)
-                .bind(SCAN_PAGE_SIZE)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, MessageRow>(SMART_PAGE_AFTER_CURSOR_SQL)
+                    .bind(date)
+                    .bind(date)
+                    .bind(id)
+                    .bind(SCAN_PAGE_SIZE)
+                    .fetch_all(&self.pool)
+                    .await?
             } else {
-                sqlx::query_as::<_, MessageRow>(
-                    "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
-                            from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
-                            seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
-                     FROM messages
-                     WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
-                       AND NOT EXISTS (
-                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                           AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
-                       )
-                     ORDER BY date DESC, id DESC LIMIT ?",
-                )
-                .bind(SCAN_PAGE_SIZE)
-                .fetch_all(&self.pool)
-                .await?
+                sqlx::query_as::<_, MessageRow>(SMART_PAGE_FIRST_SQL)
+                    .bind(SCAN_PAGE_SIZE)
+                    .fetch_all(&self.pool)
+                    .await?
             };
             let row_count = rows.len();
             let Some(last) = rows.last() else {
@@ -4304,17 +4326,10 @@ impl Db {
             };
             let next_cursor = (last.date.clone().unwrap_or_default(), last.id);
             for row in rows {
-                let mut message = MessageMeta::from(row);
-                if !included.contains(&message.folder_id) {
+                let Some(message) = context.prepare(row, true) else {
                     continue;
-                }
-                message.labels = labels.remove(&message.id).unwrap_or_default();
-                if smart_folder_matches(
-                    &folder,
-                    &message,
-                    accounts.get(&message.account_id).map(String::as_str),
-                    folders.get(&message.folder_id),
-                ) {
+                };
+                if context.matches(&folder, &message) {
                     result.push(message);
                     if result.len() >= page_size {
                         return Ok(result);
@@ -4349,32 +4364,9 @@ impl Db {
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
-        let included = sqlx::query_as::<_, (i64,)>(
-            "SELECT f.id FROM folders f
-             LEFT JOIN unified_sources us ON us.folder_id=f.id
-               AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
-             WHERE COALESCE(us.included, 1)=1",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.0)
-        .collect::<std::collections::HashSet<_>>();
-        let accounts = self
-            .list_accounts()
-            .await?
-            .into_iter()
-            .map(|account| (account.id, account.email))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut folders = std::collections::HashMap::new();
-        for account_id in accounts.keys() {
-            for folder in self.list_folders(*account_id).await? {
-                folders.insert(folder.id, folder);
-            }
-        }
         // Метки читаем, только если хоть одна папка по ним отбирает: иначе это
         // лишний проход по всей таблице связей ради данных, которые никто не
-        // спросит.
+        // спросит (S-006).
         let needs_labels = wanted.iter().any(|folder| {
             folder.groups.iter().any(|group| {
                 group
@@ -4383,47 +4375,20 @@ impl Db {
                     .any(|condition| condition.field == "label")
             })
         });
-        let mut labels = std::collections::HashMap::<i64, Vec<String>>::new();
-        if needs_labels {
-            let label_rows: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT ml.message_id, l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id",
-            )
-            .fetch_all(&self.pool)
-            .await?;
-            for (message_id, name) in label_rows {
-                labels.entry(message_id).or_default().push(name);
-            }
-        }
+        let mut context = self.smart_selection_context(needs_labels).await?;
         // Читаем таблицу одним потоковым проходом. Постраничный курсор, как в
         // выборке писем, здесь дал бы квадратичную работу: условие по
         // COALESCE(date, '') под индекс не подводится, и каждая следующая
         // страница заново перебирала бы все предыдущие. Строки обрабатываются по
         // мере поступления, поэтому в памяти не накапливаются.
         let mut counts = vec![(0_i64, 0_i64); wanted.len()];
-        let mut rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
-                    from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
-                    seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
-             FROM messages
-             WHERE (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
-               AND NOT EXISTS (
-                 SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                   AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
-               )",
-        )
-        .fetch(&self.pool);
+        let mut rows = sqlx::query_as::<_, MessageRow>(SMART_STREAM_SQL).fetch(&self.pool);
         while let Some(row) = rows.try_next().await? {
-            let mut message = MessageMeta::from(row);
-            if !included.contains(&message.folder_id) {
+            let Some(message) = context.prepare(row, needs_labels) else {
                 continue;
-            }
-            if needs_labels {
-                message.labels = labels.remove(&message.id).unwrap_or_default();
-            }
-            let account = accounts.get(&message.account_id).map(String::as_str);
-            let source_folder = folders.get(&message.folder_id);
+            };
             for (index, folder) in wanted.iter().enumerate() {
-                if smart_folder_matches(folder, &message, account, source_folder) {
+                if context.matches(folder, &message) {
                     counts[index].0 += 1;
                     if !message.flags.seen {
                         counts[index].1 += 1;
@@ -4635,7 +4600,7 @@ impl Db {
         Ok(contacts)
     }
 
-    // ---------- Починка кодировок (issue #41, docs/specs/message-charset-decoding.md) ----------
+    // ---------- Починка кодировок (issue #41, specs/message-charset-decoding.md) ----------
 
     /// Разовая фоновая починка уже сохранённой почты, испорченной парсером без
     /// фичи `mail-parser/full_encoding`. Возвращает число исправленных писем
@@ -4980,6 +4945,92 @@ fn normalize_smart_condition(field: String, op: String, value: String) -> (Strin
     }
     .to_owned();
     (field, op, value)
+}
+
+// ---------- Общий отбор писем умной папки (smart-folder-selection-shared.md) ----------
+
+/// Папки, включённые в объединённый набор. Папка без записи в `unified_sources`
+/// считается включённой.
+const SMART_INCLUDED_FOLDERS_SQL: &str = "SELECT f.id FROM folders f
+     LEFT JOIN unified_sources us ON us.folder_id=f.id
+       AND us.unified_id=(SELECT id FROM unified_folders WHERE role='all')
+     WHERE COALESCE(us.included, 1)=1";
+
+/// Поля письма, нужные списку и счётчику умной папки. Макрос, а не константа:
+/// строки запросов собираются на компиляции через `concat!`.
+macro_rules! message_list_columns_sql {
+    () => {
+        "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
+                from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
+                seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
+         FROM messages"
+    };
+}
+
+/// Письмо участвует в отборе, пока не отложено и по нему нет незавершённого
+/// переноса или удаления (S-002).
+macro_rules! message_alive_sql {
+    () => {
+        "(snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+           AND NOT EXISTS (
+             SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+               AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry')
+           )"
+    };
+}
+
+/// Страница списка после курсора: сортировка по убыванию даты, затем по id.
+const SMART_PAGE_AFTER_CURSOR_SQL: &str = concat!(
+    message_list_columns_sql!(),
+    " WHERE (COALESCE(date, '') < ? OR (COALESCE(date, '') = ? AND id < ?)) AND ",
+    message_alive_sql!(),
+    " ORDER BY date DESC, id DESC LIMIT ?"
+);
+
+/// Первая страница списка.
+const SMART_PAGE_FIRST_SQL: &str = concat!(
+    message_list_columns_sql!(),
+    " WHERE ",
+    message_alive_sql!(),
+    " ORDER BY date DESC, id DESC LIMIT ?"
+);
+
+/// Потоковое чтение для счётчика: без сортировки и без предела (S-007).
+const SMART_STREAM_SQL: &str =
+    concat!(message_list_columns_sql!(), " WHERE ", message_alive_sql!());
+
+/// Данные, по которым решается вхождение письма в умную папку.
+struct SmartSelectionContext {
+    included: std::collections::HashSet<i64>,
+    accounts: std::collections::HashMap<i64, String>,
+    folders: std::collections::HashMap<i64, Folder>,
+    labels: std::collections::HashMap<i64, Vec<String>>,
+}
+
+impl SmartSelectionContext {
+    /// Письмо из строки базы: None, если его папка не включена в объединённый
+    /// набор. Метки подставляются только когда их читали (S-006).
+    fn prepare(&mut self, row: MessageRow, with_labels: bool) -> Option<MessageMeta> {
+        let mut message = MessageMeta::from(row);
+        if !self.included.contains(&message.folder_id) {
+            return None;
+        }
+        if with_labels {
+            message.labels = self.labels.remove(&message.id).unwrap_or_default();
+        }
+        Some(message)
+    }
+
+    /// Единственная проверка вхождения письма в умную папку - одна и та же для
+    /// списка и для счётчика (S-003).
+    fn matches(&self, folder: &SmartFolder, message: &MessageMeta) -> bool {
+        smart_folder_matches(
+            folder,
+            message,
+            self.accounts.get(&message.account_id).map(String::as_str),
+            self.folders.get(&message.folder_id),
+        )
+    }
 }
 
 fn smart_folder_matches(
@@ -5820,10 +5871,97 @@ mod notification_lookup_tests {
     use rand::Rng as _;
     use std::sync::Arc;
 
+    /// smart-folder-selection-shared.md, S-002: условие отбора живых писем
+    /// объявлено один раз, поэтому все три запроса умной папки содержат его
+    /// дословно.
+    #[test]
+    fn smart_folder_queries_share_one_alive_filter() {
+        let alive = message_alive_sql!();
+        assert!(SMART_PAGE_FIRST_SQL.contains(alive));
+        assert!(SMART_PAGE_AFTER_CURSOR_SQL.contains(alive));
+        assert!(SMART_STREAM_SQL.contains(alive));
+    }
+
+    /// S-007: список читает страницами с сортировкой, счётчик - потоком без
+    /// сортировки и без предела.
+    #[test]
+    fn list_and_count_keep_their_own_reading_shape() {
+        assert!(SMART_PAGE_FIRST_SQL.contains("ORDER BY date DESC, id DESC LIMIT ?"));
+        assert!(SMART_PAGE_AFTER_CURSOR_SQL.contains("COALESCE(date, '') < ?"));
+        assert!(!SMART_STREAM_SQL.contains("ORDER BY"));
+        assert!(!SMART_STREAM_SQL.contains("LIMIT"));
+    }
+
     fn random_key() -> [u8; 32] {
         let mut key = [0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         key
+    }
+
+    /// gmail-local-body-prefetch.md, S-002 - S-006, S-011: какие письма
+    /// попадают в фоновую догрузку тел.
+    #[tokio::test]
+    async fn body_prefetch_picks_recent_small_messages_without_a_body() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let insert = |uid: i64, days_ago: i64, size: i64, body_fetched: i64| {
+            let db = &db;
+            async move {
+                let (id,): (i64,) = sqlx::query_as(
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, subject, date, size, body_fetched)                      VALUES (?, ?, ?, ?, 'тест', datetime('now', ?), ?, ?) RETURNING id",
+                )
+                .bind(account_id)
+                .bind(folder_id)
+                .bind(uid)
+                .bind(format!("remote-{uid}"))
+                .bind(format!("-{days_ago} days"))
+                .bind(size)
+                .bind(body_fetched)
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert message");
+                id
+            }
+        };
+        let fresh = insert(1, 0, 1024, 0).await;
+        let older = insert(2, 5, 1024, 0).await;
+        let beyond_retention = insert(3, 40, 1024, 0).await;
+        let huge = insert(4, 1, 40 * 1024 * 1024, 0).await;
+        let already_fetched = insert(5, 1, 1024, 1).await;
+
+        let picked = db
+            .messages_missing_body(account_id, 30, 5 * 1024 * 1024, 50)
+            .await
+            .expect("select messages without body")
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        // S-004: сначала новые. S-002: старше глубины хранения не берём.
+        // S-006: слишком большие пропускаем. S-011: письмо с телом не берём.
+        assert_eq!(picked, vec![fresh, older]);
+        assert!(!picked.contains(&beyond_retention));
+        assert!(!picked.contains(&huge));
+        assert!(!picked.contains(&already_fetched));
+
+        // S-003: без ограничения по времени берём и старые письма.
+        let unlimited = db
+            .messages_missing_body(account_id, 0, 5 * 1024 * 1024, 50)
+            .await
+            .expect("select without retention")
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(unlimited, vec![fresh, older, beyond_retention]);
+
+        // S-005: предел за проход соблюдается.
+        let limited = db
+            .messages_missing_body(account_id, 0, 5 * 1024 * 1024, 1)
+            .await
+            .expect("select with limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0, fresh);
+        assert_eq!(limited[0].1, "INBOX");
     }
 
     /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в
@@ -6241,7 +6379,7 @@ mod notification_lookup_tests {
 }
 
 /// Тесты `Db::repair_broken_charset_messages` (issue #41,
-/// docs/specs/message-charset-decoding.md). Раскодирование само по себе (фича
+/// specs/message-charset-decoding.md). Раскодирование само по себе (фича
 /// `mail-parser/full_encoding`) вне границ этой задачи, поэтому письма ниже
 /// собраны на чистом ASCII/UTF-8 без легаси-кодировок: заголовки с не-ASCII
 /// текстом кодируются RFC 2047 (`=?UTF-8?B?...?=`) - base64+UTF-8 декодируются
@@ -7448,6 +7586,7 @@ mod charset_repair_tests {
                 draft: false,
                 raw,
                 body_fetched: true,
+                has_attachments: None,
             }],
             false,
         )

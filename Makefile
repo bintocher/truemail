@@ -1,7 +1,7 @@
 # truemail - команды разработки
 # Старые build-артефакты чистятся cargo-sweep, актуальный кэш сохраняется.
 
-.PHONY: dev dev-check build migrate-new lint fmt test clean sweep sweep-preview setup
+.PHONY: dev dev-check build migrate-new lint fmt test check-ui-tags clean sweep sweep-preview setup
 
 ifeq ($(OS),Windows_NT)
 DEV_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
@@ -60,6 +60,12 @@ lint:
 test:
 	@$(TEST_CMD)
 	@$(JS_TEST_CMD)
+
+# Метки версий файлов интерфейса: изменённый файл без поднятой метки означает,
+# что после обновления останется старая копия из кэша встроенного браузера.
+# Аргумент - база сравнения (по умолчанию предыдущее состояние ветки).
+check-ui-tags:
+	@node scripts/check-ui-cache-tags.js $(BASE)
 
 clean:
 	cargo clean

@@ -882,6 +882,7 @@ fn project_messages(
                 draft: labels.contains("DRAFT"),
                 raw: raw.clone(),
                 body_fetched,
+                has_attachments: None,
             });
         }
     }
@@ -962,6 +963,7 @@ pub async fn discover(
         changed_remote_ids,
         flag_updates: Vec::new(),
         deleted_uids: Vec::new(),
+        skipped_folders: Vec::new(),
     })
 }
 

@@ -1,28 +1,33 @@
-**English** · [Русский](CLA.ru.md)
+**Русский** · [English](CLA.en.md)
 
-# Contributor License Agreement
+> Перевод предоставлен для удобства. Юридически действующим является текст
+> [CLA.en.md](CLA.en.md) на английском языке; в случае расхождений он имеет приоритет.
 
-This Contributor License Agreement ("Agreement") applies to every contribution
-submitted to the truemail project.
+# Соглашение о лицензии автора вклада (CLA)
 
-By submitting a contribution, you confirm that:
+Настоящее соглашение («Соглашение») применяется к каждому вкладу, отправленному
+в проект truemail.
 
-1. You are legally entitled to submit it and to grant the rights below.
-2. The contribution is your original work, or you have clearly identified any
-   third-party work and complied with its license.
-3. You grant the project owner, chernov <bintocher@yandex.com>, a perpetual,
-   worldwide, non-exclusive, irrevocable, royalty-free copyright license to
-   reproduce, modify, distribute, publicly perform and display, sublicense and
-   relicense the contribution, including as part of proprietary/commercial
-   versions of truemail.
-4. You grant the same patent license for patent claims you can license that are
-   necessarily infringed by your contribution alone or by its combination with
-   truemail. This patent grant terminates for a party that initiates patent
-   litigation alleging that the contribution or truemail infringes a patent.
-5. You retain ownership of your contribution. No support or warranty is
-   required from you; the contribution is provided "AS IS".
+Отправляя вклад, вы подтверждаете, что:
 
-Acceptance is recorded by adding `I have read and agree to CLA.md` to the pull
-request description. For contributions made on behalf of an employer, the
-contributor must have authority to bind that employer or provide a separate
-corporate authorization.
+1. Вы имеете законное право отправить его и предоставить указанные ниже права.
+2. Вклад является вашей оригинальной работой, либо вы явно указали любую
+   стороннюю работу и соблюли условия её лицензии.
+3. Вы предоставляете владельцу проекта, chernov <bintocher@yandex.com>,
+   бессрочную, всемирную, неисключительную, безотзывную, безвозмездную лицензию
+   на воспроизведение, изменение, распространение, публичное исполнение и
+   показ, сублицензирование и перелицензирование вклада, в том числе в составе
+   проприетарных/коммерческих версий truemail.
+4. Вы предоставляете аналогичную патентную лицензию на патентные притязания,
+   которые вы вправе лицензировать и которые неизбежно нарушаются вашим
+   вкладом самим по себе или в сочетании с truemail. Действие этой патентной
+   лицензии прекращается для стороны, которая инициирует патентный судебный
+   иск, утверждая, что вклад или truemail нарушает патент.
+5. Вы сохраняете право собственности на свой вклад. От вас не требуется
+   поддержка или гарантия; вклад предоставляется «как есть» (AS IS).
+
+Принятие соглашения фиксируется добавлением фразы
+`I have read and agree to CLA.md` в описание pull request. Для вкладов,
+сделанных от имени работодателя, автор вклада должен обладать полномочиями
+представлять этого работодателя либо предоставить отдельное корпоративное
+разрешение.

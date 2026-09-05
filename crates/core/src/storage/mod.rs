@@ -1051,6 +1051,7 @@ mod tests {
             draft: false,
             raw: Vec::new(),
             body_fetched: true,
+            has_attachments: None,
         };
         let removed = db
             .reconcile_remote_projections(
@@ -1141,6 +1142,7 @@ mod tests {
                 draft: false,
                 raw: calendar_raw.to_vec(),
                 body_fetched: true,
+                has_attachments: None,
             }],
             false,
         )
@@ -1208,6 +1210,7 @@ mod tests {
                 draft: false,
                 raw: b"Subject: Meeting\r\n\r\npreview".to_vec(),
                 body_fetched: false,
+                has_attachments: None,
             }],
             false,
         )
@@ -1250,6 +1253,7 @@ mod tests {
                 draft: false,
                 raw: b"Subject: Large\r\n\r\nsmall preview".to_vec(),
                 body_fetched: false,
+                has_attachments: None,
             }],
             false,
         )
