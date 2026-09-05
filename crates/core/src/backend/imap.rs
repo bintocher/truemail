@@ -1633,8 +1633,7 @@ async fn discover_with_auth(
 ) -> Result<ImapDiscovery> {
     let mut session = auth.connect().await?;
     let mut reconnects = 0usize;
-    let mut folders =
-        list_folders_with_reconnect(&auth, &mut session, &mut reconnects).await?;
+    let mut folders = list_folders_with_reconnect(&auth, &mut session, &mut reconnects).await?;
     let capabilities = session
         .capabilities()
         .await
@@ -2403,9 +2402,7 @@ mod utf7_tests {
 #[cfg(test)]
 mod reconnect_tests {
     //! Проверки устойчивости к обрыву соединения (imap-reconnect-resilience.md).
-    use super::{
-        Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, reconnect_delay,
-    };
+    use super::{Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, reconnect_delay};
 
     fn backend_error(message: &str) -> Error {
         Error::Backend {

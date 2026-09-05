@@ -134,7 +134,10 @@ mod skipped_folders_tests {
         let skipped = vec!["INBOX".to_string(), "Archive".to_string()];
         match skipped_folders_outcome(&skipped, 7) {
             SkippedFolders::Warn(text) => {
-                assert!(text.contains('2'), "в предупреждении нет числа папок: {text}");
+                assert!(
+                    text.contains('2'),
+                    "в предупреждении нет числа папок: {text}"
+                );
                 assert!(text.contains("INBOX"), "в предупреждении нет имени: {text}");
             }
             other => panic!("ожидалось предупреждение, получено {other:?}"),

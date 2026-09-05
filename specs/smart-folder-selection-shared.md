@@ -1,6 +1,6 @@
 # Единый отбор писем умной папки для списка и счётчика
 
-- Состояние: черновик
+- Состояние: реализована
 - Задача: issue #36
 - Обновлено: 2026-09-05
 - Ревизия: 1
@@ -100,13 +100,13 @@ IF ни одна запрошенная умная папка не отбира�
 
 | Требование | Где проверяется |
 | --- | --- |
-| S-001 | проверка сборки: общее средство используется обеими функциями |
-| S-002 | та же проверка для условия выборки |
-| S-003 | та же проверка для функции вхождения |
-| S-004 | существующие проверки списка умной папки |
-| S-005 | существующие проверки сверки счётчика и списка |
-| S-006 | проверка: без условий по меткам таблица связей не читается |
-| S-007 | существующая проверка многостраничного списка |
+| S-001 | разбор кода: обе функции получают окружение из `smart_selection_context` |
+| S-002 | `notification_lookup_tests::smart_folder_queries_share_one_alive_filter` |
+| S-003 | разбор кода: обе функции проверяют вхождение через `SmartSelectionContext::matches` |
+| S-004 | `notification_lookup_tests::smart_folder_count_matches_the_message_list` |
+| S-005 | `notification_lookup_tests::smart_folder_count_matches_a_multi_page_list` |
+| S-006 | разбор кода: `smart_selection_context(needs_labels)` в счётчике |
+| S-007 | `notification_lookup_tests::list_and_count_keep_their_own_reading_shape` |
 
 ## Отклонённые варианты
 
@@ -120,3 +120,4 @@ IF ни одна запрошенная умная папка не отбира�
 ## История решений
 
 - Ревизия 1 (2026-09-05): первая редакция по issue #36.
+- Реализовано 2026-09-05: `crates/core/src/storage/repo.rs` - `SmartSelectionContext` с методами `prepare` и `matches`, `Repo::smart_selection_context`, объявления запросов `SMART_INCLUDED_FOLDERS_SQL`, `SMART_PAGE_FIRST_SQL`, `SMART_PAGE_AFTER_CURSOR_SQL`, `SMART_STREAM_SQL`.
