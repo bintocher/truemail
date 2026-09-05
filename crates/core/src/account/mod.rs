@@ -73,6 +73,24 @@ pub struct InboxSyncResult {
     pub changed: bool,
 }
 
+/// Сколько тел писем догружаем за один проход синхронизации
+/// (gmail-local-body-prefetch.md, S-005).
+const BODY_PREFETCH_PER_PASS: i64 = 50;
+/// Письма крупнее этого размера в фоне не качаем: они тянут вложения целиком,
+/// а нужны редко. Их тело скачивается при открытии письма (S-006).
+const BODY_PREFETCH_MAX_SIZE: i64 = 5 * 1024 * 1024;
+
+/// Итог фоновой догрузки тел писем за один проход.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BodyPrefetch {
+    /// Скачано тел писем.
+    pub fetched: usize,
+    /// Письма, тело которых скачать не удалось.
+    pub failed: usize,
+    /// Осталось писем без тела в этом окне отбора.
+    pub remaining: usize,
+}
+
 /// Чем закончился проход, в котором часть папок пропущена из-за обрыва связи
 /// (imap-reconnect-resilience.md, S-007 и S-008).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1098,6 +1116,76 @@ impl AccountManager {
         self.db.store_fetched_raw(message_id, &raw).await?;
         tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
+    }
+
+    /// Фоновая догрузка тел писем аккаунта (gmail-local-body-prefetch.md).
+    /// Письма Gmail приходят при синхронизации без тела, поэтому без этой
+    /// догрузки первое открытие каждого письма упирается в сеть.
+    /// Возвращает, сколько тел скачано, сколько писем не удалось скачать и
+    /// сколько писем без тела осталось в этом окне отбора.
+    pub async fn prefetch_missing_bodies(&self, account: &Account) -> Result<BodyPrefetch> {
+        let pending = self
+            .db
+            .messages_missing_body(
+                account.id,
+                account.retention_days,
+                BODY_PREFETCH_MAX_SIZE,
+                BODY_PREFETCH_PER_PASS,
+            )
+            .await?;
+        if pending.is_empty() {
+            return Ok(BodyPrefetch::default());
+        }
+        let access_token = self.mail_credential(account).await?;
+        let backend = Self::mail_backend(account)?;
+        let mut result = BodyPrefetch {
+            remaining: pending.len(),
+            ..BodyPrefetch::default()
+        };
+        // Запросы идут по одному (S-007): фоновая догрузка не должна вытеснять
+        // обычную синхронизацию из квоты почтового сервиса.
+        for (message_id, folder_path, uid, remote_id) in pending {
+            match backend
+                .fetch_message_raw(
+                    &account.email,
+                    &access_token,
+                    &folder_path,
+                    uid as u32,
+                    remote_id.as_deref(),
+                )
+                .await
+            {
+                Ok(raw) => {
+                    self.db.store_fetched_raw(message_id, &raw).await?;
+                    result.fetched += 1;
+                    result.remaining -= 1;
+                }
+                Err(error) => {
+                    // Ограничение частоты обращений: прекращаем до следующего
+                    // прохода, иначе квота уйдёт на повторные отказы (S-009).
+                    let rate_limited = matches!(error, crate::Error::RateLimited { .. });
+                    self.remember_gmail_rate_limit(account, &error).await;
+                    tracing::warn!(
+                        message_id,
+                        account = %crate::logging::mask_email(&account.email),
+                        %error,
+                        "фоновая догрузка тела письма не удалась"
+                    );
+                    result.failed += 1;
+                    if rate_limited {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!(
+            account = %crate::logging::mask_email(&account.email),
+            fetched = result.fetched,
+            failed = result.failed,
+            remaining = result.remaining,
+            "фоновая догрузка тел писем завершена"
+        );
+        Ok(result)
     }
 
     /// Догрузить с сервера письма папки старше даты `before` и сохранить в базу.

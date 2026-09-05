@@ -2690,6 +2690,36 @@ impl Db {
         }))
     }
 
+    /// Письма аккаунта, у которых нет тела: их надо докачать заранее, чтобы
+    /// письмо открывалось локально (gmail-local-body-prefetch.md, S-002 - S-006).
+    /// `retention_days` = 0 - без ограничения по времени. Письма больше
+    /// `max_size_bytes` пропускаем: их качают по открытию.
+    /// Порядок - от новых к старым.
+    pub async fn messages_missing_body(
+        &self,
+        account_id: i64,
+        retention_days: i64,
+        max_size_bytes: i64,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, i64, Option<String>)>> {
+        let cutoff = if retention_days > 0 {
+            Some(format!("-{retention_days} days"))
+        } else {
+            None
+        };
+        let rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, f.remote_path, m.uid, m.remote_id              FROM messages m JOIN folders f ON f.id = m.folder_id              WHERE m.account_id = ? AND m.body_fetched = 0                AND (m.size IS NULL OR m.size <= ?)                AND (? IS NULL OR (m.date IS NOT NULL AND m.date >= datetime('now', ?)))              ORDER BY m.date DESC, m.id DESC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(max_size_bytes)
+        .bind(cutoff.as_deref())
+        .bind(cutoff.as_deref())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Сохранить докачанный с сервера сырой MIME и пометить тело загруженным.
     /// Свежий blob не удаляется прунингом текущей сессии (prune только на старте).
     pub async fn store_fetched_raw(&self, message_id: i64, raw: &[u8]) -> Result<()> {
@@ -5862,6 +5892,72 @@ mod notification_lookup_tests {
         let mut key = [0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         key
+    }
+
+    /// gmail-local-body-prefetch.md, S-002 - S-006, S-011: какие письма
+    /// попадают в фоновую догрузку тел.
+    #[tokio::test]
+    async fn body_prefetch_picks_recent_small_messages_without_a_body() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let folder_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+        let insert = |uid: i64, days_ago: i64, size: i64, body_fetched: i64| {
+            let db = &db;
+            async move {
+                let (id,): (i64,) = sqlx::query_as(
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, subject, date, size, body_fetched)                      VALUES (?, ?, ?, ?, 'тест', datetime('now', ?), ?, ?) RETURNING id",
+                )
+                .bind(account_id)
+                .bind(folder_id)
+                .bind(uid)
+                .bind(format!("remote-{uid}"))
+                .bind(format!("-{days_ago} days"))
+                .bind(size)
+                .bind(body_fetched)
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert message");
+                id
+            }
+        };
+        let fresh = insert(1, 0, 1024, 0).await;
+        let older = insert(2, 5, 1024, 0).await;
+        let beyond_retention = insert(3, 40, 1024, 0).await;
+        let huge = insert(4, 1, 40 * 1024 * 1024, 0).await;
+        let already_fetched = insert(5, 1, 1024, 1).await;
+
+        let picked = db
+            .messages_missing_body(account_id, 30, 5 * 1024 * 1024, 50)
+            .await
+            .expect("select messages without body")
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        // S-004: сначала новые. S-002: старше глубины хранения не берём.
+        // S-006: слишком большие пропускаем. S-011: письмо с телом не берём.
+        assert_eq!(picked, vec![fresh, older]);
+        assert!(!picked.contains(&beyond_retention));
+        assert!(!picked.contains(&huge));
+        assert!(!picked.contains(&already_fetched));
+
+        // S-003: без ограничения по времени берём и старые письма.
+        let unlimited = db
+            .messages_missing_body(account_id, 0, 5 * 1024 * 1024, 50)
+            .await
+            .expect("select without retention")
+            .into_iter()
+            .map(|(id, _, _, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(unlimited, vec![fresh, older, beyond_retention]);
+
+        // S-005: предел за проход соблюдается.
+        let limited = db
+            .messages_missing_body(account_id, 0, 5 * 1024 * 1024, 1)
+            .await
+            .expect("select with limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0, fresh);
+        assert_eq!(limited[0].1, "INBOX");
     }
 
     /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в

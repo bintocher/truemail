@@ -3286,6 +3286,15 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             } else {
                 Ok(truemail_core::storage::repo::AuxiliarySaveResult::default())
             };
+            // Тела писем, пришедших без содержимого (Gmail отдаёт при
+            // синхронизации только заголовки), догружаем сразу после успешной
+            // синхронизации - иначе первое открытие каждого письма упирается в
+            // сеть (gmail-local-body-prefetch.md, S-001).
+            if mail.is_ok()
+                && let Err(error) = sync_core.accounts.prefetch_missing_bodies(&account).await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая догрузка тел писем отложена");
+            }
             let state = match (mail, auxiliary) {
                 (Ok(result), Ok(aux)) => {
                     if !aux.changes.is_empty() {
