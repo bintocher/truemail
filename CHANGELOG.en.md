@@ -7,6 +7,61 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.12] - 2026-09-05
+
+### Added
+
+- Unified lists and the message header now show which mailbox received the
+  message. A message delivered to two connected mailboxes (for example, the
+  original in Gmail and the copy Yandex collects from it over POP3) used to
+  appear as two identical rows, and both headers showed the same address in
+  "To", because the collecting server does not rewrite that header. With a
+  single connected mailbox the label is not shown.
+- Message bodies are fetched in the background after a sync, within the
+  configured local retention. Gmail messages arrive without a body, so opening
+  each message for the first time depended on the network, and the "keep mail
+  locally" setting had no effect on Gmail. A single pass fetches at most 50
+  messages, one request at a time; messages larger than 5 MB are still fetched
+  on open.
+
+### Fixed
+
+- A dropped connection in the middle of a sync no longer wipes out the whole
+  pass over a mailbox. One connection served the entire folder walk, so after a
+  disconnect every remaining folder was skipped silently and the pass finished
+  as a success with zero messages - up to a quarter of all passes on Yandex
+  mailboxes according to the logs. The program now reconnects and repeats the
+  interrupted work, and if no folder could be read at all, the sync reports an
+  error.
+- Switching the interface language no longer translates user data: a tag named
+  "Настройки", a message subject "Календарь", a mailbox folder named
+  "Контакты". The substitution matched text against an internal phrase
+  dictionary, and the protection relied on listing sections by hand.
+- Switching the language immediately redraws the mailbox folder tree, the
+  cards in "Accounts", "Folder mapping" and "Unified folders", and the tag
+  lists. Their labels used to stay in the previous language until the next data
+  load.
+
+### Changed
+
+- The Exchange message list is built without downloading the full raw message:
+  only the needed properties and the message text are requested for a list row,
+  while the complete message with attachments is downloaded on open or by the
+  background prefetch.
+- Russian is the primary documentation language: `README.md`, `CHANGELOG.md`,
+  `CLA.md`, `CONTRIBUTING.md`, `DONATE.md`, `SECURITY.md` and `LICENSING.md`
+  hold the Russian text, and the English versions sit next to them with an
+  `.en` suffix.
+
+### Internal
+
+- The rule that decides whether a message belongs to a smart folder is written
+  once and used by both the list and the counter; it used to be duplicated, so
+  editing one copy drifted from the other.
+- The build checks that a changed interface file got a new version tag in its
+  URL. Without the tag, an update would leave the user running the old copy of
+  the file from the embedded browser cache.
+
 ## [0.2.11] - 2026-09-04
 
 ### Added
