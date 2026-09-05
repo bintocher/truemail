@@ -962,6 +962,7 @@ pub async fn discover(
         changed_remote_ids,
         flag_updates: Vec::new(),
         deleted_uids: Vec::new(),
+        skipped_folders: Vec::new(),
     })
 }
 

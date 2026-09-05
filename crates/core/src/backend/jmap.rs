@@ -465,6 +465,7 @@ impl JmapBackend {
             changed_remote_ids: changed_ids.into_iter().collect(),
             flag_updates: Vec::new(),
             deleted_uids: Vec::new(),
+            skipped_folders: Vec::new(),
         })
     }
 

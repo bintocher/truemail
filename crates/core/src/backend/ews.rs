@@ -812,6 +812,7 @@ impl EwsBackend {
             changed_remote_ids,
             flag_updates: Vec::new(),
             deleted_uids: Vec::new(),
+            skipped_folders: Vec::new(),
         })
     }
 
@@ -844,6 +845,7 @@ impl EwsBackend {
                 changed_remote_ids: Vec::new(),
                 flag_updates: Vec::new(),
                 deleted_uids: Vec::new(),
+                skipped_folders: Vec::new(),
             });
         }
         let folder_xml = format!(r#"<t:FolderId Id="{}"/>"#, escape(&folder.remote_path));
@@ -883,6 +885,7 @@ impl EwsBackend {
             changed_remote_ids,
             flag_updates: Vec::new(),
             deleted_uids: Vec::new(),
+            skipped_folders: Vec::new(),
         })
     }
 

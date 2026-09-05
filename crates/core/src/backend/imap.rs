@@ -223,6 +223,9 @@ pub struct ImapDiscovery {
     pub flag_updates: Vec<DiscoveredFlagUpdate>,
     /// Exact expunged UIDs reported by QRESYNC VANISHED, scoped per mailbox.
     pub deleted_uids: Vec<(String, Vec<u32>)>,
+    /// Папки, пропущенные из-за обрыва соединения (S-006 imap-reconnect-resilience.md).
+    /// Пустой вектор означает, что проход обошёл все папки.
+    pub skipped_folders: Vec<String>,
 }
 
 struct OAuth2<'a> {
@@ -1390,6 +1393,7 @@ async fn discover_inbox(
             .then_some((path, vanished_uids))
             .into_iter()
             .collect(),
+        skipped_folders: Vec::new(),
     })
 }
 
@@ -1480,6 +1484,75 @@ pub async fn wait_for_gmail_change(email: &str, access_token: &str) -> Result<()
     wait_for_oauth_change("imap.gmail.com", email, access_token).await
 }
 
+/// Способ подключения к ящику. Нужен, чтобы после обрыва соединения открыть
+/// новое теми же учётными данными (imap-reconnect-resilience.md).
+enum ImapAuth<'a> {
+    OAuth {
+        host: &'a str,
+        email: &'a str,
+        access_token: &'a str,
+    },
+    Password {
+        host: &'a str,
+        port: u16,
+        security: Security,
+        username: &'a str,
+        password: &'a str,
+    },
+}
+
+impl ImapAuth<'_> {
+    async fn connect(&self) -> Result<OAuthSession> {
+        match self {
+            ImapAuth::OAuth {
+                host,
+                email,
+                access_token,
+            } => connect_oauth(host, email, access_token).await,
+            ImapAuth::Password {
+                host,
+                port,
+                security,
+                username,
+                password,
+            } => connect_password(host, *port, *security, username, password).await,
+        }
+    }
+}
+
+/// Сколько раз повторяем одну операцию после обрыва соединения (S-001, S-002).
+const RECONNECT_ATTEMPTS: usize = 2;
+/// Предел переподключений на один проход по папкам (S-010).
+const RECONNECT_BUDGET: usize = 12;
+
+/// Пауза перед повтором: 1 секунда перед первым, 3 секунды перед вторым (S-003).
+fn reconnect_delay(attempt: usize) -> std::time::Duration {
+    if attempt <= 1 {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(3)
+    }
+}
+
+/// Обрыв соединения отличается от отказа сервера: после обрыва соединение
+/// непригодно и его надо открыть заново, а `NO`/`BAD` приходят по живому
+/// соединению и повтора не требуют (S-005). Признак берём из текста ошибки
+/// транспорта: async-imap показывает ошибку сокета как `io: ...`, потерю
+/// соединения - как `connection lost`. Текст самой ошибки системы локализован,
+/// поэтому опираемся только на неизменяемую часть от библиотеки.
+fn connection_lost(error: &Error) -> bool {
+    let message = match error {
+        Error::Backend { message, .. } => message.to_ascii_lowercase(),
+        Error::Io(_) => return true,
+        _ => return false,
+    };
+    message.contains("io: ")
+        || message.contains("connection lost")
+        || message.contains("connection reset")
+        || message.contains("broken pipe")
+        || message.contains("unexpected end")
+}
+
 pub async fn discover_oauth(
     host: &str,
     email: &str,
@@ -1487,8 +1560,16 @@ pub async fn discover_oauth(
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    let session = connect_oauth(host, email, access_token).await?;
-    discover_session(session, cursors, retention_days).await
+    discover_with_auth(
+        ImapAuth::OAuth {
+            host,
+            email,
+            access_token,
+        },
+        cursors,
+        retention_days,
+    )
+    .await
 }
 
 pub async fn discover_password(
@@ -1500,16 +1581,60 @@ pub async fn discover_password(
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    let session = connect_password(host, port, security, username, password).await?;
-    discover_session(session, cursors, retention_days).await
+    discover_with_auth(
+        ImapAuth::Password {
+            host,
+            port,
+            security,
+            username,
+            password,
+        },
+        cursors,
+        retention_days,
+    )
+    .await
 }
 
-async fn discover_session(
-    mut session: OAuthSession,
+/// Перечислить папки, переоткрывая соединение после обрыва (S-001).
+async fn list_folders_with_reconnect(
+    auth: &ImapAuth<'_>,
+    session: &mut OAuthSession,
+    reconnects: &mut usize,
+) -> Result<Vec<DiscoveredFolder>> {
+    let mut attempt = 0usize;
+    loop {
+        match list_oauth_folders(session).await {
+            Ok(folders) => return Ok(folders),
+            Err(error) => {
+                if !connection_lost(&error)
+                    || attempt >= RECONNECT_ATTEMPTS
+                    || *reconnects >= RECONNECT_BUDGET
+                {
+                    return Err(error);
+                }
+                attempt += 1;
+                *reconnects += 1;
+                tracing::info!(
+                    attempt,
+                    %error,
+                    "IMAP: соединение оборвалось на перечислении папок, переподключаемся"
+                );
+                tokio::time::sleep(reconnect_delay(attempt)).await;
+                *session = auth.connect().await?;
+            }
+        }
+    }
+}
+
+async fn discover_with_auth(
+    auth: ImapAuth<'_>,
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    let mut folders = list_oauth_folders(&mut session).await?;
+    let mut session = auth.connect().await?;
+    let mut reconnects = 0usize;
+    let mut folders =
+        list_folders_with_reconnect(&auth, &mut session, &mut reconnects).await?;
     let capabilities = session
         .capabilities()
         .await
@@ -1525,17 +1650,19 @@ async fn discover_session(
     let mut reset_folders = Vec::new();
     let mut flag_updates = Vec::new();
     let mut deleted_uids = Vec::new();
+    let mut skipped_folders = Vec::new();
     for folder in &mut folders {
         let path = folder.remote_path.clone();
         let folder_started = std::time::Instant::now();
-        match fetch_incremental_messages(
+        match fetch_folder_with_reconnect(
+            &auth,
             &mut session,
             folder,
             cursors.get(&path),
-            500,
             Some(retention_days),
             condstore,
             qresync,
+            &mut reconnects,
         )
         .await
         {
@@ -1587,8 +1714,16 @@ async fn discover_session(
             }
             Err(error) => {
                 tracing::warn!(folder = %folder.remote_path, %error, "IMAP: папка пропущена");
+                skipped_folders.push(path);
             }
         }
+    }
+    if !skipped_folders.is_empty() {
+        tracing::warn!(
+            skipped = skipped_folders.len(),
+            reconnects,
+            "IMAP: проход завершён с пропущенными папками"
+        );
     }
     let _ = session.logout().await;
     Ok(ImapDiscovery {
@@ -1600,7 +1735,81 @@ async fn discover_session(
         changed_remote_ids: Vec::new(),
         flag_updates,
         deleted_uids,
+        skipped_folders,
     })
+}
+
+/// Прочитать папку, переоткрывая соединение после обрыва (S-002, S-004, S-009).
+/// Отказ сервера по живому соединению возвращается сразу, без повторов (S-005).
+#[allow(clippy::too_many_arguments)]
+async fn fetch_folder_with_reconnect(
+    auth: &ImapAuth<'_>,
+    session: &mut OAuthSession,
+    folder: &mut DiscoveredFolder,
+    cursor: Option<&FolderSyncCursor>,
+    retention_days: Option<i64>,
+    condstore: bool,
+    qresync: bool,
+    reconnects: &mut usize,
+) -> Result<(
+    Vec<DiscoveredMessage>,
+    Vec<u32>,
+    bool,
+    bool,
+    Vec<DiscoveredFlagUpdate>,
+    Vec<u32>,
+)> {
+    let mut attempt = 0usize;
+    loop {
+        match fetch_incremental_messages(
+            session,
+            folder,
+            cursor,
+            500,
+            retention_days,
+            condstore,
+            qresync,
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) => {
+                if !connection_lost(&error) {
+                    return Err(error);
+                }
+                if attempt >= RECONNECT_ATTEMPTS || *reconnects >= RECONNECT_BUDGET {
+                    tracing::warn!(
+                        folder = %folder.remote_path,
+                        attempts = attempt + 1,
+                        %error,
+                        "IMAP: повторы после обрыва исчерпаны"
+                    );
+                    return Err(error);
+                }
+                attempt += 1;
+                *reconnects += 1;
+                tracing::info!(
+                    folder = %folder.remote_path,
+                    attempt,
+                    %error,
+                    "IMAP: соединение оборвалось, переподключаемся"
+                );
+                tokio::time::sleep(reconnect_delay(attempt)).await;
+                match auth.connect().await {
+                    Ok(fresh) => *session = fresh,
+                    Err(connect_error) => {
+                        tracing::warn!(
+                            folder = %folder.remote_path,
+                            attempts = attempt,
+                            %connect_error,
+                            "IMAP: переподключение не удалось"
+                        );
+                        return Err(connect_error);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub async fn discover_yandex(
@@ -2188,5 +2397,60 @@ mod utf7_tests {
             Some("<stable@example.test>")
         );
         assert_eq!(mime_message_id(b"Subject: none\r\n\r\nbody"), None);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    //! Проверки устойчивости к обрыву соединения (imap-reconnect-resilience.md).
+    use super::{
+        Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, reconnect_delay,
+    };
+
+    fn backend_error(message: &str) -> Error {
+        Error::Backend {
+            backend: "imap-select".into(),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn socket_errors_are_treated_as_a_lost_connection() {
+        // S-002: именно так выглядит разрыв со стороны сервера в журнале.
+        assert!(connection_lost(&backend_error(
+            "папка \"INBOX\": io: Удаленный хост принудительно разорвал существующее подключение. (os error 10054)"
+        )));
+        assert!(connection_lost(&backend_error("connection lost")));
+        assert!(connection_lost(&backend_error("io: Broken pipe")));
+        assert!(connection_lost(&Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        ))));
+    }
+
+    #[test]
+    fn server_refusals_do_not_trigger_a_reconnect() {
+        // S-005: ответ по живому соединению повторять незачем.
+        assert!(!connection_lost(&backend_error(
+            "папка \"INBOX\": no: Mailbox doesn't exist"
+        )));
+        assert!(!connection_lost(&backend_error(
+            "папка \"INBOX\": bad: Invalid command"
+        )));
+        assert!(!connection_lost(&Error::Other("прочее".into())));
+    }
+
+    #[test]
+    fn retry_pauses_grow_from_one_second_to_three() {
+        // S-003.
+        assert_eq!(reconnect_delay(1).as_secs(), 1);
+        assert_eq!(reconnect_delay(2).as_secs(), 3);
+    }
+
+    #[test]
+    fn retry_limits_keep_a_pass_bounded() {
+        // S-001, S-002, S-010: повторов на операцию и переподключений за проход.
+        assert_eq!(RECONNECT_ATTEMPTS, 2);
+        assert_eq!(RECONNECT_BUDGET, 12);
     }
 }
