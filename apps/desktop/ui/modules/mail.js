@@ -299,6 +299,11 @@ function createMessageRow(message,index){
   row.querySelector('.subj').textContent=message.subject||'';row.querySelector('.prev').textContent=message.preview||'';
   row.querySelector('.time').textContent=message.date?new Date(message.date).toLocaleDateString(document.documentElement.lang):'';
   row.querySelector('.time-hm').textContent=message.date?new Date(message.date).toLocaleTimeString(document.documentElement.lang,{hour:'2-digit',minute:'2-digit'}):'';
+  // Ящик письма (message-mailbox-owner.md, S-004): в объединённых списках одно
+  // и то же письмо из двух ящиков выглядит двумя одинаковыми строками, и
+  // отличить их можно только подписью.
+  const mailbox=mailAddresses.listMailboxLabel(message.account_id,coreAccounts,currentFolderId===null,L('ящик удалён','mailbox removed'));
+  if(mailbox){const box=document.createElement('span');box.className='mbox';box.textContent=mailbox;box.title=mailbox;row.querySelector('.meta').appendChild(box);}
   if(message.labels?.length){const meta=row.querySelector('.meta');message.labels.forEach(name=>{const tag=coreTags.find(item=>item.name===name);const badge=document.createElement('span');badge.className='msg-tag';badge.textContent=name;const tagColor=tag?.color||'#888';badge.style.setProperty('--tag-color',tagColor);badge.style.setProperty('--tag-text',contrastOn(tagColor));meta.appendChild(badge);});}
   row.ondragstart=event=>{if(!selectedMessageIds.has(message.id)){selectedMessageIds.clear();selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();}row.classList.add('mail-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-truemail-messages',JSON.stringify([...selectedMessageIds]));};row.ondragend=()=>{row.classList.remove('mail-dragging');document.querySelectorAll('.folder-row.drop-hi').forEach(item=>item.classList.remove('drop-hi'));};
   let swipe=null,suppressClick=false;row.onpointerdown=event=>{if(event.pointerType==='mouse'||event.button!==0)return;swipe={id:event.pointerId,x:event.clientX,y:event.clientY,dx:0};};row.onpointermove=event=>{if(!swipe||event.pointerId!==swipe.id)return;const dx=event.clientX-swipe.x,dy=event.clientY-swipe.y;if(Math.abs(dy)>Math.abs(dx)&&Math.abs(dy)>10){swipe=null;row.style.transform='';return;}if(Math.abs(dx)<8)return;event.preventDefault();swipe.dx=dx;row.classList.add('swiping');row.classList.toggle('swipe-archive',dx>0);row.classList.toggle('swipe-trash',dx<0);row.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`;};const finishSwipe=event=>{if(!swipe||event.pointerId!==swipe.id)return;const action=Math.abs(swipe.dx)>=80?(swipe.dx>0?'archive':'trash'):null;swipe=null;row.classList.remove('swiping','swipe-archive','swipe-trash');row.style.transform='';if(action){suppressClick=true;setTimeout(()=>{suppressClick=false;},250);window.performMessageActionForIds?.(action,[message.id]);}};row.onpointerup=finishSwipe;row.onpointercancel=finishSwipe;
@@ -365,6 +370,27 @@ function buildAddressLine(className,labelText,addresses){
   render(false);
   return line;
 }
+// Строка "Ящик" шапки письма (message-mailbox-owner.md, S-001, S-002, S-006).
+// null - подключён один ящик, показывать нечего.
+function buildMailboxLine(accountId){
+  const text=mailAddresses.mailboxLabel(accountId,coreAccounts,L('ящик удалён','mailbox removed'));
+  if(!text)return null;
+  const line=document.createElement('div');line.className='mail-boxline';line.dataset.accountId=String(accountId??'');
+  const label=document.createElement('span');label.className='mail-address-label';label.textContent=L('Ящик: ','Mailbox: ');line.appendChild(label);
+  const value=document.createElement('span');value.className='mail-address-item';value.textContent=text;value.title=text;line.appendChild(value);
+  return line;
+}
+// Смена языка не перерисовывает открытое письмо целиком (тело пришлось бы
+// собирать заново), поэтому подпись строки "Ящик" обновляем отдельно (S-008).
+window.relocalizeMailboxLine=function(){
+  const line=document.querySelector('.mail-boxline');
+  if(!line)return;
+  const accountId=line.dataset.accountId===''?null:Number(line.dataset.accountId);
+  const text=mailAddresses.mailboxLabel(accountId,coreAccounts,L('ящик удалён','mailbox removed'));
+  if(!text){line.remove();return;}
+  line.querySelector('.mail-address-label').textContent=L('Ящик: ','Mailbox: ');
+  const value=line.querySelector('.mail-address-item');value.textContent=text;value.title=text;
+};
 // Поколение показа письма. Ядро при необходимости докачивает письмо с сервера,
 // поэтому ответы приходят вразнобой: без сверки поколения ответ на первый клик
 // дорисовывал бы своё письмо поверх выбранного вторым (S-001..S-004).
@@ -401,6 +427,10 @@ async function showMessage(message){
     // "Свернуть". Состояния строк независимы.
     const toLine=buildAddressLine('mail-toline',L('Кому: ','To: '),full.meta.to);if(toLine)head.appendChild(toLine);
     const ccLine=buildAddressLine('mail-ccline',L('Копия: ','Cc: '),full.meta.cc);if(ccLine)head.appendChild(ccLine);
+    // Ящик, в который пришло письмо (message-mailbox-owner.md, S-001, S-003).
+    // Это не заголовок письма: у копии, забранной другим ящиком по POP3,
+    // строка "Кому" остаётся исходной, и без этой строки два ящика неразличимы.
+    const mailboxLine=buildMailboxLine(full.meta.account_id);if(mailboxLine)head.appendChild(mailboxLine);
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
     // Отрисовка тела тоже ждёт (проверка доверия отправителю для картинок), и за
     // это время выбор мог смениться - к панели и к отметке прочтения переходим

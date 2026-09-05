@@ -43,5 +43,23 @@ function addressLineModel(addresses,expanded,maxShown){
   return {shown:cut.map(addr=>({text:addressTitle(addr),title:addressTitle(addr)})),hidden:cut.length<list.length?list.length-cut.length:0};
 }
 
-const mailAddresses={rowPresentation,addressLineModel,displayName};
+// Подпись ящика письма (message-mailbox-owner.md, S-001, S-002, S-006):
+// null - подписи нет, потому что подключён один ящик и путать нечего.
+// Аккаунт письма ищется по account_id; если такого больше нет - removedText.
+function mailboxLabel(accountId,accounts,removedText){
+  const list=accounts||[];
+  if(list.length<2)return null;
+  const account=list.find(item=>item&&item.id===accountId);
+  const email=(account?.email||'').trim();
+  return email||removedText;
+}
+
+// Подпись ящика в строке списка (S-004, S-005): в папке одного ящика подписи
+// нет - там все письма одного ящика, и подпись была бы шумом.
+function listMailboxLabel(accountId,accounts,unifiedView,removedText){
+  if(!unifiedView)return null;
+  return mailboxLabel(accountId,accounts,removedText);
+}
+
+const mailAddresses={rowPresentation,addressLineModel,displayName,mailboxLabel,listMailboxLabel};
 if(typeof module!=='undefined'&&module.exports)module.exports=mailAddresses;

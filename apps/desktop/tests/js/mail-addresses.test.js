@@ -185,3 +185,36 @@ test('S-009: пустой вход дает null',()=>{
   assert.equal(addressLineModel(undefined,false,2),null);
   assert.equal(addressLineModel([addr('',''),addr('  ','')],false,2),null);
 });
+
+// --- Подпись ящика письма (message-mailbox-owner.md) ---
+const {mailboxLabel,listMailboxLabel}=require('../../ui/modules/mail-addresses.js');
+const accountsOf=(...emails)=>emails.map((email,index)=>({id:index+1,email}));
+
+// S-002: один ящик - подписи нет, путать нечего.
+test('S-002: при одном подключённом ящике подписи нет',()=>{
+  assert.equal(mailboxLabel(1,accountsOf('one@example.com'),'ящик удалён'),null);
+  assert.equal(mailboxLabel(1,[],'ящик удалён'),null);
+  assert.equal(mailboxLabel(1,null,'ящик удалён'),null);
+});
+
+// S-001: два ящика - подпись равна адресу ящика письма.
+test('S-001: при двух ящиках подпись равна адресу ящика письма',()=>{
+  const accounts=accountsOf('one@example.com','two@example.com');
+  assert.equal(mailboxLabel(1,accounts,'ящик удалён'),'one@example.com');
+  assert.equal(mailboxLabel(2,accounts,'ящик удалён'),'two@example.com');
+});
+
+// S-006: аккаунта письма больше нет - показываем подпись удалённого ящика.
+test('S-006: неизвестный или пустой аккаунт даёт подпись удалённого ящика',()=>{
+  const accounts=accountsOf('one@example.com','two@example.com');
+  assert.equal(mailboxLabel(99,accounts,'ящик удалён'),'ящик удалён');
+  assert.equal(mailboxLabel(1,[{id:1,email:'   '},{id:2,email:'two@example.com'}],'ящик удалён'),'ящик удалён');
+});
+
+// S-004, S-005: подпись в списке только в объединённом представлении.
+test('S-004, S-005: подпись строки списка зависит от представления',()=>{
+  const accounts=accountsOf('one@example.com','two@example.com');
+  assert.equal(listMailboxLabel(1,accounts,true,'ящик удалён'),'one@example.com');
+  assert.equal(listMailboxLabel(1,accounts,false,'ящик удалён'),null);
+  assert.equal(listMailboxLabel(1,accountsOf('one@example.com'),true,'ящик удалён'),null);
+});
