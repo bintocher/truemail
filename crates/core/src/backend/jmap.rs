@@ -427,6 +427,7 @@ impl JmapBackend {
                     draft: keyword(keywords, "$draft"),
                     raw: raw.clone(),
                     body_fetched: true,
+                    has_attachments: None,
                 });
             }
         }

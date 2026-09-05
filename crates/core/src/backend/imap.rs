@@ -64,6 +64,10 @@ pub struct DiscoveredMessage {
     /// `false` означает лёгкую проекцию заголовков/preview: полный MIME будет
     /// лениво загружен при открытии письма.
     pub body_fetched: bool,
+    /// Признак вложений от сервера. `None` - сервер его не сообщил, тогда
+    /// признак берётся из разбора сырого письма
+    /// (ews-lightweight-message-fetch.md, S-007).
+    pub has_attachments: Option<bool>,
 }
 
 type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -1308,6 +1312,7 @@ async fn fetch_incremental_messages(
                     .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
                 raw: raw.to_vec(),
                 body_fetched: true,
+                has_attachments: None,
             });
         }
     }
@@ -2100,6 +2105,7 @@ async fn fetch_older_messages(
                 .any(|flag| matches!(flag, async_imap::types::Flag::Draft)),
             raw: raw.to_vec(),
             body_fetched: true,
+            has_attachments: None,
         });
     }
     let _ = session.logout().await;

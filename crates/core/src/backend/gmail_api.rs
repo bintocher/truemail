@@ -882,6 +882,7 @@ fn project_messages(
                 draft: labels.contains("DRAFT"),
                 raw: raw.clone(),
                 body_fetched,
+                has_attachments: None,
             });
         }
     }

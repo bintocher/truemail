@@ -617,8 +617,11 @@ impl EwsBackend {
                 .iter()
                 .map(|id| format!(r#"<t:ItemId Id="{}"/>"#, escape(id)))
                 .collect::<String>();
+            // Сырое письмо целиком (вместе со всеми вложениями) для списка не
+            // нужно: запрашиваем свойства и текст письма, а полное письмо
+            // скачиваем при открытии (ews-lightweight-message-fetch.md, S-001).
             let body = format!(
-                r#"<m:GetItem><m:ItemShape><t:BaseShape>AllProperties</t:BaseShape><t:IncludeMimeContent>true</t:IncludeMimeContent></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
+                r#"<m:GetItem><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape><t:BodyType>Text</t:BodyType><t:AdditionalProperties>{LIGHT_MESSAGE_PROPERTIES}</t:AdditionalProperties></m:ItemShape><m:ItemIds>{item_ids}</m:ItemIds></m:GetItem>"#
             );
             let response = self.soap(password, "GetItem", &body).await?;
             messages.extend(parse_messages(&response, folder_path)?);
@@ -1356,6 +1359,122 @@ fn stable_uid(id: &str) -> u32 {
     u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]).max(1)
 }
 
+/// Свойства письма для списка: всё, что нужно строке списка, и текст письма
+/// для отрывка. Только уровень Exchange 2010 SP2 - именно эту версию объявляет
+/// конверт запроса (ews-lightweight-message-fetch.md, S-002, S-003).
+const LIGHT_MESSAGE_PROPERTIES: &str = concat!(
+    r#"<t:FieldURI FieldURI="item:Subject"/>"#,
+    r#"<t:FieldURI FieldURI="item:DateTimeSent"/>"#,
+    r#"<t:FieldURI FieldURI="item:DateTimeReceived"/>"#,
+    r#"<t:FieldURI FieldURI="message:From"/>"#,
+    r#"<t:FieldURI FieldURI="message:ToRecipients"/>"#,
+    r#"<t:FieldURI FieldURI="message:CcRecipients"/>"#,
+    r#"<t:FieldURI FieldURI="message:IsRead"/>"#,
+    r#"<t:FieldURI FieldURI="message:InternetMessageId"/>"#,
+    r#"<t:FieldURI FieldURI="message:InReplyTo"/>"#,
+    r#"<t:FieldURI FieldURI="item:HasAttachments"/>"#,
+    r#"<t:FieldURI FieldURI="item:Size"/>"#,
+    r#"<t:FieldURI FieldURI="item:Body"/>"#,
+);
+
+/// Длина отрывка текста письма для строки списка (S-004).
+const LIGHT_PREVIEW_CHARS: usize = 200;
+
+/// Значение заголовка для собранного письма: переводы строк убираем (иначе
+/// значение расползлось бы на новый заголовок), а не-ASCII кодируем по
+/// правилам заголовков почты (S-006).
+fn header_value(value: &str) -> String {
+    let single_line = value.replace(['\r', '\n'], " ");
+    if single_line.is_ascii() {
+        return single_line;
+    }
+    use base64::Engine as _;
+    format!(
+        "=?utf-8?B?{}?=",
+        base64::engine::general_purpose::STANDARD.encode(single_line.as_bytes())
+    )
+}
+
+/// Адрес участника переписки: "Имя <адрес>" либо только адрес.
+fn mailbox_header(node: Node<'_, '_>) -> Option<String> {
+    let address = node_text(node, "EmailAddress")?.trim().to_owned();
+    if address.is_empty() {
+        return None;
+    }
+    let name = node_text(node, "Name").unwrap_or("").trim().to_owned();
+    if name.is_empty() || name == address {
+        return Some(address);
+    }
+    Some(format!("{} <{address}>", header_value(&name)))
+}
+
+/// Адреса из перечня получателей (ToRecipients, CcRecipients).
+fn mailbox_list(message: Node<'_, '_>, container: &str) -> Vec<String> {
+    message
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == container)
+        .map(|node| {
+            node.children()
+                .filter(|child| child.is_element() && child.tag_name().name() == "Mailbox")
+                .filter_map(mailbox_header)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Минимальное письмо из свойств: заголовки и текст, без вложений. Занимает
+/// место сырого письма до его скачивания (S-005).
+fn light_message_projection(message: Node<'_, '_>) -> Vec<u8> {
+    let mut raw = String::new();
+    let mut push = |name: &str, value: &str| {
+        if value.is_empty() {
+            return;
+        }
+        raw.push_str(name);
+        raw.push_str(": ");
+        raw.push_str(value);
+        raw.push_str("\r\n");
+    };
+    if let Some(from) = message
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "From")
+        .and_then(|node| {
+            node.descendants()
+                .find(|child| child.is_element() && child.tag_name().name() == "Mailbox")
+        })
+        .and_then(mailbox_header)
+    {
+        push("From", &from);
+    }
+    let to = mailbox_list(message, "ToRecipients").join(", ");
+    push("To", &to);
+    let cc = mailbox_list(message, "CcRecipients").join(", ");
+    push("Cc", &cc);
+    if let Some(subject) = node_text(message, "Subject") {
+        push("Subject", &header_value(subject));
+    }
+    // Дата письма в базе - время отправки: по нему же считается курсор страниц
+    // догрузки (S-008).
+    if let Some(sent) = node_text(message, "DateTimeSent")
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+    {
+        push("Date", &sent.to_rfc2822());
+    }
+    if let Some(message_id) = node_text(message, "InternetMessageId") {
+        push("Message-ID", &header_value(message_id));
+    }
+    if let Some(in_reply_to) = node_text(message, "InReplyTo") {
+        push("In-Reply-To", &header_value(in_reply_to));
+    }
+    raw.push_str("MIME-Version: 1.0\r\n");
+    raw.push_str("Content-Type: text/plain; charset=utf-8\r\n");
+    raw.push_str("X-Truemail-Body-Pending: true\r\n\r\n");
+    if let Some(body) = node_text(message, "Body") {
+        raw.extend(body.chars().take(LIGHT_PREVIEW_CHARS));
+    }
+    raw.into_bytes()
+}
+
 fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>> {
     let document = Document::parse(xml).map_err(|error| backend_error("xml", error))?;
     let mut messages = Vec::new();
@@ -1370,23 +1489,40 @@ fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>
         else {
             continue;
         };
-        let Some(encoded) = node_text(message, "MimeContent") else {
-            continue;
+        // Ответ на облегчённый запрос сырого письма не содержит: собираем
+        // заглушку из свойств, а полное письмо скачаем при открытии
+        // (ews-lightweight-message-fetch.md, S-005).
+        let (raw, body_fetched, size, has_attachments) = match node_text(message, "MimeContent") {
+            Some(encoded) => {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|error| backend_error("mime", error))?;
+                let size = u32::try_from(raw.len()).ok();
+                (raw, true, size, None)
+            }
+            None => {
+                let raw = light_message_projection(message);
+                // Размер письма берём у сервера: длина заглушки о нём
+                // ничего не говорит.
+                let size =
+                    node_text(message, "Size").and_then(|value| value.trim().parse::<u32>().ok());
+                let has_attachments =
+                    node_text(message, "HasAttachments").map(|value| value == "true");
+                (raw, false, size, has_attachments)
+            }
         };
-        let raw = base64::engine::general_purpose::STANDARD
-            .decode(encoded.trim())
-            .map_err(|error| backend_error("mime", error))?;
         messages.push(DiscoveredMessage {
             folder_path: folder_path.to_owned(),
             uid: stable_uid(id),
             remote_id: Some(id.to_owned()),
-            size: u32::try_from(raw.len()).ok(),
+            size,
             seen: node_text(message, "IsRead") == Some("true"),
             flagged: false,
             answered: false,
             draft: node_text(message, "IsDraft") == Some("true"),
             raw,
-            body_fetched: true,
+            body_fetched,
+            has_attachments,
         });
     }
     Ok(messages)
@@ -3909,5 +4045,114 @@ mod tests {
         assert_eq!(parse_created_item_id(item_xml).unwrap(), "new-item");
         let folder_xml = r#"<CreateFolderResponse><Folders><Folder><FolderId Id="new-folder"/></Folder></Folders></CreateFolderResponse>"#;
         assert_eq!(parse_created_folder_id(folder_xml).unwrap(), "new-folder");
+    }
+}
+
+#[cfg(test)]
+mod light_fetch_tests {
+    //! Облегчённая выборка писем Exchange (ews-lightweight-message-fetch.md).
+    use super::{LIGHT_MESSAGE_PROPERTIES, header_value, parse_messages};
+
+    /// Ответ сервера на облегчённый запрос: свойства письма без сырого письма.
+    fn light_response(extra: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+<Envelope><Body><GetItemResponse><ResponseMessages><GetItemResponseMessage>
+<Items><Message>
+<ItemId Id="AAMk-1"/>
+<Subject>Отчёт за июль</Subject>
+<DateTimeSent>2026-07-16T17:00:00Z</DateTimeSent>
+<DateTimeReceived>2026-07-16T17:00:05Z</DateTimeReceived>
+<Size>240000</Size>
+<HasAttachments>true</HasAttachments>
+<IsRead>true</IsRead>
+<InternetMessageId>&lt;abc@example.test&gt;</InternetMessageId>
+<Body BodyType="Text">Текст письма для отрывка</Body>
+<From><Mailbox><Name>Пётр</Name><EmailAddress>petr@example.test</EmailAddress></Mailbox></From>
+<ToRecipients><Mailbox><Name>Анна</Name><EmailAddress>anna@example.test</EmailAddress></Mailbox></ToRecipients>
+{extra}
+</Message></Items>
+</GetItemResponseMessage></ResponseMessages></GetItemResponse></Body></Envelope>"#
+        )
+    }
+
+    /// S-002, S-003: запрашиваем нужные свойства и только те, что доступны
+    /// объявленной версии сервера Exchange 2010 SP2.
+    #[test]
+    fn light_request_asks_for_list_properties_only() {
+        for field in [
+            "item:Subject",
+            "item:DateTimeSent",
+            "item:DateTimeReceived",
+            "message:From",
+            "message:ToRecipients",
+            "message:CcRecipients",
+            "message:IsRead",
+            "message:InternetMessageId",
+            "item:HasAttachments",
+            "item:Size",
+            "item:Body",
+        ] {
+            assert!(
+                LIGHT_MESSAGE_PROPERTIES.contains(field),
+                "в запросе нет свойства {field}"
+            );
+        }
+        // Свойство отрывка появилось только в Exchange 2013.
+        assert!(!LIGHT_MESSAGE_PROPERTIES.contains("item:Preview"));
+        assert!(!LIGHT_MESSAGE_PROPERTIES.contains("MimeContent"));
+    }
+
+    /// S-005, S-007: письмо без сырого содержимого сохраняется как письмо без
+    /// тела, признак вложений берётся у сервера.
+    #[test]
+    fn light_response_becomes_a_message_without_a_body() {
+        let messages = parse_messages(&light_response(""), "INBOX").expect("разбор ответа");
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert!(!message.body_fetched);
+        assert_eq!(message.has_attachments, Some(true));
+        assert_eq!(message.size, Some(240_000));
+        assert!(message.seen);
+        let raw = String::from_utf8(message.raw.clone()).expect("заглушка в utf-8");
+        assert!(raw.contains("X-Truemail-Body-Pending: true"));
+        assert!(raw.contains("Message-ID: <abc@example.test>"));
+        assert!(raw.contains("petr@example.test"));
+        assert!(raw.contains("anna@example.test"));
+        assert!(raw.ends_with("Текст письма для отрывка"));
+    }
+
+    /// S-008: дата заглушки - время отправки, по нему считается курсор догрузки.
+    #[test]
+    fn projection_date_is_the_sent_time() {
+        let messages = parse_messages(&light_response(""), "INBOX").expect("разбор ответа");
+        let raw = String::from_utf8(messages[0].raw.clone()).expect("заглушка в utf-8");
+        let date = raw
+            .lines()
+            .find(|line| line.starts_with("Date: "))
+            .expect("в заглушке нет даты");
+        let parsed = chrono::DateTime::parse_from_rfc2822(date.trim_start_matches("Date: "))
+            .expect("дата разобрана");
+        assert_eq!(parsed.to_rfc3339(), "2026-07-16T17:00:00+00:00");
+    }
+
+    /// S-006: значения заголовков без переводов строк, не-ASCII закодировано.
+    #[test]
+    fn header_values_are_encoded_and_single_line() {
+        assert_eq!(header_value("Plain subject"), "Plain subject");
+        assert_eq!(header_value("two\r\nlines"), "two  lines");
+        let encoded = header_value("Отчёт");
+        assert!(encoded.starts_with("=?utf-8?B?"));
+        assert!(encoded.ends_with("?="));
+        assert!(!header_value("Отчёт\r\nвторая").contains('\n'));
+    }
+
+    /// S-007: если сервер признак вложений не прислал, письмо не утверждает,
+    /// что вложений нет.
+    #[test]
+    fn missing_attachment_flag_stays_unknown() {
+        let response = light_response("").replace("<HasAttachments>true</HasAttachments>", "");
+        let messages = parse_messages(&response, "INBOX").expect("разбор ответа");
+        assert_eq!(messages[0].has_attachments, None);
     }
 }

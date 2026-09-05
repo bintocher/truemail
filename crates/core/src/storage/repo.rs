@@ -2078,7 +2078,11 @@ impl Db {
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
-                .bind(source.draft as i64).bind(!attachments.is_empty() as i64).bind(dkim).bind(spf)
+                .bind(source.draft as i64)
+                // Признак вложений от сервера важнее разбора: у лёгкой проекции
+                // сырого письма нет, и по нему вложения не видны
+                // (ews-lightweight-message-fetch.md, S-007).
+                .bind(source.has_attachments.unwrap_or(!attachments.is_empty()) as i64).bind(dkim).bind(spf)
                 .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64)
                 .bind(backfilled as i64).execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
@@ -7582,6 +7586,7 @@ mod charset_repair_tests {
                 draft: false,
                 raw,
                 body_fetched: true,
+                has_attachments: None,
             }],
             false,
         )
