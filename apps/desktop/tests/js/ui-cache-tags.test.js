@@ -72,3 +72,18 @@ test('S-008: в отчёт попадают все файлы с неподня�
   assert.equal(violations.length,3);
   assert.equal(violations[2].host,'apps/desktop/ui/notify.html');
 });
+
+// S-002: версионирование не должно исчезать у изменённого файла - это тот же
+// класс ошибки, что и не поднятая метка, но выглядит как "файл не подключён".
+test('S-002: исчезновение метки у изменённого файла считается нарушением',()=>{
+  const changes=[{status:'M',path:'apps/desktop/ui/modules/mail.js'}];
+  const hostsWithLostTag=(path,side)=>{
+    if(path!=='apps/desktop/ui/index.html')return null;
+    return side==='base'
+      ?'<script src="modules/mail.js?v=20260101-1"></script>'
+      :'<script src="modules/mail.js"></script>';
+  };
+  const violations=checkCacheTags(changes,hostsWithLostTag);
+  assert.equal(violations.length,1);
+  assert.equal(violations[0].file,'apps/desktop/ui/modules/mail.js');
+});

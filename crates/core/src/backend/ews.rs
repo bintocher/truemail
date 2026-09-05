@@ -82,6 +82,26 @@ fn backend_error(kind: &str, message: impl ToString) -> Error {
     }
 }
 
+/// Exchange под нагрузкой: ошибки занятости сервера и превышения предела.
+/// Смысл у них один - подождать и повторить позже, поэтому фоновые проходы
+/// должны прекращаться, а не долбить сервер отказами.
+fn is_server_busy(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text.contains("errorserverbusy")
+        || text.contains("errortoomanyobjectsopened")
+        || text.contains("errorexceededconnectioncount")
+        || text.contains("errorinternalservererrortransientissue")
+}
+
+/// Ошибка "сервер занят": до конца прохода к серверу больше не ходим.
+fn server_busy_error(message: &str) -> Error {
+    Error::RateLimited {
+        backend: "ews".into(),
+        retry_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        message: format!("Exchange занят, запросы отложены: {message}"),
+    }
+}
+
 fn escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -455,10 +475,20 @@ impl EwsBackend {
             &envelope(body),
         )
         .await?;
+        // Сервер под нагрузкой отвечает 503 или ошибкой занятости: это не отказ
+        // запроса, а просьба подождать. Отдельная ошибка нужна фоновой догрузке
+        // тел писем, чтобы прекратить проход, а не расходовать его на отказы
+        // (gmail-local-body-prefetch.md, S-009).
+        if response.status == 503 || response.status == 429 {
+            return Err(server_busy_error(&format!("HTTP {}", response.status)));
+        }
         if !(200..300).contains(&response.status) {
             return Err(backend_error("http", format!("HTTP {}", response.status)));
         }
         if let Some(error) = response_error(&response.body) {
+            if is_server_busy(&error) {
+                return Err(server_busy_error(&error));
+            }
             return Err(backend_error("soap", error));
         }
         Ok(response.body)
@@ -1370,6 +1400,9 @@ const LIGHT_MESSAGE_PROPERTIES: &str = concat!(
     r#"<t:FieldURI FieldURI="message:ToRecipients"/>"#,
     r#"<t:FieldURI FieldURI="message:CcRecipients"/>"#,
     r#"<t:FieldURI FieldURI="message:IsRead"/>"#,
+    // Признак черновика читает разбор ответа: не спросив его, мы бы сбрасывали
+    // черновик в ноль при каждом проходе.
+    r#"<t:FieldURI FieldURI="message:IsDraft"/>"#,
     r#"<t:FieldURI FieldURI="message:InternetMessageId"/>"#,
     r#"<t:FieldURI FieldURI="message:InReplyTo"/>"#,
     r#"<t:FieldURI FieldURI="item:HasAttachments"/>"#,
@@ -4088,6 +4121,7 @@ mod light_fetch_tests {
             "message:ToRecipients",
             "message:CcRecipients",
             "message:IsRead",
+            "message:IsDraft",
             "message:InternetMessageId",
             "item:HasAttachments",
             "item:Size",
@@ -4147,6 +4181,17 @@ mod light_fetch_tests {
         assert!(!header_value("Отчёт\r\nвторая").contains('\n'));
     }
 
+    /// S-002: признак черновика запрошен и разобран - иначе каждый проход
+    /// сбрасывал бы черновик в обычное письмо.
+    #[test]
+    fn draft_flag_survives_a_light_fetch() {
+        let response = light_response("<IsDraft>true</IsDraft>");
+        let messages = parse_messages(&response, "INBOX").expect("разбор ответа");
+        assert!(messages[0].draft);
+        let plain = parse_messages(&light_response(""), "INBOX").expect("разбор ответа");
+        assert!(!plain[0].draft);
+    }
+
     /// S-007: если сервер признак вложений не прислал, письмо не утверждает,
     /// что вложений нет.
     #[test]
@@ -4154,5 +4199,26 @@ mod light_fetch_tests {
         let response = light_response("").replace("<HasAttachments>true</HasAttachments>", "");
         let messages = parse_messages(&response, "INBOX").expect("разбор ответа");
         assert_eq!(messages[0].has_attachments, None);
+    }
+}
+
+#[cfg(test)]
+mod throttling_tests {
+    //! Ошибки занятости Exchange (gmail-local-body-prefetch.md, S-009).
+    use super::{is_server_busy, server_busy_error};
+
+    #[test]
+    fn busy_answers_are_recognised() {
+        assert!(is_server_busy("ErrorServerBusy: The server is busy"));
+        assert!(is_server_busy("errortoomanyobjectsopened"));
+        assert!(is_server_busy("ErrorExceededConnectionCount"));
+        assert!(!is_server_busy("ErrorItemNotFound"));
+        assert!(!is_server_busy("ErrorAccessDenied"));
+    }
+
+    #[test]
+    fn busy_answer_becomes_a_rate_limit() {
+        let error = server_busy_error("ErrorServerBusy");
+        assert!(matches!(error, crate::Error::RateLimited { .. }));
     }
 }

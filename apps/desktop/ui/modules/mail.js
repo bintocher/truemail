@@ -148,8 +148,13 @@ window.relocalizeFolderTree=function(){
   if(currentFolderId!==null){
     const folder=coreFolders.find(item=>item.id===currentFolderId);
     const heading=document.querySelector('.listhead h2');
-    if(folder&&heading)heading.textContent=folderTitle(folder);
+    // Папка могла исчезнуть (удалена на сервере, а просмотр ещё на неё
+    // ссылается) - тогда ставим общий заголовок, а не оставляем прежний язык.
+    if(heading)heading.textContent=folder?folderTitle(folder):messagesTitle();
   }
+  // Строки списка собраны в коде: подпись ящика и подпись "без получателя"
+  // остались бы на прежнем языке до следующей прокрутки.
+  renderMessageWindow(true);
 };
 function renderTagsNav(){const host=document.getElementById('tagsNav');if(!host)return;host.innerHTML='';coreTags.forEach(tag=>{const row=document.createElement('button');row.type='button';row.className='navitem tag-row'+(currentTagName===tag.name?' active':'');row.dataset.tagId=tag.id;row.innerHTML='<span class="tag-dot"></span><span class="tag-name"></span><span class="count"></span>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);if(count)row.querySelector('.count').textContent=count;row.onclick=()=>filterTag(tag);host.appendChild(row);});}
 function renderTagSettings(){const host=document.getElementById('tagSettingsList');if(!host)return;host.innerHTML='';if(!coreTags.length){host.innerHTML=`<div class="note-muted">${L('Меток пока нет','No tags yet')}</div>`;return;}coreTags.forEach(tag=>{const row=document.createElement('div');row.className='tag-settings-row';row.innerHTML='<span class="tag-dot"></span><span class="tag-name grow"></span><span class="count"></span><button type="button" class="btn sm tag-edit"></button>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);row.querySelector('.count').textContent=count?`${count}`:'';row.querySelector('.tag-edit').textContent=L('Изменить','Edit');row.querySelector('.tag-edit').onclick=()=>openLabelEditor(tag);host.appendChild(row);});}

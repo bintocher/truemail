@@ -1333,8 +1333,15 @@ pub async fn discover_oauth_inbox(
     access_token: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let session = connect_oauth(host, email, access_token).await?;
-    discover_inbox(session, cursors).await
+    discover_inbox(
+        ImapAuth::OAuth {
+            host,
+            email,
+            access_token,
+        },
+        cursors,
+    )
+    .await
 }
 
 pub async fn discover_password_inbox(
@@ -1345,15 +1352,29 @@ pub async fn discover_password_inbox(
     password: &str,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let session = connect_password(host, port, security, username, password).await?;
-    discover_inbox(session, cursors).await
+    discover_inbox(
+        ImapAuth::Password {
+            host,
+            port,
+            security,
+            username,
+            password,
+        },
+        cursors,
+    )
+    .await
 }
 
 async fn discover_inbox(
-    mut session: OAuthSession,
+    auth: ImapAuth<'_>,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
-    let mut folders = list_oauth_folders(&mut session).await?;
+    // Этот путь идёт после каждого события IDLE, то есть чаще полной
+    // синхронизации: обрывы связи он переживает теми же повторами
+    // (imap-reconnect-resilience.md, S-001, S-002).
+    let mut reconnects = 0usize;
+    let mut session = connect_with_reconnect(&auth, &mut reconnects).await?;
+    let mut folders = list_folders_with_reconnect(&auth, &mut session, &mut reconnects).await?;
     let capabilities = session
         .capabilities()
         .await
@@ -1372,14 +1393,15 @@ async fn discover_inbox(
         })?;
     let path = inbox.remote_path.clone();
     let (messages, uids, reset, full_snapshot, flag_updates, vanished_uids) =
-        fetch_incremental_messages(
+        fetch_folder_with_reconnect(
+            &auth,
             &mut session,
             inbox,
             cursors.get(&path),
-            500,
             None,
             condstore,
             qresync,
+            &mut reconnects,
         )
         .await?;
     let _ = session.logout().await;
@@ -1600,6 +1622,37 @@ pub async fn discover_password(
     .await
 }
 
+/// Открыть соединение, переживая обрыв на самой попытке подключения. Без этого
+/// повтора один сорванный `connect` съедал бы попытку целиком, хотя предел
+/// переподключений прохода ещё не выбран (S-001, S-010).
+async fn connect_with_reconnect(
+    auth: &ImapAuth<'_>,
+    reconnects: &mut usize,
+) -> Result<OAuthSession> {
+    let mut attempt = 0usize;
+    loop {
+        match auth.connect().await {
+            Ok(session) => return Ok(session),
+            Err(error) => {
+                if !connection_lost(&error)
+                    || attempt >= RECONNECT_ATTEMPTS
+                    || *reconnects >= RECONNECT_BUDGET
+                {
+                    return Err(error);
+                }
+                attempt += 1;
+                *reconnects += 1;
+                tracing::info!(
+                    attempt,
+                    %error,
+                    "IMAP: соединение оборвалось при подключении, пробуем ещё раз"
+                );
+                tokio::time::sleep(reconnect_delay(attempt)).await;
+            }
+        }
+    }
+}
+
 /// Перечислить папки, переоткрывая соединение после обрыва (S-001).
 async fn list_folders_with_reconnect(
     auth: &ImapAuth<'_>,
@@ -1625,7 +1678,7 @@ async fn list_folders_with_reconnect(
                     "IMAP: соединение оборвалось на перечислении папок, переподключаемся"
                 );
                 tokio::time::sleep(reconnect_delay(attempt)).await;
-                *session = auth.connect().await?;
+                *session = connect_with_reconnect(auth, reconnects).await?;
             }
         }
     }
@@ -1636,8 +1689,8 @@ async fn discover_with_auth(
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
-    let mut session = auth.connect().await?;
     let mut reconnects = 0usize;
+    let mut session = connect_with_reconnect(&auth, &mut reconnects).await?;
     let mut folders = list_folders_with_reconnect(&auth, &mut session, &mut reconnects).await?;
     let capabilities = session
         .capabilities()
@@ -1658,6 +1711,11 @@ async fn discover_with_auth(
     for folder in &mut folders {
         let path = folder.remote_path.clone();
         let folder_started = std::time::Instant::now();
+        // Чтение папки помечает её курсор (uidvalidity, uidnext, highestmodseq,
+        // sync_token) сразу после выбора папки. Если папку дочитать не удалось,
+        // курсор должен остаться прежним: иначе следующий проход счёл бы папку
+        // уже сверенной и не прочитал бы её ещё сутки.
+        let before_read = folder.clone();
         match fetch_folder_with_reconnect(
             &auth,
             &mut session,
@@ -1718,6 +1776,9 @@ async fn discover_with_auth(
             }
             Err(error) => {
                 tracing::warn!(folder = %folder.remote_path, %error, "IMAP: папка пропущена");
+                // Возвращаем курсор к состоянию до чтения (S-006): пропущенная
+                // папка должна попасть в следующий проход целиком.
+                *folder = before_read;
                 skipped_folders.push(path);
             }
         }
@@ -1799,7 +1860,7 @@ async fn fetch_folder_with_reconnect(
                     "IMAP: соединение оборвалось, переподключаемся"
                 );
                 tokio::time::sleep(reconnect_delay(attempt)).await;
-                match auth.connect().await {
+                match connect_with_reconnect(auth, reconnects).await {
                     Ok(fresh) => *session = fresh,
                     Err(connect_error) => {
                         tracing::warn!(
@@ -2112,6 +2173,42 @@ async fn fetch_older_messages(
     Ok(messages)
 }
 
+/// Догрузка при прокрутке с повторами после обрыва связи: пользователь ждёт
+/// письма прямо сейчас, поэтому один разрыв не должен оставлять список пустым
+/// (imap-reconnect-resilience.md, S-002, S-003).
+async fn fetch_older_with_reconnect(
+    auth: ImapAuth<'_>,
+    folder_path: &str,
+    before: &str,
+    limit: usize,
+) -> Result<Vec<DiscoveredMessage>> {
+    let mut reconnects = 0usize;
+    let mut attempt = 0usize;
+    loop {
+        let session = connect_with_reconnect(&auth, &mut reconnects).await?;
+        match fetch_older_messages(session, folder_path, before, limit).await {
+            Ok(messages) => return Ok(messages),
+            Err(error) => {
+                if !connection_lost(&error)
+                    || attempt >= RECONNECT_ATTEMPTS
+                    || reconnects >= RECONNECT_BUDGET
+                {
+                    return Err(error);
+                }
+                attempt += 1;
+                reconnects += 1;
+                tracing::info!(
+                    folder = %folder_path,
+                    attempt,
+                    %error,
+                    "IMAP: догрузка оборвалась, переподключаемся"
+                );
+                tokio::time::sleep(reconnect_delay(attempt)).await;
+            }
+        }
+    }
+}
+
 pub async fn fetch_older_oauth(
     host: &str,
     email: &str,
@@ -2120,8 +2217,17 @@ pub async fn fetch_older_oauth(
     before: &str,
     limit: usize,
 ) -> Result<Vec<DiscoveredMessage>> {
-    let session = connect_oauth(host, email, access_token).await?;
-    fetch_older_messages(session, folder_path, before, limit).await
+    fetch_older_with_reconnect(
+        ImapAuth::OAuth {
+            host,
+            email,
+            access_token,
+        },
+        folder_path,
+        before,
+        limit,
+    )
+    .await
 }
 
 pub async fn fetch_older_password(
@@ -2134,8 +2240,19 @@ pub async fn fetch_older_password(
     before: &str,
     limit: usize,
 ) -> Result<Vec<DiscoveredMessage>> {
-    let session = connect_password(host, port, security, username, password).await?;
-    fetch_older_messages(session, folder_path, before, limit).await
+    fetch_older_with_reconnect(
+        ImapAuth::Password {
+            host,
+            port,
+            security,
+            username,
+            password,
+        },
+        folder_path,
+        before,
+        limit,
+    )
+    .await
 }
 
 async fn fetch_message_raw(

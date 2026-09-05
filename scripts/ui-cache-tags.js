@@ -33,7 +33,9 @@ function hostFor(filePath,readHost){
   }
   const fileName=filePath.slice(filePath.lastIndexOf('/')+1);
   for(const host of HTML_HOSTS){
-    if(tagFor(readHost(host,'head'),fileName)!==null){
+    // Ищем подключение в обоих состояниях: если метку убрали вместе с правкой,
+    // в текущем состоянии её уже нет, а нарушение есть.
+    if(tagFor(readHost(host,'head'),fileName)!==null||tagFor(readHost(host,'base'),fileName)!==null){
       return {host,read:text=>tagFor(text,fileName)};
     }
   }
@@ -56,8 +58,12 @@ function checkCacheTags(changes,readHost){
     if(!host)continue;                                     // S-005
     const before=host.read(readHost(host.host,'base'));
     const after=host.read(readHost(host.host,'head'));
-    if(after===null)continue;                              // подключение убрано вместе с файлом
-    if(before!==null&&before===after){                     // S-001, S-002
+    if(before===null)continue;                             // подключения не было и раньше
+    if(after===null){                                      // метка исчезла - файл перестал версионироваться
+      violations.push({file:filePath,host:host.host,tag:'метка исчезла'});
+      continue;
+    }
+    if(before===after){                                    // S-001, S-002
       violations.push({file:filePath,host:host.host,tag:after});
     }
   }
