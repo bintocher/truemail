@@ -6,21 +6,13 @@ let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
 let uiCatalog={};
-const uiKeyByRussian={
-  'Умные папки':'navSmartFolders','Аккаунты':'navAccounts','Календарь':'navCalendar','Контакты':'navContacts',
-  // Имён умных папок здесь нет намеренно: подписи ставит bindSmartNavigation по
-  // данным папки, а словарь подменял бы по ним любой совпавший текст - метку или
-  // тему письма с названием "Сегодня" превращал в "Сегодня (за 24 часа)".
-  'Ответить':'actionReply','Ответить всем':'actionReplyAll','Переслать':'actionForward','В архив':'actionArchive','Удалить':'actionDelete','Написать':'actionCompose','Отправить':'send',
-  'Настройки':'settingsTitle','Общие':'setGeneral','Панель письма':'setToolbar','Сквозные папки':'setUnified','Сопоставление папок':'setFolders','Календари':'setCalendars','Хранилище':'setStorage','Темы и оформление':'setThemes','Приватность':'setPrivacy','Горячие клавиши':'setKeys'
-};
+// Словаря русских фраз здесь больше нет (ui-language-switch.md, S-002).
+// Он подменял любой текстовый узел, совпавший с фразой интерфейса, и поэтому
+// переводил пользовательские данные: метку с именем "Настройки", тему письма
+// "Календарь", папку ящика "Контакты". Подписи программы переводятся разметкой
+// (data-i18n и родственные признаки) и перерисовкой в relocalizeDynamic.
 function applyUiCatalog(catalog){
   uiCatalog=catalog||{};
-  const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);const nodes=[];while(walker.nextNode())nodes.push(walker.currentNode);
-  // Внутрь [data-no-i18n] не заходим: там подписи из пользовательских данных, и
-  // словарь русских фраз подменял бы их переводом. Имя умной папки "Сегодня"
-  // иначе превращалось бы в "Сегодня (за 24 часа)" на первой же перерисовке.
-  nodes.forEach(node=>{if(node.parentElement?.closest('[data-no-i18n]'))return;const raw=node.nodeValue||'',trimmed=raw.trim(),key=node.__truemailI18nKey||uiKeyByRussian[trimmed];if(key&&uiCatalog[key]){node.__truemailI18nKey=key;node.nodeValue=raw.replace(trimmed,uiCatalog[key]);}});
   const palette=document.getElementById('cmdInput');if(palette&&uiCatalog.commandPlaceholder)palette.placeholder=uiCatalog.commandPlaceholder;
   const actionKeys={reply:'actionReply',replyall:'actionReplyAll',forward:'actionForward',archive:'actionArchive',trash:'actionDelete'};
   document.querySelectorAll('.tbrow').forEach(row=>{const key=actionKeys[row.dataset.action];const label=row.querySelector('.nm');if(label&&uiCatalog[key])label.textContent=uiCatalog[key];});
@@ -62,6 +54,12 @@ function relocalizeDynamic(){
     // Шапка открытого письма не пересобирается при смене языка: тело пришлось
     // бы получать заново. Подпись строки "Ящик" обновляем отдельно.
     window.relocalizeMailboxLine?.();
+    // Подписи, собранные в коде при отрисовке: имена системных папок, карточки
+    // аккаунтов и списки меток (ui-language-switch.md, S-005, S-007, S-008).
+    window.relocalizeFolderTree?.();
+    window.relocalizeAccountSettings?.();
+    if(typeof renderTagsNav==='function')renderTagsNav();
+    if(typeof renderTagSettings==='function')renderTagSettings();
     // Заголовок несёт data-i18n ради первого запуска, поэтому смена языка
     // затирает его подписью "Все входящие". Возвращаем то, что открыто на
     // самом деле - включая имя метки: без этой ветки список метки после смены

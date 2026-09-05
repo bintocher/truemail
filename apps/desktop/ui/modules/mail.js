@@ -134,6 +134,23 @@ function updateFolderBadge(row,folder){if(!row)return;let badge=row.querySelecto
 // заниженное число, пока пользователь не прокрутит все папки.
 let coreTagCounts=new Map();
 function tagMessageCount(name){return coreTagCounts.has(name)?coreTagCounts.get(name):messages.reduce((total,message)=>total+((message.labels||[]).includes(name)?1:0),0);}
+// Подписи системных папок собраны по языку в момент отрисовки, поэтому после
+// смены языка их надо переписать (ui-language-switch.md, S-005, S-006). Дерево
+// целиком не пересобираем: пропало бы состояние раскрытия и выделение.
+window.relocalizeFolderTree=function(){
+  document.querySelectorAll('.folder-row[data-folder-id]').forEach(row=>{
+    const folder=coreFolders.find(item=>item.id===Number(row.dataset.folderId));
+    if(!folder)return;
+    const name=row.querySelector('.folder-name');
+    if(name)name.textContent=folderTitle(folder);
+  });
+  // Заголовок открытой папки собран той же функцией.
+  if(currentFolderId!==null){
+    const folder=coreFolders.find(item=>item.id===currentFolderId);
+    const heading=document.querySelector('.listhead h2');
+    if(folder&&heading)heading.textContent=folderTitle(folder);
+  }
+};
 function renderTagsNav(){const host=document.getElementById('tagsNav');if(!host)return;host.innerHTML='';coreTags.forEach(tag=>{const row=document.createElement('button');row.type='button';row.className='navitem tag-row'+(currentTagName===tag.name?' active':'');row.dataset.tagId=tag.id;row.innerHTML='<span class="tag-dot"></span><span class="tag-name"></span><span class="count"></span>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);if(count)row.querySelector('.count').textContent=count;row.onclick=()=>filterTag(tag);host.appendChild(row);});}
 function renderTagSettings(){const host=document.getElementById('tagSettingsList');if(!host)return;host.innerHTML='';if(!coreTags.length){host.innerHTML=`<div class="note-muted">${L('Меток пока нет','No tags yet')}</div>`;return;}coreTags.forEach(tag=>{const row=document.createElement('div');row.className='tag-settings-row';row.innerHTML='<span class="tag-dot"></span><span class="tag-name grow"></span><span class="count"></span><button type="button" class="btn sm tag-edit"></button>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);row.querySelector('.count').textContent=count?`${count}`:'';row.querySelector('.tag-edit').textContent=L('Изменить','Edit');row.querySelector('.tag-edit').onclick=()=>openLabelEditor(tag);host.appendChild(row);});}
 async function refreshTagsNav(){try{coreTags=await window.tm.listLabels();}catch(_){coreTags=[];}
