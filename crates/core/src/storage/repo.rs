@@ -4600,7 +4600,7 @@ impl Db {
         Ok(contacts)
     }
 
-    // ---------- Починка кодировок (issue #41, docs/specs/message-charset-decoding.md) ----------
+    // ---------- Починка кодировок (issue #41, specs/message-charset-decoding.md) ----------
 
     /// Разовая фоновая починка уже сохранённой почты, испорченной парсером без
     /// фичи `mail-parser/full_encoding`. Возвращает число исправленных писем
@@ -6379,7 +6379,7 @@ mod notification_lookup_tests {
 }
 
 /// Тесты `Db::repair_broken_charset_messages` (issue #41,
-/// docs/specs/message-charset-decoding.md). Раскодирование само по себе (фича
+/// specs/message-charset-decoding.md). Раскодирование само по себе (фича
 /// `mail-parser/full_encoding`) вне границ этой задачи, поэтому письма ниже
 /// собраны на чистом ASCII/UTF-8 без легаси-кодировок: заголовки с не-ASCII
 /// текстом кодируются RFC 2047 (`=?UTF-8?B?...?=`) - base64+UTF-8 декодируются

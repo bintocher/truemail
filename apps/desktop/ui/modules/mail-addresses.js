@@ -3,7 +3,7 @@
 // отображаемых адресов, формат "первый +N", инициал аватара и модель
 // свёртки строк "Кому"/"Копия". Подключается в index.html перед mail.js
 // как обычный скрипт и отдаёт функции через один глобальный объект.
-// См. docs/specs/sent-recipient-display.md.
+// См. specs/sent-recipient-display.md.
 
 // Отображаемый адрес - после trim непусто хотя бы одно из полей name/email.
 function isDisplayableAddr(addr){if(!addr)return false;return !!((addr.name||'').trim()||(addr.email||'').trim());}
