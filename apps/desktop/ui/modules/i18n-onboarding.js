@@ -73,8 +73,10 @@ function relocalizeDynamic(){
       else if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=folderTitle(folder);}
       else if(currentSmartIndex!=null&&smartFolders[currentSmartIndex])heading.textContent=smartFolderTitle(smartFolders[currentSmartIndex])||messagesTitle();
     }
-    const accountCount=document.getElementById('mailAccountCount');
-    if(accountCount&&coreAccounts.length){const n=coreAccounts.length,label=smartIsEnglish()?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');accountCount.textContent=`${n} ${label}`;}
+    // Подзаголовок списка собирает одна и та же функция, что и обычная
+    // отрисовка: иначе смена языка в открытой папке подменяла бы число писем
+    // числом ящиков (ui-language-switch.md, S-009).
+    window.renderListSubtitle?.();
   }catch(error){console.error('relocalize',error);}
 }
 function wzGo(n){document.querySelectorAll('.wzstep').forEach(s=>s.classList.remove('active'));document.getElementById('wz'+n).classList.add('active');

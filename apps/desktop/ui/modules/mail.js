@@ -134,6 +134,24 @@ function updateFolderBadge(row,folder){if(!row)return;let badge=row.querySelecto
 // заниженное число, пока пользователь не прокрутит все папки.
 let coreTagCounts=new Map();
 function tagMessageCount(name){return coreTagCounts.has(name)?coreTagCounts.get(name):messages.reduce((total,message)=>total+((message.labels||[]).includes(name)?1:0),0);}
+// Подзаголовок списка: для папки и метки - число загруженных писем, для
+// сводных представлений - число подключённых ящиков. Правило одно на обычную
+// отрисовку и на перерисовку после смены языка, иначе переключение языка
+// меняло бы смысл подписи (ui-language-switch.md, S-009).
+window.renderListSubtitle=function(rowCount){
+  const sub=document.getElementById('mailAccountCount');
+  if(!sub)return;
+  const en=wizardLocale==='en';
+  if(currentFolderId!==null||currentTagName!=null){
+    const n=rowCount??currentMessageRows.length;
+    const word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');
+    sub.textContent=`${n} ${word}`;
+    return;
+  }
+  const n=coreAccounts.length;
+  const word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');
+  sub.textContent=`${n} ${word}`;
+};
 // Подписи системных папок собраны по языку в момент отрисовки, поэтому после
 // смены языка их надо переписать (ui-language-switch.md, S-005, S-006). Дерево
 // целиком не пересобираем: пропало бы состояние раскрытия и выделение.
@@ -155,6 +173,12 @@ window.relocalizeFolderTree=function(){
   // Строки списка собраны в коде: подпись ящика и подпись "без получателя"
   // остались бы на прежнем языке до следующей прокрутки.
   renderMessageWindow(true);
+  // Пустое состояние области письма тоже собрано в коде (S-009). Карточку
+  // "нет подключённых аккаунтов" не трогаем: её ставит и переводит мастер.
+  const empty=document.querySelector('#tbody .mail-empty h2');
+  if(empty&&!document.querySelector('#tbody .mail-content')&&!document.querySelector('#tbody .wz-logo')){
+    empty.textContent=currentMessageRows.length?L('Выберите письмо','Select a message'):L('Писем нет','No messages');
+  }
 };
 function renderTagsNav(){const host=document.getElementById('tagsNav');if(!host)return;host.innerHTML='';coreTags.forEach(tag=>{const row=document.createElement('button');row.type='button';row.className='navitem tag-row'+(currentTagName===tag.name?' active':'');row.dataset.tagId=tag.id;row.innerHTML='<span class="tag-dot"></span><span class="tag-name"></span><span class="count"></span>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);if(count)row.querySelector('.count').textContent=count;row.onclick=()=>filterTag(tag);host.appendChild(row);});}
 function renderTagSettings(){const host=document.getElementById('tagSettingsList');if(!host)return;host.innerHTML='';if(!coreTags.length){host.innerHTML=`<div class="note-muted">${L('Меток пока нет','No tags yet')}</div>`;return;}coreTags.forEach(tag=>{const row=document.createElement('div');row.className='tag-settings-row';row.innerHTML='<span class="tag-dot"></span><span class="tag-name grow"></span><span class="count"></span><button type="button" class="btn sm tag-edit"></button>';row.querySelector('.tag-dot').style.background=tag.color||'#888';row.querySelector('.tag-name').textContent=tag.name;const count=tagMessageCount(tag.name);row.querySelector('.count').textContent=count?`${count}`:'';row.querySelector('.tag-edit').textContent=L('Изменить','Edit');row.querySelector('.tag-edit').onclick=()=>openLabelEditor(tag);host.appendChild(row);});}
@@ -364,10 +388,7 @@ function renderMessageList(rows,title,resetScroll=false){
   // Заголовок списка - то же пользовательское имя, что и подпись в панели:
   // без пометки словарь автоперевода подменял бы его переводом фразы.
   const heading=document.querySelector('.listhead h2');if(heading){heading.dataset.noI18n='1';heading.textContent=title||messagesTitle();}
-  // Подзаголовок: для папки/тега - число загруженных писем, для сводных умных
-  // папок (несколько аккаунтов) - число аккаунтов.
-  const sub=document.getElementById('mailAccountCount');
-  if(sub){if(currentFolderId!==null||currentTagName!=null){const n=rows.length,en=wizardLocale==='en',word=en?(n===1?'message':'messages'):(n%10===1&&n%100!==11?'письмо':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'письма':'писем');sub.textContent=`${n} ${word}`;}else{const n=coreAccounts.length,en=wizardLocale==='en',word=en?(n===1?'account':'accounts'):(n%10===1&&n%100!==11?'аккаунт':n%10>=2&&n%10<=4&&(n%100<10||n%100>=20)?'аккаунта':'аккаунтов');sub.textContent=`${n} ${word}`;}}
+  renderListSubtitle(rows.length);
   renderMessageWindow(true);updateSelectionUi();
   // Панель письма очищена - поколение показа растёт вместе с ней: ответ на
   // запрос, начатый до очистки, рисовать уже некуда (S-001).
