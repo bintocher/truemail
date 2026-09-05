@@ -1,377 +1,381 @@
-**English** · [Русский](CHANGELOG.ru.md)
+**Русский** · [English](CHANGELOG.en.md)
 
-# Changelog
+# История изменений
 
-All notable changes are documented here. The format follows Keep a Changelog;
-versions use Semantic Versioning.
+Здесь фиксируются все значимые изменения. Формат соответствует Keep a
+Changelog; версии — Semantic Versioning.
 
 ## [Unreleased]
 
 ## [0.2.11] - 2026-09-04
 
-### Added
+### Добавлено
 
-- A pasted screenshot or an image copied from a browser lands right in the
-  message body at the cursor instead of silently becoming a file attachment.
-  The image is sent as a proper inline part with a Content-ID inside
-  multipart/related, so recipients see it in every mail client. The same now
-  holds for forwarded messages and signatures with inline images: they used to
-  arrive as a raw data string in the body and stayed invisible. A normal undo
-  removes the pasted image, and the image survives the saved draft.
-- Files dragged from Explorer onto the program window attach to the open
-  message; when no message is open, one opens on its own and nothing already
-  typed is lost. Dragging used to do nothing at all: file events never reached
-  the interface. Bytes of images in the body count toward the same 25 MB
-  per-message limit as attachments.
+- Скопированный снимок экрана или картинка из браузера вставляется прямо в
+  текст письма туда, где стоит курсор, вместо молчаливого превращения в
+  файл-вложение. Получателю картинка уходит отдельной встроенной частью с
+  меткой Content-ID внутри multipart/related и видна в любом почтовом клиенте.
+  То же касается пересылки письма с картинками и подписи с картинкой: раньше
+  они уходили получателю строкой данных в тексте и не показывались. Вставку
+  снимает обычная отмена, а картинка в теле переживает черновик.
+- Файлы, перетащенные из проводника в окно программы, прикладываются к
+  открытому письму; если письмо не открыто, оно открывается само, и набранное
+  раньше не теряется. Раньше перетаскивание не делало ничего: события с
+  файлами до интерфейса не доходили. Байты картинок в тексте письма считаются
+  в том же пределе 25 МБ, что и вложения.
 
 ## [0.2.10] - 2026-09-03
 
-### Fixed
+### Исправлено
 
-- Messages in iso-2022-jp, shift_jis, big5, gbk and euc-jp/kr are readable:
-  subject and body used to appear as a run of control characters. Exchange
-  newsletters carrying Cyrillic inside iso-2022-jp now open correctly.
-  Already downloaded messages repair themselves after the update: subject,
-  sender, preview, attachment names, address book names and full-text search
-  are restored from the stored source, with no re-download from the server.
-  The repair runs in the background and does not delay startup.
-- Folder names are readable in sync error messages: instead of "Spam" the text
-  used to show a raw IMAP string like "&BCEEPwQwBDw-".
+- Письма в кодировках iso-2022-jp, shift_jis, big5, gbk и euc-jp/kr читаются:
+  раньше тема и текст показывались набором служебных символов. Рассылки
+  Exchange с русским текстом внутри iso-2022-jp теперь открываются нормально.
+  Уже скачанные письма чинятся сами после обновления: тема, отправитель,
+  превью, имена вложений, имена в адресной книге и поиск по тексту
+  восстанавливаются из сохранённого исходника, без повторной загрузки с
+  сервера. Починка идёт в фоне и запуск не задерживает.
+- В сообщениях о сбоях синхронизации имя папки читается: раньше вместо "Спам"
+  показывалась строка вида "&BCEEPwQwBDw-" - служебная запись имени в IMAP.
 
 ## [0.2.9] - 2026-09-02
 
-### Added
+### Добавлено
 
-- Account cards in settings collapse: only one stays expanded, so the section no
-  longer requires long scrolling with several mailboxes. The state is remembered
-  between runs.
-- Password mailboxes get a "Change password" button. It verifies the new
-  password against the server and changes only that: the account name and
-  settings stay, and mail is not downloaded again. The previous password is kept
-  if the new one does not work.
+- Карточки аккаунтов в настройках сворачиваются: развёрнутой остаётся одна, и
+  при нескольких ящиках раздел больше не приходится долго прокручивать.
+  Состояние запоминается между запусками.
+- У ящиков с паролем появилась кнопка "Сменить пароль". Она проверяет новый
+  пароль на сервере и меняет только его: название аккаунта и настройки
+  остаются, почта заново не выкачивается. Прежний пароль сохраняется, если
+  новый не подошёл.
 
-### Changed
+### Изменено
 
-- The "Unified folders" section shows plain folder names with their nesting
-  instead of encoded strings and long identifiers.
-- Recipient suggestions, quick search and the contacts section understand
-  transliteration: typing "коннова" finds "Valentina Konnova" and the other way
-  round.
-- The "To" and "Cc" lines in the message header show the address next to the
-  name, just like the "From" line.
+- В разделе "Сквозные папки" вместо служебных строк и длинных идентификаторов
+  видны обычные имена папок с их вложенностью.
+- Подсказка адресата, быстрый поиск и раздел контактов понимают транслит: ввод
+  "коннова" находит "Valentina Konnova" и наоборот.
+- В шапке письма строки "Кому" и "Копия" показывают адрес рядом с именем, как
+  строка "От".
 
-### Fixed
+### Исправлено
 
-- Clicking a message always shows the message you picked. Previously, if the
-  earlier message took longer to load, its content was drawn over the selected
-  one.
-- Focus stays on the list row after a click, so keys keep working with the list.
-  List rows are now reachable from the keyboard and exposed to screen readers.
-- The keys for the next and previous message work after a click inside the
-  message body as well.
-- The list no longer shifts under the pointer when new mail arrives during work:
-  the position is restored by message instead of by pixel count.
-- Shift selection takes the range you actually see, even if the list was rebuilt
-  in the meantime.
+- Клик по письму всегда показывает выбранное письмо. Раньше, если предыдущее
+  письмо грузилось дольше, его содержимое дорисовывалось поверх выбранного.
+- После клика фокус остаётся на строке списка, и клавиши продолжают работать со
+  списком. Строки списка стали доступны с клавиатуры и для экранного диктора.
+- Клавиши перехода к следующему и предыдущему письму работают и после клика в
+  тело письма.
+- Список не сдвигается под курсором, когда во время работы приходят новые
+  письма: положение восстанавливается по письму, а не по числу пикселей.
+- Выделение с Shift берёт тот диапазон, который видно на экране, даже если
+  список успел перестроиться.
 
 
 ## [0.2.8] - 2026-09-02
 
-### Changed
+### Изменено
 
-- In "Sent" and "Drafts" the message list shows the recipient instead of the
-  sender. It used to show the user's own name, so the list looked like a column
-  of the same name. With several recipients the first one and a counter of the
-  rest are shown. The rule follows the role of the message's own folder, so it
-  also applies in smart folders, tag views and conversations.
-- The message header shows every available address: "From", "To" and "Cc". The
-  "To" line did not exist before. Empty lines are not rendered, and each address
-  has a tooltip with the full "Name (email)" form.
+- В папках "Отправленные" и "Черновики" список писем показывает получателя, а не
+  отправителя. Раньше там стояло имя самого пользователя, и список выглядел как
+  столбец из одного и того же имени. При нескольких адресатах видны первый и
+  счётчик остальных. Правило работает по роли папки самого письма, поэтому
+  действует и в умных папках, и в разделе метки, и в беседах.
+- Шапка открытого письма показывает все доступные адреса: "От", "Кому" и
+  "Копия". Строки "Кому" раньше не было вовсе. Пустые строки не рисуются, у
+  каждого адреса есть подсказка с полным видом "Имя (email)".
 
-### Fixed
+### Исправлено
 
-- Selected weekday and reminder buttons in the event window are readable again:
-  the caption colour on an accent fill now comes from a dedicated variable
-  instead of the accent text colour meant for a plain background.
-- A recipient name made of spaces no longer breaks the avatar initial - the
-  address is shown instead.
+- Выбранные кнопки дней недели и напоминаний в окне встречи снова читаемы: цвет
+  подписи поверх акцентной заливки задаётся отдельной переменной, а не
+  акцентным цветом текста для обычного фона.
+- Имя адресата из одних пробелов больше не ломает вычисление буквы аватара -
+  вместо имени показывается адрес.
 
 ## [0.2.7] - 2026-08-09
 
-### Fixed
+### Исправлено
 
-- A smart folder counter changes the moment a message is read. The sidebar
-  number used to wait for the next background reload, so in the "Unread" folder
-  it disagreed with the list for up to half a minute.
-- Moving messages in Gmail between "All mail" and "Inbox" is no longer rejected
-  by the server. The request asked to both add and remove the same label, so the
-  operations got stuck in the queue and retried for nothing.
-- The message list memory limit applies again while a smart folder is open.
+- Счётчик умной папки меняется сразу, как только письмо прочитано. Раньше число
+  в боковой панели обновлялось только с приходом фоновой перезагрузки, и в папке
+  "Непрочитанные" оно ещё полминуты не совпадало со списком.
+- Перенос писем в Gmail между "Всей почтой" и "Входящими" больше не отклоняется
+  сервером. Запрос просил снять и поставить одну и ту же метку, операции
+  застревали в очереди и повторялись впустую.
+- Ограничение памяти на список писем снова действует при открытой умной папке.
 
-### Added
+### Добавлено
 
-- Interface journal: page errors and memory usage are written to the common log.
-  A window that dies from memory exhaustion now leaves a trail - previously the
-  journal stayed empty.
+- Журнал интерфейса: ошибки страницы и расход памяти пишутся в общий лог. Нужно,
+  чтобы у падения окна из-за нехватки памяти оставался след - раньше в такой
+  ситуации журнал был пуст.
 
 ## [0.2.6] - 2026-08-07
 
-### Added
+### Добавлено
 
-- Message counters for smart folders: the context menu of a smart folder in the
-  sidebar can show unread, total, or both - just like ordinary mailbox folders.
-  The counter is off by default.
+- Счётчик писем у умной папки: в контекстном меню папки в боковой панели можно
+  включить показ непрочитанных, общего числа или обоих - как у обычных папок
+  почтового ящика. По умолчанию счётчик выключен.
 
-### Fixed
+### Исправлено
 
-- The minimize button minimizes the window again: hiding to the tray was
-  rejected by the permission list, so the click did nothing.
-- A renamed built-in smart folder shows its own name in the sidebar and in the
-  settings list. The default caption used to win there, so the name set in
-  settings was only visible inside the edit dialog. The name field of a built-in
-  folder now shows the default caption as a hint: clear the field to bring it
-  back and have the name follow the interface language again.
+- Кнопка "свернуть" снова сворачивает окно: сворачивание в трей отклонялось
+  правами доступа, и нажатие ничего не делало.
+- Переименованная встроенная умная папка показывает своё имя в боковой панели и
+  в списке настроек. Раньше там всегда стояла подпись по умолчанию, и имя,
+  заданное в настройках, было видно только в самом окне правки. Поле имени у
+  встроенной папки теперь показывает подпись по умолчанию подсказкой: очистите
+  поле, чтобы вернуть её и снова получать имя на языке интерфейса.
 
 ## [0.2.5] - 2026-08-01
 
-### Added
+### Добавлено
 
-- A "Minimize to tray" setting: the minimize button hides the window into the
-  tray icon instead of the taskbar. Turn it off for ordinary minimizing.
+- Настройка "Сворачивать в трей": кнопка "свернуть" прячет окно в значок в трее,
+  а не в панель задач. Можно выключить и вернуть обычное сворачивание.
 
-### Fixed
+### Исправлено
 
-- Smart folders with legacy conditions show messages again. Conditions created
-  by early versions kept the old vocabulary ("Status" instead of "Read state",
-  not_seen instead of unread) and the query did not understand them: "Unread
-  (all)", for one, stayed empty while the mailbox had unread mail.
-- Smart folders with a date condition no longer break the message query: an
-  absurdly large period (billions of weeks) failed instead of returning results.
-- The window now opens by itself after an update. The installer restarted the
-  app with the previous process arguments, so a copy started by autostart hid
-  itself in the tray and could only be restored from the tray icon.
+- Умные папки со старыми условиями снова показывают письма. Условия, созданные
+  ранними версиями, остались в прежнем словаре ("Статус" вместо "Прочтение",
+  not_seen вместо unread), и выборка их не понимала: например "Непрочитанные
+  (все)" была пуста при непрочитанных письмах в ящике.
+- Умные папки с условием по дате больше не роняют выборку писем: слишком
+  большой период (например миллиарды недель) приводил к отказу вместо результата.
+- После обновления окно программы открывается само. Установщик перезапускал её с
+  аргументами прежнего процесса, и запущенная автозапуском версия пряталась в
+  трей - вытащить окно можно было только из значка.
 
 ## [0.2.4] - 2026-07-31
 
-### Added
+### Добавлено
 
-- A custom title bar replaces the system one: drag the window by it, and next to
-  the minimize/maximize/close buttons an "Update" button appears when a new
-  version is out. Closing still hides the app to the tray.
-- Updates are checked automatically every 6 hours and downloaded ahead of time,
-  so the "Update" button installs right away instead of waiting for a download.
-- Downloaded update packages no longer pile up: once an update is installed the
-  old installers are removed, leaving at most the one still pending.
+- Своя строка заголовка вместо системной: окно перетаскивается за неё, рядом с
+  кнопками свернуть/развернуть/закрыть появляется кнопка "Обновить", когда вышла
+  новая версия. Закрытие по-прежнему прячет программу в трей.
+- Новая версия проверяется автоматически каждые 6 часов и скачивается заранее,
+  поэтому по кнопке "Обновить" установка идёт сразу, без ожидания загрузки.
+- Скачанные пакеты обновления не копятся: после установки старые удаляются, на
+  диске остаётся не больше одного - того, что ещё не поставлен.
 
 ## [0.2.3] - 2026-07-31
 
-### Added
+### Добавлено
 
-- "Send to -> truemail" in the Windows Explorer context menu: the selected files
-  open as attachments in a new message. The installer adds the entry, and a
-  setting turns it off and back on.
-- A "Today" button in the calendar header: it jumps back to the current date in
-  whichever view is active - month, week or day.
+- Пункт "Отправить -> truemail" в контекстном меню проводника Windows: выбранные
+  файлы сразу открываются вложениями в новом письме. Установщик добавляет пункт
+  сам, а в настройках его можно выключить и включить обратно.
+- Кнопка "Сегодня" в шапке календаря: возвращает к текущей дате в том
+  представлении, которое выбрано - месяц, неделя или день.
 
-### Fixed
+### Исправлено
 
-- The "Launch on system startup" switch showed the off state even when autostart
-  was enabled: it read the state before the bridge to the core was up.
+- Галочка "Запускать при старте системы" показывала выключенное состояние, даже
+  когда автозапуск был включён: состояние читалось до подключения к ядру.
 
 ## [0.2.2] - 2026-07-29
 
-### Added
+### Добавлено
 
-- A clear-filter button next to the funnel: it shows up only when a filter is
-  actually narrowing the list. Hovering lists the active conditions, clicking
-  removes all of them.
-- Opening the filter menu now puts the caret straight into the text field.
+- Кнопка сброса фильтра рядом с воронкой: появляется, только когда фильтр
+  что-то отсекает. При наведении показывает список активных условий, по клику
+  снимает их все.
+- Открытие меню фильтра сразу ставит курсор в поле ввода.
 
-### Fixed
+### Исправлено
 
-- Memory usage. The UI rendering process grew past a gigabyte; it now runs under
-  a heap cap and returns the excess to the system.
-- A leak in account settings: colour-picker handlers piled up on every
-  background data refresh and kept obsolete markup alive.
-- A hidden window now releases memory: the message list markup is dropped and is
-  not rebuilt while the window stays hidden. On return the list appears
-  immediately and scrolls back to the message you left off at.
+- Расход памяти. Процесс отрисовки интерфейса разрастался до гигабайта и больше:
+  теперь ему задан потолок, и лишнее возвращается системе.
+- Утечка в настройках аккаунтов: обработчики выбора цвета копились при каждом
+  фоновом обновлении данных и удерживали в памяти уже ненужную разметку.
+- Свёрнутое окно освобождает память: разметка списка писем сбрасывается, а пока
+  окно скрыто, она и не строится заново. При возврате список появляется сразу, и
+  прокрутка возвращается на прежнее письмо.
 
 ## [0.2.1] - 2026-07-26
 
-### Fixed
+### Исправлено
 
-- The app no longer downloads mail and burns CPU while nobody is using it.
-  Smart-folder backfill ran in an endless loop: it pulled old messages from the
-  server, restarted itself when those messages hit the database, and kept going
-  for days. A day of uptime produced thousands of pointless server round-trips
-  and grew memory usage to several gigabytes.
-- The message list no longer grows in memory without bound: at most 8000 recent
-  messages are kept, and the open message plus everything on screen stay.
-- Data refresh after a sync runs at most once every 5 seconds, and is deferred
-  while the window is hidden - previously every sync event reloaded all folders,
-  contacts and calendars in full.
-- The routine mail-watch reconnect (roughly every 90 seconds) no longer triggers
-  a full data reload when nothing changed; new mail, deletions and flag changes
-  still refresh the list immediately.
-- The "Message sources for smart folders" settings block no longer restarts the
-  message list on every background refresh - only when the user changes the
-  sources. Previously this reset the list scroll position.
-- Restoring the scroll position after a data refresh is no longer mistaken for
-  user scrolling and no longer triggers a server fetch.
-- Message-list bookkeeping is faster: the per-folder pass is no longer quadratic.
+- Программа больше не качает почту и не грузит процессор, когда её никто не
+  трогает. Догрузка старых писем в умной папке уходила в бесконечный круг:
+  скачивала письма с сервера, сама себя перезапускала на записи в базу и так по
+  кругу сутками. За сутки работы это давало тысячи лишних обращений к серверу, а
+  расход памяти вырастал до нескольких гигабайт.
+- Список писем больше не растёт в памяти без предела: держим не больше 8000
+  последних писем, открытое письмо и то, что видно на экране, не выгружаются.
+- Обновление данных после синхронизации идёт не чаще раза в 5 секунд, а при
+  свёрнутом окне откладывается до возвращения - раньше каждое событие
+  синхронизации перезагружало все папки, контакты и календари целиком.
+- Плановая переустановка наблюдения за почтой (примерно раз в полторы минуты)
+  больше не вызывает полную перезагрузку данных, если ничего не изменилось:
+  новые письма, удаления и смена флагов по-прежнему обновляют список сразу.
+- Раздел настроек "Источники писем для умных папок" больше не перезапускает
+  список писем при каждом фоновом обновлении - только когда источники меняет
+  сам пользователь. Раньше это сбрасывало прокрутку списка.
+- Восстановление позиции прокрутки после обновления данных больше не
+  принимается за прокрутку пользователя и не запускает загрузку с сервера.
+- Ускорены пересчёты по списку писем: обход папок больше не квадратичный.
 
 ## [0.2.0] - 2026-07-25
 
-### Added
+### Добавлено
 
-- Labels for mail: a section of their own in the sidebar, a list of labels with
-  colours in settings, assigning a label straight from the message menu and a
-  coloured badge in the list. Sorting rules can also assign a label on their
-  own.
-- The message list loads older mail from the server by itself when you scroll to
-  the end: in batches, with an indicator and a clear status. Works for Exchange,
-  Gmail and ordinary mail (Yandex, Outlook and others). If the list holds only a
-  few messages, the app tops it up without waiting for you to scroll.
-- For every folder you can choose what is shown next to its name: the total
-  number of messages, the number of unread ones, or nothing.
-- In conversation mode actions apply to the whole thread at once: mark as read,
-  move, delete.
-- The "Cc" list in the message header expands on click.
-- Esc closes any pop-up window.
+- Метки для писем: отдельный раздел в боковой панели, список меток с цветом в
+  настройках, назначение метки прямо из меню письма и цветной значок в списке.
+  Правила сортировки тоже умеют ставить метку автоматически.
+- Список писем сам подгружает старые письма с сервера, когда докручиваешь до
+  конца: порциями, с индикатором и понятным статусом. Работает для Exchange,
+  Gmail и обычной почты (Яндекс, Outlook и другие). Если в списке мало писем,
+  программа дозагрузит их, не дожидаясь прокрутки.
+- Для каждой папки можно выбрать, что показывать рядом с именем: сколько всего
+  писем, сколько непрочитанных или ничего.
+- В режиме диалогов действия применяются сразу ко всей переписке: отметить
+  прочитанной, переместить, удалить.
+- Список "Копия" в шапке письма раскрывается по щелчку.
+- Esc закрывает любое всплывающее окно.
 
-### Fixed
+### Исправлено
 
-- The message context menu no longer runs off the edge of the window - it always
-  opens towards the visible side.
-- An opened message no longer disappears from unread at that very moment: it
-  stays where it is until you move on to another one.
-- Exchange folders line up in the same tree as on the server: nested folders no
-  longer scatter across the top level.
-- Meeting invitations from Exchange show their participants, and the reply
-  buttons finally appear.
-- Meeting reply buttons are now the same width, and the chosen reply is
-  highlighted.
-- The message list header no longer says "4 accounts" when a single account's
-  folder is open - it shows the number of messages in that folder instead.
-- The message list no longer jumps back to the top when you switch to another
-  program and back, or when the data refreshes.
-- Yandex Mail loads older messages again - the request used to go out for
-  nothing and the list hit a ceiling.
-- Loading older messages no longer repeats them or gets stuck in the same place.
-- An action on a collapsed conversation applies to that conversation only:
-  messages with the same subject from other senders used to be caught too.
-- Mail rules no longer fire on old messages pulled in by scrolling - years-old
-  correspondence stays where it is instead of scattering across folders.
-- Deleting a label no longer deletes the rule that assigned it: the rule stays,
-  you only pick a label for it again.
-- Recurring events keep their settings when saved: day of month, ordinal week
-  and the end time of the repetition stay in place, and the server accepts the
-  exception dates without errors.
+- Контекстное меню письма больше не уезжает за край окна - оно всегда
+  разворачивается в видимую сторону.
+- Открытое письмо больше не исчезает из непрочитанных в тот же миг: оно
+  остаётся на месте, пока не перейдёшь к другому.
+- Папки Exchange выстраиваются в то же дерево, что и на сервере: вложенные
+  папки больше не разъезжаются по верхнему уровню.
+- Приглашения на встречи из Exchange показывают участников, а кнопки ответа
+  наконец появляются.
+- Кнопки ответа на встречу стали одинаковой ширины, выбранный ответ
+  подсвечивается.
+- Шапка списка писем больше не пишет "4 аккаунта", когда открыта папка одного
+  аккаунта - вместо этого показывает число писем в папке.
+- Список писем не прыгает в начало, когда переключаешься на другую программу и
+  обратно или когда данные обновляются.
+- Яндекс.Почта снова догружает старые письма - раньше запрос уходил впустую и
+  список упирался в потолок.
+- При загрузке старых писем больше нет повторов и застревания на одном и том же
+  месте.
+- Действие над свёрнутой перепиской применяется к самой переписке: раньше под
+  раздачу попадали письма с той же темой от других отправителей.
+- Правила разбора почты не срабатывают на старые письма, поднятые прокруткой -
+  переписка многолетней давности больше не разъезжается по папкам.
+- Удаление метки больше не удаляет правило, которое её ставило: правило
+  остаётся, нужно лишь выбрать метку заново.
+- Повторяющиеся события больше не теряют настройки при сохранении: день месяца,
+  порядковый номер недели и время окончания повторов остаются на месте, а даты
+  исключений сервер принимает без ошибок.
 
-### Changed
+### Изменено
 
-- A calendar event is set up by clicking ready-made fields instead of typing
-  service strings by hand. The account and the calendar are shown as text when
-  editing an event, and the window is wider - every field is visible at once.
-- In the Russian interface everything is called "метка": some places used to say
-  "тег" and others "метка".
+- Событие календаря настраивается щелчками по готовым полям, без ручного ввода
+  служебных строк. Аккаунт и календарь при правке события показываются текстом,
+  а окно стало шире - все поля видны сразу.
+- В русском интерфейсе всё называется "метка": раньше в одних местах был "тег",
+  в других "метка".
 
 ## [0.1.7] - 2026-07-23
 
-### Fixed
+### Исправлено
 
-- Installing a new version over an older one no longer asks you to remove the
-  previous one first - the update installs straight away and keeps your mail
-  and settings. You are still asked to uninstall only when installing the same
-  version again or going back to an older one.
+- При установке новой версии поверх старой программа больше не просит сначала
+  удалить прежнюю - обновление ставится сразу, письма и настройки сохраняются.
+  Предложение удалить остаётся только если ставишь ту же версию заново или
+  возвращаешься на более старую.
 
 ## [0.1.6] - 2026-07-22
 
-### Fixed
+### Исправлено
 
-- The app could lose access to Google mail and show "account not configured":
-  sign-in stopped renewing and Gmail stopped updating. Sign-in now stays
-  connected as it should.
+- Раньше программа могла потерять доступ к почте Google и написать "аккаунт не
+  настроен": вход переставал продлеваться, письма Gmail не обновлялись. Теперь
+  вход держится как положено.
 
-### Changed
+### Изменено
 
-- The project moved to GitHub: https://github.com/bintocher/truemail. Sources
-  and updates now come from there; the update arrives on its own, as usual.
+- Проект переехал на GitHub: https://github.com/bintocher/truemail. Исходники
+  и обновления теперь берутся оттуда; обновление придёт само, как обычно.
 
 ## [0.1.5] - 2026-07-21
 
-### Added
+### Добавлено
 
-- Postal addresses for contacts: model, storage, card and edit form,
-  synchronization with CardDAV (`ADR`), Exchange
-  (`contacts:PhysicalAddress:*`) and Google People.
-- Recurring Exchange events are read and written: daily, weekly, monthly and
-  yearly rules (including relative ones such as "second Tuesday"), with
-  `UNTIL` and `COUNT` bounds. Dropping the recurrence clears it on the server
-  through `DeleteItemField`.
-- CalDAV/CardDAV discovery through DNS SRV records (RFC 6764), including the
-  `path=` hint from TXT.
-- The Windows build now runs on PowerShell 7.
+- Почтовые адреса контакта: модель, хранилище, карточка и форма
+  редактирования, синхронизация с CardDAV (`ADR`), Exchange
+  (`contacts:PhysicalAddress:*`) и Google People.
+- Повторяющиеся события Exchange читаются и отправляются: ежедневные,
+  еженедельные, ежемесячные и ежегодные правила (включая относительные вида
+  "второй вторник"), границы `UNTIL` и `COUNT`. Снятое повторение стирается
+  на сервере через `DeleteItemField`.
+- Обнаружение адресов CalDAV/CardDAV через SRV-записи DNS (RFC 6764) с
+  разбором `path=` из TXT.
+- Windows-сборка идёт на PowerShell 7.
 
-### Fixed
+### Исправлено
 
-- The address book stopped at 500 contacts: the hard `LIMIT 500` is gone and
-  emails, phones and addresses are read with four queries instead of `1 + 3N`.
-- Phones and addresses removed from a contact stayed on the Exchange server;
-  they are now deleted through `DeleteItemField`.
-- The update prompt repeated every 6 hours for the same version.
+- Адресная книга обрывалась на 500 контактах: жёсткий `LIMIT 500` снят,
+  почты, телефоны и адреса читаются четырьмя запросами вместо `1 + 3N`.
+- Убранные из контакта телефоны и адреса оставались на сервере Exchange -
+  теперь удаляются через `DeleteItemField`.
+- Предложение обновиться повторялось каждые 6 часов для одной и той же
+  версии.
 
-### Security
+### Безопасность
 
-- An SRV target is accepted only inside the mail domain: DNS without DNSSEC
-  can be spoofed in transit, and the password is sent to that address next.
+- Цель SRV-записи принимается, только если она внутри домена почты: DNS без
+  DNSSEC подделывается по пути, а следом по этому адресу уходит пароль.
 
 ## [0.1.4] - 2026-07-21
 
-### Added
+### Добавлено
 
-- Notifications for meeting changes: created, rescheduled, cancelled, renamed,
-  location changed, attendee list changed. Cards show the date, time, location,
-  organizer and attendee count.
-- Replying to an invitation straight from the notification, sending an iTIP
-  REPLY to the organizer; the answer can be changed later.
-- Exchange: creating, updating and deleting events and contacts over EWS.
-- CalDAV and CardDAV for iCloud, Mail.ru, Outlook and arbitrary servers with
-  `.well-known` discovery (RFC 6764) and sync-collection (RFC 6578).
-- Creating a folder on the server: IMAP, Exchange, JMAP and Gmail.
-- The selected calendar view persists across restarts; the grid stretches to
-  the available height and follows the configured working hours.
-- Sending mail in the background and update checks every 6 hours.
+- Уведомления об изменениях встреч: создана, перенесена, отменена,
+  переименована, изменилось место, изменился состав участников. В карточке
+  дата, время, место, организатор и число участников.
+- Ответ на приглашение прямо из уведомления с отправкой iTIP REPLY
+  организатору; ответ можно изменить позже.
+- Exchange: создание, изменение и удаление событий и контактов через EWS.
+- CalDAV и CardDAV для iCloud, Mail.ru, Outlook и произвольных серверов
+  с автоопределением по `.well-known` (RFC 6764) и sync-collection (RFC 6578).
+- Создание папки на сервере: IMAP, Exchange, JMAP и Gmail.
+- Выбранный вид календаря сохраняется между запусками, сетка растягивается
+  на высоту области и учитывает рабочие часы.
+- Отправка письма в фоне и проверка обновлений каждые 6 часов.
 
-### Fixed
+### Исправлено
 
-- New-mail notifications appeared twice and for messages that were not new:
-  the card is now built from the actual new messages and deduplication is
-  shared across all synchronization paths.
-- Flag synchronization overwrote the seen state in the outbox payload.
+- Уведомление о новой почте показывалось повторно и по уже прочитанным
+  письмам: карточка строится по конкретным новым письмам, а дедуп общий для
+  всех путей синхронизации.
+- Синхронизация флага "важное" затирала признак прочитанности в очереди
+  отправки.
 
-### Security
+### Безопасность
 
-- Attachment saving sanitizes the name, canonicalizes the path and requires it
-  to sit exactly in the chosen directory.
-- List-Unsubscribe One-Click refuses private addresses and does not follow
-  redirects; the address is pinned before connecting (DNS rebinding).
-- Only `data:` URIs of raster images are allowed in messages.
-- Changing the authentication method removes the stale keychain entry.
-- Mail addresses are masked in logs; logs are kept for 7 days and release
-  builds log at `info`.
+- Сохранение вложений: имя санируется, путь канонизируется и обязан лежать
+  ровно в выбранной папке.
+- List-Unsubscribe One-Click не обращается к приватным адресам и не следует
+  за переадресациями; адрес фиксируется до соединения (защита от DNS
+  rebinding).
+- В письмах разрешены только `data:`-URI растровых изображений.
+- При смене метода аутентификации прежняя запись keychain удаляется.
+- Адреса почты в журналах маскируются; журналы хранятся 7 дней, в релизной
+  сборке уровень `info`.
 
 ## [0.1.0]
 
-### Added
+### Добавлено
 
-- SQLCipher storage, encrypted blob store and system-keychain integration.
-- Yandex OAuth/IMAP/CalDAV/CardDAV synchronization with IMAP IDLE.
-- Desktop onboarding, mail, calendar, contacts, search and settings UI.
+- Хранилище на SQLCipher, зашифрованный blob-store и интеграция с системным
+  keychain.
+- Синхронизация Yandex через OAuth/IMAP/CalDAV/CardDAV с IMAP IDLE.
+- Онбординг desktop-приложения, интерфейсы почты, календаря, контактов, поиска
+  и настроек.
 
-### Security
+### Безопасность
 
-- IMAP downloads use `BODY.PEEK[]` and never mark messages read implicitly.
-- Blob references are random and bound to XChaCha20-Poly1305 ciphertext via AAD.
-- Installation keys combine OS CSPRNG and user input through HKDF.
+- Загрузка писем по IMAP использует `BODY.PEEK[]` и никогда не помечает письма
+  прочитанными неявно.
+- Ссылки на blob случайны и привязаны к шифротексту XChaCha20-Poly1305 через AAD.
+- Ключи установки объединяют OS CSPRNG и пользовательский ввод через HKDF.

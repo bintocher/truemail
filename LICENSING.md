@@ -1,12 +1,14 @@
-# Licensing
+**Русский** · [English](LICENSING.en.md)
 
-The open-source edition of truemail is licensed under
-`AGPL-3.0-or-later`. The complete GNU AGPL version 3 text is in [LICENSE](LICENSE).
+# Лицензирование
 
-Commercial licenses are available for organizations that need to distribute or
-operate modified versions without the AGPL obligations. Contact
-`bintocher@yandex.com` for commercial terms.
+Открытая редакция truemail распространяется по лицензии `AGPL-3.0-or-later`.
+Полный текст GNU AGPL версии 3 - в файле [LICENSE](LICENSE).
 
-Contributions are accepted under [CLA.md](CLA.md), which gives the project owner
-the rights required to maintain this dual-licensing model while contributors
-retain ownership of their work.
+Для организаций, которым нужно распространять или эксплуатировать изменённые
+версии без обязательств AGPL, доступны коммерческие лицензии. Условия -
+по адресу `bintocher@yandex.com`.
+
+Вклад в проект принимается на условиях [CLA.md](CLA.md): он даёт владельцу
+проекта права, необходимые для двойного лицензирования, а автор вклада
+сохраняет за собой авторство своей работы.

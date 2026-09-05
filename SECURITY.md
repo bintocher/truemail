@@ -1,16 +1,17 @@
-**English** · [Русский](SECURITY.ru.md)
+**Русский** · [English](SECURITY.en.md)
 
-# Security policy
+# Политика безопасности
 
-Please do not report vulnerabilities in public issues. Send a minimal encrypted
-or plaintext report to `bintocher@yandex.com` with:
+Пожалуйста, не сообщайте об уязвимостях в публичных issue. Отправьте минимальный
+отчёт (в зашифрованном или открытом виде) на `bintocher@yandex.com`, указав:
 
-- affected version and operating system;
-- reproducible steps or proof of concept;
-- expected impact;
-- whether any user data or credentials were accessed.
+- затронутую версию и операционную систему;
+- шаги для воспроизведения или proof of concept;
+- ожидаемое воздействие;
+- был ли получен доступ к пользовательским данным или учётным данным.
 
-Do not access data that does not belong to you. The project will acknowledge a
-report within 7 days and coordinate disclosure after a fix is available.
+Не получайте доступ к данным, которые вам не принадлежат. Проект подтвердит
+получение отчёта в течение 7 дней и согласует раскрытие информации после
+выхода исправления.
 
-Supported versions: the latest released version and the current default branch.
+Поддерживаемые версии: последняя выпущенная версия и текущая ветка по умолчанию.

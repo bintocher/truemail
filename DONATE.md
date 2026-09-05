@@ -1,10 +1,10 @@
-**English** · [Русский](DONATE.ru.md)
+**Русский** · [English](DONATE.en.md)
 
-# Support the project
+# Поддержать проект
 
-truemail is a free, open-source project. If it is useful to you, please
-support its development.
+truemail — бесплатный проект с исходным кодом. Если он вам полезен,
+поддержите разработку.
 
-For commercial licensing inquiries: bintocher@yandex.com.
+По вопросам коммерческой лицензии: bintocher@yandex.com.
 
-Author: Chernov ([@bintocher](https://github.com/bintocher/truemail)).
+Автор: Чернов ([@bintocher](https://github.com/bintocher/truemail)).
