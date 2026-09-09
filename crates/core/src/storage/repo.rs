@@ -1,6 +1,7 @@
 //! Репозитории: типобезопасные запросы к таблицам.
 
 use super::Db;
+use super::encoded_words;
 use crate::Result;
 use crate::model::*;
 use futures::TryStreamExt;
@@ -1861,7 +1862,8 @@ impl Db {
         let mut rows = Vec::new();
         let mut created_refs: Vec<String> = Vec::new();
         for source in messages {
-            let Some(message) = MessageParser::default().parse(&source.raw) else {
+            let normalized = encoded_words::join_split_encoded_words(&source.raw);
+            let Some(message) = MessageParser::default().parse(normalized.as_ref()) else {
                 continue;
             };
             let from = message.from().and_then(|value| value.first());
@@ -2782,7 +2784,8 @@ impl Db {
             .as_deref()
             .map(|reference| self.blobs.get(reference))
             .transpose()?;
-        let parsed = raw
+        let normalized = raw.as_deref().map(encoded_words::join_split_encoded_words);
+        let parsed = normalized
             .as_deref()
             .and_then(|bytes| MessageParser::default().parse(bytes));
         let body_text = parsed
@@ -4623,11 +4626,14 @@ impl Db {
 
     // ---------- Починка кодировок (issue #41, specs/message-charset-decoding.md) ----------
 
-    /// Разовая фоновая починка уже сохранённой почты, испорченной парсером без
-    /// фичи `mail-parser/full_encoding`. Возвращает число исправленных писем
-    /// за проход.
+    /// Разовая фоновая починка уже сохранённой почты с символами замены в теме
+    /// и в именах. Возвращает число исправленных писем за проход.
     ///
-    /// Флаг `charset_repair_v1` в `storage_meta` защищает от повторного
+    /// Номер в имени флага растёт вместе с правками разбора: письма, испорченные
+    /// прежним разбором, чинятся новым проходом. Проход `v2` перечитывает почту
+    /// после склейки разрезанных закодированных слов (issue #62).
+    ///
+    /// Флаг `charset_repair_v2` в `storage_meta` защищает от повторного
     /// полного скана (S-008): при уже выставленном флаге функция сразу
     /// возвращает 0, не трогая `messages`. Ошибка на отдельном письме не
     /// прерывает проход и не пробрасывается наружу (S-007): письмо
@@ -4637,7 +4643,7 @@ impl Db {
     /// при следующем запуске (S-011).
     pub async fn repair_broken_charset_messages(&self) -> Result<usize> {
         let already_done: Option<(String,)> =
-            sqlx::query_as("SELECT value FROM storage_meta WHERE key = 'charset_repair_v1'")
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = 'charset_repair_v2'")
                 .fetch_optional(&self.pool)
                 .await?;
         if already_done.is_some() {
@@ -4689,7 +4695,7 @@ impl Db {
         self.repair_contact_names_from_messages().await?;
 
         sqlx::query(
-            "INSERT INTO storage_meta(key, value) VALUES('charset_repair_v1', '1')
+            "INSERT INTO storage_meta(key, value) VALUES('charset_repair_v2', '1')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         )
         .execute(&self.write_pool)
@@ -4766,8 +4772,9 @@ impl Db {
     ) -> Result<bool> {
         use mail_parser::{MessageParser, MimeHeaders};
         let raw = self.blobs.get(raw_blob_ref)?;
+        let normalized = encoded_words::join_split_encoded_words(&raw);
         let message = MessageParser::default()
-            .parse(&raw)
+            .parse(normalized.as_ref())
             .ok_or_else(|| crate::Error::Other("не удалось разобрать письмо повторно".into()))?;
         let from = message.from().and_then(|value| value.first());
         let addresses = |value: Option<&mail_parser::Address<'_>>| {
@@ -6716,7 +6723,7 @@ mod charset_repair_tests {
 
     async fn charset_repair_flag_is_set(db: &Db) -> bool {
         sqlx::query_as::<_, (String,)>(
-            "SELECT value FROM storage_meta WHERE key = 'charset_repair_v1'",
+            "SELECT value FROM storage_meta WHERE key = 'charset_repair_v2'",
         )
         .fetch_optional(&db.pool)
         .await
@@ -7767,6 +7774,51 @@ mod charset_repair_tests {
 #[cfg(test)]
 mod charset_decoding_tests {
     use mail_parser::MessageParser;
+
+    /// issue #62: тема разбита на два закодированных слова, и разрез пришёлся на
+    /// середину двухбайтовой буквы "г". Без склейки слов до разбора обрубки
+    /// байтов давали два символа замены: "Сер??еевич".
+    #[test]
+    fn split_encoded_word_keeps_the_character() {
+        let raw = concat!(
+            "From: test@example.test\r\n",
+            "Subject: =?UTF-8?B?0J/QvtC00L/QuNGI0LjRgtC1INC/0LvQsNGC0ZHQtiDQtNC70Y8g0KfQtdGA0L3QvtCyINCh0YLQsNC90LjRgdC70LDQsiDQodC10YDQ?=\r\n",
+            " =?UTF-8?B?s9C10LXQstC40Yc=?=\r\n",
+            "\r\n",
+            "body\r\n"
+        );
+        let normalized = crate::storage::encoded_words::join_split_encoded_words(raw.as_bytes());
+        let message = MessageParser::default()
+            .parse(normalized.as_ref())
+            .expect("parse");
+        assert_eq!(
+            message.subject().unwrap_or_default(),
+            "Подпишите платёж для Чернов Станислав Сергеевич"
+        );
+    }
+
+    /// Имя отправителя приходит теми же закодированными словами и ломалось так же.
+    #[test]
+    fn split_encoded_word_in_sender_name_keeps_the_character() {
+        let raw = concat!(
+            "From: =?UTF-8?B?0KfQtdGA0L3QvtCyINCh0YLQsNC90LjRgdC70LDQsiDQodC10YDQ?=\r\n",
+            " =?UTF-8?B?s9C10LXQstC40Yc=?= <test@example.test>\r\n",
+            "Subject: тема\r\n",
+            "\r\n",
+            "body\r\n"
+        );
+        let normalized = crate::storage::encoded_words::join_split_encoded_words(raw.as_bytes());
+        let message = MessageParser::default()
+            .parse(normalized.as_ref())
+            .expect("parse");
+        let name = message
+            .from()
+            .and_then(|value| value.first())
+            .and_then(|address| address.name())
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(name, "Чернов Станислав Сергеевич");
+    }
 
     /// Outlook Exchange рассылает кириллицу в iso-2022-jp: русские буквы лежат
     /// в 7-м ряду JIS X 0208. Без фичи full_encoding у mail-parser такие письма

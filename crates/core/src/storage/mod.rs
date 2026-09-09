@@ -3,6 +3,7 @@
 //! шифруются на уровне приложения.
 
 mod blobs;
+pub mod encoded_words;
 pub mod repo;
 
 pub use blobs::BlobStore;
