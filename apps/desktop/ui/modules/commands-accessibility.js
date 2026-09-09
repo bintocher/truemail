@@ -134,7 +134,11 @@ document.addEventListener('keydown',e=>{
     if(e.code==='Enter'&&activeMessage){e.preventDefault();const row=document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`);row?.click();}
   }
   if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&e.code==='KeyA'&&document.getElementById('mailView').classList.contains('active')&&!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){e.preventDefault();selectAllCurrentMessages();}
-  if(e.key==='Escape'){closeCmd();pop.classList.remove('open');closeSmart();ctxmenu.classList.remove('open');ctxsmart.classList.remove('open');ctxfolder.classList.remove('open');filterMenu?.classList.add('hidden');sortMenu?.classList.add('hidden');}});
+  // Escape сначала закрывает вспомогательные меню и на этом останавливается:
+  // палитра команд и окно умной папки закрываются только следующим нажатием
+  // (specs/single-popup-menu.md, S-011 и S-012). Перечня меню тут нет - его
+  // знает единая точка закрытия.
+  if(e.key==='Escape'){if(handlePopupMenusEscape(e))return;closeCmd();pop.classList.remove('open');closeSmart();}});
 
 /* Клик в тело HTML-письма уводит фокус внутрь рамки, и нажатия оттуда до общего
    обработчика не доходят. Пересылаем закрытый список действий: переход к

@@ -119,7 +119,7 @@ smartOverlay.onclick=e=>{if(e.target===smartOverlay)closeSmart();};
 const smartIconKeys=Object.keys(ic).filter(key=>!['chevR','chevL','up','down','back','dots','grip'].includes(key)).slice(0,50);
 const smartIconsEl=document.getElementById('smartIcons');smartIconsEl.innerHTML=smartIconKeys.map(key=>`<span class="ic-pick" data-sel="${key}" title="${key}"><i data-i="${key}"></i></span>`).join('');renderIcons(smartIconsEl);
 function updateSmartIconButton(){const i=document.querySelector('#smartIconButton i');i.dataset.i=selectedSmartIcon;i.innerHTML=ic[selectedSmartIcon]||ic.star;document.querySelectorAll('#smartIcons .ic-pick').forEach(p=>p.classList.toggle('on',p.dataset.sel===selectedSmartIcon));}
-document.getElementById('smartIconButton').onclick=()=>smartIconsEl.classList.toggle('hidden');document.querySelectorAll('#smartIcons .ic-pick').forEach(p=>p.onclick=()=>{selectedSmartIcon=p.dataset.sel;updateSmartIconButton();smartIconsEl.classList.add('hidden');});
+document.getElementById('smartIconButton').onclick=event=>{event.stopPropagation();if(!smartIconsEl.classList.contains('hidden')){closePopupMenus(['icon']);return;}openPopupMenu('icon','icon');smartIconsEl.classList.remove('hidden');};document.querySelectorAll('#smartIcons .ic-pick').forEach(p=>p.onclick=()=>{selectedSmartIcon=p.dataset.sel;updateSmartIconButton();smartIconsEl.classList.add('hidden');});
 
 /* toolbar customizer */
 const tbActions=[
@@ -180,10 +180,10 @@ async function executeToolbarAction(action){if(['reply','replyall','forward'].in
   showToast(L('В письме нет ссылки для автоматической отписки','This message has no automatic unsubscribe link'));}}
 document.querySelector('.thread .actions').addEventListener('click',e=>{const button=e.target.closest('[data-toolbar-generated]');if(button)executeToolbarAction(button.dataset.act);});
 const threadMoreButton=document.getElementById('threadMoreButton'),threadMoreMenu=document.getElementById('threadMoreMenu');
-function closeThreadMore(){threadMoreMenu.classList.remove('open');threadMoreButton.setAttribute('aria-expanded','false');}
-threadMoreButton.onclick=event=>{event.stopPropagation();const open=threadMoreMenu.classList.toggle('open');threadMoreButton.setAttribute('aria-expanded',String(open));};
+function closeThreadMore(){closePopupMenus(['more']);}
+threadMoreButton.onclick=event=>{event.stopPropagation();if(threadMoreMenu.classList.contains('open')){closeThreadMore();return;}openPopupMenu('more','more');threadMoreMenu.classList.add('open');threadMoreButton.setAttribute('aria-expanded','true');};
 threadMoreMenu.onclick=async event=>{const toolbarItem=event.target.closest('[data-toolbar-menu]');if(toolbarItem){closeThreadMore();executeToolbarAction(toolbarItem.dataset.toolbarMenu);return;}const button=event.target.closest('[data-thread-action]');if(!button)return;closeThreadMore();const action=button.dataset.threadAction;if(action==='settings'){showView('settingsView');setSection('toolbar');return;}if(action==='rules'){showView('settingsView');setSection('rules');return;}if(action==='raw'){openRawViewer(activeMessage?.id);return;}if(action==='export-eml'){exportActiveMessageEml();return;}if(action==='create-rule'){openRuleEditor(activeMessage);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(['archive','trash'].includes(action))performMessageAction(action);};
-document.addEventListener('click',event=>{if(!threadMoreMenu.contains(event.target)&&event.target!==threadMoreButton)closeThreadMore();});
+
 
 /* Server-side mail actions driven by locally stored, editable rules. */
 const ruleEditor=document.getElementById('ruleEditor'),ruleAccount=document.getElementById('ruleAccount'),ruleAction=document.getElementById('ruleAction'),ruleTarget=document.getElementById('ruleTarget'),ruleTag=document.getElementById('ruleTag');
