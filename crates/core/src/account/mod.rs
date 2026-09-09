@@ -68,9 +68,8 @@ pub const NOTIFICATION_MAX_AGE_HOURS: i64 = 24;
 /// том числе при догрузке истории.
 fn notification_date_borders() -> (String, String) {
     let now = chrono::Utc::now();
-    let format = |value: chrono::DateTime<chrono::Utc>| {
-        value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
-    };
+    let format =
+        |value: chrono::DateTime<chrono::Utc>| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
     (
         format(now - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
         format(now + chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),

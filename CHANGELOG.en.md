@@ -7,6 +7,8 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-09-09
+
 ### Added
 
 - The installed version is shown at the bottom of the sidebar. Clicking it
@@ -23,7 +25,11 @@ versions use Semantic Versioning.
   when its identifier was missing from the local database - which also happens
   when mail history is backfilled, a folder appears for the first time or a
   folder is re-fetched after a UIDVALIDITY change, so a years-old message could
-  trigger a notification. Only messages newer than a day are notified now.
+  trigger a notification. Only messages whose date is within a day of the
+  current moment are notified now; a message without a Date header still is.
+- The core test run no longer crashes on process exit. Storage tests left their
+  connection pools open, and their worker threads raced with the encryption
+  library shutdown, so the build went red on green tests.
 
 ## [0.2.12] - 2026-09-05
 
