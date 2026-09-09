@@ -362,10 +362,46 @@ function createMessageRow(message,index){
   // дальнейшие нажатия адресовались бы пустому месту (S-005).
   row.onclick=e=>{if(suppressClick)return;row.focus({preventScroll:true});if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();selectionAnchorId=message.id;showMessage(message);};renderIcons(row);return row;
 }
+// Пока кнопка указателя прижата к списку, окно не перестраиваем: строки
+// пересоздаются целиком, и замена узла между прижатием и отпусканием съедает
+// нажатие - письмо не открывалось (specs/message-click-not-lost.md).
+let listPointerHeld=false,pendingWindowRender=null;
+// Разметку списка сносит не только это окно (clearDemoData при каждой
+// перезагрузке данных), поэтому состояние удержания видно всему интерфейсу.
+window.messageListRenderHeld=()=>listPointerHeld;
+msgsEl.addEventListener('pointerdown',event=>{if(event.button===0)listPointerHeld=true;});
+// Перетаскивание письма начинается с отмены указателя: без продления удержания
+// список перестроился бы прямо под перетаскиваемой строкой.
+msgsEl.addEventListener('dragstart',()=>{listPointerHeld=true;});
+function releaseListPointer(immediate=false){
+  if(!listPointerHeld)return;
+  listPointerHeld=false;
+  const run=()=>{
+    const plan=listRenderHold.releaseWindowRender(pendingWindowRender);
+    pendingWindowRender=plan.pending;
+    if(plan.render)renderMessageWindow(plan.render.force);
+  };
+  // Отложенное перестроение запускаем после того, как нажатие обработано:
+  // браузер порождает его сразу за отпусканием, до отложенной задачи.
+  if(immediate)run();else setTimeout(run,0);
+}
+// Конец удержания слушаем на документе, а не на списке: кнопку могли отпустить,
+// уведя курсор за его пределы, и события списка тогда не будет вовсе.
+['pointerup','pointercancel','lostpointercapture'].forEach(name=>document.addEventListener(name,()=>releaseListPointer()));
+document.addEventListener('dragend',()=>releaseListPointer());
+// Страховка от залипания: события отпускания может не быть вовсе, если окно
+// потеряло ввод (переключение окна с прижатой кнопкой, скрытие окна). Без неё
+// список замер бы до следующего нажатия.
+window.addEventListener('blur',()=>releaseListPointer(true));
+document.addEventListener('visibilitychange',()=>{if(document.hidden)releaseListPointer(true);});
 function renderMessageWindow(force=false){
   // Окно скрыто - разметку не строим: её только что освободили ради памяти, и
   // наполнять невидимый список заново незачем. Отрисуется при возврате окна.
   if(document.hidden)return;
+  const hold=listRenderHold.planWindowRender(listPointerHeld,force,pendingWindowRender);
+  pendingWindowRender=hold.pending;
+  if(!hold.render)return;
+  force=hold.render.force;
   messageRowHeight=Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--message-row-height'))||76;
   const list=msgsEl,total=currentMessageRows.length,viewport=Math.max(list.clientHeight,400),start=Math.max(0,Math.floor(list.scrollTop/messageRowHeight)-MESSAGE_WINDOW_OVERSCAN),end=Math.min(total,Math.ceil((list.scrollTop+viewport)/messageRowHeight)+MESSAGE_WINDOW_OVERSCAN);
   if(!force&&start===messageWindowStart&&end===messageWindowEnd)return;messageWindowStart=start;messageWindowEnd=end;
