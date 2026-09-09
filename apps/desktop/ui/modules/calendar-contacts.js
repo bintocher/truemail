@@ -186,12 +186,15 @@ const POPUP_MENU_REGISTRY={
 // Элемент, для которого открыто текущее меню: по нему отличаем повторный правый
 // клик по тому же письму или папке от клика по соседнему (S-004).
 let popupMenuAnchor={id:null,key:null};
+// Меняется при каждом открытии и закрытии меню. Подменю меток ждёт ответа ядра
+// и по этому счётчику узнаёт, что за время ожидания состав меню сменился.
+let popupMenuEpoch=0;
 function popupMenuNodes(id){return (POPUP_MENU_REGISTRY[id]?.find()||[]).filter(Boolean);}
 function popupMenuIsOpen(id){const entry=POPUP_MENU_REGISTRY[id];return popupMenuNodes(id).some(node=>entry.isOpen(node));}
 function openPopupMenuIds(){return POPUP_MENU_IDS.filter(popupMenuIsOpen);}
 // Отсутствующий узел не мешает закрыть остальные меню (S-019).
 function closePopupMenus(ids){
-  withDependentMenus(ids).forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node))entry.close(node);});});
+  withDependentMenus(ids).forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
 }
 function applyPopupMenuAction(action){const plan=planPopupMenus(openPopupMenuIds(),action);closePopupMenus(plan.close);return plan;}
 // Вызывается перед показом любого меню семейства: закрывает все прочие (S-002).
@@ -199,6 +202,7 @@ function applyPopupMenuAction(action){const plan=planPopupMenus(openPopupMenuIds
 function openPopupMenu(id,key=null,hover=false){
   const sameTarget=popupMenuAnchor.id===id&&popupMenuAnchor.key===key&&key!==null&&popupMenuIsOpen(id);
   const plan=applyPopupMenuAction({type:'open',id,sameTarget,hover});
+  popupMenuEpoch++;
   if(!hover)popupMenuAnchor={id,key};
   return plan;
 }
@@ -219,9 +223,20 @@ function posMenu(menu,e){menu.classList.add('open');const w=menu.offsetWidth,h=m
 document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;e.preventDefault();
   const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
   if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
+// Меню, которые остаются открытыми при клике внутри них: в фильтре стоят поле
+// ввода и переключатели, в подменю меток за одно открытие отмечают несколько
+// меток (S-015). Остальные закрываются выбранным пунктом (S-022) - на своих
+// обработчиках пунктов это не держится: smart-rules.js переписывает onclick
+// пунктов меню умной папки своим действием.
+const POPUP_MENUS_KEEP_ON_INNER_CLICK=new Set(['filter','flag']);
 document.addEventListener('click',event=>{
-  if(popupMenuAtNode(event.target))return;
-  applyPopupMenuAction({type:'outside'});
+  const inside=popupMenuAtNode(event.target);
+  if(inside){
+    if(POPUP_MENUS_KEEP_ON_INNER_CLICK.has(inside)||event.target.closest('.tmi-check'))return;
+    closePopupMenus([inside]);
+  }else{
+    applyPopupMenuAction({type:'outside'});
+  }
   popupMenuAnchor={id:null,key:null};
 });
 // Esc закрывает верхнее открытое окно: сначала вспомогательные меню, затем модалки.
@@ -251,10 +266,13 @@ async function openFlagMenu(message,event,hover=false){
   if(!message){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   const ticket=++flagMenuTicket;
   openPopupMenu('flag',`flag:${message.id}`,hover);
+  const epoch=popupMenuEpoch;
   let labels=[],active=[];
   try{[labels,active]=await Promise.all([window.tm.listLabels(),window.tm.messageLabelIds(message.id)]);}catch(error){showToast(error.message||String(error));return;}
-  // Родитель закрылся или подменю открывали заново - показывать нечего (S-009).
-  if(ticket!==flagMenuTicket||(hover&&!popupMenuIsOpen('message')))return;
+  // Родитель закрылся, сменился на меню другого письма или подменю открывали
+  // заново - показывать нечего (S-009).
+  if(ticket!==flagMenuTicket||epoch!==popupMenuEpoch)return;
+  if(hover&&(!popupMenuIsOpen('message')||popupMenuAnchor.key!==`message:${message.id}`))return;
   const activeSet=new Set(active);
   // Имена меток - пользовательские данные: словарь автоперевода их не трогает.
   const menu=document.createElement('div');menu.className='att-menu flag-menu';menu.dataset.noI18n='1';
@@ -271,6 +289,7 @@ async function openFlagMenu(message,event,hover=false){
   const create=document.createElement('button');create.type='button';create.className='flag-item flag-create';create.innerHTML=`<span class="flag-dot flag-dot-new"></span><span>${L('Создать метку…','Create label…')}</span>`;
   create.onclick=e=>{e.stopPropagation();menu.remove();openLabelCreator(message);};
   menu.appendChild(create);
+  document.querySelectorAll('.flag-menu').forEach(node=>node.remove());
   document.body.appendChild(menu);
   const w=menu.offsetWidth,h=menu.offsetHeight;
   menu.style.left=Math.min(event.clientX,innerWidth-w-8)+'px';menu.style.top=Math.min(event.clientY,innerHeight-h-8)+'px';

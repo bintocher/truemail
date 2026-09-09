@@ -2938,25 +2938,29 @@ impl Db {
     /// "OR role IS NULL" - уведомлению не нужны письма из папок без роли),
     /// у которых remote_id входит в переданный список. Сортировка по дате
     /// по возрастанию: последний элемент результата - самое свежее письмо.
-    /// `not_before` - нижняя граница даты письма в том же виде, в каком дата
-    /// лежит в базе (UTC, "%Y-%m-%dT%H:%M:%S+00:00"). Письма старше границы в
+    /// `not_before` и `not_after` - границы даты письма в том же виде, в каком
+    /// дата лежит в базе (UTC, "%Y-%m-%dT%H:%M:%S+00:00"). За границами письма в
     /// выборку не попадают: локально новый id бывает и у догруженной истории, а
-    /// уведомлять о письме позапрошлого года незачем. Письма без даты остаются:
-    /// заголовок Date не обязателен, и терять из-за него уведомление нельзя.
+    /// уведомлять о письме позапрошлого года незачем. Верхняя граница нужна для
+    /// писем с испорченной датой далеко в будущем - без неё такое письмо всегда
+    /// считалось бы свежим. Письма без даты остаются: заголовок Date не
+    /// обязателен, и терять из-за него уведомление нельзя.
     pub async fn inbox_message_ids_by_remote_ids(
         &self,
         account_id: i64,
         remote_ids: &[String],
         not_before: Option<&str>,
+        not_after: Option<&str>,
     ) -> Result<Vec<i64>> {
         if remote_ids.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; remote_ids.len()].join(",");
-        let date_filter = if not_before.is_some() {
-            " AND (m.date IS NULL OR m.date >= ?)"
-        } else {
-            ""
+        let date_filter = match (not_before.is_some(), not_after.is_some()) {
+            (true, true) => " AND (m.date IS NULL OR (m.date >= ? AND m.date <= ?))",
+            (true, false) => " AND (m.date IS NULL OR m.date >= ?)",
+            (false, true) => " AND (m.date IS NULL OR m.date <= ?)",
+            (false, false) => "",
         };
         let sql = format!(
             "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id \
@@ -2970,6 +2974,9 @@ impl Db {
             query = query.bind(id);
         }
         if let Some(border) = not_before {
+            query = query.bind(border.to_owned());
+        }
+        if let Some(border) = not_after {
             query = query.bind(border.to_owned());
         }
         let rows = query.fetch_all(&self.pool).await?;
@@ -6182,6 +6189,7 @@ mod notification_lookup_tests {
                 account_id,
                 &["remote-inbox".to_owned(), "remote-archive".to_owned()],
                 None,
+                None,
             )
             .await
             .expect("query inbox ids");
@@ -6199,8 +6207,19 @@ mod notification_lookup_tests {
         let account_id = seed_account(&db).await;
         let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
 
-        // Свежее письмо, письмо позапрошлого года и письмо без даты.
+        // Свежее письмо, письмо позапрошлого года и письмо без даты. Дата
+        // свежего письма записывается в том же виде, в каком её пишет рабочий
+        // код (UTC с "+00:00"), иначе проверка сравнивала бы разные формы.
         let fresh_id = seed_message(&db, account_id, inbox_id, 1, "remote-fresh").await;
+        let fresh_date = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        sqlx::query("UPDATE messages SET date = ? WHERE id = ?")
+            .bind(&fresh_date)
+            .bind(fresh_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set fresh date");
         let old_id = seed_message(&db, account_id, inbox_id, 2, "remote-old").await;
         let undated_id = seed_message(&db, account_id, inbox_id, 3, "remote-undated").await;
         sqlx::query("UPDATE messages SET date = '2022-07-12T17:00:54+00:00' WHERE id = ?")
@@ -6214,16 +6233,35 @@ mod notification_lookup_tests {
             .await
             .expect("clear date");
 
+        // Письмо с испорченной датой далеко в будущем: без верхней границы оно
+        // считалось бы свежим всегда.
+        let future_id = seed_message(&db, account_id, inbox_id, 4, "remote-future").await;
+        sqlx::query("UPDATE messages SET date = '2031-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(future_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set future date");
+
         let remote_ids = [
             "remote-fresh".to_owned(),
             "remote-old".to_owned(),
             "remote-undated".to_owned(),
+            "remote-future".to_owned(),
         ];
-        let border = (chrono::Utc::now() - chrono::Duration::hours(24))
+        let now = chrono::Utc::now();
+        let not_before = (now - chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        let not_after = (now + chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%S+00:00")
             .to_string();
         let mut ids = db
-            .inbox_message_ids_by_remote_ids(account_id, &remote_ids, Some(&border))
+            .inbox_message_ids_by_remote_ids(
+                account_id,
+                &remote_ids,
+                Some(&not_before),
+                Some(&not_after),
+            )
             .await
             .expect("query inbox ids");
         ids.sort_unstable();
@@ -6232,21 +6270,21 @@ mod notification_lookup_tests {
         expected.sort_unstable();
         assert_eq!(
             ids, expected,
-            "письмо 2022 года не должно попадать в уведомление, письмо без даты - должно"
+            "письма 2022 и 2031 годов в уведомление не попадают, письмо без даты - попадает"
         );
 
         let all = db
-            .inbox_message_ids_by_remote_ids(account_id, &remote_ids, None)
+            .inbox_message_ids_by_remote_ids(account_id, &remote_ids, None, None)
             .await
             .expect("query inbox ids");
-        assert_eq!(all.len(), 3, "без границы выбираются все письма Входящих");
+        assert_eq!(all.len(), 4, "без границ выбираются все письма Входящих");
     }
 
     #[tokio::test]
     async fn empty_input_returns_empty_result_without_querying() {
         let db = test_db().await;
         let ids = db
-            .inbox_message_ids_by_remote_ids(1, &[], None)
+            .inbox_message_ids_by_remote_ids(1, &[], None, None)
             .await
             .expect("query with empty input");
         assert!(ids.is_empty());

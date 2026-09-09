@@ -120,17 +120,24 @@
      сети), клик открывает страницу этого выпуска на GitHub во внешнем браузере:
      webview ссылку сам не откроет. */
   const versionButton=document.getElementById('appVersionLink');
-  if(versionButton){
+  // Мост window.tm создаётся в bridge.js, который подключён ниже этого модуля,
+  // поэтому обращаться к нему сразу нельзя: к моменту DOMContentLoaded он готов.
+  function showAppVersion(){
+    if(!window.tm?.appVersion)return;
     window.tm.appVersion().then(version=>{
       if(!version)return;
       versionButton.textContent=`v${version}`;
       versionButton.dataset.version=version;
     }).catch(console.error);
+  }
+  if(versionButton){
     versionButton.addEventListener('click',()=>{
       const version=versionButton.dataset.version;
       if(!version)return;
       window.tm.openExternal(`https://github.com/bintocher/truemail/releases/tag/v${version}`)
         .catch(error=>showToast(error.message||String(error)));
     });
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',showAppVersion,{once:true});
+    else showAppVersion();
   }
 })();

@@ -55,18 +55,26 @@ fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
         .map_err(|error| crate::Error::AccountConfig(format!("append_sent outbox: {error}")))
 }
 
-/// Насколько старым может быть письмо, чтобы о нём ещё имело смысл уведомлять.
+/// Насколько далеко от текущего момента может отстоять дата письма, чтобы о нём
+/// ещё имело смысл уведомлять.
 /// Локально новый remote_id сам по себе не значит "письмо только что пришло":
 /// так же выглядит догруженная история, только что заведённая папка и повторная
 /// выкачка после смены UIDVALIDITY.
 pub const NOTIFICATION_MAX_AGE_HOURS: i64 = 24;
 
-/// Нижняя граница даты письма для уведомлений в том виде, в каком дата лежит в
-/// базе (UTC, см. миграцию 0034).
-fn notification_date_border() -> String {
-    (chrono::Utc::now() - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS))
-        .format("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string()
+/// Границы даты письма для уведомлений в том виде, в каком дата лежит в базе
+/// (UTC, см. миграцию 0034). Верхняя граница отсекает письма с испорченной
+/// датой далеко в будущем: без неё такое письмо считалось бы свежим всегда, в
+/// том числе при догрузке истории.
+fn notification_date_borders() -> (String, String) {
+    let now = chrono::Utc::now();
+    let format = |value: chrono::DateTime<chrono::Utc>| {
+        value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
+    };
+    (
+        format(now - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
+        format(now + chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
+    )
 }
 
 /// Результат короткой синхронизации Входящих. `new_messages` считает только
@@ -1058,11 +1066,13 @@ impl AccountManager {
         let new_message_ids = if unknown_remote_ids.is_empty() {
             Vec::new()
         } else {
+            let (not_before, not_after) = notification_date_borders();
             self.db
                 .inbox_message_ids_by_remote_ids(
                     account.id,
                     &unknown_remote_ids,
-                    Some(&notification_date_border()),
+                    Some(&not_before),
+                    Some(&not_after),
                 )
                 .await?
         };

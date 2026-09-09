@@ -76,6 +76,9 @@ async function saveAllAttachments(messageId){
 function closeAttMenu(){closePopupMenus(['attachment']);}
 function attachmentMenu(event,full,att,messageId,anchorKey=null){
   openPopupMenu('attachment',anchorKey===null?null:`attachment:${messageId}:${anchorKey}`);
+  // Повторный правый клик по той же плашке - показ на новом месте, а не второе
+  // меню: узел создаётся заново, поэтому прежний убираем всегда.
+  closeAttMenu();
   const menu=document.createElement('div');menu.className='att-menu';
   const items=[
     [L('Открыть','Open'),()=>openAttachment(full,att,messageId)],
