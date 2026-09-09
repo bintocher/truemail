@@ -7,6 +7,30 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.13] - 2026-09-09
+
+### Added
+
+- The installed version is shown at the bottom of the sidebar. Clicking it
+  opens that release page on GitHub in the default browser.
+
+### Fixed
+
+- Only one popup menu stays on screen. Right-clicking a regular folder used to
+  leave the previously opened menu next to it, and the "More" menu, filter,
+  sort, smart folder icon picker and account color palette closed neither on
+  Escape nor when another menu opened. Escape now closes menus first and only
+  closes a modal window on the next press.
+- Notifications are no longer raised for old messages. A message counted as new
+  when its identifier was missing from the local database - which also happens
+  when mail history is backfilled, a folder appears for the first time or a
+  folder is re-fetched after a UIDVALIDITY change, so a years-old message could
+  trigger a notification. Only messages whose date is within a day of the
+  current moment are notified now; a message without a Date header still is.
+- The core test run no longer crashes on process exit. Storage tests left their
+  connection pools open, and their worker threads raced with the encryption
+  library shutdown, so the build went red on green tests.
+
 ## [0.2.12] - 2026-09-05
 
 ### Added

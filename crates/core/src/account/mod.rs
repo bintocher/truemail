@@ -55,12 +55,64 @@ fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
         .map_err(|error| crate::Error::AccountConfig(format!("append_sent outbox: {error}")))
 }
 
+/// Насколько далеко от текущего момента может отстоять дата письма, чтобы о нём
+/// ещё имело смысл уведомлять.
+/// Локально новый remote_id сам по себе не значит "письмо только что пришло":
+/// так же выглядит догруженная история, только что заведённая папка и повторная
+/// выкачка после смены UIDVALIDITY.
+pub const NOTIFICATION_MAX_AGE_HOURS: i64 = 24;
+
+/// Границы даты письма для уведомлений в том виде, в каком дата лежит в базе
+/// (UTC, см. миграцию 0034). Верхняя граница отсекает письма с испорченной
+/// датой далеко в будущем: без неё такое письмо считалось бы свежим всегда, в
+/// том числе при догрузке истории.
+fn notification_date_borders() -> (String, String) {
+    let now = chrono::Utc::now();
+    let format =
+        |value: chrono::DateTime<chrono::Utc>| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
+    (
+        format(now - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
+        format(now + chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
+    )
+}
+
+#[cfg(test)]
+mod notification_border_tests {
+    use super::{NOTIFICATION_MAX_AGE_HOURS, notification_date_borders};
+
+    #[test]
+    fn borders_are_written_the_way_dates_are_stored() {
+        let (not_before, not_after) = notification_date_borders();
+        for border in [&not_before, &not_after] {
+            assert_eq!(border.len(), 25, "длина границы: {border}");
+            assert!(border.ends_with("+00:00"), "смещение границы: {border}");
+            assert_eq!(border.as_bytes()[10], b'T', "разделитель даты: {border}");
+            chrono::DateTime::parse_from_rfc3339(border)
+                .unwrap_or_else(|error| panic!("граница {border} не разбирается: {error}"));
+        }
+        assert!(not_before < not_after, "нижняя граница раньше верхней");
+    }
+
+    #[test]
+    fn borders_are_symmetric_around_now() {
+        let (not_before, not_after) = notification_date_borders();
+        let before = chrono::DateTime::parse_from_rfc3339(&not_before).expect("нижняя граница");
+        let after = chrono::DateTime::parse_from_rfc3339(&not_after).expect("верхняя граница");
+        assert_eq!(
+            (after - before).num_hours(),
+            NOTIFICATION_MAX_AGE_HOURS * 2,
+            "границы отстоят от текущего момента на предел свежести в обе стороны"
+        );
+    }
+}
+
 /// Результат короткой синхронизации Входящих. `new_messages` считает только
 /// remote ID, которых не было в локальной БД до этого прохода; повторно
 /// полученные EWS Modified-события поэтому не создают уведомления.
-/// `new_message_ids` - локальные id этих же писем (только из папки Входящие),
-/// отсортированные по дате по возрастанию: используются для карточки
-/// уведомления, чтобы показывать именно новое письмо, а не самое свежее в БД.
+/// `new_message_ids` - локальные id этих же писем (только из папки Входящие и
+/// только со свежей датой, см. NOTIFICATION_MAX_AGE_HOURS), отсортированные по
+/// дате по возрастанию: используются для карточки уведомления, чтобы показывать
+/// именно новое письмо, а не самое свежее в БД.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxSyncResult {
     pub downloaded: usize,
@@ -1043,8 +1095,14 @@ impl AccountManager {
         let new_message_ids = if unknown_remote_ids.is_empty() {
             Vec::new()
         } else {
+            let (not_before, not_after) = notification_date_borders();
             self.db
-                .inbox_message_ids_by_remote_ids(account.id, &unknown_remote_ids)
+                .inbox_message_ids_by_remote_ids(
+                    account.id,
+                    &unknown_remote_ids,
+                    Some(&not_before),
+                    Some(&not_after),
+                )
                 .await?
         };
         self.db

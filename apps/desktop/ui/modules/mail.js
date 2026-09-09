@@ -44,7 +44,9 @@ function buildAttachmentBar(full,messageId){
     chip.querySelector('.att-cname').textContent=att.filename;
     chip.querySelector('.att-csize').textContent=formatBytes(att.size);
     chip.ondblclick=()=>openAttachment(full,att,messageId);
-    chip.oncontextmenu=e=>{e.preventDefault();attachmentMenu(e,full,att,messageId);};
+    // Собственный обработчик: общий contextmenu на документе иначе закрыл бы
+    // только что открытое меню вложения (правило одного меню).
+    chip.oncontextmenu=e=>{e.preventDefault();e.stopPropagation();attachmentMenu(e,full,att,messageId,att.id);};
     list.appendChild(chip);
   });
   const more=document.createElement('button');more.type='button';more.className='att-more';more.hidden=true;
@@ -71,8 +73,11 @@ async function saveAllAttachments(messageId){
   try{const dir=await window.tm.chooseDir();if(!dir)return;const saved=await window.tm.saveAllAttachments(messageId,dir);showToast(L(`Сохранено вложений: ${saved.length}`,`Attachments saved: ${saved.length}`));}
   catch(error){showToast(error.message||String(error));}
 }
-function closeAttMenu(){document.querySelector('.att-menu')?.remove();}
-function attachmentMenu(event,full,att,messageId){
+function closeAttMenu(){closePopupMenus(['attachment']);}
+function attachmentMenu(event,full,att,messageId,anchorKey=null){
+  openPopupMenu('attachment',anchorKey===null?null:`attachment:${messageId}:${anchorKey}`);
+  // Повторный правый клик по той же плашке - показ на новом месте, а не второе
+  // меню: узел создаётся заново, поэтому прежний убираем всегда.
   closeAttMenu();
   const menu=document.createElement('div');menu.className='att-menu';
   const items=[
@@ -86,7 +91,6 @@ function attachmentMenu(event,full,att,messageId){
   const w=menu.offsetWidth,h=menu.offsetHeight;
   menu.style.left=Math.min(event.clientX,innerWidth-w-8)+'px';
   menu.style.top=Math.min(event.clientY,innerHeight-h-8)+'px';
-  setTimeout(()=>document.addEventListener('click',closeAttMenu,{once:true}),0);
 }
 // Инлайн-галерея изображений с листанием (стрелки/клавиши).
 async function openGallery(full,att,messageId){
@@ -763,7 +767,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
       const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;
       row.querySelector('.folder-name').textContent=folderTitle(folder);updateFolderBadge(row,folder);
-      const openFolder=()=>{window.setListLoading?.(false);goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
+      const openFolder=()=>{window.setListLoading?.(false);goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openPopupMenu('folder',`folder:${folder.id}`);contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
     anchor.after(sub);anchor=sub;
   });
   renderIcons(document.querySelector('.nav'));

@@ -9,7 +9,7 @@ function renderAccountColorPicker(card,account){
   button.title=L('Выбрать цвет','Pick a color');
   const grid=document.createElement('div');grid.className='color-grid hidden';
   const close=()=>grid.classList.add('hidden');
-  button.onclick=e=>{e.stopPropagation();const open=grid.classList.contains('hidden');document.querySelectorAll('.color-grid').forEach(other=>other.classList.add('hidden'));grid.classList.toggle('hidden',!open);};
+  button.onclick=e=>{e.stopPropagation();const open=grid.classList.contains('hidden');closePopupMenus(['color']);if(open){openPopupMenu('color',`color:${account.id}`);grid.classList.remove('hidden');}};
   grid.onclick=e=>e.stopPropagation();
   ACCOUNT_COLORS.forEach(color=>{
     const swatch=document.createElement('button');
@@ -183,8 +183,7 @@ function applyStorageStatus(storage){document.querySelector('.storage-big').text
 const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElementById('sortMenu'),filterButton=document.getElementById('filterBtn'),sortButton=document.getElementById('sortBtn');
 // Открыли фильтр - сразу ставим курсор в поле ввода: набирать текст можно
 // не целясь мышью. Фокус даём после снятия hidden, скрытый элемент его не берёт.
-filterButton.onclick=e=>{e.stopPropagation();const opened=filterMenu.classList.toggle('hidden')===false;sortMenu.classList.add('hidden');if(opened){const input=document.getElementById('filterText');input?.focus();input?.select();}};sortButton.onclick=e=>{e.stopPropagation();sortMenu.classList.toggle('hidden');filterMenu.classList.add('hidden');};
-document.addEventListener('click',event=>{if(!filterMenu.contains(event.target)&&!filterButton.contains(event.target))filterMenu.classList.add('hidden');if(!sortMenu.contains(event.target)&&!sortButton.contains(event.target))sortMenu.classList.add('hidden');});
+filterButton.onclick=e=>{e.stopPropagation();const opened=filterMenu.classList.contains('hidden');closePopupMenus(['filter']);if(opened){openPopupMenu('filter','filter');filterMenu.classList.remove('hidden');const input=document.getElementById('filterText');input?.focus();input?.select();}};sortButton.onclick=e=>{e.stopPropagation();const opened=sortMenu.classList.contains('hidden');closePopupMenus(['sort']);if(opened){openPopupMenu('sort','sort');sortMenu.classList.remove('hidden');}};
 function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyReadIds.clear();window.resetAutoFill?.();window.forgetHiddenAnchor?.();}let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
   // Удержать письма, прочитанные в этом показе списка: они выпали из smartRows
   // (умная папка "непрочитанные") или из unread-фильтра только из-за смены seen.

@@ -2938,18 +2938,33 @@ impl Db {
     /// "OR role IS NULL" - уведомлению не нужны письма из папок без роли),
     /// у которых remote_id входит в переданный список. Сортировка по дате
     /// по возрастанию: последний элемент результата - самое свежее письмо.
+    /// `not_before` и `not_after` - границы даты письма в том же виде, в каком
+    /// дата лежит в базе (UTC, "%Y-%m-%dT%H:%M:%S+00:00"). За границами письма в
+    /// выборку не попадают: локально новый id бывает и у догруженной истории, а
+    /// уведомлять о письме позапрошлого года незачем. Верхняя граница нужна для
+    /// писем с испорченной датой далеко в будущем - без неё такое письмо всегда
+    /// считалось бы свежим. Письма без даты остаются: заголовок Date не
+    /// обязателен, и терять из-за него уведомление нельзя.
     pub async fn inbox_message_ids_by_remote_ids(
         &self,
         account_id: i64,
         remote_ids: &[String],
+        not_before: Option<&str>,
+        not_after: Option<&str>,
     ) -> Result<Vec<i64>> {
         if remote_ids.is_empty() {
             return Ok(Vec::new());
         }
         let placeholders = vec!["?"; remote_ids.len()].join(",");
+        let date_filter = match (not_before.is_some(), not_after.is_some()) {
+            (true, true) => " AND (m.date IS NULL OR (m.date >= ? AND m.date <= ?))",
+            (true, false) => " AND (m.date IS NULL OR m.date >= ?)",
+            (false, true) => " AND (m.date IS NULL OR m.date <= ?)",
+            (false, false) => "",
+        };
         let sql = format!(
             "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id \
-                 WHERE m.account_id = ? AND f.role = 'inbox' AND m.remote_id IN ({placeholders}) \
+                 WHERE m.account_id = ? AND f.role = 'inbox' AND m.remote_id IN ({placeholders}){date_filter} \
                  ORDER BY m.date ASC"
         );
         // Плейсхолдеры формируются только из числа id (не из пользовательских
@@ -2957,6 +2972,12 @@ impl Db {
         let mut query = sqlx::query_as::<_, (i64,)>(sqlx::AssertSqlSafe(sql)).bind(account_id);
         for id in remote_ids {
             query = query.bind(id);
+        }
+        if let Some(border) = not_before {
+            query = query.bind(border.to_owned());
+        }
+        if let Some(border) = not_after {
+            query = query.bind(border.to_owned());
         }
         let rows = query.fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
@@ -5865,11 +5886,64 @@ mod smart_condition_legacy_tests {
 }
 
 #[cfg(test)]
-mod notification_lookup_tests {
-    use super::*;
+mod test_storage {
     use crate::crypto::{DatabaseKey, StorageCrypto};
-    use rand::Rng as _;
+    use crate::storage::Db;
     use std::sync::Arc;
+
+    /// Тестовое хранилище: база вместе со своим временным каталогом.
+    /// Закрывать обязательно: незакрытые пулы доживают до выхода из процесса,
+    /// и их рабочие потоки сталкиваются с обработчиком завершения SQLCipher -
+    /// прогон падает уже после "test result: ok"
+    /// (см. specs/core-test-process-exit.md).
+    pub struct TestDb {
+        db: Db,
+        root: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestDb {
+        type Target = Db;
+
+        fn deref(&self) -> &Db {
+            &self.db
+        }
+    }
+
+    impl TestDb {
+        /// Закрыть оба пула и убрать за собой временный каталог. Занятый каталог
+        /// не роняет тест: результат теста определяют его утверждения.
+        pub async fn close(self) {
+            self.db.close().await;
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn random_key() -> [u8; 32] {
+        use rand::Rng as _;
+        let mut key = [0_u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        key
+    }
+
+    /// Открыть тестовое хранилище с применёнными миграциями. `prefix` попадает
+    /// в имя временного каталога и помогает узнать, чей это каталог.
+    pub async fn open_test_db(prefix: &str) -> TestDb {
+        let root = std::env::temp_dir().join(format!("truemail-{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let database_key = DatabaseKey::from_key(random_key());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        db.migrate().await.expect("migrate database");
+        TestDb { db, root }
+    }
+}
+
+#[cfg(test)]
+mod notification_lookup_tests {
+    use super::test_storage::{TestDb, open_test_db};
+    use super::*;
 
     /// smart-folder-selection-shared.md, S-002: условие отбора живых писем
     /// объявлено один раз, поэтому все три запроса умной папки содержат его
@@ -5890,12 +5964,6 @@ mod notification_lookup_tests {
         assert!(SMART_PAGE_AFTER_CURSOR_SQL.contains("COALESCE(date, '') < ?"));
         assert!(!SMART_STREAM_SQL.contains("ORDER BY"));
         assert!(!SMART_STREAM_SQL.contains("LIMIT"));
-    }
-
-    fn random_key() -> [u8; 32] {
-        let mut key = [0_u8; 32];
-        rand::rng().fill_bytes(&mut key);
-        key
     }
 
     /// gmail-local-body-prefetch.md, S-002 - S-006, S-011: какие письма
@@ -5962,21 +6030,13 @@ mod notification_lookup_tests {
         assert_eq!(limited.len(), 1);
         assert_eq!(limited[0].0, fresh);
         assert_eq!(limited[0].1, "INBOX");
+        db.close().await;
     }
 
-    /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в
-    /// storage::tests (storage/mod.rs).
-    async fn test_db() -> Db {
-        let root =
-            std::env::temp_dir().join(format!("truemail-repo-notify-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("create temp data dir");
-        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
-        let database_key = DatabaseKey::from_key(random_key());
-        let db = Db::open_with_database_key(&root, crypto, &database_key)
-            .await
-            .expect("open database");
-        db.migrate().await.expect("migrate database");
-        db
+    /// Тестовое хранилище с применёнными миграциями. Закрывать обязательно:
+    /// см. specs/core-test-process-exit.md.
+    async fn test_db() -> TestDb {
+        open_test_db("repo-notify").await
     }
 
     /// Заводит аккаунт, возвращает его id.
@@ -6115,6 +6175,7 @@ mod notification_lookup_tests {
             after_swap, after_rename,
             "переименование папки обязано менять слепок"
         );
+        db.close().await;
     }
 
     #[tokio::test]
@@ -6151,6 +6212,7 @@ mod notification_lookup_tests {
             Some("2024-01-02T03:04:05Z"),
             "курсором должна быть самая старая дата папки"
         );
+        db.close().await;
     }
 
     #[tokio::test]
@@ -6167,6 +6229,8 @@ mod notification_lookup_tests {
             .inbox_message_ids_by_remote_ids(
                 account_id,
                 &["remote-inbox".to_owned(), "remote-archive".to_owned()],
+                None,
+                None,
             )
             .await
             .expect("query inbox ids");
@@ -6176,16 +6240,108 @@ mod notification_lookup_tests {
             vec![inbox_message_id],
             "письмо из архива не должно попасть в выборку"
         );
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn old_messages_are_left_out_of_notifications() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let inbox_id = seed_folder(&db, account_id, "INBOX", Some("inbox")).await;
+
+        // Свежее письмо, письмо позапрошлого года и письмо без даты. Дата
+        // свежего письма записывается в том же виде, в каком её пишет рабочий
+        // код (UTC с "+00:00"), иначе проверка сравнивала бы разные формы.
+        let fresh_id = seed_message(&db, account_id, inbox_id, 1, "remote-fresh").await;
+        let fresh_date = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        sqlx::query("UPDATE messages SET date = ? WHERE id = ?")
+            .bind(&fresh_date)
+            .bind(fresh_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set fresh date");
+        let old_id = seed_message(&db, account_id, inbox_id, 2, "remote-old").await;
+        let undated_id = seed_message(&db, account_id, inbox_id, 3, "remote-undated").await;
+        sqlx::query("UPDATE messages SET date = '2022-07-12T17:00:54+00:00' WHERE id = ?")
+            .bind(old_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set old date");
+        sqlx::query("UPDATE messages SET date = NULL WHERE id = ?")
+            .bind(undated_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("clear date");
+
+        // Письмо с испорченной датой далеко в будущем: без верхней границы оно
+        // считалось бы свежим всегда.
+        let future_id = seed_message(&db, account_id, inbox_id, 4, "remote-future").await;
+        sqlx::query("UPDATE messages SET date = '2031-01-01T00:00:00+00:00' WHERE id = ?")
+            .bind(future_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set future date");
+
+        // Письмо ровно на нижней границе: границы включающие, оно уведомляется.
+        let border_id = seed_message(&db, account_id, inbox_id, 5, "remote-border").await;
+
+        let remote_ids = [
+            "remote-fresh".to_owned(),
+            "remote-old".to_owned(),
+            "remote-undated".to_owned(),
+            "remote-future".to_owned(),
+            "remote-border".to_owned(),
+        ];
+        let now = chrono::Utc::now();
+        let not_before = (now - chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        let not_after = (now + chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string();
+        sqlx::query("UPDATE messages SET date = ? WHERE id = ?")
+            .bind(&not_before)
+            .bind(border_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set border date");
+        let mut ids = db
+            .inbox_message_ids_by_remote_ids(
+                account_id,
+                &remote_ids,
+                Some(&not_before),
+                Some(&not_after),
+            )
+            .await
+            .expect("query inbox ids");
+        ids.sort_unstable();
+
+        let mut expected = vec![fresh_id, undated_id, border_id];
+        expected.sort_unstable();
+        assert_eq!(
+            ids, expected,
+            "письма 2022 и 2031 годов не попадают; письмо без даты и письмо ровно на границе - попадают"
+        );
+
+        let all = db
+            .inbox_message_ids_by_remote_ids(account_id, &remote_ids, None, None)
+            .await
+            .expect("query inbox ids");
+        assert_eq!(all.len(), 5, "без границ выбираются все письма Входящих");
+        db.close().await;
     }
 
     #[tokio::test]
     async fn empty_input_returns_empty_result_without_querying() {
         let db = test_db().await;
         let ids = db
-            .inbox_message_ids_by_remote_ids(1, &[])
+            .inbox_message_ids_by_remote_ids(1, &[], None, None)
             .await
             .expect("query with empty input");
         assert!(ids.is_empty());
+        db.close().await;
     }
 
     /// Читает payload единственной pending-операции 'flag' письма из outbox.
@@ -6249,6 +6405,7 @@ mod notification_lookup_tests {
                 .expect("query message flags");
         assert_eq!(seen, 0);
         assert_eq!(flagged, 1);
+        db.close().await;
     }
 
     /// Счётчик умной папки и её список писем описывают одно и то же множество.
@@ -6321,6 +6478,7 @@ mod notification_lookup_tests {
         // отложенное и ожидающее переноса скрыты обоими путями.
         assert_eq!(counts[0].total, 5);
         assert_eq!(counts[0].unread, 2);
+        db.close().await;
     }
 
     /// Счётчик идёт по таблице одним потоком, а список - страницами курсора.
@@ -6375,6 +6533,7 @@ mod notification_lookup_tests {
         assert_eq!(listed, 1200);
         assert_eq!(counts[0].total, listed);
         assert_eq!(counts[0].unread, unread);
+        db.close().await;
     }
 }
 
@@ -6388,33 +6547,16 @@ mod notification_lookup_tests {
 /// реальное декодирование.
 #[cfg(test)]
 mod charset_repair_tests {
+    use super::test_storage::{TestDb, open_test_db};
     use super::*;
-    use crate::crypto::{DatabaseKey, StorageCrypto};
-    use rand::Rng as _;
-    use std::sync::Arc;
 
     const ESC: char = '\u{1B}';
     const FFFD: char = '\u{FFFD}';
 
-    fn random_key() -> [u8; 32] {
-        let mut key = [0_u8; 32];
-        rand::rng().fill_bytes(&mut key);
-        key
-    }
-
-    /// Тестовое хранилище с применёнными миграциями - тот же паттерн, что в
-    /// notification_lookup_tests (repo.rs) и storage::tests (storage/mod.rs).
-    async fn test_db() -> Db {
-        let root =
-            std::env::temp_dir().join(format!("truemail-repo-charset-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("create temp data dir");
-        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
-        let database_key = DatabaseKey::from_key(random_key());
-        let db = Db::open_with_database_key(&root, crypto, &database_key)
-            .await
-            .expect("open database");
-        db.migrate().await.expect("migrate database");
-        db
+    /// Тестовое хранилище с применёнными миграциями. Закрывать обязательно:
+    /// см. specs/core-test-process-exit.md.
+    async fn test_db() -> TestDb {
+        open_test_db("repo-charset").await
     }
 
     async fn seed_account(db: &Db) -> i64 {
@@ -6625,6 +6767,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read from_name");
         assert_eq!(from_name.as_deref(), Some("Иван Петров"));
+        db.close().await;
     }
 
     /// Маркер только в `to_addrs` при остальных чистых полях (S-003).
@@ -6669,6 +6812,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read to_addrs");
         assert_eq!(to_addrs, "[]", "у письма без To починка обязана дать []");
+        db.close().await;
     }
 
     /// Письмо без текстовой части: превью и поля `messages` чистые, маркер -
@@ -6728,6 +6872,7 @@ mod charset_repair_tests {
             cached.is_none(),
             "устаревший кэш обязан удаляться при починке (S-004)"
         );
+        db.close().await;
     }
 
     /// Маркер только в `attachments.filename` (S-003, S-005).
@@ -6782,6 +6927,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read filename");
         assert_eq!(filename, "report.txt");
+        db.close().await;
     }
 
     /// Маркер только в `messages_fts.body`, остальное чистое (S-003, S-004).
@@ -6831,6 +6977,7 @@ mod charset_repair_tests {
             .await
             .expect("read fts body");
         assert_eq!(body, "Уникальноеслово");
+        db.close().await;
     }
 
     /// Письмо испорчено сразу в нескольких источниках (тема, имя, кэш,
@@ -6931,6 +7078,7 @@ mod charset_repair_tests {
             .await
             .expect("read fts body");
         assert_eq!(body, "Текст письма");
+        db.close().await;
     }
 
     /// Имя контакта чинится по самому свежему по дате письму (S-006).
@@ -6996,6 +7144,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read display_name");
         assert_eq!(display_name, "Новое Имя");
+        db.close().await;
     }
 
     /// Контакту без подходящего письма имя не трогаем (S-006).
@@ -7029,6 +7178,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read display_name");
         assert_eq!(display_name, broken_name);
+        db.close().await;
     }
 
     /// Фаза контактов идёт после починки писем (S-006): кандидат сам был
@@ -7088,6 +7238,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read display_name");
         assert_eq!(display_name, "Иван Петров");
+        db.close().await;
     }
 
     /// Смена `raw_blob_ref` между выборкой и записью (S-014): письмо
@@ -7171,6 +7322,7 @@ mod charset_repair_tests {
             Some("старое тело".to_owned()),
             "кэш не должен удаляться при пропуске"
         );
+        db.close().await;
     }
 
     /// Недоступный blob (S-007): письмо пропускается с предупреждением,
@@ -7248,6 +7400,7 @@ mod charset_repair_tests {
             charset_repair_flag_is_set(&db).await,
             "флаг ставится, даже если часть писем пропущена (S-008)"
         );
+        db.close().await;
     }
 
     /// Флаг защищает от повторного полного скана (S-008): второй вызов ничего
@@ -7313,6 +7466,7 @@ mod charset_repair_tests {
             .await
             .expect("second pass");
         assert_eq!(second, 0, "второй проход обязан быть no-op");
+        db.close().await;
     }
 
     /// Битых писем больше внутреннего размера страницы (S-010) - постраничная
@@ -7359,6 +7513,7 @@ mod charset_repair_tests {
             remaining.is_empty(),
             "после прохода битых писем оставаться не должно"
         );
+        db.close().await;
     }
 
     /// Прерванный проход продолжается со следующего запуска: уже исправленные
@@ -7420,6 +7575,7 @@ mod charset_repair_tests {
             assert!(!subject.contains(ESC), "маркер порчи не остался");
         }
         assert!(charset_repair_flag_is_set(&db).await);
+        db.close().await;
     }
 
     /// После починки письмо находится поиском по слову из декодированной темы:
@@ -7472,6 +7628,7 @@ mod charset_repair_tests {
             by_body.contains(&message_id),
             "письмо должно находиться по слову из тела"
         );
+        db.close().await;
     }
 
     /// У контакта несколько адресов, а даты писем равны: побеждает письмо с
@@ -7542,6 +7699,7 @@ mod charset_repair_tests {
                 .await
                 .expect("read display_name");
         assert_eq!(display_name, "Имя По Второму Адресу");
+        db.close().await;
     }
 
     /// Письмо в iso-2022-jp, прошедшее обычным путём синхронизации, попадает в
@@ -7602,6 +7760,7 @@ mod charset_repair_tests {
         assert_eq!(subject, "Вышел новый");
         assert_eq!(from_name.as_deref(), Some("Вышел"));
         assert_eq!(preview, "Вышел новый");
+        db.close().await;
     }
 }
 
