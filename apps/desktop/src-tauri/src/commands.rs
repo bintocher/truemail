@@ -1311,6 +1311,13 @@ fn extract_meeting_urls(location: &str, description: &str) -> Vec<String> {
     urls
 }
 
+/// Версия установленного приложения. Берётся из package_info (та же строка,
+/// что и в tauri.conf.json), сети не требует - в отличие от check_for_update.
+#[tauri::command]
+pub fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 /// Открыть ссылку в браузере по умолчанию: из уведомления, письма, отписки.
 ///
 /// Webview сам ссылку не откроет: target="_blank" в нём означает попап, а Tauri

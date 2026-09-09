@@ -115,4 +115,22 @@
   updateButton?.addEventListener('click',()=>{
     window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
   });
+
+  /* Версия внизу боковой панели. Номер берём у приложения (без обращения к
+     сети), клик открывает страницу этого выпуска на GitHub во внешнем браузере:
+     webview ссылку сам не откроет. */
+  const versionButton=document.getElementById('appVersionLink');
+  if(versionButton){
+    window.tm.appVersion().then(version=>{
+      if(!version)return;
+      versionButton.textContent=`v${version}`;
+      versionButton.dataset.version=version;
+    }).catch(console.error);
+    versionButton.addEventListener('click',()=>{
+      const version=versionButton.dataset.version;
+      if(!version)return;
+      window.tm.openExternal(`https://github.com/bintocher/truemail/releases/tag/v${version}`)
+        .catch(error=>showToast(error.message||String(error)));
+    });
+  }
 })();

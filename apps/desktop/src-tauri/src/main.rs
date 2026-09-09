@@ -606,6 +606,7 @@ fn run() -> anyhow::Result<()> {
             commands::read_local_file,
             commands::notify_open,
             commands::notify_close,
+            commands::app_version,
             commands::open_external_url,
             commands::notify_resize,
             commands::set_notify_position,
