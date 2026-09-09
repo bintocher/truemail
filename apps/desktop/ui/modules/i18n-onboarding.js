@@ -201,7 +201,11 @@ document.getElementById('accountWizardCancel').onclick=closeAccountWizard;
 window.clearDemoData=function(preserveMessage=false){
   document.querySelectorAll('.acc-h,.acc-sub,.acct-row').forEach(el=>el.remove());
   document.querySelectorAll('.nav .count').forEach(el=>{el.textContent='';});
-  document.getElementById('msgs').innerHTML='';if(!preserveMessage){document.getElementById('tSubject').textContent='';const actions=document.querySelector('.thread .actions');if(actions)actions.classList.add('hidden');document.getElementById('tbody').innerHTML='';}
+  // Пока кнопка указателя прижата к списку, разметку не сносим: замена узлов
+  // между прижатием и отпусканием съедает нажатие, и письмо не открывается
+  // (specs/message-click-not-lost.md). Список перестроится после нажатия.
+  if(!window.messageListRenderHeld?.())document.getElementById('msgs').innerHTML='';
+  if(!preserveMessage){document.getElementById('tSubject').textContent='';const actions=document.querySelector('.thread .actions');if(actions)actions.classList.add('hidden');document.getElementById('tbody').innerHTML='';}
   ['calgrid','calweek','calday','cgrid'].forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML='';});
   const contactCount=document.querySelector('.ct-count');if(contactCount)contactCount.textContent=wizardLocale==='en'?'0 contacts':'0 контактов';
   document.getElementById('acctDetail')?.remove();
