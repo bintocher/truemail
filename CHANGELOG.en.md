@@ -7,6 +7,23 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.14] - 2026-09-10
+
+### Fixed
+
+- Clicking a message no longer gets lost. List rows are rebuilt as a whole, and
+  with several mailboxes background sync refreshes the list every few seconds:
+  when the refresh landed between pressing and releasing the button, the browser
+  raised no click on the row and the message did not open, even though the row
+  had already taken the focus ring. While the button is held on the list, the
+  markup is not dropped and the window is not rebuilt.
+- A header cut by the sender in the middle of a character now reads in full.
+  Bulk senders split a long subject by bytes rather than character boundaries;
+  each encoded word was decoded on its own, so the halves produced two
+  replacement marks - "Ser??eevich" instead of "Sergeevich". Adjacent words of
+  the same charset are now joined before parsing, and stored messages are
+  re-read on start.
+
 ## [0.2.13] - 2026-09-09
 
 ### Added
