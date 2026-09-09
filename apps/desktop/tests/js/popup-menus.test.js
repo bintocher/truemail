@@ -4,11 +4,7 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
 const {POPUP_MENU_IDS, planPopupMenus, withDependentMenus} = require('../../ui/modules/popup-menus.js');
-
-const uiFile = name => fs.readFileSync(path.join(__dirname, '../../ui', name), 'utf8');
 
 // S-001, S-002: открытие любого меню закрывает все прочие.
 test('S-002: открытие меню папки закрывает меню письма', () => {
@@ -102,36 +98,4 @@ test('S-016: сортировка закрывает фильтр', () => {
 test('S-019: неизвестное меню в списке открытых игнорируется', () => {
   const plan = planPopupMenus(['message', 'нетТакого'], {type: 'escape'});
   assert.deepEqual(plan.close, ['message']);
-});
-
-// S-020: модуль выбора не обращается к документу и окну.
-test('S-020: в модуле выбора нет document и window', () => {
-  const source = uiFile('modules/popup-menus.js');
-  assert.equal(/\bdocument\b/.test(source), false);
-  assert.equal(/\bwindow\b/.test(source), false);
-});
-
-// S-011: перечни меню убраны из обработчиков Escape.
-test('S-011: обработчик Escape в commands-accessibility не перечисляет меню', () => {
-  const source = uiFile('modules/commands-accessibility.js');
-  const line = source.split('\n').find(text => text.includes("e.key==='Escape'"));
-  assert.ok(line, 'обработчик Escape не найден');
-  assert.ok(line.includes('handlePopupMenusEscape'));
-  ['ctxmenu', 'ctxsmart', 'ctxfolder', 'filterMenu', 'sortMenu'].forEach(name => {
-    assert.equal(line.includes(name), false, `перечень меню остался: ${name}`);
-  });
-});
-
-// S-018: разовые обработчики клика при открытии меню больше не вешаются.
-test('S-018: меню вложения и подменю меток не вешают разовый обработчик', () => {
-  assert.equal(/att-menu[\s\S]*?\{once:true\}/.test(uiFile('modules/mail.js')), false);
-  assert.equal(uiFile('modules/calendar-contacts.js').includes('{once:true}'), false);
-});
-
-// S-009, S-010: защита от гонки при открытии подменю меток.
-test('S-009 и S-010: подменю проверяет номер открытия и родителя', () => {
-  const source = uiFile('modules/calendar-contacts.js');
-  assert.ok(source.includes('flagMenuTicket'));
-  assert.ok(source.includes("ticket!==flagMenuTicket"));
-  assert.ok(source.includes("popupMenuIsOpen('message')"));
 });

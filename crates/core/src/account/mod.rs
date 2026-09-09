@@ -55,12 +55,27 @@ fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
         .map_err(|error| crate::Error::AccountConfig(format!("append_sent outbox: {error}")))
 }
 
+/// Насколько старым может быть письмо, чтобы о нём ещё имело смысл уведомлять.
+/// Локально новый remote_id сам по себе не значит "письмо только что пришло":
+/// так же выглядит догруженная история, только что заведённая папка и повторная
+/// выкачка после смены UIDVALIDITY.
+pub const NOTIFICATION_MAX_AGE_HOURS: i64 = 24;
+
+/// Нижняя граница даты письма для уведомлений в том виде, в каком дата лежит в
+/// базе (UTC, см. миграцию 0034).
+fn notification_date_border() -> String {
+    (chrono::Utc::now() - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string()
+}
+
 /// Результат короткой синхронизации Входящих. `new_messages` считает только
 /// remote ID, которых не было в локальной БД до этого прохода; повторно
 /// полученные EWS Modified-события поэтому не создают уведомления.
-/// `new_message_ids` - локальные id этих же писем (только из папки Входящие),
-/// отсортированные по дате по возрастанию: используются для карточки
-/// уведомления, чтобы показывать именно новое письмо, а не самое свежее в БД.
+/// `new_message_ids` - локальные id этих же писем (только из папки Входящие и
+/// только со свежей датой, см. NOTIFICATION_MAX_AGE_HOURS), отсортированные по
+/// дате по возрастанию: используются для карточки уведомления, чтобы показывать
+/// именно новое письмо, а не самое свежее в БД.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxSyncResult {
     pub downloaded: usize,
@@ -1044,7 +1059,11 @@ impl AccountManager {
             Vec::new()
         } else {
             self.db
-                .inbox_message_ids_by_remote_ids(account.id, &unknown_remote_ids)
+                .inbox_message_ids_by_remote_ids(
+                    account.id,
+                    &unknown_remote_ids,
+                    Some(&notification_date_border()),
+                )
                 .await?
         };
         self.db
