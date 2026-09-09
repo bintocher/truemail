@@ -25,7 +25,7 @@ jobs:
       # и съедает минуты на пустом месте.
       OPENSSL_NO_VENDOR: 1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Проверке меток версий нужен доступ к состоянию базовой ветки.
           fetch-depth: 0
@@ -66,7 +66,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all -- --check
@@ -84,7 +84,7 @@ jobs:
     # autostart) и Tauri-бандл нельзя проверить в Linux-раннере.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - name: Formatting
         run: cargo fmt --all -- --check
