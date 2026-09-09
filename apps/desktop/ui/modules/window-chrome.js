@@ -133,7 +133,7 @@
   if(versionButton){
     versionButton.addEventListener('click',()=>{
       const version=versionButton.dataset.version;
-      if(!version)return;
+      if(!version||!window.tm?.openExternal)return;
       window.tm.openExternal(`https://github.com/bintocher/truemail/releases/tag/v${version}`)
         .catch(error=>showToast(error.message||String(error)));
     });

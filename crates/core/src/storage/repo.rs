@@ -6242,11 +6242,15 @@ mod notification_lookup_tests {
             .await
             .expect("set future date");
 
+        // Письмо ровно на нижней границе: границы включающие, оно уведомляется.
+        let border_id = seed_message(&db, account_id, inbox_id, 5, "remote-border").await;
+
         let remote_ids = [
             "remote-fresh".to_owned(),
             "remote-old".to_owned(),
             "remote-undated".to_owned(),
             "remote-future".to_owned(),
+            "remote-border".to_owned(),
         ];
         let now = chrono::Utc::now();
         let not_before = (now - chrono::Duration::hours(24))
@@ -6255,6 +6259,12 @@ mod notification_lookup_tests {
         let not_after = (now + chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%S+00:00")
             .to_string();
+        sqlx::query("UPDATE messages SET date = ? WHERE id = ?")
+            .bind(&not_before)
+            .bind(border_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("set border date");
         let mut ids = db
             .inbox_message_ids_by_remote_ids(
                 account_id,
@@ -6266,18 +6276,18 @@ mod notification_lookup_tests {
             .expect("query inbox ids");
         ids.sort_unstable();
 
-        let mut expected = vec![fresh_id, undated_id];
+        let mut expected = vec![fresh_id, undated_id, border_id];
         expected.sort_unstable();
         assert_eq!(
             ids, expected,
-            "письма 2022 и 2031 годов в уведомление не попадают, письмо без даты - попадает"
+            "письма 2022 и 2031 годов не попадают; письмо без даты и письмо ровно на границе - попадают"
         );
 
         let all = db
             .inbox_message_ids_by_remote_ids(account_id, &remote_ids, None, None)
             .await
             .expect("query inbox ids");
-        assert_eq!(all.len(), 4, "без границ выбираются все письма Входящих");
+        assert_eq!(all.len(), 5, "без границ выбираются все письма Входящих");
     }
 
     #[tokio::test]

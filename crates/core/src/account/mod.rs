@@ -77,6 +77,36 @@ fn notification_date_borders() -> (String, String) {
     )
 }
 
+#[cfg(test)]
+mod notification_border_tests {
+    use super::{NOTIFICATION_MAX_AGE_HOURS, notification_date_borders};
+
+    #[test]
+    fn borders_are_written_the_way_dates_are_stored() {
+        let (not_before, not_after) = notification_date_borders();
+        for border in [&not_before, &not_after] {
+            assert_eq!(border.len(), 25, "длина границы: {border}");
+            assert!(border.ends_with("+00:00"), "смещение границы: {border}");
+            assert_eq!(border.as_bytes()[10], b'T', "разделитель даты: {border}");
+            chrono::DateTime::parse_from_rfc3339(border)
+                .unwrap_or_else(|error| panic!("граница {border} не разбирается: {error}"));
+        }
+        assert!(not_before < not_after, "нижняя граница раньше верхней");
+    }
+
+    #[test]
+    fn borders_are_symmetric_around_now() {
+        let (not_before, not_after) = notification_date_borders();
+        let before = chrono::DateTime::parse_from_rfc3339(&not_before).expect("нижняя граница");
+        let after = chrono::DateTime::parse_from_rfc3339(&not_after).expect("верхняя граница");
+        assert_eq!(
+            (after - before).num_hours(),
+            NOTIFICATION_MAX_AGE_HOURS * 2,
+            "границы отстоят от текущего момента на предел свежести в обе стороны"
+        );
+    }
+}
+
 /// Результат короткой синхронизации Входящих. `new_messages` считает только
 /// remote ID, которых не было в локальной БД до этого прохода; повторно
 /// полученные EWS Modified-события поэтому не создают уведомления.
