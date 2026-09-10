@@ -7,6 +7,17 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.15] - 2026-09-10
+
+### Fixed
+
+- The version at the bottom of the sidebar is visible again. The number and the
+  release address are now written into the interface at build time, so the label
+  no longer depends on the core or on the bridge being ready: it used to stay
+  silently empty when the core had not answered by the time the window loaded.
+  The label sticks to the bottom edge of the sidebar and no longer scrolls out
+  of sight behind a long folder list.
+
 ## [0.2.14] - 2026-09-10
 
 ### Fixed

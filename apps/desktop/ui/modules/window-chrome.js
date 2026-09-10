@@ -116,30 +116,17 @@
     window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
   });
 
-  /* Версия внизу боковой панели. Номер и адрес выпуска приходят из приложения
-     одной парой (без обращения к сети) и хранятся у самой подписи; клик
-     открывает сохранённый адрес во внешнем браузере: webview ссылку сам не
-     откроет, а собирать адрес второй раз в интерфейсе незачем. */
+  /* Версия внизу боковой панели. Номер и адрес выпуска зашиты в интерфейс на
+     сборке (modules/app-version.js), поэтому подпись не зависит ни от ядра, ни
+     от готовности моста. Клик открывает сохранённый адрес во внешнем браузере:
+     webview ссылку сам не откроет. */
   const versionButton=document.getElementById('appVersionLink');
-  // Мост window.tm создаётся в bridge.js, который подключён ниже этого модуля,
-  // поэтому обращаться к нему сразу нельзя: к моменту DOMContentLoaded он готов.
-  function showAppVersion(){
-    if(!window.tm?.appVersion)return;
-    window.tm.appVersion().then(info=>{
-      if(!info?.version)return;
-      versionButton.textContent=`v${info.version}`;
-      versionButton.dataset.version=info.version;
-      versionButton.dataset.releaseUrl=info.release_url||'';
-    }).catch(console.error);
-  }
-  if(versionButton){
+  if(versionButton&&window.truemailVersion?.version){
+    const {version,releaseUrl}=window.truemailVersion;
+    versionButton.textContent=`v${version}`;
     versionButton.addEventListener('click',()=>{
-      const releaseUrl=versionButton.dataset.releaseUrl;
       if(!releaseUrl||!window.tm?.openExternal)return;
-      window.tm.openExternal(releaseUrl)
-        .catch(error=>showToast(error.message||String(error)));
+      window.tm.openExternal(releaseUrl).catch(error=>showToast(error.message||String(error)));
     });
-    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',showAppVersion,{once:true});
-    else showAppVersion();
   }
 })();
