@@ -7,6 +7,13 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.16] - 2026-09-10
+
+### Changed
+
+- The application version is shown in the window status bar, at the right edge,
+  instead of the sidebar. Clicking it still opens that release page on GitHub.
+
 ## [0.2.15] - 2026-09-10
 
 ### Fixed
