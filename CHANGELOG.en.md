@@ -7,6 +7,14 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- The version at the bottom of the sidebar is visible again. The label was
+  filled once on window load and stayed silently empty when the bridge to the
+  core was not ready yet, with nothing written to the log. The request now
+  retries until the bridge is ready, a failure goes to the log, and the label
+  sticks to the bottom edge of the sidebar instead of scrolling out of sight.
+
 ## [0.2.14] - 2026-09-10
 
 ### Fixed
