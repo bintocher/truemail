@@ -1311,59 +1311,6 @@ fn extract_meeting_urls(location: &str, description: &str) -> Vec<String> {
     urls
 }
 
-/// Постоянная часть адреса страницы выпуска. Держим её в приложении, чтобы вид
-/// адреса был задан в одном месте, а не собирался заново в интерфейсе.
-const RELEASE_PAGE_PREFIX: &str = "https://github.com/bintocher/truemail/releases/tag/v";
-
-/// Номер установленной версии и адрес страницы её выпуска.
-#[derive(serde::Serialize)]
-pub struct AppVersionInfo {
-    pub version: String,
-    pub release_url: String,
-}
-
-/// Сведения о версии для подписи внизу боковой панели: номер из package_info
-/// (та же строка, что и в tauri.conf.json) и адрес её выпуска. Сети не требует -
-/// в отличие от check_for_update.
-#[tauri::command]
-pub fn app_version(app: AppHandle) -> AppVersionInfo {
-    app_version_info(&app.package_info().version.to_string())
-}
-
-/// Собственно сборка пары. Вынесена из команды, чтобы её можно было проверить
-/// без запуска приложения.
-fn app_version_info(version: &str) -> AppVersionInfo {
-    AppVersionInfo {
-        version: version.to_owned(),
-        release_url: format!("{RELEASE_PAGE_PREFIX}{version}"),
-    }
-}
-
-#[cfg(test)]
-mod app_version_tests {
-    use super::app_version_info;
-
-    #[test]
-    fn release_url_points_at_the_installed_version() {
-        let info = app_version_info("0.2.13");
-        assert_eq!(info.version, "0.2.13");
-        assert_eq!(
-            info.release_url,
-            "https://github.com/bintocher/truemail/releases/tag/v0.2.13"
-        );
-    }
-
-    #[test]
-    fn release_url_is_a_web_address() {
-        let info = app_version_info("1.0.0");
-        assert!(
-            info.release_url.starts_with("https://"),
-            "адрес выпуска должен быть веб-адресом: {}",
-            info.release_url
-        );
-    }
-}
-
 /// Открыть ссылку в браузере по умолчанию: из уведомления, письма, отписки.
 ///
 /// Webview сам ссылку не откроет: target="_blank" в нём означает попап, а Tauri

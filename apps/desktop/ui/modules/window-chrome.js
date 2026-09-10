@@ -116,47 +116,17 @@
     window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
   });
 
-  /* Версия внизу боковой панели. Номер и адрес выпуска приходят из приложения
-     одной парой (без обращения к сети) и хранятся у самой подписи; клик
-     открывает сохранённый адрес во внешнем браузере: webview ссылку сам не
-     откроет, а собирать адрес второй раз в интерфейсе незачем. */
+  /* Версия внизу боковой панели. Номер и адрес выпуска зашиты в интерфейс на
+     сборке (modules/app-version.js), поэтому подпись не зависит ни от ядра, ни
+     от готовности моста. Клик открывает сохранённый адрес во внешнем браузере:
+     webview ссылку сам не откроет. */
   const versionButton=document.getElementById('appVersionLink');
-  // Мост window.tm создаётся в bridge.js, который подключён ниже этого модуля.
-  // Ждать готовности документа мало: порядок выполнения скриптов и момент
-  // готовности моста связаны не жёстко, поэтому пробуем ещё несколько раз.
-  // Неудача уходит в журнал приложения: подпись просто исчезала, и разбирать
-  // жалобу "версии не видно" было нечем.
-  const VERSION_RETRY_LIMIT=25,VERSION_RETRY_DELAY=200;
-  function showAppVersion(attempt=0){
-    if(!window.tm?.appVersion){
-      if(attempt<VERSION_RETRY_LIMIT){setTimeout(()=>showAppVersion(attempt+1),VERSION_RETRY_DELAY);return;}
-      console.error('truemail: мост недоступен, версия не показана');
-      return;
-    }
-    window.tm.appVersion().then(info=>{
-      if(!info?.version){
-        window.tm.uiLog?.('версия не показана: пустой ответ команды');
-        return;
-      }
-      versionButton.textContent=`v${info.version}`;
-      versionButton.dataset.version=info.version;
-      versionButton.dataset.releaseUrl=info.release_url||'';
-    }).catch(error=>{
-      window.tm?.uiLog?.(`версия не показана: ${error?.message||error}`);
-      console.error(error);
-    });
-  }
-  if(versionButton){
+  if(versionButton&&window.truemailVersion?.version){
+    const {version,releaseUrl}=window.truemailVersion;
+    versionButton.textContent=`v${version}`;
     versionButton.addEventListener('click',()=>{
-      const releaseUrl=versionButton.dataset.releaseUrl;
       if(!releaseUrl||!window.tm?.openExternal)return;
-      window.tm.openExternal(releaseUrl)
-        .catch(error=>showToast(error.message||String(error)));
+      window.tm.openExternal(releaseUrl).catch(error=>showToast(error.message||String(error)));
     });
-    // Пробуем сразу и, если документ ещё грузится, ещё раз по его готовности:
-    // повторы сами дождутся моста, а второй заход перекрывает редкий случай,
-    // когда первый исчерпал попытки на медленном старте.
-    showAppVersion();
-    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>showAppVersion(),{once:true});
   }
 })();

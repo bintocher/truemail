@@ -117,7 +117,6 @@ window.corePageSize = 100;
     setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
-    appVersion: () => invoke("app_version"),
     openExternal: (url) => invoke("open_external_url", { url }),
     beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
     completePasswordImap: (config) => invoke("complete_password_imap", config),
