@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260910-1">
+  <link rel="stylesheet" href="styles.css?v=20260910-2">
 </head>
 <body>
 
@@ -60,9 +60,6 @@
       <div id="tagsNav" class="tags-nav" data-no-i18n></div>
 
       <div class="nav-spacer"></div>
-      <!-- Версия программы внизу панели: клик открывает страницу этого выпуска
-           на GitHub. Подпись подставляет интерфейс, словарь её не трогает. -->
-      <button type="button" class="nav-version" id="appVersionLink" data-no-i18n data-i18n-title="tipAppVersion" title="Открыть страницу выпуска на GitHub"></button>
     </aside>
 
     <section class="list">
@@ -132,6 +129,9 @@
   <div class="statusbar" id="statusbar">
     <span class="statusbar-text" id="statusbarText"></span>
     <span class="statusbar-right" id="statusbarRight"></span>
+    <!-- Версия программы в строке состояния: номер и адрес выпуска приходят из
+         файла, который пишет сборка. Словарь подпись не трогает. -->
+    <button type="button" class="statusbar-version" id="appVersionLink" data-no-i18n data-i18n-title="tipAppVersion" title="Открыть страницу выпуска на GitHub"></button>
   </div>
 </div>
 
@@ -689,7 +689,7 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.2.15"></script>
+<script src="modules/app-version.js?v=0.2.16"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
@@ -706,7 +706,7 @@
 <script src="modules/composer.js?v=20260904-1"></script>
 <script src="modules/account-cards.js?v=20260905-1"></script>
 <script src="modules/settings.js?v=20260909-1"></script>
-<script src="modules/window-chrome.js?v=20260910-1"></script>
+<script src="modules/window-chrome.js?v=20260910-2"></script>
 <script src="bridge.js?v=20260910-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>

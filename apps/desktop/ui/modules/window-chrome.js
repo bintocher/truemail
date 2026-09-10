@@ -116,10 +116,10 @@
     window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
   });
 
-  /* Версия внизу боковой панели. Номер и адрес выпуска зашиты в интерфейс на
-     сборке (modules/app-version.js), поэтому подпись не зависит ни от ядра, ни
-     от готовности моста. Клик открывает сохранённый адрес во внешнем браузере:
-     webview ссылку сам не откроет. */
+  /* Версия в строке состояния окна. Номер и адрес выпуска зашиты в интерфейс
+     на сборке (modules/app-version.js), поэтому подпись не зависит ни от ядра,
+     ни от готовности моста. Клик открывает сохранённый адрес во внешнем
+     браузере: webview ссылку сам не откроет. */
   const versionButton=document.getElementById('appVersionLink');
   if(versionButton&&window.truemailVersion?.version){
     const {version,releaseUrl}=window.truemailVersion;

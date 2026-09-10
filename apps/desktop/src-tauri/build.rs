@@ -7,19 +7,19 @@ fn main() {
 
 /// Зашить версию в интерфейс на сборке.
 ///
-/// Подпись версии внизу боковой панели не должна зависеть ни от готовности
+/// Подпись версии в строке состояния не должна зависеть ни от готовности
 /// моста к ядру, ни от ответа команды: раньше она молча оставалась пустой,
 /// если мост в момент загрузки окна был ещё не готов. Здесь сборка кладёт
 /// номер версии и адрес выпуска прямо в файл интерфейса, а заодно ставит его
 /// же меткой подключения - тогда встроенный браузер не подсунет старую копию.
-/// См. specs/app-version-in-sidebar.md.
+/// См. specs/app-version-in-statusbar.md.
 fn write_ui_version() {
     let version = env!("CARGO_PKG_VERSION");
     let ui = Path::new("../ui");
     let module = ui.join("modules/app-version.js");
     let contents = format!(
         "// Файл создаётся сборкой из версии пакета: править руками бессмысленно.\n\
-         // См. specs/app-version-in-sidebar.md.\n\
+         // См. specs/app-version-in-statusbar.md.\n\
          window.truemailVersion={{version:\"{version}\",releaseUrl:\"https://github.com/bintocher/truemail/releases/tag/v{version}\"}};\n"
     );
     // Пишем только при изменении: иначе каждая сборка трогала бы файл и сбивала

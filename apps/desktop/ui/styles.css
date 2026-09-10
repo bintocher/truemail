@@ -134,6 +134,11 @@
   /* Ровно одна строка: длинный текст обрезается многоточием, а не ломает высоту. */
   .statusbar-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .statusbar-right{margin-left:auto;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  /* Версия в строке состояния: прижата к правому краю, читается как ссылка. */
+  .statusbar-version{border:0;background:transparent;font:inherit;color:inherit;padding:0;margin-left:auto;flex:none;cursor:pointer;}
+  .statusbar-right:not(:empty)+.statusbar-version{margin-left:12px;}
+  .statusbar-version:hover{color:var(--accent);text-decoration:underline;}
+  .statusbar-version:empty{display:none;}
   .nav{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;position:relative;user-select:none;-webkit-user-select:none;}
   .nav-resizer{position:fixed;left:calc(var(--nav-w) - 4px);top:var(--titlebar-h);width:8px;height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));cursor:col-resize;z-index:45;}
   /* Граница между списком писем и письмом: тянется так же, как левая панель. */
@@ -165,11 +170,6 @@
   .acc-sub .navitem{margin-left:22px;font-size:12.5px;padding:5px 8px;}
   .nav-spacer{flex:1;}
   /* Версия внизу панели: неяркая подпись, при наведении читается как ссылка. */
-  /* Подпись прижата к низу панели: список папок с несколькими ящиками длиннее
-     окна, и при прокрутке версия уезжала за край - её просто не было видно. */
-  .nav-version{border:0;background:var(--panel);font:inherit;font-size:11.5px;color:var(--text-2);padding:6px 14px 10px;text-align:left;cursor:pointer;width:100%;position:sticky;bottom:0;z-index:1;}
-  .nav-version:hover{color:var(--accent);text-decoration:underline;}
-  .nav-version:empty{display:none;}
 
   .list{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--bg);user-select:none;-webkit-user-select:none;position:relative;}
   .list-loading{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:6;display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:var(--bg);border:1px solid var(--border);border-radius:50%;box-shadow:var(--shadow);}
