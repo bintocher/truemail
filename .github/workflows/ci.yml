@@ -41,7 +41,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --workspace --locked
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           # Не ниже 22: раскрытие маски в node --test появилось там. На Node 20
           # шаг молча прогонял бы ноль файлов и всегда был бы зелёным.
