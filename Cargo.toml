@@ -59,7 +59,7 @@ quoted_printable = "0.5.2"
 keyring = "4.1.4"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 
 [patch.crates-io]
 # libsqlite3-sys 0.38.x не удовлетворяет диапазону SQLx 0.9 (`<0.38`).
