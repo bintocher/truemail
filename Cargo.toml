@@ -51,7 +51,7 @@ url = "2.5.8"
 sha2 = "0.11.0"
 hkdf = "0.13.0"
 zeroize = { version = "1.8.2", features = ["derive"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 roxmltree = "0.21.1"
 quoted_printable = "0.5.2"
 

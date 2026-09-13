@@ -6274,7 +6274,7 @@ dependencies = [
  "async-imap",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chacha20poly1305",
  "chrono",
  "futures",
@@ -6311,7 +6311,7 @@ name = "truemail-desktop"
 version = "0.2.16"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "rfd 0.17.2",
  "serde",
