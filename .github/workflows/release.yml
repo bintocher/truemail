@@ -36,7 +36,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       publish: ${{ steps.gate.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Версия из Cargo.toml
         id: version
         run: |
@@ -81,7 +81,7 @@ jobs:
       # вместо монтирования.
       APPIMAGE_EXTRACT_AND_RUN: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Системные зависимости Tauri
         run: |
           sudo apt-get update
@@ -118,7 +118,7 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: Установить tauri-cli
@@ -152,7 +152,7 @@ jobs:
     if: needs.meta.outputs.publish == 'true'
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - uses: cargo-bins/cargo-binstall@main
       - name: Установить tauri-cli
@@ -183,7 +183,7 @@ jobs:
     if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Собрать latest.json
         env:
           GH_TOKEN: ${{ github.token }}
