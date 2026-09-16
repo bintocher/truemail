@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260910-2">
+  <link rel="stylesheet" href="styles.css?v=20260916-1">
 </head>
 <body>
 
@@ -597,6 +597,10 @@
 <div class="view" id="welcomeView">
   <div class="wz">
     <div class="wzcard">
+      <!-- Кнопка выхода из повторного мастера (specs/setup-wizard-exit.md,
+           S-001, S-002): общая для всех шагов, по умолчанию скрыта - показывается
+           только когда сохранённая настройка onboarding_completed завершена. -->
+      <button type="button" class="iconbtn x wz-close hidden" id="wzClose" disabled data-i18n-aria="closeWizard" aria-label="Закрыть мастер"><i data-i="back"></i></button>
       <div class="wzstep active" id="wz1">
         <div class="wz-logo"><i data-i="globe"></i></div>
         <h1 data-i18n="languageTitle">Choose your language</h1>
@@ -693,15 +697,16 @@
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
+<script src="modules/wizard-exit.js?v=20260916-1"></script>
 <script src="modules/shell.js?v=20260902-2"></script>
-<script src="modules/calendar-contacts.js?v=20260909-2"></script>
+<script src="modules/calendar-contacts.js?v=20260916-1"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
 <script src="modules/commands-accessibility.js?v=20260909-1"></script>
 <script src="modules/smart-rules.js?v=20260909-1"></script>
-<script src="modules/i18n-onboarding.js?v=20260910-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260916-1"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
-<script src="modules/mail.js?v=20260910-1"></script>
+<script src="modules/mail.js?v=20260916-1"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
 <script src="modules/composer.js?v=20260904-1"></script>
 <script src="modules/account-cards.js?v=20260905-1"></script>

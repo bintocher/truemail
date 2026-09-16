@@ -151,6 +151,7 @@
   "clearAllLocal": "Clear all local data",
   "clearAllLocalDesc": "Messages will be re-downloaded from the servers",
   "close": "Close",
+  "closeWizard": "Close wizard",
   "codeExpired": "The code expired or was already used. Select Connect to get a new code.",
   "codePlaceholder": "Confirmation code",
   "codeShort": "Code",

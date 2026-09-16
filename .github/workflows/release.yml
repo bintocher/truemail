@@ -147,7 +147,9 @@ jobs:
           foreach ($f in $files) { gh release upload $env:TAG $f.FullName --clobber }
 
   macos:
-    # Нативная arm64-сборка: .dmg для установки и .app.tar.gz для updater.
+    # Универсальная сборка (arm64 + x86_64 в одном бинарнике): один .dmg для
+    # установки и один .app.tar.gz для updater подходят на обеих архитектурах
+    # Apple (specs/macos-universal-release.md, issue #65).
     needs: meta
     if: needs.meta.outputs.publish == 'true'
     runs-on: macos-latest
@@ -162,18 +164,83 @@ jobs:
         # --force: rust-cache восстанавливает метаданные binstall, но не
         # ~/.cargo/bin - без --force binstall считает cli установленным.
         run: cargo binstall tauri-cli --version 2.11.4 --locked --no-confirm --force
-      - name: Сборка пакетов
+      - name: Цели Rust для универсальной сборки
+        # S-001: обе цели ставятся заранее, а не полагаемся на неявную
+        # установку внутри cargo tauri build - ошибка любой из них должна
+        # остановить задание до сборки.
+        run: |
+          set -e
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            if ! rustup target list --installed | grep -qx "$t"; then
+              echo "цель Rust не установлена: $t" >&2
+              exit 1
+            fi
+          done
+      - name: Сборка универсального пакета
+        # S-002: один вызов cargo tauri build с целью universal-apple-darwin
+        # вместо нативной сборки под архитектуру раннера.
         run: |
           cd apps/desktop/src-tauri
-          cargo tauri build --bundles app,dmg
+          cargo tauri build --target universal-apple-darwin --bundles app,dmg
+      - name: Проверить архитектуры универсального пакета
+        # S-003: подтверждаем средствами macOS (lipo), что arm64 и x86_64
+        # присутствуют не только в основном бинарнике, но и во всех прочих
+        # исполняемых файлах и библиотеках внутри .app - иначе универсальный
+        # пакет мог бы оказаться собран лишь наполовину.
+        run: |
+          set -e
+          bundle_dir="target/universal-apple-darwin/release/bundle"
+          app_count=$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')
+          if [ "$app_count" -ne 1 ]; then
+            echo "ожидался ровно один каталог .app, найдено: $app_count" >&2
+            exit 1
+          fi
+          app_path=$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app')
+          check_arch() {
+            local f="$1"
+            local archs
+            archs=$(lipo -archs "$f" 2>/dev/null || true)
+            case "$archs" in
+              *arm64*x86_64*|*x86_64*arm64*) echo "ок: $f -> $archs" ;;
+              *) echo "нет обеих архитектур (arm64, x86_64) в $f (найдено: $archs)" >&2; exit 1 ;;
+            esac
+          }
+          while IFS= read -r -d '' f; do check_arch "$f"; done < <(find "$app_path/Contents/MacOS" -type f -print0)
+          if [ -d "$app_path/Contents/Frameworks" ]; then
+            while IFS= read -r -d '' f; do check_arch "$f"; done < <(find "$app_path/Contents/Frameworks" -type f -print0)
+          fi
       - name: Залить ассеты
+        # S-004/S-006: источник - только каталог universal-apple-darwin;
+        # ровно один .dmg и ровно один архив .app.tar.gz с подписью, иначе
+        # ошибка (выбор по порядку обхода каталога запрещён спецификацией).
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.meta.outputs.tag }}
         run: |
-          find target/release/bundle -type f \
-            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) \
-            -exec gh release upload "$TAG" {} --clobber \;
+          set -e
+          bundle_dir="target/universal-apple-darwin/release/bundle"
+          dmg_count=$(find "$bundle_dir" -type f -name '*.dmg' | wc -l | tr -d ' ')
+          if [ "$dmg_count" -ne 1 ]; then
+            echo "ожидался ровно один .dmg в $bundle_dir, найдено: $dmg_count" >&2
+            exit 1
+          fi
+          archive_count=$(find "$bundle_dir" -type f -name '*.app.tar.gz' | wc -l | tr -d ' ')
+          if [ "$archive_count" -ne 1 ]; then
+            echo "ожидался ровно один .app.tar.gz в $bundle_dir, найдено: $archive_count" >&2
+            exit 1
+          fi
+          dmg=$(find "$bundle_dir" -type f -name '*.dmg')
+          archive=$(find "$bundle_dir" -type f -name '*.app.tar.gz')
+          sig="$archive.sig"
+          if [ ! -f "$sig" ]; then
+            echo "не найдена подпись архива обновления: $sig" >&2
+            exit 1
+          fi
+          echo "dmg: $dmg"
+          echo "archive: $archive"
+          echo "signature: $sig"
+          gh release upload "$TAG" "$dmg" "$archive" "$sig" --clobber
 
   manifest:
     # Собирает updater latest.json из ассетов всех платформ, заливает его
@@ -207,12 +274,30 @@ jobs:
           ]
           platforms = {}
           for key, suffix in specs:
-              pkg = next((a for a in assets if a.endswith(suffix)), None)
-              if pkg and pkg + ".sig" in sigs:
-                  platforms[key] = {"signature": sigs[pkg + ".sig"], "url": url(pkg)}
-          missing = {k for k, _ in specs} - set(platforms)
+              # S-006: ровно один подходящий файл, иначе манифест не должен
+              # выбирать файл по порядку обхода assets.txt.
+              matches = [a for a in assets if a.endswith(suffix)]
+              if len(matches) != 1:
+                  raise SystemExit(
+                      f"ожидался ровно один файл для {key} ({suffix}), найдено: {len(matches)}"
+                  )
+              pkg = matches[0]
+              if pkg + ".sig" not in sigs:
+                  raise SystemExit(f"нет подписи для {pkg}")
+              platforms[key] = {"signature": sigs[pkg + ".sig"], "url": url(pkg)}
+          # S-005: универсальный пакет macOS один на обе архитектуры - записи
+          # darwin-aarch64 и darwin-x86_64 ссылаются на один и тот же архив
+          # и одну и ту же подпись.
+          platforms["darwin-x86_64"] = dict(platforms["darwin-aarch64"])
+          required_keys = {k for k, _ in specs} | {"darwin-x86_64"}
+          missing = required_keys - set(platforms)
           if missing:
               raise SystemExit(f"нет платформ для манифеста: {sorted(missing)}")
+          # S-008: полнота манифеста - обязательные ключи и непустые поля.
+          for key in sorted(required_keys):
+              entry = platforms[key]
+              if not entry.get("url") or not entry.get("signature"):
+                  raise SystemExit(f"пустое поле url или signature у платформы {key}")
           manifest = {
               "version": tag.lstrip("v"),
               "notes": f"truemail update {tag}",

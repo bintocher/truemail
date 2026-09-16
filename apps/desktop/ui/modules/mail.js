@@ -860,14 +860,41 @@ document.getElementById('accountOauthConfirm').onclick=async()=>{
 document.getElementById('wzConnect').onclick=async()=>{
   const email=document.getElementById('wzEmail').value.trim(),status=document.getElementById('wzConnectStatus');
   const button=document.getElementById('wzConnect');
+  // S-009: номер попытки мастера на момент запуска команды - поздний ответ
+  // мастера, который к тому моменту закрыт или заново открыт с другим номером,
+  // не должен трогать чужой (или уже несуществующий) экран мастера.
+  const attempt=window.currentWizardAttempt?.();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=wt('invalidEmail');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=wt('oauthUnavailable');status.dataset.kind='error';return;}
-  try{button.disabled=true;status.textContent=wizardLocale==='en'?'Detecting provider and sign-in method…':'Определяю провайдера и способ входа…';status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();}
-  catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
+  try{
+    button.disabled=true;status.textContent=wizardLocale==='en'?'Detecting provider and sign-in method…':'Определяю провайдера и способ входа…';status.dataset.kind='';
+    const pending=await window.tm.beginAccountConnection(email);
+    if(!window.isWizardAttemptCurrent?.(attempt)){
+      // S-009, S-012: мастер этой попытки уже не тот, что сейчас на экране -
+      // обновляем только данные аккаунтов и готовность композера, мастер не
+      // открываем и его разметку не трогаем.
+      if(pending.mode==='connected'&&pending.connected){await window.reloadCoreData?.();await window.refreshComposerReadiness?.();}
+      return;
+    }
+    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
+    if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
+    pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();
+  }catch(e){if(!window.isWizardAttemptCurrent?.(attempt))return;button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
 };
 document.getElementById('wzConfirm').onclick=async()=>{
   const code=document.getElementById('wzOauthCode').value.trim(),status=document.getElementById('wzConnectStatus');if(!code)return;
-  try{status.textContent=wt('connecting');status.dataset.kind='';document.getElementById('wzConfirm').disabled=true;const connected=await window.tm.completeYandexOauth(pendingOauthState,code);status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;}
-  catch(e){if(isExpiredOauthCode(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');document.getElementById('wzConnect').disabled=false;status.textContent=wt('codeExpired');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('wzConfirm').disabled=false;}
+  const attempt=window.currentWizardAttempt?.(); // S-009: см. пояснение у wzConnect
+  try{
+    status.textContent=wt('connecting');status.dataset.kind='';document.getElementById('wzConfirm').disabled=true;
+    const connected=await window.tm.completeYandexOauth(pendingOauthState,code);
+    if(!window.isWizardAttemptCurrent?.(attempt)){
+      if(connected){await window.reloadCoreData?.();await window.refreshComposerReadiness?.();}
+      return;
+    }
+    status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;
+  }catch(e){
+    if(!window.isWizardAttemptCurrent?.(attempt))return;
+    if(isExpiredOauthCode(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');document.getElementById('wzConnect').disabled=false;status.textContent=wt('codeExpired');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('wzConfirm').disabled=false;
+  }
 };
 

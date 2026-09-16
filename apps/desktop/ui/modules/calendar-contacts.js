@@ -239,19 +239,31 @@ document.addEventListener('click',event=>{
   }
   popupMenuAnchor={id:null,key:null};
 });
-// Esc закрывает верхнее открытое окно: сначала вспомогательные меню, затем модалки.
+// Esc закрывает верхнее открытое окно: сначала вспомогательные меню, затем
+// модалки, и только когда над мастером ничего не осталось - повторный мастер
+// первичной настройки (setup-wizard-exit.md, S-006, S-011). Проверка мастера
+// встроена последним шагом в этот же единый обработчик, а не заведена
+// отдельным слушателем keydown.
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape')return;
   if(handlePopupMenusEscape(e))return;
   const overlays=[...document.querySelectorAll('.raw-overlay,.overlay.open')];
-  const top=overlays[overlays.length-1];if(!top)return;
-  e.preventDefault();
-  // .raw-overlay всегда создаётся заново - его можно удалять. Постоянные окна
-  // (.overlay: auxOverlay, smartOverlay, linkOverlay и др.) только скрываем,
-  // иначе повторно не откроются. Динамические .overlay закрываем их же кнопкой.
-  if(top.classList.contains('raw-overlay')){top.remove();return;}
-  const closer=top.querySelector('.label-cancel,.template-close,.snooze-cancel,.confirm-cancel');
-  if(closer)closer.click();else top.classList.remove('open');
+  const top=overlays[overlays.length-1];
+  if(top){
+    e.preventDefault();
+    // .raw-overlay всегда создаётся заново - его можно удалять. Постоянные окна
+    // (.overlay: auxOverlay, smartOverlay, linkOverlay и др.) только скрываем,
+    // иначе повторно не откроются. Динамические .overlay закрываем их же кнопкой.
+    if(top.classList.contains('raw-overlay')){top.remove();return;}
+    const closer=top.querySelector('.label-cancel,.template-close,.snooze-cancel,.confirm-cancel');
+    if(closer)closer.click();else top.classList.remove('open');
+    return;
+  }
+  const wizardState=window.wizardEscapeState?.();
+  if(wizardExit.wizardEscapeAction({wizardOpen:wizardState?.wizardOpen,wizardExitAvailable:wizardState?.wizardExitAvailable})==='wizard'){
+    e.preventDefault();
+    window.closeWizard?.();
+  }
 });
 [ctxsmart,ctxfolder,ctxcontact,ctxtag].forEach(m=>m.querySelectorAll('.tmi:not(.tmi-check)').forEach(i=>i.onclick=()=>m.classList.remove('open')));
 ctxtag.querySelectorAll('[data-tag-action]').forEach(item=>item.addEventListener('click',async()=>{if(!contextTag)return;const action=item.dataset.tagAction;if(action==='open'){filterTag(contextTag);return;}if(action==='edit'){openLabelEditor(contextTag);return;}if(action==='delete'){if(!confirm(L(`Удалить метку «${contextTag.name}»? Она снимется со всех писем.`,`Delete tag "${contextTag.name}"? It will be removed from all messages.`)))return;try{await window.tm.deleteLabel(contextTag.id);if(currentTagName===contextTag.name)currentTagName=null;await window.reloadCoreData();showToast(L('Метка удалена','Tag deleted'));}catch(error){showToast(error.message||String(error));}}}));

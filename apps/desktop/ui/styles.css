@@ -539,7 +539,9 @@
   .tbrow .grip{color:var(--text-3);cursor:grab;display:inline-flex;} .tbrow .grip svg{width:16px;height:16px;}
   .tbrow .nm{flex:1;font-weight:500;} .tbrow.off{opacity:.5;} .tbrow .ord{display:flex;gap:2px;}
   .tbrow .ord .iconbtn{width:26px;height:26px;} .tbrow .ord .iconbtn svg{width:15px;height:15px;}
-  .wzcard{background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:34px 34px 26px;text-align:center;}
+  .wzcard{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:34px 34px 26px;text-align:center;}
+  /* Кнопка выхода из повторного мастера (setup-wizard-exit.md, S-001) - общая для всех шагов. */
+  .wz-close{position:absolute;top:14px;right:14px;}
   .wzcard h1{margin:0 0 8px;font-size:24px;letter-spacing:-.02em;} .wzcard .sub{color:var(--text-3);margin:0 auto 26px;max-width:42ch;line-height:1.5;}
   .wzstep{display:none;} .wzstep.active{display:block;}
   .wzstep .left{text-align:left;}
