@@ -292,12 +292,13 @@ async fn get_json<T: DeserializeOwned>(
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|error| api_error(backend, error.to_string()))?;
+        .map_err(|error| Error::from_reqwest(backend, error))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(api_error(
+        return Err(Error::from_http_status(
             backend,
+            status.as_u16(),
             format!("GET {url}: HTTP {status}: {body}"),
         ));
     }
@@ -318,15 +319,16 @@ async fn get_sync_json<T: DeserializeOwned>(
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|error| api_error(backend, error.to_string()))?;
+        .map_err(|error| Error::from_reqwest(backend, error))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if status == reqwest::StatusCode::GONE || body.contains("EXPIRED_SYNC_TOKEN") {
         return Ok(SyncResponse::Expired);
     }
     if !status.is_success() {
-        return Err(api_error(
+        return Err(Error::from_http_status(
             backend,
+            status.as_u16(),
             format!("GET {url}: HTTP {status}: {body}"),
         ));
     }

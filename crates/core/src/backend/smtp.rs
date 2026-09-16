@@ -240,6 +240,32 @@ fn extract_inline_images(html: &str) -> (String, Vec<InlineImagePart>) {
     (out, parts)
 }
 
+// Вид ошибки отправки определяется по типу исключения lettre и коду ответа
+// сервера, а не по тексту: 535 и 534 - отказ входа, 4xx - сервер занят или
+// временно недоступен, обрыв соединения и таймаут - проблема связи
+// (specs/error-kinds-and-messages.md, S-002).
+fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
+    use crate::ErrorKind;
+    let kind = if error.is_timeout() {
+        ErrorKind::Timeout
+    } else if error.is_tls() {
+        ErrorKind::CertificateError
+    } else if let Some(code) = error.status() {
+        use lettre::transport::smtp::response::Severity;
+        match (code.severity, code.to_string().as_str()) {
+            // 535 и 534 - отказ проверки подлинности, 530 - сервер требует входа.
+            (_, "535" | "534" | "530") => ErrorKind::InvalidCredentials,
+            (Severity::TransientNegativeCompletion, _) => ErrorKind::ServerUnavailable,
+            _ => ErrorKind::Unknown,
+        }
+    } else if error.is_client() || error.is_transport_shutdown() {
+        ErrorKind::NetworkUnavailable
+    } else {
+        ErrorKind::Unknown
+    };
+    Error::classified_backend(backend, kind, error.to_string())
+}
+
 pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
@@ -360,10 +386,7 @@ pub(crate) async fn send_oauth_with_raw(
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     };
     let transport = builder
-        .map_err(|error| Error::Backend {
-            backend: "smtp".into(),
-            message: error.to_string(),
-        })?
+        .map_err(|error| smtp_error("smtp", error))?
         .port(port)
         .credentials(credentials)
         .authentication(vec![Mechanism::Xoauth2])
@@ -372,10 +395,7 @@ pub(crate) async fn send_oauth_with_raw(
     transport
         .send_raw(email.envelope(), &raw)
         .await
-        .map_err(|error| Error::Backend {
-            backend: "smtp".into(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| smtp_error("smtp", error))?;
     Ok(raw)
 }
 
@@ -393,17 +413,15 @@ pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<
         .json(&serde_json::json!({"raw":raw}))
         .send()
         .await
-        .map_err(|error| Error::Backend {
-            backend: "gmail-send".into(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("gmail-send", error))?;
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        return Err(Error::Backend {
-            backend: "gmail-send".into(),
-            message: format!("HTTP {status}: {body}"),
-        });
+        return Err(Error::from_http_status(
+            "gmail-send",
+            status.as_u16(),
+            format!("HTTP {status}: {body}"),
+        ));
     }
     Ok(())
 }
@@ -441,10 +459,7 @@ pub(crate) async fn send_password_with_raw(
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     }
-    .map_err(|error| Error::Backend {
-        backend: "smtp".into(),
-        message: error.to_string(),
-    })?;
+    .map_err(|error| smtp_error("smtp", error))?;
     let transport = builder
         .port(port)
         .credentials(Credentials::new(username.to_owned(), password.to_owned()))
@@ -453,10 +468,7 @@ pub(crate) async fn send_password_with_raw(
     transport
         .send_raw(email.envelope(), &raw)
         .await
-        .map_err(|error| Error::Backend {
-            backend: "smtp".into(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| smtp_error("smtp", error))?;
     Ok(raw)
 }
 

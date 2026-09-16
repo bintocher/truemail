@@ -162,6 +162,26 @@ impl Error {
         Self::classified_backend(backend, kind, error.to_string())
     }
 
+    /// Вид ошибки по коду ответа HTTP: единое правило для всех транспортов,
+    /// которые общаются по HTTP (JMAP, Gmail API, CalDAV и CardDAV, отправка
+    /// Gmail). Успешные коды сюда не приходят.
+    pub fn from_http_status(backend: impl Into<String>, status: u16, message: impl Into<String>) -> Self {
+        let backend = backend.into();
+        let message = message.into();
+        match status {
+            401 => Self::classified_backend(backend, ErrorKind::InvalidCredentials, message),
+            403 => Self::classified_backend(backend, ErrorKind::Forbidden, message),
+            408 => Self::classified_backend(backend, ErrorKind::Timeout, message),
+            429 => Self::RateLimited {
+                backend,
+                retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+                message,
+            },
+            500..=599 => Self::classified_backend(backend, ErrorKind::ServerUnavailable, message),
+            _ => Self::classified_backend(backend, ErrorKind::Unknown, message),
+        }
+    }
+
     pub fn retry_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
             Self::RateLimited { retry_at, .. } => Some(*retry_at),
@@ -287,6 +307,25 @@ fn redact_named_value(input: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{Error, ErrorKind, sanitize_error_message};
+
+    #[test]
+    fn http_status_defines_the_error_kind() {
+        // Общее правило для всех транспортов поверх HTTP: вид ошибки берётся из
+        // кода ответа, а не из текста тела (S-002, S-012).
+        let cases = [
+            (401_u16, "invalid_credentials"),
+            (403, "forbidden"),
+            (408, "timeout"),
+            (429, "rate_limited"),
+            (500, "server_unavailable"),
+            (503, "server_unavailable"),
+            (418, "unknown"),
+        ];
+        for (status, expected) in cases {
+            let error = Error::from_http_status("dav", status, "тело ответа");
+            assert_eq!(error.code(), expected, "код ответа {status}");
+        }
+    }
 
     #[test]
     fn every_general_error_has_a_stable_code() {
