@@ -251,6 +251,10 @@ mod sync_registry_tests {
             color: None,
             retention_days: 30,
             enabled: true,
+            last_sync_at: None,
+            last_sync_error: None,
+            last_sync_error_kind: None,
+            needs_reauth: false,
         }
     }
 

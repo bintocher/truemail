@@ -729,6 +729,48 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
 // только обновляет страницу из локальной базы.
 function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;const folder=smartFolders[index];if(resetScroll&&folder){smartServerExhausted.delete(folder.id);smartCircleFetched.delete(folder.id);smartBackfillVisited.delete(folder.id);smartBackfillCursor.clear();}applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true,resetScroll);}
 
+// Признак состояния синхронизации почты рядом с заголовком аккаунта в боковой
+// панели (mail-sync-visible-state.md, S-006, S-007). Показывается только для
+// четырёх "заметных" состояний - успешный последний проход и "ещё ничего не
+// синхронизировалось" индикатора не получают (S-006).
+const ACC_SYNC_VISIBLE_KINDS=new Set(['needs_reauth','error','retrying','syncing']);
+function accountSyncBadgeTitle(state){
+  if(state.kind==='needs_reauth')return L('Нужен повторный вход. Нажмите, чтобы переподключить.','Sign-in required. Click to reconnect.');
+  if(state.kind==='error')return window.errorPresentation.presentError({kind:state.errorKind,message:state.message},{locale:wizardLocale,translations:typeof wizardText==='undefined'?undefined:wizardText,connected:true}).text;
+  if(state.kind==='retrying')return L('Восстановление соединения…','Reconnecting…');
+  if(state.kind==='syncing')return L('Идёт синхронизация…','Syncing…');
+  return '';
+}
+// header - элемент .acc-h; читает текущее сохранённое и переходное состояние
+// заново на каждый вызов, поэтому безопасно звать как при первой отрисовке
+// (S-006, S-008), так и точечно из обработчика событий (S-011).
+function renderAccountSyncBadge(header,account){
+  const badge=header.querySelector('.acc-sync');
+  if(!badge)return;
+  const state=window.mailSyncIndicator.resolveSyncIndicator(account,window.mailSyncTransient?.[account.id]);
+  if(!ACC_SYNC_VISIBLE_KINDS.has(state.kind)){
+    badge.hidden=true;badge.className='acc-sync';badge.onclick=null;badge.onkeydown=null;badge.removeAttribute('role');badge.removeAttribute('tabindex');
+    return;
+  }
+  badge.hidden=false;badge.className=`acc-sync acc-sync-${state.kind}`;badge.title=accountSyncBadgeTitle(state);
+  if(state.kind==='needs_reauth'){
+    // S-010: клик по признаку открывает переподключение, как и кнопка в карточке.
+    badge.setAttribute('role','button');badge.tabIndex=0;
+    badge.onclick=event=>{event.stopPropagation();showAccountWizard(account.email);};
+    badge.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();badge.click();}};
+  }else{
+    badge.onclick=null;badge.onkeydown=null;badge.removeAttribute('role');badge.removeAttribute('tabindex');
+  }
+}
+// Точечное обновление одного признака по событию truemail-sync-state
+// (composer.js, handleSyncState): переходные статусы видны сразу, не дожидаясь
+// полной перезагрузки данных по truemail-data-changed (S-011).
+window.refreshAccountSyncIndicator=function(accountId){
+  const header=document.querySelector(`.acc-h[data-account-id="${accountId}"]`);
+  const account=coreAccounts.find(item=>item.id===accountId);
+  if(header&&account)renderAccountSyncBadge(header,account);
+};
+
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   // Якорь списка снимаем здесь, до clearDemoData: сразу за ним прокрутка
@@ -796,8 +838,9 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
     const accountOpen=accountNavIsOpen(account.id);
     const header=document.createElement('button');header.type='button';header.className='acc-h'+(accountOpen?' open':'');header.dataset.accountId=account.id;header.dataset.noI18n='1';
     const initial=(account.display_name||account.email||'?').trim()[0].toUpperCase();
-    header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)};color:${contrastOn(accountColorById(account.id))}"></span><span class="em"></span><span class="chev"><i data-i="chevR"></i></span>`;
+    header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)};color:${contrastOn(accountColorById(account.id))}"></span><span class="em"></span><span class="acc-sync" hidden></span><span class="chev"><i data-i="chevR"></i></span>`;
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
+    renderAccountSyncBadge(header,account);
     anchor.after(header);anchor=header;
     // Имена папок ящика приходят с сервера: словарь автоперевода не должен их
     // трогать, иначе папка "Календарь" переводилась бы вместе с интерфейсом.

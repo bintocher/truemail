@@ -27,7 +27,9 @@ use truemail_core::model::{
     MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
     ServerConfig, Signature, SmartFolder, SmartFolderCount, resolve_my_attendance,
 };
-use truemail_core::storage::repo::{CalendarChange, CalendarChangeKind, CalendarSummary};
+use truemail_core::storage::repo::{
+    CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
@@ -3383,6 +3385,17 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     | truemail_core::model::Provider::Exchange
             );
             let mail = sync_core.accounts.sync_mail_account(&account).await;
+            // Постоянное состояние пишем по фактическому исходу sync_mail_account,
+            // а не по итоговому статусу события ниже - они расходятся при
+            // частичном исходе цикла, когда почта не синхронизировалась, а
+            // календарь и контакты - да (mail-sync-visible-state.md, S-013).
+            if let Err(error) = sync_core
+                .db
+                .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&mail))
+                .await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+            }
             // Ограничение почтового транспорта не должно останавливать
             // независимые Calendar/Contacts/Tasks API этого же аккаунта.
             let auxiliary = if supports_auxiliary {
@@ -3607,6 +3620,20 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             } else {
                                 watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
+                            // Постоянное состояние - по фактическому исходу этого
+                            // прохода (mail-sync-visible-state.md, S-002, S-003);
+                            // обрыв ожидания IDLE ("retrying" ниже) - отдельное
+                            // переходное состояние и сюда не попадает.
+                            if let Err(error) = watch_core
+                                .db
+                                .record_mail_sync_outcome(
+                                    watch_account.id,
+                                    &MailSyncOutcome::from_result(&inbox_sync),
+                                )
+                                .await
+                            {
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "не удалось сохранить состояние синхронизации почты");
+                            }
                             // Данные меняются не на каждой итерации: IDLE
                             // переустанавливается сам примерно раз в 90 секунд, и
                             // раньше каждая такая переустановка поднимала во
@@ -4226,16 +4253,36 @@ async fn spawn_initial_mail_sync(
     let sync_set = state.syncing.clone();
     let aux_sync_set = state.syncing_aux.clone();
     let sync_app = app.clone();
+    // S-012: первая синхронизация тоже сообщает о начале и об исходе, тем же
+    // событием и той же областью "all", что и цикл sync_accounts - иначе между
+    // "аккаунт подключён" и первым исходом синхронизации в интерфейсе нет
+    // никакого признака.
+    let _ = app.emit(
+        "truemail-sync-state",
+        serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
+    );
     tokio::spawn(async move {
-        match core.accounts.sync_mail_account(&account).await {
+        let mail_result = core.accounts.sync_mail_account(&account).await;
+        // Постоянное состояние - по факту Ok/Err этого прохода (S-002, S-003).
+        if let Err(error) = core
+            .db
+            .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&mail_result))
+            .await
+        {
+            tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+        }
+        let sync_state = match &mail_result {
             Ok(result) => {
-                tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена")
+                tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена");
+                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready"})
             }
             Err(error) => {
                 let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
-                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась")
+                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась");
+                sync_error_state(account.id, "all", "error", error)
             }
-        }
+        };
+        let _ = sync_app.emit("truemail-sync-state", sync_state);
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
         if matches!(account.provider, Provider::Gmail | Provider::Exchange)
@@ -5342,6 +5389,44 @@ mod api_error_tests {
             assert_eq!(value["status"], "error");
             assert_eq!(value["error_kind"], kind);
             assert_eq!(value["error"], value["error_message"]);
+        }
+    }
+
+    // mail-sync-visible-state.md, S-013: в цикле sync_accounts почта аккаунта
+    // не синхронизировалась, а вспомогательные данные - да. Опубликованное
+    // событие в этой ветке (commands.rs, match (mail, auxiliary) =>
+    // (Err(mail_error), Ok(aux)) if supports_auxiliary) сообщает статус
+    // "ready" с текстом ошибки внутри warnings - но запись в базу строится по
+    // MailSyncOutcome::from_result(&mail) отдельно, до этого match, и не
+    // должна превращаться в успех только из-за того, что итоговое событие
+    // выглядит благополучно.
+    #[test]
+    fn partial_cycle_outcome_records_mail_failure_even_when_event_says_ready() {
+        let mail: truemail_core::Result<()> = Err(truemail_core::Error::classified_backend(
+            "imap",
+            ErrorKind::Timeout,
+            "нет ответа",
+        ));
+        let auxiliary: truemail_core::Result<truemail_core::storage::repo::AuxiliarySaveResult> =
+            Ok(truemail_core::storage::repo::AuxiliarySaveResult::default());
+
+        // Событие для этой ветки в sync_accounts - "ready" с предупреждением,
+        // как и в реальном коде.
+        let message =
+            truemail_core::error::sanitize_error_message(&mail.as_ref().unwrap_err().to_string());
+        let event = serde_json::json!({"account_id": 1, "scope": "all", "status": "ready", "warnings": [message], "error_kind": "timeout"});
+        assert_eq!(event["status"], "ready");
+        assert!(auxiliary.is_ok());
+
+        // А запись в базу - неуспех именно почты, независимо от статуса события.
+        match MailSyncOutcome::from_result(&mail) {
+            MailSyncOutcome::Failure {
+                kind, needs_reauth, ..
+            } => {
+                assert_eq!(kind, "timeout");
+                assert!(!needs_reauth);
+            }
+            MailSyncOutcome::Success => panic!("почта завершилась ошибкой - ожидался Failure"),
         }
     }
 }

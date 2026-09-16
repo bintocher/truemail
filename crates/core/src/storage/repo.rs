@@ -26,6 +26,38 @@ pub struct FolderState {
     pub total_count: i64,
 }
 
+/// Итог одного прохода синхронизации почты аккаунта - то, что попадает в
+/// постоянное состояние (mail-sync-visible-state.md). Строится по фактическому
+/// Ok/Err вызова прохода (sync_mail_account, sync_mail_inbox/_delta), а не по
+/// тексту опубликованного события truemail-sync-state: они могут расходиться
+/// при частичном исходе цикла sync_accounts (S-013).
+#[derive(Debug, Clone)]
+pub enum MailSyncOutcome {
+    Success,
+    Failure {
+        /// Безопасный текст ошибки (секреты уже вырезаны).
+        message: String,
+        /// Устойчивый вид ошибки, error-kinds-and-messages.md.
+        kind: String,
+        /// Вид ошибки входит в список требующих повторного входа (S-016 там).
+        needs_reauth: bool,
+    },
+}
+
+impl MailSyncOutcome {
+    /// Строит исход по результату прохода, каким бы ни было содержимое Ok.
+    pub fn from_result<T>(result: &std::result::Result<T, crate::Error>) -> Self {
+        match result {
+            Ok(_) => Self::Success,
+            Err(error) => Self::Failure {
+                message: crate::error::sanitize_error_message(&error.to_string()),
+                kind: error.code().to_owned(),
+                needs_reauth: error.requires_reauth(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AuxiliarySaveResult {
     pub calendars: usize,
@@ -432,12 +464,58 @@ impl Db {
         let rows = sqlx::query_as::<_, AccountRow>(
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
-                ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, include_in_unified, color, retention_days, enabled
+                ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, include_in_unified, color, retention_days, enabled,
+                last_sync_at, last_sync_error, last_sync_error_kind, needs_reauth
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Записывает исход прохода синхронизации почты аккаунта
+    /// (mail-sync-visible-state.md, S-002 - S-005). Успех обновляет
+    /// last_sync_at и снимает сохранённую ошибку и признак "нужен повторный
+    /// вход"; неудача сохраняет текст, вид ошибки и признак, не трогая
+    /// last_sync_at (S-003, S-004) - время последнего успеха должно
+    /// оставаться прежним. Ошибка самой этой записи (например, база временно
+    /// заблокирована) не должна прерывать проход синхронизации - вызывающая
+    /// сторона теряет её без повтора (см. mail-sync-visible-state.md,
+    /// "Ошибки и частичные отказы").
+    pub async fn record_mail_sync_outcome(
+        &self,
+        account_id: i64,
+        outcome: &MailSyncOutcome,
+    ) -> Result<()> {
+        match outcome {
+            MailSyncOutcome::Success => {
+                sqlx::query(
+                    "UPDATE accounts SET last_sync_at = datetime('now'), last_sync_error = NULL,
+                            last_sync_error_kind = NULL, needs_reauth = 0
+                     WHERE id = ?",
+                )
+                .bind(account_id)
+                .execute(&self.write_pool)
+                .await?;
+            }
+            MailSyncOutcome::Failure {
+                message,
+                kind,
+                needs_reauth,
+            } => {
+                sqlx::query(
+                    "UPDATE accounts SET last_sync_error = ?, last_sync_error_kind = ?, needs_reauth = ?
+                     WHERE id = ?",
+                )
+                .bind(message)
+                .bind(kind)
+                .bind(*needs_reauth as i64)
+                .bind(account_id)
+                .execute(&self.write_pool)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn rename_account(&self, account_id: i64, display_name: &str) -> Result<()> {
@@ -5286,6 +5364,10 @@ struct AccountRow {
     color: Option<String>,
     retention_days: i64,
     enabled: i64,
+    last_sync_at: Option<String>,
+    last_sync_error: Option<String>,
+    last_sync_error_kind: Option<String>,
+    needs_reauth: i64,
 }
 
 impl From<AccountRow> for Account {
@@ -5340,6 +5422,10 @@ impl From<AccountRow> for Account {
             color: r.color,
             retention_days: r.retention_days,
             enabled: r.enabled != 0,
+            last_sync_at: r.last_sync_at,
+            last_sync_error: r.last_sync_error,
+            last_sync_error_kind: r.last_sync_error_kind,
+            needs_reauth: r.needs_reauth != 0,
         }
     }
 }
@@ -7868,5 +7954,183 @@ mod charset_decoding_tests {
                 "{charset}: в тексте не должно оставаться управляющих байтов"
             );
         }
+    }
+}
+
+/// Постоянное состояние синхронизации почты аккаунта (mail-sync-visible-state.md).
+#[cfg(test)]
+mod mail_sync_state_tests {
+    use super::test_storage::{TestDb, open_test_db};
+    use super::*;
+
+    async fn test_db() -> TestDb {
+        open_test_db("repo-mail-sync-state").await
+    }
+
+    /// Заводит аккаунт, возвращает его id.
+    async fn seed_account(db: &Db) -> i64 {
+        let (account_id,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind) \
+                 VALUES (?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(format!("{}@example.test", uuid::Uuid::new_v4()))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert account");
+        account_id
+    }
+
+    async fn account(db: &Db, account_id: i64) -> Account {
+        db.list_accounts()
+            .await
+            .expect("list accounts")
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .expect("account present")
+    }
+
+    // S-001: после миграции новые поля читаются с ожидаемыми значениями по
+    // умолчанию - до первого прохода состояние синхронизации отсутствует.
+    #[tokio::test]
+    async fn fresh_account_has_no_sync_state_after_migration() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        let loaded = account(&db, account_id).await;
+        assert_eq!(loaded.last_sync_at, None);
+        assert_eq!(loaded.last_sync_error, None);
+        assert_eq!(loaded.last_sync_error_kind, None);
+        assert!(!loaded.needs_reauth);
+        db.close().await;
+    }
+
+    // S-002: успешный исход записывает время и очищает прежнюю ошибку.
+    #[tokio::test]
+    async fn success_outcome_sets_last_sync_at_and_clears_error() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        db.record_mail_sync_outcome(
+            account_id,
+            &MailSyncOutcome::Failure {
+                message: "сервер не отвечает".into(),
+                kind: "timeout".into(),
+                needs_reauth: false,
+            },
+        )
+        .await
+        .expect("record failure");
+        db.record_mail_sync_outcome(account_id, &MailSyncOutcome::Success)
+            .await
+            .expect("record success");
+        let loaded = account(&db, account_id).await;
+        assert!(loaded.last_sync_at.is_some());
+        assert_eq!(loaded.last_sync_error, None);
+        assert_eq!(loaded.last_sync_error_kind, None);
+        assert!(!loaded.needs_reauth);
+        db.close().await;
+    }
+
+    // S-003: неудачный исход сохраняет безопасный текст и вид ошибки, не трогая
+    // время последнего успеха.
+    #[tokio::test]
+    async fn failure_outcome_stores_message_and_kind_without_touching_last_success() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        db.record_mail_sync_outcome(account_id, &MailSyncOutcome::Success)
+            .await
+            .expect("record success");
+        let after_success = account(&db, account_id).await;
+        db.record_mail_sync_outcome(
+            account_id,
+            &MailSyncOutcome::Failure {
+                message: "сеть недоступна".into(),
+                kind: "network_unavailable".into(),
+                needs_reauth: false,
+            },
+        )
+        .await
+        .expect("record failure");
+        let loaded = account(&db, account_id).await;
+        assert_eq!(loaded.last_sync_error.as_deref(), Some("сеть недоступна"));
+        assert_eq!(
+            loaded.last_sync_error_kind.as_deref(),
+            Some("network_unavailable")
+        );
+        // Время последнего успеха не изменилось неудачным проходом.
+        assert_eq!(loaded.last_sync_at, after_success.last_sync_at);
+        db.close().await;
+    }
+
+    // S-004: отказ входа ставит признак "нужен повторный вход".
+    #[tokio::test]
+    async fn auth_failure_sets_needs_reauth() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        db.record_mail_sync_outcome(
+            account_id,
+            &MailSyncOutcome::Failure {
+                message: "неверный пароль".into(),
+                kind: "invalid_credentials".into(),
+                needs_reauth: true,
+            },
+        )
+        .await
+        .expect("record failure");
+        let loaded = account(&db, account_id).await;
+        assert!(loaded.needs_reauth);
+        db.close().await;
+    }
+
+    // S-005: последующий успех снимает ранее установленный признак.
+    #[tokio::test]
+    async fn success_after_auth_failure_clears_needs_reauth() {
+        let db = test_db().await;
+        let account_id = seed_account(&db).await;
+        db.record_mail_sync_outcome(
+            account_id,
+            &MailSyncOutcome::Failure {
+                message: "неверный пароль".into(),
+                kind: "invalid_credentials".into(),
+                needs_reauth: true,
+            },
+        )
+        .await
+        .expect("record failure");
+        db.record_mail_sync_outcome(account_id, &MailSyncOutcome::Success)
+            .await
+            .expect("record success");
+        let loaded = account(&db, account_id).await;
+        assert!(!loaded.needs_reauth);
+        db.close().await;
+    }
+
+    // Классификация видов, требующих повторного входа, строится по
+    // error-kinds-and-messages.md (S-016 там), а не заново здесь: from_result
+    // должен просто перенести error.requires_reauth() в поле needs_reauth.
+    #[test]
+    fn from_result_carries_requires_reauth_from_error_kind() {
+        let auth_error: crate::Result<()> = Err(crate::Error::classified_backend(
+            "test",
+            crate::error::ErrorKind::InvalidCredentials,
+            "неверный пароль",
+        ));
+        match MailSyncOutcome::from_result(&auth_error) {
+            MailSyncOutcome::Failure { needs_reauth, .. } => assert!(needs_reauth),
+            MailSyncOutcome::Success => panic!("ожидался Failure"),
+        }
+        let timeout_error: crate::Result<()> = Err(crate::Error::classified_backend(
+            "test",
+            crate::error::ErrorKind::Timeout,
+            "нет ответа",
+        ));
+        match MailSyncOutcome::from_result(&timeout_error) {
+            MailSyncOutcome::Failure { needs_reauth, .. } => assert!(!needs_reauth),
+            MailSyncOutcome::Success => panic!("ожидался Failure"),
+        }
+        let ok: crate::Result<()> = Ok(());
+        assert!(matches!(
+            MailSyncOutcome::from_result(&ok),
+            MailSyncOutcome::Success
+        ));
     }
 }
