@@ -9,7 +9,7 @@ use crate::account::{
     DavSyncResult, EventInput, SyncScope,
 };
 use crate::model::{Attendee, ContactAddress, ContactPhone, FolderRole, infer_folder_role};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use roxmltree::{Document, Node};
@@ -79,6 +79,18 @@ fn backend_error(kind: &str, message: impl ToString) -> Error {
     Error::Backend {
         backend: format!("ews-{kind}"),
         message: message.to_string(),
+    }
+}
+
+fn http_error(status: u16, message: impl Into<String>) -> Error {
+    let message = message.into();
+    match status {
+        401 => Error::classified_backend("ews-http", ErrorKind::InvalidCredentials, message),
+        403 => Error::classified_backend("ews-http", ErrorKind::Forbidden, message),
+        408 => Error::classified_backend("ews-http", ErrorKind::Timeout, message),
+        429 => server_busy_error(&message),
+        500..=599 => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
+        _ => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
     }
 }
 
@@ -475,15 +487,13 @@ impl EwsBackend {
             &envelope(body),
         )
         .await?;
-        // Сервер под нагрузкой отвечает 503 или ошибкой занятости: это не отказ
-        // запроса, а просьба подождать. Отдельная ошибка нужна фоновой догрузке
-        // тел писем, чтобы прекратить проход, а не расходовать его на отказы
-        // (gmail-local-body-prefetch.md, S-009).
-        if response.status == 503 || response.status == 429 {
-            return Err(server_busy_error(&format!("HTTP {}", response.status)));
-        }
+        // Код HTTP классифицируется до разбора тела. Текст ответа не должен
+        // определять причину отказа на границе интерфейса.
         if !(200..300).contains(&response.status) {
-            return Err(backend_error("http", format!("HTTP {}", response.status)));
+            return Err(http_error(
+                response.status,
+                format!("HTTP {}", response.status),
+            ));
         }
         if let Some(error) = response_error(&response.body) {
             if is_server_busy(&error) {
@@ -4205,7 +4215,7 @@ mod light_fetch_tests {
 #[cfg(test)]
 mod throttling_tests {
     //! Ошибки занятости Exchange (gmail-local-body-prefetch.md, S-009).
-    use super::{is_server_busy, server_busy_error};
+    use super::{http_error, is_server_busy, server_busy_error};
 
     #[test]
     fn busy_answers_are_recognised() {
@@ -4220,5 +4230,16 @@ mod throttling_tests {
     fn busy_answer_becomes_a_rate_limit() {
         let error = server_busy_error("ErrorServerBusy");
         assert!(matches!(error, crate::Error::RateLimited { .. }));
+    }
+
+    #[test]
+    fn http_status_defines_the_error_kind() {
+        assert_eq!(http_error(401, "any body").code(), "invalid_credentials");
+        assert_eq!(http_error(429, "any body").code(), "rate_limited");
+        assert_eq!(http_error(503, "any body").code(), "server_unavailable");
+        assert_eq!(
+            http_error(500, "invalid password").code(),
+            "server_unavailable"
+        );
     }
 }

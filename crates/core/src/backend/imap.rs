@@ -1,7 +1,7 @@
 //! Синхронизация почты через IMAP с OAuth2.
 
 use crate::model::{FolderRole, Security, infer_folder_role};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use async_imap::{Authenticator, types::Name, types::NameAttribute};
 use futures::TryStreamExt;
 use imap_proto::{AttributeValue, MailboxDatum, Response, ResponseCode, Status};
@@ -282,10 +282,7 @@ async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OA
     let session = client
         .authenticate("XOAUTH2", auth)
         .await
-        .map_err(|(e, _)| Error::Backend {
-            backend: "imap-auth".into(),
-            message: e.to_string(),
-        })?;
+        .map_err(|(error, _)| imap_error("imap-auth", error.to_string()))?;
     Ok(session)
 }
 
@@ -300,10 +297,45 @@ async fn connect_password(
     client
         .login(username, password)
         .await
-        .map_err(|(error, _)| Error::Backend {
-            backend: "imap-auth".into(),
-            message: error.to_string(),
-        })
+        .map_err(|(error, _)| imap_error("imap-auth", error.to_string()))
+}
+
+/// async-imap не предоставляет отдельный тип для отказа LOGIN и обрыва.
+/// Временная эвристика остается внутри ядра и наружу отдается только код.
+fn imap_error(backend: &str, message: String) -> Error {
+    let text = message.to_ascii_lowercase();
+    let kind = if backend.contains("auth")
+        && [
+            "authenticationfailed",
+            "authentication failed",
+            "invalid credentials",
+            "login failed",
+            "authenticate failed",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+    {
+        ErrorKind::InvalidCredentials
+    } else if text.contains("timed out") || text.contains("timeout") || text.contains("тайм-аут")
+    {
+        ErrorKind::Timeout
+    } else if [
+        "connection reset",
+        "connection lost",
+        "broken pipe",
+        "unexpected eof",
+        "10054",
+        "соединение разорвано",
+        "сервер закрыл соединение",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        ErrorKind::NetworkUnavailable
+    } else {
+        ErrorKind::Unknown
+    };
+    Error::classified_backend(backend, kind, message)
 }
 
 async fn connect_tls_client(
@@ -321,10 +353,7 @@ async fn connect_tls_client(
         TcpStream::connect((host, port)),
     )
     .await
-    .map_err(|_| Error::Backend {
-        backend: "imap".into(),
-        message: "тайм-аут подключения".into(),
-    })??;
+    .map_err(|_| Error::classified_backend("imap", ErrorKind::Timeout, "тайм-аут подключения"))??;
     // TCP keepalive держит канал живым на уровне ОС, чтобы простаивающее IDLE
     // не закрывалось промежуточным NAT по таймауту неактивности.
     {
@@ -367,9 +396,8 @@ async fn connect_tls_client(
     let tls = TlsConnector::from(config)
         .connect(server_name, tcp)
         .await
-        .map_err(|e| Error::Backend {
-            backend: "imap-tls".into(),
-            message: e.to_string(),
+        .map_err(|error| {
+            Error::classified_backend("imap-tls", ErrorKind::CertificateError, error.to_string())
         })?;
     let mut client = async_imap::Client::new(tls);
     if security == Security::Ssl {
@@ -1569,7 +1597,13 @@ fn reconnect_delay(attempt: usize) -> std::time::Duration {
 /// поэтому опираемся только на неизменяемую часть от библиотеки.
 fn connection_lost(error: &Error) -> bool {
     let message = match error {
-        Error::Backend { message, .. } => message.to_ascii_lowercase(),
+        Error::ClassifiedBackend {
+            kind: ErrorKind::NetworkUnavailable,
+            ..
+        } => return true,
+        Error::Backend { message, .. } | Error::ClassifiedBackend { message, .. } => {
+            message.to_ascii_lowercase()
+        }
         Error::Io(_) => return true,
         _ => return false,
     };
@@ -2525,7 +2559,9 @@ mod utf7_tests {
 #[cfg(test)]
 mod reconnect_tests {
     //! Проверки устойчивости к обрыву соединения (imap-reconnect-resilience.md).
-    use super::{Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, reconnect_delay};
+    use super::{
+        Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, imap_error, reconnect_delay,
+    };
 
     fn backend_error(message: &str) -> Error {
         Error::Backend {
@@ -2558,6 +2594,22 @@ mod reconnect_tests {
             "папка \"INBOX\": bad: Invalid command"
         )));
         assert!(!connection_lost(&Error::Other("прочее".into())));
+    }
+
+    #[test]
+    fn imap_text_classification_stays_inside_the_core() {
+        assert_eq!(
+            imap_error("imap-auth", "NO [AUTHENTICATIONFAILED] invalid".into()).code(),
+            "invalid_credentials"
+        );
+        assert_eq!(
+            imap_error("imap-select", "io: connection reset".into()).code(),
+            "network_unavailable"
+        );
+        assert_eq!(
+            imap_error("imap-select", "NO mailbox missing".into()).code(),
+            "unknown"
+        );
     }
 
     #[test]

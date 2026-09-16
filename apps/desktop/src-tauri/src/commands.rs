@@ -212,33 +212,112 @@ pub struct ApiError {
     pub(crate) message: String,
 }
 
+const API_ERROR_META: &str = "\u{1e}truemail-error\u{1f}";
+
+struct ApiErrorParts<'a> {
+    message: &'a str,
+    kind: &'a str,
+    account_id: Option<i64>,
+    retry_at: Option<&'a str>,
+}
+
+impl ApiError {
+    fn from_parts(
+        message: impl Into<String>,
+        kind: &str,
+        account_id: Option<i64>,
+        retry_at: Option<String>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            // Метаданные живут только внутри Rust и удаляются сериализатором.
+            // Такой конверт сохраняет совместимость старых литералов ApiError.
+            message: format!(
+                "{API_ERROR_META}{kind}\u{1f}{}\u{1f}{}\u{1f}{message}",
+                account_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                retry_at.unwrap_or_default()
+            ),
+        }
+    }
+
+    fn parts(&self) -> ApiErrorParts<'_> {
+        let Some(encoded) = self.message.strip_prefix(API_ERROR_META) else {
+            return ApiErrorParts {
+                message: &self.message,
+                kind: "unknown",
+                account_id: None,
+                retry_at: None,
+            };
+        };
+        let mut fields = encoded.splitn(4, '\u{1f}');
+        let kind = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let account_id = fields.next().and_then(|value| value.parse().ok());
+        let retry_at = fields.next().filter(|value| !value.is_empty());
+        let message = fields.next().unwrap_or_default();
+        ApiErrorParts {
+            message,
+            kind,
+            account_id,
+            retry_at,
+        }
+    }
+
+    fn safe_message(&self) -> String {
+        truemail_core::error::sanitize_error_message(self.parts().message)
+    }
+
+    fn with_account_id(self, account_id: i64) -> Self {
+        let parts = self.parts();
+        Self::from_parts(
+            parts.message,
+            parts.kind,
+            Some(account_id),
+            parts.retry_at.map(str::to_owned),
+        )
+    }
+}
+
 // Централизованный логгинг: каждый ApiError перед возвратом в UI сериализуется
-// Tauri именно здесь, поэтому это единственная точка, где ошибку нужно
-// залогировать - независимо от того, как она была создана (From, api_error или
-// литерал). Локальный троттлинг (RateLimited) - ожидаемое состояние, пишем info;
-// остальное - warn.
+// Tauri именно здесь, поэтому текст очищается до журнала и ответа.
 impl Serialize for ApiError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        if self.message.contains("временно ограничен") {
-            tracing::info!(error = %self.message, "команда ограничена лимитом транспорта");
+        let parts = self.parts();
+        let message = truemail_core::error::sanitize_error_message(parts.message);
+        if parts.kind == "rate_limited" {
+            tracing::info!(error_kind = parts.kind, account_id = ?parts.account_id, error = %message, "команда ограничена лимитом транспорта");
         } else {
-            tracing::warn!(error = %self.message, "команда вернула ошибку в UI");
+            tracing::warn!(error_kind = parts.kind, account_id = ?parts.account_id, error = %message, "команда вернула ошибку в UI");
         }
-        let mut state = serializer.serialize_struct("ApiError", 1)?;
-        state.serialize_field("message", &self.message)?;
+        let mut state = serializer.serialize_struct(
+            "ApiError",
+            2 + usize::from(parts.account_id.is_some()) + usize::from(parts.retry_at.is_some()),
+        )?;
+        state.serialize_field("message", &message)?;
+        state.serialize_field("kind", parts.kind)?;
+        if let Some(account_id) = parts.account_id {
+            state.serialize_field("account_id", &account_id)?;
+        }
+        if let Some(retry_at) = parts.retry_at {
+            state.serialize_field("retry_at", retry_at)?;
+        }
         state.end()
     }
 }
 
 impl From<truemail_core::Error> for ApiError {
     fn from(e: truemail_core::Error) -> Self {
-        ApiError {
-            message: e.to_string(),
-        }
+        let kind = e.code();
+        let retry_at = e.retry_at().map(|value| value.to_rfc3339());
+        ApiError::from_parts(e.to_string(), kind, None, retry_at)
     }
 }
 
@@ -248,6 +327,23 @@ fn api_error(message: impl Into<String>) -> ApiError {
     ApiError {
         message: message.into(),
     }
+}
+
+fn sync_error_state(
+    account_id: i64,
+    scope: &str,
+    status: &str,
+    error: &truemail_core::Error,
+) -> serde_json::Value {
+    let message = truemail_core::error::sanitize_error_message(&error.to_string());
+    serde_json::json!({
+        "account_id": account_id,
+        "scope": scope,
+        "status": status,
+        "error": message,
+        "error_kind": error.code(),
+        "error_message": message,
+    })
 }
 
 const DEFAULT_UPDATE_ENDPOINT: &str =
@@ -333,7 +429,7 @@ pub async fn announce_available_update(app: AppHandle) -> CmdResult<()> {
         }
         // Не смогли скачать заранее - не беда: установка по кнопке скачает сама.
         Err(error) => tracing::warn!(
-            error = %error.message,
+            error = %error.safe_message(),
             version,
             "обновление не удалось скачать заранее"
         ),
@@ -1623,11 +1719,12 @@ pub async fn rename_account(
     account_id: i64,
     display_name: String,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .rename_account(account_id, &display_name)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 #[derive(Serialize)]
@@ -1703,11 +1800,12 @@ pub async fn set_account_color(
     account_id: i64,
     color: String,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .set_account_color(account_id, &color)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 /// Глубина локального кэша аккаунта в днях (0 - без ограничений).
@@ -1717,16 +1815,17 @@ pub async fn set_account_retention(
     account_id: i64,
     days: i64,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .set_account_retention(account_id, days)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 /// Ошибка тихой смены пароля (accounts-accordion-password.md, S-010): свой
 /// тип с полем `code` - интерфейс различает случаи по нему, а не по тексту
-/// сообщения. Общий `ApiError` кода не несёт и не меняется.
+/// сообщения. Его прежняя форма сохраняется отдельно от общего `ApiError`.
 #[derive(Serialize)]
 pub struct ChangePasswordApiError {
     code: &'static str,
@@ -1746,7 +1845,7 @@ impl From<ApiError> for ChangePasswordApiError {
     fn from(error: ApiError) -> Self {
         ChangePasswordApiError {
             code: "backend_unavailable",
-            message: error.message,
+            message: error.safe_message(),
         }
     }
 }
@@ -1790,7 +1889,12 @@ pub async fn change_account_password(
 
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>, account_id: i64) -> CmdResult<Vec<Folder>> {
-    Ok(core(&state).await?.db.list_folders(account_id).await?)
+    core(&state)
+        .await?
+        .db
+        .list_folders(account_id)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 #[tauri::command]
@@ -3102,7 +3206,7 @@ pub async fn move_storage(
             .map_err(|restore| ApiError {
                 message: format!(
                     "{}; исходное хранилище не открылось: {restore}",
-                    error.message
+                    error.safe_message()
                 ),
             })?;
         *state.core.write().await = Some(Arc::new(restored));
@@ -3318,7 +3422,9 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
                 (Err(mail_error), Ok(aux)) if supports_auxiliary => {
-                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "почта отложена, вспомогательный sync завершён");
+                    let message =
+                        truemail_core::error::sanitize_error_message(&mail_error.to_string());
+                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %message, calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "почта отложена, вспомогательный sync завершён");
                     if !aux.changes.is_empty() {
                         notify_calendar_changes(
                             &sync_app,
@@ -3330,17 +3436,20 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         )
                         .await;
                     }
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [message.clone()], "error_kind": mail_error.code(), "error_message": message, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
-                    let error =
-                        format!("почта: {mail_error}; календарь/контакты: {auxiliary_error}");
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error})
+                    let error = truemail_core::error::sanitize_error_message(&format!(
+                        "почта: {mail_error}; календарь/контакты: {auxiliary_error}"
+                    ));
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %error, "фоновая синхронизация не удалась");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.clone(), "error_kind": mail_error.code(), "error_message": error})
                 }
                 (Err(error), Ok(_)) => {
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая синхронизация не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.to_string()})
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "фоновая синхронизация не удалась");
+                    sync_error_state(account.id, "all", "error", &error)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3399,8 +3508,10 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
                     serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready", "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 Err(error) => {
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "синхронизация календаря, задач и контактов не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "error", "error": error.to_string()})
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "синхронизация календаря, задач и контактов не удалась");
+                    sync_error_state(account.id, "auxiliary", "error", &error)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3502,6 +3613,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             // фронтенде полную перезагрузку данных (страница писем
                             // по каждой папке, контакты, календари) вхолостую.
                             let mail_changed;
+                            let mut error_state = None;
                             match inbox_sync {
                                 Ok(result) => {
                                     let ids = notification_ids(&result);
@@ -3542,15 +3654,26 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     // лишняя перезагрузка дешевле, чем список,
                                     // застрявший до следующего удачного прохода.
                                     mail_changed = true;
+                                    error_state = Some(sync_error_state(
+                                        watch_account.id,
+                                        "mail",
+                                        "error",
+                                        &error,
+                                    ));
+                                    let safe_error = truemail_core::error::sanitize_error_message(
+                                        &error.to_string(),
+                                    );
                                     tracing::error!(
                                         account = %truemail_core::logging::mask_email(&watch_account.email),
-                                        %error,
+                                        error_kind = error.code(),
+                                        error = %safe_error,
                                         "не удалось дозагрузить входящие"
                                     );
                                 }
                             }
                             watch_syncing.lock().await.remove(&watch_account.id);
-                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let state = error_state.unwrap_or_else(|| serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let _ = watch_app.emit("truemail-sync-state", state);
                             if mail_changed {
                                 let _ = watch_app.emit("truemail-data-changed", watch_account.id);
                             }
@@ -3567,11 +3690,17 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
                             if routine {
-                                tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой переустанавливается");
+                                let safe_error =
+                                    truemail_core::error::sanitize_error_message(&text);
+                                tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой переустанавливается");
                             } else {
-                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой будет восстановлено");
+                                let safe_error =
+                                    truemail_core::error::sanitize_error_message(&text);
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой будет восстановлено");
                             }
-                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
+                            let state =
+                                sync_error_state(watch_account.id, "mail", "retrying", &error);
+                            let _ = watch_app.emit("truemail-sync-state", state);
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
                         }
@@ -4103,7 +4232,8 @@ async fn spawn_initial_mail_sync(
                 tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена")
             }
             Err(error) => {
-                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "первая синхронизация почты не удалась")
+                let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
+                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась")
             }
         }
         sync_set.lock().await.remove(&account.id);
@@ -4126,11 +4256,16 @@ async fn spawn_initial_mail_sync(
                     contacts = aux.contacts,
                     "первая синхронизация календарей и контактов завершена"
                 ),
-                Err(error) => tracing::error!(
-                    account = %truemail_core::logging::mask_email(&account.email),
-                    %error,
-                    "первая синхронизация календарей и контактов не удалась"
-                ),
+                Err(error) => {
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(
+                        account = %truemail_core::logging::mask_email(&account.email),
+                        error_kind = error.code(),
+                        error = %safe_error,
+                        "первая синхронизация календарей и контактов не удалась"
+                    )
+                }
             }
             aux_sync_set.lock().await.remove(&account.id);
             let _ = sync_app.emit("truemail-data-changed", account.id);
@@ -5143,5 +5278,70 @@ mod attachment_name_tests {
     #[test]
     fn trims_trailing_dots_and_spaces() {
         assert_eq!(safe_attachment_name("evil.. "), "evil");
+    }
+}
+
+#[cfg(test)]
+mod api_error_tests {
+    use super::*;
+    use truemail_core::ErrorKind;
+
+    #[test]
+    fn api_error_serializes_required_and_optional_fields() {
+        let retry_at = chrono::Utc::now() + chrono::Duration::minutes(2);
+        let error = ApiError::from(truemail_core::Error::RateLimited {
+            backend: "test".into(),
+            retry_at,
+            message: "token=secret".into(),
+        })
+        .with_account_id(17);
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["kind"], "rate_limited");
+        assert_eq!(value["account_id"], 17);
+        assert_eq!(value["retry_at"], retry_at.to_rfc3339());
+        assert!(value["message"].as_str().unwrap().contains("[скрыто]"));
+        assert!(!value["message"].as_str().unwrap().contains("secret"));
+
+        let legacy = serde_json::to_value(api_error("plain failure")).unwrap();
+        assert_eq!(legacy["kind"], "unknown");
+        assert!(legacy.get("account_id").is_none());
+        assert!(legacy.get("retry_at").is_none());
+    }
+
+    #[test]
+    fn sync_error_event_keeps_old_fields_and_adds_kind_and_message() {
+        let cases = [
+            (
+                truemail_core::Error::classified_backend(
+                    "imap",
+                    ErrorKind::InvalidCredentials,
+                    "login",
+                ),
+                "invalid_credentials",
+            ),
+            (
+                truemail_core::Error::RateLimited {
+                    backend: "gmail".into(),
+                    retry_at: chrono::Utc::now(),
+                    message: "quota".into(),
+                },
+                "rate_limited",
+            ),
+            (
+                truemail_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "offline",
+                )),
+                "network_unavailable",
+            ),
+        ];
+        for (error, kind) in cases {
+            let value = sync_error_state(9, "mail", "error", &error);
+            assert_eq!(value["account_id"], 9);
+            assert_eq!(value["scope"], "mail");
+            assert_eq!(value["status"], "error");
+            assert_eq!(value["error_kind"], kind);
+            assert_eq!(value["error"], value["error_message"]);
+        }
     }
 }

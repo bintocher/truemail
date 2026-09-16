@@ -15,7 +15,7 @@ pub mod model;
 pub mod search;
 pub mod storage;
 
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 
 use std::path::PathBuf;
 use std::sync::Arc;

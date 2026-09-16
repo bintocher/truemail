@@ -214,14 +214,14 @@ document.getElementById('wzChooseDataDir').onclick=async()=>{
   try{
     const chosen=await window.tm?.chooseDataDir(document.getElementById('wzDataDir').value||window.tmDefaultDataDir);
     if(typeof chosen==='string'&&chosen){document.getElementById('wzDataDir').value=chosen;selectedDataDir=chosen;status.textContent='';}
-  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 };
 document.getElementById('wzChooseBackup').onclick=async()=>{
   const status=document.getElementById('wzRestoreStatus');
   try{
     const chosen=await window.tm?.chooseKeyBackup(selectedBackupPath||selectedDataDir);
     if(typeof chosen==='string'&&chosen){selectedBackupPath=chosen;document.getElementById('wzBackupPath').value=chosen;status.textContent='';}
-  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 };
 document.getElementById('wzRestoreKeys').onclick=async()=>{
   const button=document.getElementById('wzRestoreKeys'),status=document.getElementById('wzRestoreStatus'),passwordInput=document.getElementById('wzRestorePassword');
@@ -231,7 +231,7 @@ document.getElementById('wzRestoreKeys').onclick=async()=>{
     button.disabled=true;status.textContent=wizardLocale==='en'?'Opening encrypted archive…':'Открываю зашифрованный архив…';status.dataset.kind='';
     await window.tm.restoreKeyBackup(selectedDataDir,selectedBackupPath,password);
     passwordInput.value='';window.tmStorageReady=true;status.textContent='';configureStorageWizard(await window.tm.bootstrapStatus());wzGo(5);
-  }catch(error){passwordInput.value='';status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){passwordInput.value='';status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
   finally{button.disabled=false;}
 };
 document.getElementById('wzStorageNext').onclick=()=>{
@@ -269,7 +269,7 @@ async function createStorageFromEntropy(){
     createKeysButton.disabled=true;status.textContent=wt('creatingStorage');status.dataset.kind='';
     await window.tm.initializeStorage(selectedDataDir,wizardLocale||'ru',Array.from(entropy));
     window.tmStorageReady=true;entropy.fill(0);entropyChunks.forEach(chunk=>chunk.fill(0));entropyChunks.length=0;entropyBytes=0;lastEntropySample=null;status.textContent='';wzGo(5);
-  }catch(error){entropy.fill(0);entropyCreationStarted=false;createKeysButton.disabled=false;status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){entropy.fill(0);entropyCreationStarted=false;createKeysButton.disabled=false;status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 }
 createKeysButton.onclick=createStorageFromEntropy;
 function showAccountWizard(prefillEmail=''){

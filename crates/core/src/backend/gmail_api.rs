@@ -1,6 +1,6 @@
 use super::{DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery};
 use crate::model::FolderRole;
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use base64::Engine as _;
 use base64::alphabet::URL_SAFE;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
@@ -315,6 +315,25 @@ fn retryable_response(status: StatusCode, body: &str) -> bool {
         || status.is_server_error()
 }
 
+fn response_error(status: StatusCode, body: String) -> Error {
+    let message = format!("HTTP {status}: {body}");
+    if quota_limited_response(status, &body) {
+        return Error::RateLimited {
+            backend: "gmail-api".into(),
+            retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+            message,
+        };
+    }
+    let kind = match status {
+        StatusCode::UNAUTHORIZED => ErrorKind::NeedsReauth,
+        StatusCode::FORBIDDEN => ErrorKind::Forbidden,
+        StatusCode::REQUEST_TIMEOUT => ErrorKind::Timeout,
+        _ if status.is_server_error() => ErrorKind::ServerUnavailable,
+        _ => ErrorKind::ServerUnavailable,
+    };
+    Error::classified_backend("gmail-api", kind, message)
+}
+
 fn retry_timestamp_delay(value: &str) -> Option<Duration> {
     let retry_at = chrono::DateTime::parse_from_rfc3339(value)
         .or_else(|_| chrono::DateTime::parse_from_rfc2822(value))
@@ -411,10 +430,10 @@ async fn execute_request(
             Some(body) => request.json(body),
             None => request.header(reqwest::header::CONTENT_LENGTH, 0),
         };
-        let response = request.send().await.map_err(|error| Error::Backend {
-            backend: "gmail-api".into(),
-            message: error.to_string(),
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Error::from_reqwest("gmail-api", error))?;
         if allow_not_found && response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -444,10 +463,7 @@ async fn execute_request(
 
         if !may_retry || !retryable_response(status, &response_body) || attempt >= MAX_READ_RETRIES
         {
-            return Err(Error::Backend {
-                backend: "gmail-api".into(),
-                message: format!("HTTP {status}: {response_body}"),
-            });
+            return Err(response_error(status, response_body));
         }
 
         // 408/5xx keep a short bounded retry. Release the process-wide gate
@@ -1298,6 +1314,34 @@ mod tests {
             StatusCode::FORBIDDEN,
             r#"{"reason":"domainPolicy"}"#
         ));
+    }
+
+    #[test]
+    fn gmail_response_kind_uses_status_and_structured_quota_reason() {
+        assert_eq!(
+            response_error(StatusCode::UNAUTHORIZED, "invalid".into()).code(),
+            "needs_reauth"
+        );
+        assert_eq!(
+            response_error(
+                StatusCode::FORBIDDEN,
+                r#"{"reason":"rateLimitExceeded"}"#.into()
+            )
+            .code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            response_error(
+                StatusCode::FORBIDDEN,
+                r#"{"status":"RESOURCE_EXHAUSTED"}"#.into()
+            )
+            .code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            response_error(StatusCode::SERVICE_UNAVAILABLE, "invalid token".into()).code(),
+            "server_unavailable"
+        );
     }
 
     #[test]

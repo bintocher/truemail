@@ -8,7 +8,7 @@ async function openRawViewer(messageId){
   overlay.innerHTML=`<div class="raw-box"><div class="raw-head"><button class="btn raw-back">← ${L('Назад','Back')}</button><span class="raw-title">${L('Исходный текст письма','Message source')}</span><button class="btn raw-eml">${L('Сохранить .eml','Save .eml')}</button><button class="btn primary raw-copy">${L('Копировать','Copy')}</button></div><textarea class="raw-text" readonly spellcheck="false"></textarea></div>`;
   document.body.appendChild(overlay);
   const ta=overlay.querySelector('.raw-text');ta.value=L('Загрузка…','Loading…');
-  try{ta.value=await window.tm.messageRaw(messageId);}catch(error){ta.value=error.message||String(error);}
+  try{ta.value=await window.tm.messageRaw(messageId);}catch(error){ta.value=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText}).text;}
   function close(){overlay.remove();document.removeEventListener('keydown',key);}
   function key(e){if(e.key==='Escape')close();}
   overlay.querySelector('.raw-back').onclick=close;
@@ -30,7 +30,7 @@ async function saveMessageAsEml(messageId){
     if(!path)return;
     await window.tm.exportMessageEml(messageId,path);
     showToast(L('Письмо сохранено как .eml','Message saved as .eml'));
-  }catch(error){showToast(error.message||String(error));}
+  }catch(error){showToast(error);}
 }
 const isImageAttachment=att=>String(att.mime_type||'').toLowerCase().startsWith('image/');
 // Компактная панель вложений над телом: 1 строка плашек, "ещё +N" с разворотом.
@@ -67,11 +67,11 @@ function openAttachment(full,att,messageId){
 }
 async function saveOneAttachment(messageId,att){
   try{const path=await window.tm.saveFileDialog(att.filename);if(!path)return;await window.tm.saveAttachment(messageId,att.id,path);showToast(L('Вложение сохранено','Attachment saved'));}
-  catch(error){showToast(error.message||String(error));}
+  catch(error){showToast(error);}
 }
 async function saveAllAttachments(messageId){
   try{const dir=await window.tm.chooseDir();if(!dir)return;const saved=await window.tm.saveAllAttachments(messageId,dir);showToast(L(`Сохранено вложений: ${saved.length}`,`Attachments saved: ${saved.length}`));}
-  catch(error){showToast(error.message||String(error));}
+  catch(error){showToast(error);}
 }
 function closeAttMenu(){closePopupMenus(['attachment']);}
 function attachmentMenu(event,full,att,messageId,anchorKey=null){
@@ -104,7 +104,7 @@ async function openGallery(full,att,messageId){
     idx=(i+images.length)%images.length;const a=images[idx];
     cap.textContent=`${a.filename} · ${idx+1}/${images.length}`;img.removeAttribute('src');
     try{const c=await window.tm.attachmentContent(messageId,a.id);img.src=`data:${c.mime_type||'image/png'};base64,${c.base64}`;}
-    catch(error){cap.textContent=error.message||String(error);}
+    catch(error){cap.textContent=accountError(error).text;}
   }
   function key(e){if(['ArrowLeft','ArrowUp'].includes(e.key)){e.preventDefault();show(idx-1);}else if(['ArrowRight','ArrowDown'].includes(e.key)){e.preventDefault();show(idx+1);}else if(e.key==='Escape')close();}
   function close(){overlay.remove();document.removeEventListener('keydown',key);}
@@ -223,7 +223,7 @@ function bindExternalLinks(scope){
     const href=link.href||'';
     if(!/^https?:/i.test(href))return;
     event.preventDefault();
-    window.tm?.openExternal(href).catch(error=>showToast(error.message||String(error)));
+    window.tm?.openExternal(href).catch(error=>showToast(error));
   });
 }
 
@@ -322,7 +322,7 @@ function expandConversationIds(ids){
 window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 function createMessageRow(message,index){
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
   // Строка - элемент списка, а не кнопка: роли кнопки достался бы общий
@@ -530,7 +530,7 @@ async function showMessage(message){
       window.markMessagesSeen?.(message,true).catch(console.error);
     }
   // Ошибка устаревшего запроса на экран не идёт: там уже актуальное письмо (S-004).
-  }catch(error){if(!stillCurrent())return;body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=error.message||String(error);body.appendChild(err);}
+  }catch(error){if(!stillCurrent())return;body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText}).text;body.appendChild(err);}
 }
 function smartMessageValue(message,field){const folder=coreFolders.find(item=>item.id===message.folder_id);switch(field){
   case 'sender':return `${message.from?.name||''} ${message.from?.email||''}`.trim();case 'recipient':return [...(message.to||[]),...(message.cc||[])].map(address=>`${address.name||''} ${address.email||''}`.trim()).join(' ');case 'subject':return message.subject||'';case 'body':return message.preview||'';case 'account':return coreAccounts.find(account=>account.id===message.account_id)?.email||'';case 'folder':return `${folder?.display_name||''} ${folder?.remote_path||''}`.trim();case 'folder_role':return folder?.role||'other';case 'read_state':return message.flags?.seen?'read':'unread';case 'importance':return message.flags?.flagged?'flagged':'normal';case 'reply_state':return message.flags?.answered?'answered':'unanswered';case 'draft_state':return message.flags?.draft?'draft':'not_draft';case 'attachment':return message.has_attachments?'has':'none';case 'size':return message.size;case 'label':return (message.labels||[]).join(' ');case 'date':return message.date||'';default:return '';}}
@@ -842,7 +842,8 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
 };
 let accountOauthState='';
 let accountPasswordProvider='generic';
-function isExpiredOauthCode(error){return /invalid_grant|code has expired|verification code.*expired/i.test(error?.message||String(error));}
+function accountError(error){return window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText,connected:false});}
+function isReauthError(error){return accountError(error).requiresReauth;}
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
@@ -852,13 +853,13 @@ document.getElementById('accountOauthStart').onclick=async()=>{
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=L('Введите корректный адрес почты.','Enter a valid email address.');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=L('OAuth доступен внутри приложения truemail.','OAuth is available inside the truemail app.');status.dataset.kind='error';return;}
   try{button.disabled=true;status.textContent=L('Определяю провайдера и способ входа…','Detecting provider and sign-in method…');status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent=L('После входа скопируйте сюда код подтверждения.','After signing in, paste the confirmation code here.');document.getElementById('accountOauthCode').focus();}
-  catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
+  catch(e){button.disabled=false;status.textContent=accountError(e).text;status.dataset.kind='error';}
 };
-document.getElementById('accountPasswordConfirm').onclick=async()=>{const button=document.getElementById('accountPasswordConfirm'),status=document.getElementById('accountOauthStatus'),password=document.getElementById('accountPassword').value,email=document.getElementById('accountEmail').value.trim(),username=document.getElementById('accountUsername').value.trim(),type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap';if(!password){status.textContent=L('Введите пароль.','Enter the password.');status.dataset.kind='error';return;}try{button.disabled=true;status.textContent=exchange?L('Ищу EWS через Autodiscover и проверяю Exchange…','Discovering EWS and checking Exchange…'):jmap?L('Проверяю JMAP Session и доступ к почте…','Checking the JMAP Session and mail access…'):L('Проверяю IMAP и подключаю аккаунт…','Checking IMAP and connecting the account…');status.dataset.kind='';const connected=exchange?await window.tm.completeExchangeEws({email,username,password,serverHint:document.getElementById('accountEwsServer').value.trim()}):jmap?await window.tm.completeJmap({email,username,password,sessionUrl:document.getElementById('accountJmapServer').value.trim()}):await window.tm.completePasswordImap({email,username,password,provider:accountPasswordProvider,imapHost:document.getElementById('accountImapHost').value.trim(),imapPort:Number(document.getElementById('accountImapPort').value),imapSecurity:document.getElementById('accountImapSecurity').value,smtpHost:document.getElementById('accountSmtpHost').value.trim(),smtpPort:Number(document.getElementById('accountSmtpPort').value),smtpSecurity:document.getElementById('accountSmtpSecurity').value});document.getElementById('accountPassword').value='';status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';button.disabled=false;}};
+document.getElementById('accountPasswordConfirm').onclick=async()=>{const button=document.getElementById('accountPasswordConfirm'),status=document.getElementById('accountOauthStatus'),password=document.getElementById('accountPassword').value,email=document.getElementById('accountEmail').value.trim(),username=document.getElementById('accountUsername').value.trim(),type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap';if(!password){status.textContent=L('Введите пароль.','Enter the password.');status.dataset.kind='error';return;}try{button.disabled=true;status.textContent=exchange?L('Ищу EWS через Autodiscover и проверяю Exchange…','Discovering EWS and checking Exchange…'):jmap?L('Проверяю JMAP Session и доступ к почте…','Checking JMAP Session and mail access…'):L('Проверяю IMAP и подключаю аккаунт…','Checking IMAP and connecting the account…');status.dataset.kind='';const connected=exchange?await window.tm.completeExchangeEws({email,username,password,serverHint:document.getElementById('accountEwsServer').value.trim()}):jmap?await window.tm.completeJmap({email,username,password,sessionUrl:document.getElementById('accountJmapServer').value.trim()}):await window.tm.completePasswordImap({email,username,password,provider:accountPasswordProvider,imapHost:document.getElementById('accountImapHost').value.trim(),imapPort:Number(document.getElementById('accountImapPort').value),imapSecurity:document.getElementById('accountImapSecurity').value,smtpHost:document.getElementById('accountSmtpHost').value.trim(),smtpPort:Number(document.getElementById('accountSmtpPort').value),smtpSecurity:document.getElementById('accountSmtpSecurity').value});document.getElementById('accountPassword').value='';status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);}catch(error){status.textContent=accountError(error).text;status.dataset.kind='error';button.disabled=false;}};
 document.getElementById('accountOauthConfirm').onclick=async()=>{
   const code=document.getElementById('accountOauthCode').value.trim(),status=document.getElementById('accountOauthStatus');if(!code)return;
   try{status.textContent=L('Подключаю почту, календарь и контакты…','Connecting mail, calendar and contacts…');status.dataset.kind='';document.getElementById('accountOauthConfirm').disabled=true;const connected=await window.tm.completeYandexOauth(accountOauthState,code);status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);}
-  catch(e){if(isExpiredOauthCode(e)){accountOauthState='';document.getElementById('accountOauthCode').value='';document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountOauthStart').disabled=false;status.textContent=L('Код истёк или уже был использован. Нажмите «Подключить» и получите новый код.','The code expired or was already used. Select Connect to get a new code.');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('accountOauthConfirm').disabled=false;}
+  catch(e){if(isReauthError(e)){accountOauthState='';document.getElementById('accountOauthCode').value='';document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountOauthStart').disabled=false;status.textContent=L('Код истёк или уже был использован. Нажмите «Подключить» и получите новый код.','The code expired or was already used. Select Connect to get a new code.');}else status.textContent=accountError(e).text;status.dataset.kind='error';document.getElementById('accountOauthConfirm').disabled=false;}
 };
 document.getElementById('wzConnect').onclick=async()=>{
   const email=document.getElementById('wzEmail').value.trim(),status=document.getElementById('wzConnectStatus');
@@ -882,7 +883,7 @@ document.getElementById('wzConnect').onclick=async()=>{
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
     if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();
-  }catch(e){if(!window.isWizardAttemptCurrent?.(attempt))return;button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
+  }catch(e){if(!window.isWizardAttemptCurrent?.(attempt))return;button.disabled=false;status.textContent=accountError(e).text;status.dataset.kind='error';}
 };
 document.getElementById('wzConfirm').onclick=async()=>{
   const code=document.getElementById('wzOauthCode').value.trim(),status=document.getElementById('wzConnectStatus');if(!code)return;
@@ -897,7 +898,6 @@ document.getElementById('wzConfirm').onclick=async()=>{
     status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;
   }catch(e){
     if(!window.isWizardAttemptCurrent?.(attempt))return;
-    if(isExpiredOauthCode(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');document.getElementById('wzConnect').disabled=false;status.textContent=wt('codeExpired');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('wzConfirm').disabled=false;
+    if(isReauthError(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');document.getElementById('wzConnect').disabled=false;status.textContent=wt('codeExpired');}else status.textContent=accountError(e).text;status.dataset.kind='error';document.getElementById('wzConfirm').disabled=false;
   }
 };
-

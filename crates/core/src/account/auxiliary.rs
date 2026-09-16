@@ -6,7 +6,7 @@ use crate::model::{
     Alarm, Attendee, AuthKind, ContactAddress, ContactPhone, Event, EventClass, Provider,
     RsvpResponse, Transp,
 };
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -89,6 +89,29 @@ fn backend_error(backend: &str, message: impl Into<String>) -> Error {
     }
 }
 
+fn http_error(backend: &str, status: reqwest::StatusCode, message: String) -> Error {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Error::classified_backend(backend, ErrorKind::NeedsReauth, message)
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            Error::classified_backend(backend, ErrorKind::Forbidden, message)
+        }
+        reqwest::StatusCode::REQUEST_TIMEOUT => {
+            Error::classified_backend(backend, ErrorKind::Timeout, message)
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Error::RateLimited {
+            backend: backend.into(),
+            retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+            message,
+        },
+        _ if status.is_server_error() => {
+            Error::classified_backend(backend, ErrorKind::ServerUnavailable, message)
+        }
+        _ => Error::classified_backend(backend, ErrorKind::Unknown, message),
+    }
+}
+
 fn client() -> Result<Client> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -122,12 +145,13 @@ async fn google_json(
     let response = request
         .send()
         .await
-        .map_err(|error| backend_error("google-auxiliary", error.to_string()))?;
+        .map_err(|error| Error::from_reqwest("google-auxiliary", error))?;
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(backend_error(
+        return Err(http_error(
             "google-auxiliary",
+            status,
             format!("{url}: HTTP {status}: {body}"),
         ));
     }
@@ -946,6 +970,27 @@ pub async fn delete_contact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_http_status_defines_the_error_kind() {
+        assert_eq!(
+            http_error("google", reqwest::StatusCode::UNAUTHORIZED, "x".into()).code(),
+            "needs_reauth"
+        );
+        assert_eq!(
+            http_error("google", reqwest::StatusCode::TOO_MANY_REQUESTS, "x".into()).code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            http_error(
+                "google",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "x".into()
+            )
+            .code(),
+            "server_unavailable"
+        );
+    }
 
     #[test]
     fn recurrence_lines_use_icalendar_format() {

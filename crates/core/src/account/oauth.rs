@@ -1,6 +1,6 @@
 //! OAuth 2.0 helpers for provider authorization.
 
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -247,10 +247,7 @@ pub async fn exchange_yandex_code(
         ])
         .send()
         .await
-        .map_err(|e| Error::Backend {
-            backend: "yandex-oauth".into(),
-            message: e.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("yandex-oauth", error))?;
 
     parse_token_response(response, "yandex-oauth").await
 }
@@ -274,10 +271,7 @@ pub async fn exchange_google_code(
         ])
         .send()
         .await
-        .map_err(|e| Error::Backend {
-            backend: "google-oauth".into(),
-            message: e.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("google-oauth", error))?;
     parse_token_response(response, "google-oauth").await
 }
 
@@ -300,10 +294,7 @@ pub async fn exchange_microsoft_code(
         ])
         .send()
         .await
-        .map_err(|error| Error::Backend {
-            backend: "microsoft-oauth".into(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("microsoft-oauth", error))?;
     parse_token_response(response, "microsoft-oauth").await
 }
 
@@ -318,10 +309,7 @@ pub async fn refresh_yandex_token(client_id: &str, refresh_token: &str) -> Resul
         ])
         .send()
         .await
-        .map_err(|e| Error::Backend {
-            backend: "yandex-oauth".into(),
-            message: e.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("yandex-oauth", error))?;
     parse_token_response(response, "yandex-oauth").await
 }
 
@@ -340,10 +328,7 @@ pub async fn refresh_google_token(
         ])
         .send()
         .await
-        .map_err(|e| Error::Backend {
-            backend: "google-oauth".into(),
-            message: e.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("google-oauth", error))?;
     parse_token_response(response, "google-oauth").await
 }
 
@@ -362,10 +347,7 @@ pub async fn refresh_microsoft_token(
         ])
         .send()
         .await
-        .map_err(|error| Error::Backend {
-            backend: "microsoft-oauth".into(),
-            message: error.to_string(),
-        })?;
+        .map_err(|error| Error::from_reqwest("microsoft-oauth", error))?;
     parse_token_response(response, "microsoft-oauth").await
 }
 
@@ -384,25 +366,56 @@ async fn parse_token_response(response: reqwest::Response, backend: &str) -> Res
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<OAuthErrorResponse>(&body)
+        let parsed = serde_json::from_str::<OAuthErrorResponse>(&body).ok();
+        let message = parsed
+            .as_ref()
             .map(|e| {
                 if e.error_description.is_empty() {
-                    e.error
+                    e.error.clone()
                 } else {
                     format!("{}: {}", e.error, e.error_description)
                 }
             })
-            .unwrap_or_else(|_| format!("HTTP {status}: {body}"));
-        return Err(Error::Backend {
-            backend: backend.into(),
+            .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+        return Err(oauth_response_error(
+            backend,
+            status,
+            parsed.as_ref().map(|value| value.error.as_str()),
             message,
-        });
+        ));
     }
 
     response.json().await.map_err(|e| Error::Backend {
         backend: backend.into(),
         message: format!("не удалось разобрать токен: {e}"),
     })
+}
+
+fn oauth_response_error(
+    backend: &str,
+    status: reqwest::StatusCode,
+    error_code: Option<&str>,
+    message: String,
+) -> Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Error::RateLimited {
+            backend: backend.into(),
+            retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+            message,
+        };
+    }
+    let kind = if status == reqwest::StatusCode::UNAUTHORIZED
+        || matches!(error_code, Some("invalid_grant" | "invalid_token"))
+    {
+        ErrorKind::NeedsReauth
+    } else if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+        ErrorKind::Timeout
+    } else if status.is_server_error() {
+        ErrorKind::ServerUnavailable
+    } else {
+        ErrorKind::Unknown
+    };
+    Error::classified_backend(backend, kind, message)
 }
 
 impl From<OAuthToken> for StoredOAuthCredential {
@@ -441,6 +454,30 @@ impl StoredOAuthCredential {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_error_code_defines_reauthentication() {
+        assert_eq!(
+            oauth_response_error(
+                "oauth",
+                reqwest::StatusCode::BAD_REQUEST,
+                Some("invalid_grant"),
+                "code expired".into(),
+            )
+            .code(),
+            "needs_reauth"
+        );
+        assert_eq!(
+            oauth_response_error(
+                "oauth",
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                Some("invalid_grant"),
+                "body text does not win".into(),
+            )
+            .code(),
+            "needs_reauth"
+        );
+    }
 
     #[test]
     fn pkce_has_expected_shape() {
