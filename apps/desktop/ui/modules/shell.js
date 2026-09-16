@@ -329,7 +329,7 @@ const selectedMessageIds=new Set();
 let selectionAnchorId=null;
 let selectionDragMode=null;
 function updateSelectionUi(){
-  document.querySelectorAll('.msg').forEach(row=>row.classList.toggle('selected',selectedMessageIds.has(Number(row.dataset.messageId))));
+  document.querySelectorAll('.msg').forEach(row=>{const picked=selectedMessageIds.has(Number(row.dataset.messageId));row.classList.toggle('selected',picked);row.toggleAttribute('data-bulk-selected',picked);});
   const count=selectedMessageIds.size,bar=document.getElementById('selectionBar');bar.classList.toggle('hidden',count===0);document.getElementById('selectionCount').textContent=L(`${count} выбрано`,`${count} selected`);
 }
 function clearMessageSelection(){selectedMessageIds.clear();selectionAnchorId=null;updateSelectionUi();}

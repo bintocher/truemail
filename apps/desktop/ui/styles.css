@@ -208,9 +208,10 @@
   .msg{display:grid;grid-template-columns:32px 1fr auto;gap:10px;height:var(--message-row-height);overflow:hidden;padding:var(--row-py) 14px;border-bottom:1px solid var(--border);cursor:pointer;align-items:start;position:relative;content-visibility:auto;contain-intrinsic-size:var(--message-row-height);user-select:none;-webkit-user-select:none;touch-action:pan-y;}.msg.selected{background:var(--accent-weak)}
   .msg:hover{background:var(--hover);} .msg.active{background:var(--active);}
   /* Рамка внутрь строки: снаружи её срезал бы overflow списка, а соседние строки
-     стоят вплотную. Показываем и по клику мышью (:focus), а не только по
-     :focus-visible: без неё непонятно, куда адресованы нажатия. */
-  .msg:focus{outline:2px solid var(--accent);outline-offset:-2px;}
+     стоят вплотную. Показываем только при обходе с клавиатуры (:focus-visible),
+     как у кнопок и полей: после клика мышью строка и так выделена фоном и
+     полосой слева, а рамка висела бы поверх до следующего клика (S-005). */
+  .msg:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
   /* Список берёт фокус, только когда строки нужного письма в разметке нет. Рамку
      вокруг всей панели показываем лишь при обходе с клавиатуры: при программном
      возврате фокуса она была бы шумом. */

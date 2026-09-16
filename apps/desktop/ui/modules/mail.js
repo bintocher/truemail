@@ -330,7 +330,10 @@ function createMessageRow(message,index){
   // пускаем одну строку - активную, а без активной первую; к остальным ведут
   // стрелки (S-005).
   const active=activeMessage?.id===message.id;
-  row.setAttribute('role','option');row.setAttribute('aria-selected',String(active||selectedMessageIds.has(message.id)));
+  // aria-selected читают программы экранного доступа как "это открытое письмо",
+  // поэтому групповое выделение для массовых действий помечается своим
+  // признаком: иначе отмеченные галочкой письма звучали бы как открытые (S-005).
+  row.setAttribute('role','option');row.setAttribute('aria-selected',String(active));row.toggleAttribute('data-bulk-selected',selectedMessageIds.has(message.id));
   row.tabIndex=-1;
   // Сторона строки - роль папки самого письма: в Отправленных и Черновиках
   // показываем получателя. Роль берём из готовой карты, поиск по coreFolders в
@@ -490,7 +493,7 @@ async function showMessage(message){
   body.innerHTML=`<div class="mail-loading">${L('Загрузка письма…','Loading message…')}</div>`;
   // Признак активной строки и остановка Tab идут вместе: сюда приходят и клик,
   // и навигация клавишами, а окно списка при этом не перестраивается (S-005).
-  const rows=[...document.querySelectorAll('.msg')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active||selectedMessageIds.has(+row.dataset.messageId)));row.tabIndex=active?0:-1;});
+  const rows=[...document.querySelectorAll('.msg')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active));row.tabIndex=active?0:-1;});
   // Строки активного письма в окне может не быть (открыто из палитры, а список
   // прокручен в другое место) - тогда остановка Tab достаётся первой строке,
   // иначе список выпал бы из обхода целиком.
