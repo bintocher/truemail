@@ -260,7 +260,8 @@ document.addEventListener('keydown',e=>{
     return;
   }
   const wizardState=window.wizardEscapeState?.();
-  if(wizardExit.wizardEscapeAction({wizardOpen:wizardState?.wizardOpen,wizardExitAvailable:wizardState?.wizardExitAvailable})==='wizard'){
+  const editingField=Boolean(document.activeElement?.closest?.('#welcomeView')&&document.activeElement.matches('input,textarea,select,[contenteditable="true"]'));
+  if(wizardExit.wizardEscapeAction({wizardOpen:wizardState?.wizardOpen,wizardExitAvailable:wizardState?.wizardExitAvailable,editingField})==='wizard'){
     e.preventDefault();
     window.closeWizard?.();
   }

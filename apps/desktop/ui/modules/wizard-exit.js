@@ -20,9 +20,13 @@ function wizardExitAllowed(savedOnboardingCompleted){
 // модальные окна, и только когда над мастером ничего не осталось - сам мастер
 // (S-004, S-005). Возвращает 'popup', 'overlay', 'wizard' или 'none'.
 function wizardEscapeAction(state){
-  const {popupMenuOpen=false,overlayOpen=false,wizardOpen=false,wizardExitAvailable=false}=state||{};
+  const {popupMenuOpen=false,overlayOpen=false,wizardOpen=false,wizardExitAvailable=false,editingField=false}=state||{};
   if(popupMenuOpen)return 'popup';
   if(overlayOpen)return 'overlay';
+  // Escape в поле ввода мастера привычно отменяет сам ввод: закрывать по нему
+  // весь мастер значило бы терять введённый адрес или код подтверждения от
+  // случайного нажатия (S-013).
+  if(wizardOpen&&editingField)return 'none';
   if(wizardOpen&&wizardExitAvailable)return 'wizard';
   return 'none';
 }

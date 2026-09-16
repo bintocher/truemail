@@ -48,3 +48,9 @@ test('S-006: второе нажатие после закрытия окна - 
 test('меню имеет приоритет даже без открытого мастера',()=>{
   assert.equal(wizardEscapeAction({popupMenuOpen:true,wizardOpen:false,wizardExitAvailable:false}),'popup');
 });
+test('S-013: Escape в поле ввода мастера мастер не закрывает',()=>{
+  assert.equal(wizardEscapeAction({wizardOpen:true,wizardExitAvailable:true,editingField:true}),'none');
+});
+test('S-013: поле ввода не мешает закрыть верхнее меню',()=>{
+  assert.equal(wizardEscapeAction({popupMenuOpen:true,wizardOpen:true,wizardExitAvailable:true,editingField:true}),'popup');
+});
