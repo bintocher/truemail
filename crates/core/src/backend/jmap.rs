@@ -5,7 +5,7 @@ use super::{
     OutgoingMessage,
 };
 use crate::model::FolderRole;
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use futures::{StreamExt, TryStreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,31 @@ fn backend_error(scope: &str, message: impl std::fmt::Display) -> Error {
     }
 }
 
+fn request_error(scope: &str, error: reqwest::Error) -> Error {
+    Error::from_reqwest(format!("jmap-{scope}"), error)
+}
+
+fn http_error(scope: &str, status: reqwest::StatusCode, message: String) -> Error {
+    let backend = format!("jmap-{scope}");
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Error::classified_backend(backend, ErrorKind::InvalidCredentials, message)
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            Error::classified_backend(backend, ErrorKind::Forbidden, message)
+        }
+        reqwest::StatusCode::REQUEST_TIMEOUT => {
+            Error::classified_backend(backend, ErrorKind::Timeout, message)
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Error::RateLimited {
+            backend,
+            retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
+            message,
+        },
+        _ => Error::classified_backend(backend, ErrorKind::ServerUnavailable, message),
+    }
+}
+
 fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -102,7 +127,7 @@ impl JmapBackend {
             .basic_auth(&self.username, Some(password))
             .send()
             .await
-            .map_err(|error| backend_error("session", error))?;
+            .map_err(|error| request_error("session", error))?;
         response_json(response, "session").await
     }
 
@@ -120,7 +145,7 @@ impl JmapBackend {
             }))
             .send()
             .await
-            .map_err(|error| backend_error("api", error))?;
+            .map_err(|error| request_error("api", error))?;
         response_json(response, "api").await
     }
 
@@ -313,7 +338,7 @@ impl JmapBackend {
             .header(reqwest::header::ACCEPT, "message/rfc822")
             .send()
             .await
-            .map_err(|error| backend_error("download", error))?;
+            .map_err(|error| request_error("download", error))?;
         response_bytes(response, "download").await
     }
 
@@ -507,7 +532,7 @@ impl JmapBackend {
             .body(raw)
             .send()
             .await
-            .map_err(|error| backend_error("upload", error))?;
+            .map_err(|error| request_error("upload", error))?;
         let upload: Value = response_json(upload, "upload").await?;
         let blob_id = required_string(&upload, "blobId")?;
         let mailboxes = self.mailboxes(&session, password).await?;
@@ -795,7 +820,7 @@ impl MailBackend for JmapBackend {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send()
             .await
-            .map_err(|error| backend_error("events", error))?;
+            .map_err(|error| request_error("events", error))?;
         let _ = response_bytes(response, "events").await?;
         Ok(())
     }
@@ -862,10 +887,11 @@ async fn response_json<T: serde::de::DeserializeOwned>(
     let body = response
         .bytes()
         .await
-        .map_err(|error| backend_error(scope, error))?;
+        .map_err(|error| request_error(scope, error))?;
     if !status.is_success() {
-        return Err(backend_error(
+        return Err(http_error(
             scope,
+            status,
             format!("HTTP {status}: {}", String::from_utf8_lossy(&body)),
         ));
     }
@@ -877,10 +903,11 @@ async fn response_bytes(response: reqwest::Response, scope: &str) -> Result<Vec<
     let body = response
         .bytes()
         .await
-        .map_err(|error| backend_error(scope, error))?;
+        .map_err(|error| request_error(scope, error))?;
     if !status.is_success() {
-        return Err(backend_error(
+        return Err(http_error(
             scope,
+            status,
             format!("HTTP {status}: {}", String::from_utf8_lossy(&body)),
         ));
     }
@@ -1008,6 +1035,31 @@ mod tests {
     fn rejects_plaintext_remote_session_urls() {
         assert!(validate_session_url("http://mail.example/.well-known/jmap").is_err());
         assert!(validate_session_url("http://127.0.0.1:8080/jmap").is_ok());
+    }
+
+    #[test]
+    fn http_status_defines_the_error_kind() {
+        assert_eq!(
+            http_error("api", reqwest::StatusCode::UNAUTHORIZED, "x".into()).code(),
+            "invalid_credentials"
+        );
+        assert_eq!(
+            http_error("api", reqwest::StatusCode::TOO_MANY_REQUESTS, "x".into()).code(),
+            "rate_limited"
+        );
+        assert_eq!(
+            http_error("api", reqwest::StatusCode::SERVICE_UNAVAILABLE, "x".into()).code(),
+            "server_unavailable"
+        );
+        assert_eq!(
+            http_error(
+                "api",
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                "password".into()
+            )
+            .code(),
+            "server_unavailable"
+        );
     }
 
     async fn mock_session(State(base): State<String>) -> Json<Value> {

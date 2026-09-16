@@ -254,10 +254,10 @@ async fn dav_send(
         .header("Depth", depth)
         .header("Content-Type", "application/xml; charset=utf-8")
         .body(body.to_owned());
-    let response = request.send().await.map_err(|e| Error::Backend {
-        backend: "dav".into(),
-        message: e.to_string(),
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|e| Error::from_reqwest("dav", e))?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     Ok(DavHttpResponse { status, body })
@@ -324,13 +324,14 @@ async fn dav_request_optional(
         return Ok(None);
     }
     if response.status != StatusCode::MULTI_STATUS && !response.status.is_success() {
-        return Err(Error::Backend {
-            backend: "dav".into(),
-            message: format!(
+        return Err(Error::from_http_status(
+            "dav",
+            response.status.as_u16(),
+            format!(
                 "{method} {url}: HTTP {}: {}",
                 response.status, response.body
             ),
-        });
+        ));
     }
     Ok(Some(response.body))
 }

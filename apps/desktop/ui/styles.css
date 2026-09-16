@@ -167,6 +167,22 @@
   .acc-h .em{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12.5px;}
   .acc-h .chev{margin-left:auto;transition:transform .15s;} .acc-h .chev svg{width:15px;height:15px;}
   .acc-h.open .chev{transform:rotate(90deg);} .acc-sub{display:none;} .acc-sub.open{display:block;}
+  /* Признак состояния синхронизации почты рядом с заголовком аккаунта
+     (mail-sync-visible-state.md, S-006). Переходные состояния - тем же
+     приёмом вращения, что и .spinner; сохранённая ошибка и "нужен повторный
+     вход" - сплошная точка тревожного цвета, кликабельная только у reauth. */
+  .acc-h .acc-sync{width:9px;height:9px;border-radius:50%;flex:none;}
+  .acc-sync-error,.acc-sync-needs_reauth{background:var(--danger);}
+  .acc-sync-needs_reauth{cursor:pointer;}
+  .acc-sync-needs_reauth:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+  .acc-sync-syncing,.acc-sync-retrying{width:11px;height:11px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:tm-spin .7s linear infinite;background:transparent;}
+  /* Подробности состояния в карточке аккаунта настроек (S-009). */
+  .account-sync-state{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--text-3);font-size:12px;margin-top:3px;}
+  .account-sync-state.reauth{color:var(--danger);}
+  .account-sync-state .account-sync-reauth{flex:none;}
+  .account-sync-state details{color:var(--text-3);}
+  .account-sync-state summary{cursor:pointer;}
+  .account-sync-state pre{max-height:120px;margin:4px 0 0;overflow:auto;white-space:pre-wrap;font:11px/1.4 ui-monospace,monospace;}
   .acc-sub .navitem{margin-left:22px;font-size:12.5px;padding:5px 8px;}
   .nav-spacer{flex:1;}
   /* Версия внизу панели: неяркая подпись, при наведении читается как ссылка. */
@@ -208,9 +224,10 @@
   .msg{display:grid;grid-template-columns:32px 1fr auto;gap:10px;height:var(--message-row-height);overflow:hidden;padding:var(--row-py) 14px;border-bottom:1px solid var(--border);cursor:pointer;align-items:start;position:relative;content-visibility:auto;contain-intrinsic-size:var(--message-row-height);user-select:none;-webkit-user-select:none;touch-action:pan-y;}.msg.selected{background:var(--accent-weak)}
   .msg:hover{background:var(--hover);} .msg.active{background:var(--active);}
   /* Рамка внутрь строки: снаружи её срезал бы overflow списка, а соседние строки
-     стоят вплотную. Показываем и по клику мышью (:focus), а не только по
-     :focus-visible: без неё непонятно, куда адресованы нажатия. */
-  .msg:focus{outline:2px solid var(--accent);outline-offset:-2px;}
+     стоят вплотную. Показываем только при обходе с клавиатуры (:focus-visible),
+     как у кнопок и полей: после клика мышью строка и так выделена фоном и
+     полосой слева, а рамка висела бы поверх до следующего клика (S-005). */
+  .msg:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
   /* Список берёт фокус, только когда строки нужного письма в разметке нет. Рамку
      вокруг всей панели показываем лишь при обходе с клавиатуры: при программном
      возврате фокуса она была бы шумом. */
@@ -303,7 +320,7 @@
   .blocked span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
   .blocked b{color:var(--text);font-weight:600;} .blocked button{margin-left:auto;flex:none;border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:6px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px;}
   .blocked button:hover{background:var(--hover);}
-  .app-toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:1500;display:flex;align-items:center;gap:16px;max-width:min(520px,calc(100vw - 32px));padding:11px 14px;border-radius:10px;background:var(--text);color:var(--bg);box-shadow:var(--shadow);font-size:13px}.app-toast button{border:0;background:transparent;color:#aeb4ff;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px}
+  .app-toast-stack{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:1500;display:flex;flex-direction:column;gap:8px;width:min(560px,calc(100vw - 32px))}.app-toast{display:flex;align-items:flex-start;gap:12px;padding:11px 14px;border-radius:10px;background:var(--text);color:var(--bg);box-shadow:var(--shadow);font-size:13px}.app-toast-body{min-width:0;flex:1}.app-toast-line{display:flex;align-items:center;gap:8px}.app-toast-count{flex:none;padding:1px 6px;border-radius:10px;background:color-mix(in srgb,var(--bg) 18%,transparent);font-weight:700}.app-toast details{margin-top:6px;color:color-mix(in srgb,var(--bg) 78%,transparent)}.app-toast summary{cursor:pointer}.app-toast pre{max-height:120px;margin:6px 0 0;overflow:auto;white-space:pre-wrap;font:11px/1.4 ui-monospace,monospace}.app-toast button{flex:none;border:0;background:transparent;color:#aeb4ff;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px}.app-toast button:disabled{cursor:default;opacity:.55}.app-toast .app-toast-close{color:inherit;font-weight:400;opacity:.7}
   .comp-send-at{width:190px;padding:6px 8px}
   .attach{display:flex;gap:10px;margin:8px 0 4px;flex-wrap:wrap;}
   .att{display:flex;align-items:center;gap:9px;border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;background:var(--panel);min-width:190px;}
@@ -539,7 +556,9 @@
   .tbrow .grip{color:var(--text-3);cursor:grab;display:inline-flex;} .tbrow .grip svg{width:16px;height:16px;}
   .tbrow .nm{flex:1;font-weight:500;} .tbrow.off{opacity:.5;} .tbrow .ord{display:flex;gap:2px;}
   .tbrow .ord .iconbtn{width:26px;height:26px;} .tbrow .ord .iconbtn svg{width:15px;height:15px;}
-  .wzcard{background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:34px 34px 26px;text-align:center;}
+  .wzcard{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:20px;box-shadow:var(--shadow);padding:34px 34px 26px;text-align:center;}
+  /* Кнопка выхода из повторного мастера (setup-wizard-exit.md, S-001) - общая для всех шагов. */
+  .wz-close{position:absolute;top:14px;right:14px;}
   .wzcard h1{margin:0 0 8px;font-size:24px;letter-spacing:-.02em;} .wzcard .sub{color:var(--text-3);margin:0 auto 26px;max-width:42ch;line-height:1.5;}
   .wzstep{display:none;} .wzstep.active{display:block;}
   .wzstep .left{text-align:left;}
@@ -562,6 +581,27 @@
   button.wz-opt{width:100%;background:var(--bg);color:var(--text);font:inherit;}
   .wz-connect-status{min-height:20px;margin-top:10px;color:var(--text-3);font-size:12.5px;line-height:1.45;}
   .wz-connect-status[data-kind="error"]{color:var(--danger);}.wz-connect-status[data-kind="success"]{color:var(--good);}
+  /* Заметная область хода подключения (account-connect-progress.md, S-002):
+     пока этап не пуст, строка получает фон, рамку и более крупный шрифт - не
+     только мелкий приглушённый текст, как раньше. Правило намеренно задано по
+     двум идентификаторам, а не по классу .wz-connect-status: тот же класс
+     носят статусные строки календаря, контактов и шагов хранилища мастера, и
+     их вид эта задача не меняет. Пустая строка (попытки нет) остаётся
+     невидимой, чтобы не показывать пустую рамку между полями формы. */
+  #wzConnectStatus:not(:empty),#accountOauthStatus:not(:empty){padding:8px 12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--panel2);font-size:13px;font-weight:500;}
+  #wzConnectStatus[data-kind="error"]:not(:empty),#accountOauthStatus[data-kind="error"]:not(:empty){border-color:var(--danger);}
+  #wzConnectStatus[data-kind="success"]:not(:empty),#accountOauthStatus[data-kind="success"]:not(:empty){border-color:var(--good);}
+  /* Значок ожидания внутри самой кнопки подключения (S-001): .btn уже flex
+     с gap - спиннер и подпись этапа встают на место обычной иконки и текста. */
+  .btn .spinner{flex:none;}
+  /* Список категорий обезличивания в предупреждении перед сбором диагностики
+     (diagnostics-bundle.md, S-014). */
+  .diag-categories{margin:10px 0;padding-left:20px;color:var(--text-2);font-size:13px;line-height:1.6;}
+  /* Итог сбора диагностики и выгрузки ключей в разделе хранилища: успех,
+     частичный архив и ошибка должны отличаться не только текстом. */
+  #set-storage .d[data-kind="success"]{color:var(--good);}
+  #set-storage .d[data-kind="warning"]{color:var(--warn,var(--text-2));}
+  #set-storage .d[data-kind="error"]{color:var(--danger);}
   .mail-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px;color:var(--text);}
   .mail-empty h2{margin:4px 0 8px}.mail-empty p{margin:0 0 20px;color:var(--text-3);}
   .settings.account-wizard-mode{grid-template-columns:1fr;background:var(--panel2);}

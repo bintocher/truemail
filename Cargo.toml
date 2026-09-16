@@ -7,7 +7,7 @@ members = [
 exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
-version = "0.2.16"
+version = "0.2.17"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["chernov <bintocher@yandex.com>"]
@@ -51,15 +51,17 @@ url = "2.5.8"
 sha2 = "0.11.0"
 hkdf = "0.13.0"
 zeroize = { version = "1.8.2", features = ["derive"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 roxmltree = "0.21.1"
 quoted_printable = "0.5.2"
+# Обезличивание строк журнала для архива диагностики (specs/diagnostics-bundle.md).
+regex = "1.13.1"
 
 # крипто и секреты
 keyring = "4.1.4"
 chacha20poly1305 = "0.11.0"
 rand = "0.10.2"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 
 [patch.crates-io]
 # libsqlite3-sys 0.38.x не удовлетворяет диапазону SQLx 0.9 (`<0.38`).

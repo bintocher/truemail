@@ -9,7 +9,7 @@ use crate::account::{
     DavSyncResult, EventInput, SyncScope,
 };
 use crate::model::{Attendee, ContactAddress, ContactPhone, FolderRole, infer_folder_role};
-use crate::{Error, Result};
+use crate::{Error, ErrorKind, Result};
 use async_trait::async_trait;
 use base64::Engine as _;
 use roxmltree::{Document, Node};
@@ -25,6 +25,49 @@ const TYPES_NS: &str = "http://schemas.microsoft.com/exchange/services/2006/type
 pub struct EwsBackend {
     pub endpoint: String,
     pub username: String,
+    /// Пределы одного HTTP-соединения (account-connect-progress.md, S-014):
+    /// фоновая синхронизация и наблюдение за почтой держат прежние 10/30/30
+    /// секунд, а автопоиск и проверка учётных данных при подключении - 5/15/15.
+    pub timeouts: EwsTimeouts,
+}
+
+/// Пределы одного HTTP-соединения EWS: на установление соединения и отдельно
+/// на отправку и приём данных (account-connect-progress.md, S-014). Значения
+/// передаются вызывающей стороной, а не задаются одним числом на все вызовы
+/// `authenticated_post`.
+#[derive(Debug, Clone, Copy)]
+pub struct EwsTimeouts {
+    pub connect_ms: u32,
+    pub send_ms: u32,
+    pub receive_ms: u32,
+}
+
+impl EwsTimeouts {
+    /// Прежние пределы для фоновой синхронизации и наблюдения за почтой.
+    pub const fn background() -> Self {
+        Self {
+            connect_ms: 10_000,
+            send_ms: 30_000,
+            receive_ms: 30_000,
+        }
+    }
+
+    /// Сниженные пределы для автопоиска адреса и проверки учётных данных при
+    /// подключении аккаунта - одно медленное соединение не должно съедать
+    /// весь предел автопоиска (60 секунд) или проверки (45 секунд).
+    pub const fn connect() -> Self {
+        Self {
+            connect_ms: 5_000,
+            send_ms: 15_000,
+            receive_ms: 15_000,
+        }
+    }
+}
+
+impl Default for EwsTimeouts {
+    fn default() -> Self {
+        Self::background()
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +122,18 @@ fn backend_error(kind: &str, message: impl ToString) -> Error {
     Error::Backend {
         backend: format!("ews-{kind}"),
         message: message.to_string(),
+    }
+}
+
+fn http_error(status: u16, message: impl Into<String>) -> Error {
+    let message = message.into();
+    match status {
+        401 => Error::classified_backend("ews-http", ErrorKind::InvalidCredentials, message),
+        403 => Error::classified_backend("ews-http", ErrorKind::Forbidden, message),
+        408 => Error::classified_backend("ews-http", ErrorKind::Timeout, message),
+        429 => server_busy_error(&message),
+        500..=599 => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
+        _ => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
     }
 }
 
@@ -294,6 +349,7 @@ async fn authenticated_post(
     content_type: &str,
     soap_action: Option<&str>,
     body: &str,
+    timeouts: EwsTimeouts,
 ) -> Result<EwsResponse> {
     use winhttp::{AuthScheme, AuthTarget, RedirectPolicy, Session, SessionConfig};
 
@@ -314,9 +370,9 @@ async fn authenticated_post(
     }
     let session = Session::with_config_async(SessionConfig {
         user_agent: "truemail/0.1 Exchange EWS".into(),
-        connect_timeout_ms: 10_000,
-        send_timeout_ms: 30_000,
-        receive_timeout_ms: 30_000,
+        connect_timeout_ms: timeouts.connect_ms,
+        send_timeout_ms: timeouts.send_ms,
+        receive_timeout_ms: timeouts.receive_ms,
     })
     .map_err(|error| backend_error("http", error))?;
     let connection = session
@@ -377,6 +433,7 @@ async fn authenticated_post(
     _content_type: &str,
     _soap_action: Option<&str>,
     _body: &str,
+    _timeouts: EwsTimeouts,
 ) -> Result<EwsResponse> {
     Err(Error::AccountConfig(
         "NTLM/Negotiate для self-hosted Exchange сейчас поддерживается в Windows-сборке".into(),
@@ -404,6 +461,7 @@ pub async fn discover_ews_url(
     username: &str,
     password: &str,
     server_hint: Option<&str>,
+    timeouts: EwsTimeouts,
 ) -> Result<String> {
     if let Some(hint) = server_hint.filter(|value| value.to_ascii_lowercase().contains("/ews/")) {
         return direct_ews_url(hint).ok_or_else(|| Error::AccountConfig("адрес EWS пуст".into()));
@@ -438,6 +496,7 @@ pub async fn discover_ews_url(
             "text/xml; charset=utf-8",
             None,
             &request,
+            timeouts,
         )
         .await
         {
@@ -473,17 +532,16 @@ impl EwsBackend {
             "text/xml; charset=utf-8",
             Some(&soap_action),
             &envelope(body),
+            self.timeouts,
         )
         .await?;
-        // Сервер под нагрузкой отвечает 503 или ошибкой занятости: это не отказ
-        // запроса, а просьба подождать. Отдельная ошибка нужна фоновой догрузке
-        // тел писем, чтобы прекратить проход, а не расходовать его на отказы
-        // (gmail-local-body-prefetch.md, S-009).
-        if response.status == 503 || response.status == 429 {
-            return Err(server_busy_error(&format!("HTTP {}", response.status)));
-        }
+        // Код HTTP классифицируется до разбора тела. Текст ответа не должен
+        // определять причину отказа на границе интерфейса.
         if !(200..300).contains(&response.status) {
-            return Err(backend_error("http", format!("HTTP {}", response.status)));
+            return Err(http_error(
+                response.status,
+                format!("HTTP {}", response.status),
+            ));
         }
         if let Some(error) = response_error(&response.body) {
             if is_server_busy(&error) {
@@ -3261,6 +3319,28 @@ impl MailBackend for EwsBackend {
 mod tests {
     use super::*;
 
+    /// S-014 (account-connect-progress.md): автопоиск и проверка учётных
+    /// данных при подключении держат сниженные пределы одного соединения EWS,
+    /// а фоновая синхронизация и наблюдение за почтой - прежние 10/30/30.
+    #[test]
+    fn s014_connect_timeouts_are_lower_than_background_ones() {
+        let connect = EwsTimeouts::connect();
+        assert_eq!(
+            (connect.connect_ms, connect.send_ms, connect.receive_ms),
+            (5_000, 15_000, 15_000)
+        );
+        let background = EwsTimeouts::background();
+        assert_eq!(
+            (
+                background.connect_ms,
+                background.send_ms,
+                background.receive_ms
+            ),
+            (10_000, 30_000, 30_000)
+        );
+        assert_eq!(EwsTimeouts::default().connect_ms, background.connect_ms);
+    }
+
     #[test]
     fn parses_autodiscover_ews_url() {
         let xml = r#"<Autodiscover><Response><Account><Protocol><EwsUrl>https://mail.example.test/EWS/Exchange.asmx</EwsUrl></Protocol></Account></Response></Autodiscover>"#;
@@ -4205,7 +4285,7 @@ mod light_fetch_tests {
 #[cfg(test)]
 mod throttling_tests {
     //! Ошибки занятости Exchange (gmail-local-body-prefetch.md, S-009).
-    use super::{is_server_busy, server_busy_error};
+    use super::{http_error, is_server_busy, server_busy_error};
 
     #[test]
     fn busy_answers_are_recognised() {
@@ -4220,5 +4300,16 @@ mod throttling_tests {
     fn busy_answer_becomes_a_rate_limit() {
         let error = server_busy_error("ErrorServerBusy");
         assert!(matches!(error, crate::Error::RateLimited { .. }));
+    }
+
+    #[test]
+    fn http_status_defines_the_error_kind() {
+        assert_eq!(http_error(401, "any body").code(), "invalid_credentials");
+        assert_eq!(http_error(429, "any body").code(), "rate_limited");
+        assert_eq!(http_error(503, "any body").code(), "server_unavailable");
+        assert_eq!(
+            http_error(500, "invalid password").code(),
+            "server_unavailable"
+        );
     }
 }

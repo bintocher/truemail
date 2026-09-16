@@ -8,7 +8,7 @@ async function openRawViewer(messageId){
   overlay.innerHTML=`<div class="raw-box"><div class="raw-head"><button class="btn raw-back">← ${L('Назад','Back')}</button><span class="raw-title">${L('Исходный текст письма','Message source')}</span><button class="btn raw-eml">${L('Сохранить .eml','Save .eml')}</button><button class="btn primary raw-copy">${L('Копировать','Copy')}</button></div><textarea class="raw-text" readonly spellcheck="false"></textarea></div>`;
   document.body.appendChild(overlay);
   const ta=overlay.querySelector('.raw-text');ta.value=L('Загрузка…','Loading…');
-  try{ta.value=await window.tm.messageRaw(messageId);}catch(error){ta.value=error.message||String(error);}
+  try{ta.value=await window.tm.messageRaw(messageId);}catch(error){ta.value=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText}).text;}
   function close(){overlay.remove();document.removeEventListener('keydown',key);}
   function key(e){if(e.key==='Escape')close();}
   overlay.querySelector('.raw-back').onclick=close;
@@ -30,7 +30,7 @@ async function saveMessageAsEml(messageId){
     if(!path)return;
     await window.tm.exportMessageEml(messageId,path);
     showToast(L('Письмо сохранено как .eml','Message saved as .eml'));
-  }catch(error){showToast(error.message||String(error));}
+  }catch(error){showToast(error);}
 }
 const isImageAttachment=att=>String(att.mime_type||'').toLowerCase().startsWith('image/');
 // Компактная панель вложений над телом: 1 строка плашек, "ещё +N" с разворотом.
@@ -67,11 +67,11 @@ function openAttachment(full,att,messageId){
 }
 async function saveOneAttachment(messageId,att){
   try{const path=await window.tm.saveFileDialog(att.filename);if(!path)return;await window.tm.saveAttachment(messageId,att.id,path);showToast(L('Вложение сохранено','Attachment saved'));}
-  catch(error){showToast(error.message||String(error));}
+  catch(error){showToast(error);}
 }
 async function saveAllAttachments(messageId){
   try{const dir=await window.tm.chooseDir();if(!dir)return;const saved=await window.tm.saveAllAttachments(messageId,dir);showToast(L(`Сохранено вложений: ${saved.length}`,`Attachments saved: ${saved.length}`));}
-  catch(error){showToast(error.message||String(error));}
+  catch(error){showToast(error);}
 }
 function closeAttMenu(){closePopupMenus(['attachment']);}
 function attachmentMenu(event,full,att,messageId,anchorKey=null){
@@ -104,7 +104,7 @@ async function openGallery(full,att,messageId){
     idx=(i+images.length)%images.length;const a=images[idx];
     cap.textContent=`${a.filename} · ${idx+1}/${images.length}`;img.removeAttribute('src');
     try{const c=await window.tm.attachmentContent(messageId,a.id);img.src=`data:${c.mime_type||'image/png'};base64,${c.base64}`;}
-    catch(error){cap.textContent=error.message||String(error);}
+    catch(error){cap.textContent=accountError(error).text;}
   }
   function key(e){if(['ArrowLeft','ArrowUp'].includes(e.key)){e.preventDefault();show(idx-1);}else if(['ArrowRight','ArrowDown'].includes(e.key)){e.preventDefault();show(idx+1);}else if(e.key==='Escape')close();}
   function close(){overlay.remove();document.removeEventListener('keydown',key);}
@@ -223,7 +223,7 @@ function bindExternalLinks(scope){
     const href=link.href||'';
     if(!/^https?:/i.test(href))return;
     event.preventDefault();
-    window.tm?.openExternal(href).catch(error=>showToast(error.message||String(error)));
+    window.tm?.openExternal(href).catch(error=>showToast(error));
   });
 }
 
@@ -322,7 +322,7 @@ function expandConversationIds(ids){
 window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 function createMessageRow(message,index){
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
   // Строка - элемент списка, а не кнопка: роли кнопки достался бы общий
@@ -330,7 +330,10 @@ function createMessageRow(message,index){
   // пускаем одну строку - активную, а без активной первую; к остальным ведут
   // стрелки (S-005).
   const active=activeMessage?.id===message.id;
-  row.setAttribute('role','option');row.setAttribute('aria-selected',String(active||selectedMessageIds.has(message.id)));
+  // aria-selected читают программы экранного доступа как "это открытое письмо",
+  // поэтому групповое выделение для массовых действий помечается своим
+  // признаком: иначе отмеченные галочкой письма звучали бы как открытые (S-005).
+  row.setAttribute('role','option');row.setAttribute('aria-selected',String(active));row.toggleAttribute('data-bulk-selected',selectedMessageIds.has(message.id));
   row.tabIndex=-1;
   // Сторона строки - роль папки самого письма: в Отправленных и Черновиках
   // показываем получателя. Роль берём из готовой карты, поиск по coreFolders в
@@ -490,7 +493,7 @@ async function showMessage(message){
   body.innerHTML=`<div class="mail-loading">${L('Загрузка письма…','Loading message…')}</div>`;
   // Признак активной строки и остановка Tab идут вместе: сюда приходят и клик,
   // и навигация клавишами, а окно списка при этом не перестраивается (S-005).
-  const rows=[...document.querySelectorAll('.msg')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active||selectedMessageIds.has(+row.dataset.messageId)));row.tabIndex=active?0:-1;});
+  const rows=[...document.querySelectorAll('.msg')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active));row.tabIndex=active?0:-1;});
   // Строки активного письма в окне может не быть (открыто из палитры, а список
   // прокручен в другое место) - тогда остановка Tab достаётся первой строке,
   // иначе список выпал бы из обхода целиком.
@@ -527,7 +530,7 @@ async function showMessage(message){
       window.markMessagesSeen?.(message,true).catch(console.error);
     }
   // Ошибка устаревшего запроса на экран не идёт: там уже актуальное письмо (S-004).
-  }catch(error){if(!stillCurrent())return;body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=error.message||String(error);body.appendChild(err);}
+  }catch(error){if(!stillCurrent())return;body.innerHTML='';const err=document.createElement('div');err.className='mail-error';err.textContent=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText}).text;body.appendChild(err);}
 }
 function smartMessageValue(message,field){const folder=coreFolders.find(item=>item.id===message.folder_id);switch(field){
   case 'sender':return `${message.from?.name||''} ${message.from?.email||''}`.trim();case 'recipient':return [...(message.to||[]),...(message.cc||[])].map(address=>`${address.name||''} ${address.email||''}`.trim()).join(' ');case 'subject':return message.subject||'';case 'body':return message.preview||'';case 'account':return coreAccounts.find(account=>account.id===message.account_id)?.email||'';case 'folder':return `${folder?.display_name||''} ${folder?.remote_path||''}`.trim();case 'folder_role':return folder?.role||'other';case 'read_state':return message.flags?.seen?'read':'unread';case 'importance':return message.flags?.flagged?'flagged':'normal';case 'reply_state':return message.flags?.answered?'answered':'unanswered';case 'draft_state':return message.flags?.draft?'draft':'not_draft';case 'attachment':return message.has_attachments?'has':'none';case 'size':return message.size;case 'label':return (message.labels||[]).join(' ');case 'date':return message.date||'';default:return '';}}
@@ -726,6 +729,48 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
 // только обновляет страницу из локальной базы.
 function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;const folder=smartFolders[index];if(resetScroll&&folder){smartServerExhausted.delete(folder.id);smartCircleFetched.delete(folder.id);smartBackfillVisited.delete(folder.id);smartBackfillCursor.clear();}applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true,resetScroll);}
 
+// Признак состояния синхронизации почты рядом с заголовком аккаунта в боковой
+// панели (mail-sync-visible-state.md, S-006, S-007). Показывается только для
+// четырёх "заметных" состояний - успешный последний проход и "ещё ничего не
+// синхронизировалось" индикатора не получают (S-006).
+const ACC_SYNC_VISIBLE_KINDS=new Set(['needs_reauth','error','retrying','syncing']);
+function accountSyncBadgeTitle(state){
+  if(state.kind==='needs_reauth')return L('Нужен повторный вход. Нажмите, чтобы переподключить.','Sign-in required. Click to reconnect.');
+  if(state.kind==='error')return window.errorPresentation.presentError({kind:state.errorKind,message:state.message},{locale:wizardLocale,translations:typeof wizardText==='undefined'?undefined:wizardText,connected:true}).text;
+  if(state.kind==='retrying')return L('Восстановление соединения…','Reconnecting…');
+  if(state.kind==='syncing')return L('Идёт синхронизация…','Syncing…');
+  return '';
+}
+// header - элемент .acc-h; читает текущее сохранённое и переходное состояние
+// заново на каждый вызов, поэтому безопасно звать как при первой отрисовке
+// (S-006, S-008), так и точечно из обработчика событий (S-011).
+function renderAccountSyncBadge(header,account){
+  const badge=header.querySelector('.acc-sync');
+  if(!badge)return;
+  const state=window.mailSyncIndicator.resolveSyncIndicator(account,window.mailSyncTransient?.[account.id]);
+  if(!ACC_SYNC_VISIBLE_KINDS.has(state.kind)){
+    badge.hidden=true;badge.className='acc-sync';badge.onclick=null;badge.onkeydown=null;badge.removeAttribute('role');badge.removeAttribute('tabindex');
+    return;
+  }
+  badge.hidden=false;badge.className=`acc-sync acc-sync-${state.kind}`;badge.title=accountSyncBadgeTitle(state);
+  if(state.kind==='needs_reauth'){
+    // S-010: клик по признаку открывает переподключение, как и кнопка в карточке.
+    badge.setAttribute('role','button');badge.tabIndex=0;
+    badge.onclick=event=>{event.stopPropagation();showAccountWizard(account.email);};
+    badge.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();badge.click();}};
+  }else{
+    badge.onclick=null;badge.onkeydown=null;badge.removeAttribute('role');badge.removeAttribute('tabindex');
+  }
+}
+// Точечное обновление одного признака по событию truemail-sync-state
+// (composer.js, handleSyncState): переходные статусы видны сразу, не дожидаясь
+// полной перезагрузки данных по truemail-data-changed (S-011).
+window.refreshAccountSyncIndicator=function(accountId){
+  const header=document.querySelector(`.acc-h[data-account-id="${accountId}"]`);
+  const account=coreAccounts.find(item=>item.id===accountId);
+  if(header&&account)renderAccountSyncBadge(header,account);
+};
+
 window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   // Якорь списка снимаем здесь, до clearDemoData: сразу за ним прокрутка
@@ -793,8 +838,9 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
     const accountOpen=accountNavIsOpen(account.id);
     const header=document.createElement('button');header.type='button';header.className='acc-h'+(accountOpen?' open':'');header.dataset.accountId=account.id;header.dataset.noI18n='1';
     const initial=(account.display_name||account.email||'?').trim()[0].toUpperCase();
-    header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)};color:${contrastOn(accountColorById(account.id))}"></span><span class="em"></span><span class="chev"><i data-i="chevR"></i></span>`;
+    header.innerHTML=`<span class="ava" style="background:${accountColorById(account.id)};color:${contrastOn(accountColorById(account.id))}"></span><span class="em"></span><span class="acc-sync" hidden></span><span class="chev"><i data-i="chevR"></i></span>`;
     header.querySelector('.ava').textContent=initial;header.querySelector('.em').textContent=account.email;
+    renderAccountSyncBadge(header,account);
     anchor.after(header);anchor=header;
     // Имена папок ящика приходят с сервера: словарь автоперевода не должен их
     // трогать, иначе папка "Календарь" переводилась бы вместе с интерфейсом.
@@ -839,35 +885,202 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
 };
 let accountOauthState='';
 let accountPasswordProvider='generic';
-function isExpiredOauthCode(error){return /invalid_grant|code has expired|verification code.*expired/i.test(error?.message||String(error));}
+function accountError(error){return window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText,connected:false});}
+function isReauthError(error){return accountError(error).requiresReauth;}
+// specs/account-connect-progress.md, S-006: у истечения общего предела
+// времени - свой, более конкретный текст, чем общий "Сервер не ответил
+// вовремя" у прочих таймаутов; вид ошибки и действие ("Повторить") по-прежнему
+// берутся из error-kinds-and-messages.md через accountError.
+function connectFailureText(error){const presented=accountError(error);return window.connectProgress.connectErrorText(presented.kind,presented.text,wt('connectTimeoutMessage'));}
+// S-017: аккаунт мог быть уже сохранён в базе к моменту истечения общего
+// предела времени (или другой ошибки ответа) - тогда после перезагрузки
+// списка он виден как подключённый, а повторная попытка тем же адресом не
+// создаёт дубликат (save_account в ядре - ON CONFLICT(email) DO UPDATE).
+// F5: обновление данных ждём (await), а не запускаем и забываем - решение о
+// показе результата на экране (проверка поколения попытки) принимается уже
+// после того, как список аккаунтов и готовность окна нового письма обновлены,
+// а не до этого (account-connect-progress.md S-017, setup-wizard-exit.md
+// S-012): иначе поздний ответ мог отбросить обновление раньше, чем оно
+// успело выполниться, и уже сохранённый аккаунт не появился бы в списке до
+// следующей перезагрузки данных.
+async function refreshAccountsAndComposerReadiness(){
+  try{await window.reloadCoreData?.();}catch(error){console.error(error);}
+  try{await window.refreshComposerReadiness?.();}catch(error){console.error(error);}
+}
+// S-001, S-002, S-005, S-010: общая функция состояния кнопки и заметной
+// области попытки подключения - использует и первичный мастер, и мастер
+// добавления аккаунта в настройках. Значок и текст этапа показываются внутри
+// самой кнопки (S-001), а заметная область получает тот же подтверждённый
+// текст этапа (S-002, S-003, role="status" уже в разметке).
+function setConnectBusy(button,status,stage,busy,attemptId){
+  if(!button)return;
+  if(busy){
+    if(button.dataset.connectLabel===undefined)button.dataset.connectLabel=button.innerHTML;
+    // F7: номер попытки, которой принадлежит этот вызов команды подключения -
+    // handleConnectStage сверяет его с событием, а не только адрес и занятость
+    // кнопки, иначе позднее событие прежней попытки того же адреса могло бы
+    // изменить текст уже новой попытки на той же кнопке.
+    if(attemptId!==undefined)button.dataset.connectAttempt=String(attemptId);
+    button.disabled=true;
+    const key=window.connectProgress.connectStageMessageKey(stage),text=key?wt(key):'';
+    button.innerHTML='<span class="spinner" aria-hidden="true"></span><span class="connect-busy-label"></span>';
+    button.querySelector('.connect-busy-label').textContent=text;
+    if(status){status.textContent=text;status.dataset.kind='';}
+  }else{
+    button.disabled=false;
+    delete button.dataset.connectAttempt;
+    if(button.dataset.connectLabel!==undefined){button.innerHTML=button.dataset.connectLabel;delete button.dataset.connectLabel;}
+  }
+}
+window.setConnectBusy=setConnectBusy;
+// S-002, S-003, S-016: подтверждённый этап приходит из Rust событием
+// truemail-connect-stage (bridge.js) в ходе ОДНОГО вызова команды подключения
+// (например, переход "определяю способ входа" -> "проверяю сервер" внутри
+// begin_account_connection для OAuth). Обновляем только ту кнопку/область,
+// которая сейчас действительно в процессе (busy), относится к тому же адресу
+// и к тому же номеру попытки (F7) - иначе поздний или чужой (другой адрес,
+// другое окно, прежняя попытка того же адреса) этап тронул бы не тот экран.
+const CONNECT_STAGE_TARGETS=[
+  {emailField:'wzEmail',button:'wzConnect',status:'wzConnectStatus'},
+  {emailField:'wzEmail',button:'wzConfirm',status:'wzConnectStatus'},
+  {emailField:'accountEmail',button:'accountOauthStart',status:'accountOauthStatus'},
+  {emailField:'accountEmail',button:'accountPasswordConfirm',status:'accountOauthStatus'},
+  {emailField:'accountEmail',button:'accountOauthConfirm',status:'accountOauthStatus'},
+];
+window.handleConnectStage=function(payload){
+  if(!payload||!payload.stage)return;
+  const email=String(payload.email||'').trim().toLowerCase();
+  if(!email)return;
+  CONNECT_STAGE_TARGETS.forEach(({emailField,button,status})=>{
+    const buttonEl=document.getElementById(button);
+    // dataset.connectLabel стоит только пока кнопка в состоянии ожидания
+    // (setConnectBusy) - иначе эта попытка на этой кнопке уже не активна.
+    if(!buttonEl||buttonEl.dataset.connectLabel===undefined)return;
+    // F7: событие без номера попытки или от чужой (прежней/более поздней уже
+    // не активной) попытки этой же кнопки не должно менять текст.
+    if(payload.attempt_id===undefined||String(payload.attempt_id)!==buttonEl.dataset.connectAttempt)return;
+    const fieldEl=document.getElementById(emailField);
+    if(!fieldEl||fieldEl.value.trim().toLowerCase()!==email)return;
+    setConnectBusy(buttonEl,document.getElementById(status),payload.stage,true,payload.attempt_id);
+  });
+};
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
 document.getElementById('accountOauthStart').onclick=async()=>{
   const email=document.getElementById('accountEmail').value.trim(),status=document.getElementById('accountOauthStatus');
   const button=document.getElementById('accountOauthStart');
+  // S-010, S-016: поколение попытки общее с первичным мастером (см.
+  // showAccountWizard в i18n-onboarding.js) - поздний ответ прежнего
+  // открытия этого диалога не должен тронуть уже другой (или закрытый) экран.
+  const attempt=window.currentWizardAttempt?.();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=L('Введите корректный адрес почты.','Enter a valid email address.');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=L('OAuth доступен внутри приложения truemail.','OAuth is available inside the truemail app.');status.dataset.kind='error';return;}
-  try{button.disabled=true;status.textContent=L('Определяю провайдера и способ входа…','Detecting provider and sign-in method…');status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent=L('После входа скопируйте сюда код подтверждения.','After signing in, paste the confirmation code here.');document.getElementById('accountOauthCode').focus();}
-  catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
+  try{
+    setConnectBusy(button,status,'detecting',true,attempt);
+    const pending=await window.tm.beginAccountConnection(email,attempt);
+    // F5: данные аккаунтов и готовность композера обновляем при любом
+    // завершении команды - до решения, показывать ли результат на этом
+    // экране, а не только когда попытка ещё актуальна.
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
+    if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
+    // S-009: команда перешла к ожиданию кода - кнопка освобождается, а
+    // заметная область показывает отдельное подтверждённое состояние.
+    accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent=wt('connectStageWaitingCode');document.getElementById('accountOauthCode').focus();
+  }
+  catch(e){
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+  }
 };
-document.getElementById('accountPasswordConfirm').onclick=async()=>{const button=document.getElementById('accountPasswordConfirm'),status=document.getElementById('accountOauthStatus'),password=document.getElementById('accountPassword').value,email=document.getElementById('accountEmail').value.trim(),username=document.getElementById('accountUsername').value.trim(),type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap';if(!password){status.textContent=L('Введите пароль.','Enter the password.');status.dataset.kind='error';return;}try{button.disabled=true;status.textContent=exchange?L('Ищу EWS через Autodiscover и проверяю Exchange…','Discovering EWS and checking Exchange…'):jmap?L('Проверяю JMAP Session и доступ к почте…','Checking the JMAP Session and mail access…'):L('Проверяю IMAP и подключаю аккаунт…','Checking IMAP and connecting the account…');status.dataset.kind='';const connected=exchange?await window.tm.completeExchangeEws({email,username,password,serverHint:document.getElementById('accountEwsServer').value.trim()}):jmap?await window.tm.completeJmap({email,username,password,sessionUrl:document.getElementById('accountJmapServer').value.trim()}):await window.tm.completePasswordImap({email,username,password,provider:accountPasswordProvider,imapHost:document.getElementById('accountImapHost').value.trim(),imapPort:Number(document.getElementById('accountImapPort').value),imapSecurity:document.getElementById('accountImapSecurity').value,smtpHost:document.getElementById('accountSmtpHost').value.trim(),smtpPort:Number(document.getElementById('accountSmtpPort').value),smtpSecurity:document.getElementById('accountSmtpSecurity').value});document.getElementById('accountPassword').value='';status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';button.disabled=false;}};
+document.getElementById('accountPasswordConfirm').onclick=async()=>{
+  const button=document.getElementById('accountPasswordConfirm'),status=document.getElementById('accountOauthStatus'),password=document.getElementById('accountPassword').value,email=document.getElementById('accountEmail').value.trim(),username=document.getElementById('accountUsername').value.trim(),type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap';
+  if(!password){status.textContent=L('Введите пароль.','Enter the password.');status.dataset.kind='error';return;}
+  const attempt=window.currentWizardAttempt?.(); // S-010, S-016: см. пояснение у accountOauthStart
+  try{
+    setConnectBusy(button,status,'checking_server',true,attempt);
+    const connected=exchange?await window.tm.completeExchangeEws({email,username,password,serverHint:document.getElementById('accountEwsServer').value.trim(),attemptId:attempt}):jmap?await window.tm.completeJmap({email,username,password,sessionUrl:document.getElementById('accountJmapServer').value.trim(),attemptId:attempt}):await window.tm.completePasswordImap({email,username,password,provider:accountPasswordProvider,imapHost:document.getElementById('accountImapHost').value.trim(),imapPort:Number(document.getElementById('accountImapPort').value),imapSecurity:document.getElementById('accountImapSecurity').value,smtpHost:document.getElementById('accountSmtpHost').value.trim(),smtpPort:Number(document.getElementById('accountSmtpPort').value),smtpSecurity:document.getElementById('accountSmtpSecurity').value,attemptId:attempt});
+    document.getElementById('accountPassword').value='';
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
+    setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);
+  }catch(error){
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(error);status.dataset.kind='error';
+  }
+};
 document.getElementById('accountOauthConfirm').onclick=async()=>{
-  const code=document.getElementById('accountOauthCode').value.trim(),status=document.getElementById('accountOauthStatus');if(!code)return;
-  try{status.textContent=L('Подключаю почту, календарь и контакты…','Connecting mail, calendar and contacts…');status.dataset.kind='';document.getElementById('accountOauthConfirm').disabled=true;const connected=await window.tm.completeYandexOauth(accountOauthState,code);status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);}
-  catch(e){if(isExpiredOauthCode(e)){accountOauthState='';document.getElementById('accountOauthCode').value='';document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountOauthStart').disabled=false;status.textContent=L('Код истёк или уже был использован. Нажмите «Подключить» и получите новый код.','The code expired or was already used. Select Connect to get a new code.');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('accountOauthConfirm').disabled=false;}
+  const code=document.getElementById('accountOauthCode').value.trim(),status=document.getElementById('accountOauthStatus'),button=document.getElementById('accountOauthConfirm');if(!code)return;
+  const attempt=window.currentWizardAttempt?.(); // S-010, S-016: см. пояснение у accountOauthStart
+  try{
+    setConnectBusy(button,status,'checking_server',true,attempt);
+    const connected=await window.tm.completeYandexOauth(accountOauthState,code,attempt);
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
+    setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);
+  }
+  catch(e){
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    if(isReauthError(e)){accountOauthState='';document.getElementById('accountOauthCode').value='';document.getElementById('accountCodeRow').classList.add('hidden');setConnectBusy(document.getElementById('accountOauthStart'),null,null,false);status.textContent=L('Код истёк или уже был использован. Нажмите «Подключить» и получите новый код.','The code expired or was already used. Select Connect to get a new code.');}
+    else status.textContent=connectFailureText(e);
+    status.dataset.kind='error';
+  }
 };
 document.getElementById('wzConnect').onclick=async()=>{
   const email=document.getElementById('wzEmail').value.trim(),status=document.getElementById('wzConnectStatus');
   const button=document.getElementById('wzConnect');
+  // S-009: номер попытки мастера на момент запуска команды - поздний ответ
+  // мастера, который к тому моменту закрыт или заново открыт с другим номером,
+  // не должен трогать чужой (или уже несуществующий) экран мастера.
+  const attempt=window.currentWizardAttempt?.();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=wt('invalidEmail');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=wt('oauthUnavailable');status.dataset.kind='error';return;}
-  try{button.disabled=true;status.textContent=wizardLocale==='en'?'Detecting provider and sign-in method…':'Определяю провайдера и способ входа…';status.dataset.kind='';const pending=await window.tm.beginAccountConnection(email);if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('enterCode');document.getElementById('wzOauthCode').focus();}
-  catch(e){button.disabled=false;status.textContent=e.message||String(e);status.dataset.kind='error';}
+  try{
+    setConnectBusy(button,status,'detecting',true,attempt);
+    const pending=await window.tm.beginAccountConnection(email,attempt);
+    // F5, S-009, S-012: данные аккаунтов и готовность композера обновляем при
+    // любом завершении команды, до решения, показывать ли результат в
+    // мастере - мастер этой попытки мог тем временем уже закрыться или
+    // переоткрыться с другим номером попытки.
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isWizardAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
+    if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
+    // S-009: команда перешла к ожиданию кода - кнопка освобождается (уже
+    // сделано выше), а заметная область показывает отдельное состояние.
+    pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('connectStageWaitingCode');document.getElementById('wzOauthCode').focus();
+  }catch(e){
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isWizardAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+  }
 };
 document.getElementById('wzConfirm').onclick=async()=>{
-  const code=document.getElementById('wzOauthCode').value.trim(),status=document.getElementById('wzConnectStatus');if(!code)return;
-  try{status.textContent=wt('connecting');status.dataset.kind='';document.getElementById('wzConfirm').disabled=true;const connected=await window.tm.completeYandexOauth(pendingOauthState,code);status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;}
-  catch(e){if(isExpiredOauthCode(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');document.getElementById('wzConnect').disabled=false;status.textContent=wt('codeExpired');}else status.textContent=e.message||String(e);status.dataset.kind='error';document.getElementById('wzConfirm').disabled=false;}
+  const code=document.getElementById('wzOauthCode').value.trim(),status=document.getElementById('wzConnectStatus'),button=document.getElementById('wzConfirm');if(!code)return;
+  const attempt=window.currentWizardAttempt?.(); // S-009: см. пояснение у wzConnect
+  try{
+    setConnectBusy(button,status,'checking_server',true,attempt);
+    const connected=await window.tm.completeYandexOauth(pendingOauthState,code,attempt);
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isWizardAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;
+  }catch(e){
+    await refreshAccountsAndComposerReadiness();
+    if(!window.isWizardAttemptCurrent?.(attempt))return;
+    setConnectBusy(button,null,null,false);
+    if(isReauthError(e)){pendingOauthState='';document.getElementById('wzOauthCode').value='';document.getElementById('wzCodeBox').classList.add('hidden');setConnectBusy(document.getElementById('wzConnect'),null,null,false);status.textContent=wt('codeExpired');}else status.textContent=connectFailureText(e);status.dataset.kind='error';
+  }
 };
-

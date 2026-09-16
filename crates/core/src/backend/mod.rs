@@ -6,7 +6,7 @@ mod imap;
 mod jmap;
 mod smtp;
 
-pub use ews::{EwsBackend, discover_ews_url};
+pub use ews::{EwsBackend, EwsTimeouts, discover_ews_url};
 pub use imap::{
     DiscoveredFlagUpdate, DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery,
     apply_gmail_operation, apply_password_operation, apply_yandex_operation, discover_gmail,

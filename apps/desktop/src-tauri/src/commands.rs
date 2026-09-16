@@ -27,7 +27,9 @@ use truemail_core::model::{
     MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
     ServerConfig, Signature, SmartFolder, SmartFolderCount, resolve_my_attendance,
 };
-use truemail_core::storage::repo::{CalendarChange, CalendarChangeKind, CalendarSummary};
+use truemail_core::storage::repo::{
+    CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
@@ -72,6 +74,16 @@ pub struct AppState {
     // соглашается прочитать. Иначе команда была бы примитивом чтения любого
     // файла пользователя для произвольного кода в окне.
     pub allowed_attachments: Arc<std::sync::Mutex<HashSet<String>>>,
+    // Сбор диагностики (diagnostics-bundle.md): одновременно разрешён только
+    // один сбор, повторное нажатие видит уже активное состояние (границы
+    // задачи, "Скорость и потребление ресурсов").
+    pub diagnostics_running: std::sync::atomic::AtomicBool,
+    // Адреса почты с активной попыткой подключения (account-connect-progress.md,
+    // S-015): вторая попытка того же адреса из любого окна отклоняется, пока
+    // первая не завершится. Не переживает перезапуск программы и не пишется в БД.
+    // Arc - ConnectAttemptGuard клонирует ссылку на реестр, чтобы снять свою
+    // запись из отдельной задачи в Drop (async-освобождение при синхронном drop).
+    pub connecting_addresses: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 /// Скачанный пакет обновления: версия, файл в каталоге данных и отпечаток
@@ -208,37 +220,117 @@ pub struct ConnectedAccount {
     warnings: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     pub(crate) message: String,
 }
 
+const API_ERROR_META: &str = "\u{1e}truemail-error\u{1f}";
+
+struct ApiErrorParts<'a> {
+    message: &'a str,
+    kind: &'a str,
+    account_id: Option<i64>,
+    retry_at: Option<&'a str>,
+}
+
+impl ApiError {
+    fn from_parts(
+        message: impl Into<String>,
+        kind: &str,
+        account_id: Option<i64>,
+        retry_at: Option<String>,
+    ) -> Self {
+        let message = message.into();
+        Self {
+            // Метаданные живут только внутри Rust и удаляются сериализатором.
+            // Такой конверт сохраняет совместимость старых литералов ApiError.
+            message: format!(
+                "{API_ERROR_META}{kind}\u{1f}{}\u{1f}{}\u{1f}{message}",
+                account_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                retry_at.unwrap_or_default()
+            ),
+        }
+    }
+
+    fn parts(&self) -> ApiErrorParts<'_> {
+        let Some(encoded) = self.message.strip_prefix(API_ERROR_META) else {
+            return ApiErrorParts {
+                message: &self.message,
+                kind: "unknown",
+                account_id: None,
+                retry_at: None,
+            };
+        };
+        let mut fields = encoded.splitn(4, '\u{1f}');
+        let kind = fields
+            .next()
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let account_id = fields.next().and_then(|value| value.parse().ok());
+        let retry_at = fields.next().filter(|value| !value.is_empty());
+        let message = fields.next().unwrap_or_default();
+        ApiErrorParts {
+            message,
+            kind,
+            account_id,
+            retry_at,
+        }
+    }
+
+    fn safe_message(&self) -> String {
+        truemail_core::error::sanitize_error_message(self.parts().message)
+    }
+
+    fn with_account_id(self, account_id: i64) -> Self {
+        let parts = self.parts();
+        Self::from_parts(
+            parts.message,
+            parts.kind,
+            Some(account_id),
+            parts.retry_at.map(str::to_owned),
+        )
+    }
+}
+
 // Централизованный логгинг: каждый ApiError перед возвратом в UI сериализуется
-// Tauri именно здесь, поэтому это единственная точка, где ошибку нужно
-// залогировать - независимо от того, как она была создана (From, api_error или
-// литерал). Локальный троттлинг (RateLimited) - ожидаемое состояние, пишем info;
-// остальное - warn.
+// Tauri именно здесь, поэтому текст очищается до журнала и ответа.
 impl Serialize for ApiError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        if self.message.contains("временно ограничен") {
-            tracing::info!(error = %self.message, "команда ограничена лимитом транспорта");
+        let parts = self.parts();
+        let message = truemail_core::error::sanitize_error_message(parts.message);
+        if parts.kind == "rate_limited" {
+            tracing::info!(error_kind = parts.kind, account_id = ?parts.account_id, error = %message, "команда ограничена лимитом транспорта");
         } else {
-            tracing::warn!(error = %self.message, "команда вернула ошибку в UI");
+            tracing::warn!(error_kind = parts.kind, account_id = ?parts.account_id, error = %message, "команда вернула ошибку в UI");
         }
-        let mut state = serializer.serialize_struct("ApiError", 1)?;
-        state.serialize_field("message", &self.message)?;
+        let mut state = serializer.serialize_struct(
+            "ApiError",
+            2 + usize::from(parts.account_id.is_some()) + usize::from(parts.retry_at.is_some()),
+        )?;
+        state.serialize_field("message", &message)?;
+        state.serialize_field("kind", parts.kind)?;
+        if let Some(account_id) = parts.account_id {
+            state.serialize_field("account_id", &account_id)?;
+        }
+        if let Some(retry_at) = parts.retry_at {
+            state.serialize_field("retry_at", retry_at)?;
+        }
         state.end()
     }
 }
 
 impl From<truemail_core::Error> for ApiError {
     fn from(e: truemail_core::Error) -> Self {
-        ApiError {
-            message: e.to_string(),
-        }
+        let kind = e.code();
+        let retry_at = e.retry_at().map(|value| value.to_rfc3339());
+        ApiError::from_parts(e.to_string(), kind, None, retry_at)
     }
 }
 
@@ -248,6 +340,23 @@ fn api_error(message: impl Into<String>) -> ApiError {
     ApiError {
         message: message.into(),
     }
+}
+
+fn sync_error_state(
+    account_id: i64,
+    scope: &str,
+    status: &str,
+    error: &truemail_core::Error,
+) -> serde_json::Value {
+    let message = truemail_core::error::sanitize_error_message(&error.to_string());
+    serde_json::json!({
+        "account_id": account_id,
+        "scope": scope,
+        "status": status,
+        "error": message,
+        "error_kind": error.code(),
+        "error_message": message,
+    })
 }
 
 const DEFAULT_UPDATE_ENDPOINT: &str =
@@ -333,7 +442,7 @@ pub async fn announce_available_update(app: AppHandle) -> CmdResult<()> {
         }
         // Не смогли скачать заранее - не беда: установка по кнопке скачает сама.
         Err(error) => tracing::warn!(
-            error = %error.message,
+            error = %error.safe_message(),
             version,
             "обновление не удалось скачать заранее"
         ),
@@ -1253,9 +1362,26 @@ async fn gmail_realtime_loop(
             }
             let synced = core.accounts.sync_mail_inbox(&account).await;
             syncing.lock().await.remove(&account.id);
+            // F4: постоянное состояние синхронизации почты аккаунта пишем и
+            // публикуем по фактическому исходу этого прохода - как и общий
+            // цикл sync_accounts, и наблюдатель за почтой у остальных
+            // провайдеров (mail-sync-visible-state.md, S-002, S-003). Без
+            // этого старая ошибка (или, наоборот, старый успех) оставались бы
+            // в базе после прохода Gmail realtime, который их не обновлял.
+            if let Err(error) = core
+                .db
+                .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&synced))
+                .await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+            }
             match synced {
                 Ok(result) => {
                     pending.remove(&account.id);
+                    let _ = app.emit(
+                        "truemail-sync-state",
+                        serde_json::json!({"account_id": account.id, "scope": "mail", "status": "ready"}),
+                    );
                     let _ = app.emit("truemail-data-changed", account.id);
                     notify_new_mail(
                         &app,
@@ -1268,6 +1394,8 @@ async fn gmail_realtime_loop(
                     .await;
                 }
                 Err(error) => {
+                    let state = sync_error_state(account.id, "mail", "error", &error);
+                    let _ = app.emit("truemail-sync-state", state);
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
             }
@@ -1623,11 +1751,12 @@ pub async fn rename_account(
     account_id: i64,
     display_name: String,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .rename_account(account_id, &display_name)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 #[derive(Serialize)]
@@ -1703,11 +1832,12 @@ pub async fn set_account_color(
     account_id: i64,
     color: String,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .set_account_color(account_id, &color)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 /// Глубина локального кэша аккаунта в днях (0 - без ограничений).
@@ -1717,16 +1847,17 @@ pub async fn set_account_retention(
     account_id: i64,
     days: i64,
 ) -> CmdResult<()> {
-    Ok(core(&state)
+    core(&state)
         .await?
         .db
         .set_account_retention(account_id, days)
-        .await?)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 /// Ошибка тихой смены пароля (accounts-accordion-password.md, S-010): свой
 /// тип с полем `code` - интерфейс различает случаи по нему, а не по тексту
-/// сообщения. Общий `ApiError` кода не несёт и не меняется.
+/// сообщения. Его прежняя форма сохраняется отдельно от общего `ApiError`.
 #[derive(Serialize)]
 pub struct ChangePasswordApiError {
     code: &'static str,
@@ -1735,9 +1866,13 @@ pub struct ChangePasswordApiError {
 
 impl From<truemail_core::account::ChangePasswordError> for ChangePasswordApiError {
     fn from(error: truemail_core::account::ChangePasswordError) -> Self {
+        // F6: message здесь собирался из error.to_string() без очистки, в
+        // отличие от общего ApiError (см. From<truemail_core::Error> для
+        // ApiError выше) - код (code) не меняется по смыслу, обезличивается
+        // только текст.
         ChangePasswordApiError {
             code: error.code(),
-            message: error.to_string(),
+            message: truemail_core::error::sanitize_error_message(&error.to_string()),
         }
     }
 }
@@ -1746,7 +1881,7 @@ impl From<ApiError> for ChangePasswordApiError {
     fn from(error: ApiError) -> Self {
         ChangePasswordApiError {
             code: "backend_unavailable",
-            message: error.message,
+            message: error.safe_message(),
         }
     }
 }
@@ -1790,7 +1925,12 @@ pub async fn change_account_password(
 
 #[tauri::command]
 pub async fn list_folders(state: State<'_, AppState>, account_id: i64) -> CmdResult<Vec<Folder>> {
-    Ok(core(&state).await?.db.list_folders(account_id).await?)
+    core(&state)
+        .await?
+        .db
+        .list_folders(account_id)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
 #[tauri::command]
@@ -3102,7 +3242,7 @@ pub async fn move_storage(
             .map_err(|restore| ApiError {
                 message: format!(
                     "{}; исходное хранилище не открылось: {restore}",
-                    error.message
+                    error.safe_message()
                 ),
             })?;
         *state.core.write().await = Some(Arc::new(restored));
@@ -3279,6 +3419,17 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     | truemail_core::model::Provider::Exchange
             );
             let mail = sync_core.accounts.sync_mail_account(&account).await;
+            // Постоянное состояние пишем по фактическому исходу sync_mail_account,
+            // а не по итоговому статусу события ниже - они расходятся при
+            // частичном исходе цикла, когда почта не синхронизировалась, а
+            // календарь и контакты - да (mail-sync-visible-state.md, S-013).
+            if let Err(error) = sync_core
+                .db
+                .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&mail))
+                .await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+            }
             // Ограничение почтового транспорта не должно останавливать
             // независимые Calendar/Contacts/Tasks API этого же аккаунта.
             let auxiliary = if supports_auxiliary {
@@ -3318,7 +3469,9 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
                 }
                 (Err(mail_error), Ok(aux)) if supports_auxiliary => {
-                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "почта отложена, вспомогательный sync завершён");
+                    let message =
+                        truemail_core::error::sanitize_error_message(&mail_error.to_string());
+                    tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %message, calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "почта отложена, вспомогательный sync завершён");
                     if !aux.changes.is_empty() {
                         notify_calendar_changes(
                             &sync_app,
@@ -3330,17 +3483,20 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         )
                         .await;
                     }
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [mail_error.to_string()], "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [message.clone()], "error_kind": mail_error.code(), "error_message": message, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
-                    let error =
-                        format!("почта: {mail_error}; календарь/контакты: {auxiliary_error}");
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %mail_error, %auxiliary_error, "фоновая синхронизация не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error})
+                    let error = truemail_core::error::sanitize_error_message(&format!(
+                        "почта: {mail_error}; календарь/контакты: {auxiliary_error}"
+                    ));
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %error, "фоновая синхронизация не удалась");
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.clone(), "error_kind": mail_error.code(), "error_message": error})
                 }
                 (Err(error), Ok(_)) => {
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая синхронизация не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.to_string()})
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "фоновая синхронизация не удалась");
+                    sync_error_state(account.id, "all", "error", &error)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3399,8 +3555,10 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
                     serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready", "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 Err(error) => {
-                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "синхронизация календаря, задач и контактов не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "error", "error": error.to_string()})
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "синхронизация календаря, задач и контактов не удалась");
+                    sync_error_state(account.id, "auxiliary", "error", &error)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3496,12 +3654,27 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             } else {
                                 watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
+                            // Постоянное состояние - по фактическому исходу этого
+                            // прохода (mail-sync-visible-state.md, S-002, S-003);
+                            // обрыв ожидания IDLE ("retrying" ниже) - отдельное
+                            // переходное состояние и сюда не попадает.
+                            if let Err(error) = watch_core
+                                .db
+                                .record_mail_sync_outcome(
+                                    watch_account.id,
+                                    &MailSyncOutcome::from_result(&inbox_sync),
+                                )
+                                .await
+                            {
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "не удалось сохранить состояние синхронизации почты");
+                            }
                             // Данные меняются не на каждой итерации: IDLE
                             // переустанавливается сам примерно раз в 90 секунд, и
                             // раньше каждая такая переустановка поднимала во
                             // фронтенде полную перезагрузку данных (страница писем
                             // по каждой папке, контакты, календари) вхолостую.
                             let mail_changed;
+                            let mut error_state = None;
                             match inbox_sync {
                                 Ok(result) => {
                                     let ids = notification_ids(&result);
@@ -3542,15 +3715,26 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     // лишняя перезагрузка дешевле, чем список,
                                     // застрявший до следующего удачного прохода.
                                     mail_changed = true;
+                                    error_state = Some(sync_error_state(
+                                        watch_account.id,
+                                        "mail",
+                                        "error",
+                                        &error,
+                                    ));
+                                    let safe_error = truemail_core::error::sanitize_error_message(
+                                        &error.to_string(),
+                                    );
                                     tracing::error!(
                                         account = %truemail_core::logging::mask_email(&watch_account.email),
-                                        %error,
+                                        error_kind = error.code(),
+                                        error = %safe_error,
                                         "не удалось дозагрузить входящие"
                                     );
                                 }
                             }
                             watch_syncing.lock().await.remove(&watch_account.id);
-                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let state = error_state.unwrap_or_else(|| serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let _ = watch_app.emit("truemail-sync-state", state);
                             if mail_changed {
                                 let _ = watch_app.emit("truemail-data-changed", watch_account.id);
                             }
@@ -3566,12 +3750,33 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("unexpected eof")
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
+                            let safe_error = truemail_core::error::sanitize_error_message(&text);
                             if routine {
-                                tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой переустанавливается");
+                                tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой переустанавливается");
                             } else {
-                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), %error, "наблюдение за почтой будет восстановлено");
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой будет восстановлено");
                             }
-                            let _ = watch_app.emit("truemail-sync-state", serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "retrying"}));
+                            // F4: обрыв ожидания IDLE (wait_for_mail_change)
+                            // раньше публиковался только переходным "retrying"
+                            // и не писался в постоянное состояние - отказ
+                            // авторизации наблюдателя пропадал после
+                            // перезапуска программы, пока не пройдёт новый
+                            // успешный или неуспешный проход самой синхронизации.
+                            let outcome = MailSyncOutcome::Failure {
+                                message: safe_error.clone(),
+                                kind: error.code().to_owned(),
+                                needs_reauth: error.requires_reauth(),
+                            };
+                            if let Err(db_error) = watch_core
+                                .db
+                                .record_mail_sync_outcome(watch_account.id, &outcome)
+                                .await
+                            {
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error = %db_error, "не удалось сохранить состояние синхронизации почты");
+                            }
+                            let state =
+                                sync_error_state(watch_account.id, "mail", "retrying", &error);
+                            let _ = watch_app.emit("truemail-sync-state", state);
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
                         }
@@ -4097,15 +4302,36 @@ async fn spawn_initial_mail_sync(
     let sync_set = state.syncing.clone();
     let aux_sync_set = state.syncing_aux.clone();
     let sync_app = app.clone();
+    // S-012: первая синхронизация тоже сообщает о начале и об исходе, тем же
+    // событием и той же областью "all", что и цикл sync_accounts - иначе между
+    // "аккаунт подключён" и первым исходом синхронизации в интерфейсе нет
+    // никакого признака.
+    let _ = app.emit(
+        "truemail-sync-state",
+        serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
+    );
     tokio::spawn(async move {
-        match core.accounts.sync_mail_account(&account).await {
+        let mail_result = core.accounts.sync_mail_account(&account).await;
+        // Постоянное состояние - по факту Ok/Err этого прохода (S-002, S-003).
+        if let Err(error) = core
+            .db
+            .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&mail_result))
+            .await
+        {
+            tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+        }
+        let sync_state = match &mail_result {
             Ok(result) => {
-                tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена")
+                tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена");
+                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready"})
             }
             Err(error) => {
-                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), %error, "первая синхронизация почты не удалась")
+                let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
+                tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась");
+                sync_error_state(account.id, "all", "error", error)
             }
-        }
+        };
+        let _ = sync_app.emit("truemail-sync-state", sync_state);
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
         if matches!(account.provider, Provider::Gmail | Provider::Exchange)
@@ -4126,11 +4352,16 @@ async fn spawn_initial_mail_sync(
                     contacts = aux.contacts,
                     "первая синхронизация календарей и контактов завершена"
                 ),
-                Err(error) => tracing::error!(
-                    account = %truemail_core::logging::mask_email(&account.email),
-                    %error,
-                    "первая синхронизация календарей и контактов не удалась"
-                ),
+                Err(error) => {
+                    let safe_error =
+                        truemail_core::error::sanitize_error_message(&error.to_string());
+                    tracing::error!(
+                        account = %truemail_core::logging::mask_email(&account.email),
+                        error_kind = error.code(),
+                        error = %safe_error,
+                        "первая синхронизация календарей и контактов не удалась"
+                    )
+                }
             }
             aux_sync_set.lock().await.remove(&account.id);
             let _ = sync_app.emit("truemail-data-changed", account.id);
@@ -4180,225 +4411,456 @@ fn open_in_yandex_browser(app: &AppHandle, url: &str) -> CmdResult<()> {
     }
 }
 
+// --- Видимый ход подключения аккаунта (issue #68, account-connect-progress.md) ---
+
+/// Общий предел одного вызова команды подключения (S-004). Время, пока
+/// пользователь сам входит в браузере или вводит код OAuth, сюда не входит -
+/// у этого ожидания свой отдельный предел (S-009).
+const CONNECT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn connect_timeout_error() -> ApiError {
+    ApiError::from_parts(
+        "Подключение заняло слишком много времени. Проверьте сеть и адрес сервера, затем повторите попытку",
+        "timeout",
+        None,
+        None,
+    )
+}
+
+/// Оборачивает часть попытки подключения общим пределом времени (S-004) и
+/// превращает истечение в вид ошибки `timeout` - error-kinds-and-messages.md
+/// не переопределяется, код ошибки берётся из уже существующего набора.
+async fn with_connect_timeout<F, T>(future: F) -> CmdResult<T>
+where
+    F: std::future::Future<Output = CmdResult<T>>,
+{
+    match tokio::time::timeout(CONNECT_COMMAND_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_timeout_error()),
+    }
+}
+
+/// Та же обёртка, но с бюджетом, уменьшенным на `elapsed_before` - часть
+/// попытки, которая уже прошла раньше в этом же вызове команды (S-004: предел
+/// один на весь вызов целиком, а не отдельный на каждый его сетевой этап).
+/// Используется там, где после исключённого из предела ожидания (S-009, вход
+/// в браузере) идёт вторая сетевая часть одного и того же вызова.
+async fn with_connect_timeout_remaining<F, T>(
+    elapsed_before: std::time::Duration,
+    future: F,
+) -> CmdResult<T>
+where
+    F: std::future::Future<Output = CmdResult<T>>,
+{
+    let remaining = CONNECT_COMMAND_TIMEOUT.saturating_sub(elapsed_before);
+    match tokio::time::timeout(remaining, future).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_timeout_error()),
+    }
+}
+
+/// Сообщает интерфейсу подтверждённый этап попытки подключения (S-002, S-003).
+/// Событие адресовано конкретному адресу почты - экран решает сам, относится
+/// ли оно к попытке, которая на нём сейчас активна (S-016). `attempt_id` -
+/// номер попытки, полученный от интерфейса при запуске команды (F7): интерфейс
+/// сверяет его с номером, активным сейчас на экране, а не только адрес и
+/// занятость кнопки - иначе позднее событие прежней попытки того же адреса
+/// могло бы изменить текст уже новой попытки.
+#[derive(Clone, Serialize)]
+struct ConnectStageEvent<'a> {
+    email: &'a str,
+    stage: &'a str,
+    attempt_id: i64,
+}
+
+fn emit_connect_stage(app: &AppHandle, email: &str, stage: &str, attempt_id: i64) {
+    let _ = app.emit(
+        "truemail-connect-stage",
+        ConnectStageEvent {
+            email,
+            stage,
+            attempt_id,
+        },
+    );
+}
+
+/// S-015: не более одной активной попытки подключения на адрес почты во всей
+/// программе - реестр общий для мастера и настроек, поэтому вторая попытка из
+/// любого другого окна отклоняется, пока не завершится первая. Запись в
+/// реестре снимается при уничтожении guard - успехом, ошибкой или истечением
+/// общего предела времени.
+struct ConnectAttemptGuard {
+    registry: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    email: String,
+}
+
+impl ConnectAttemptGuard {
+    async fn acquire(
+        registry: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+        email: &str,
+    ) -> CmdResult<Self> {
+        let mut active = registry.lock().await;
+        if !active.insert(email.to_owned()) {
+            return Err(api_error(
+                "Подключение этого адреса уже выполняется в другом окне. Дождитесь его завершения.",
+            ));
+        }
+        Ok(Self {
+            registry: registry.clone(),
+            email: email.to_owned(),
+        })
+    }
+}
+
+impl Drop for ConnectAttemptGuard {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let email = std::mem::take(&mut self.email);
+        // Drop синхронный - снятие записи из реестра уходит отдельной задачей.
+        tokio::spawn(async move {
+            registry.lock().await.remove(&email);
+        });
+    }
+}
+
+/// Последний подтверждённый этап и вид подключения для S-008 - обычная
+/// `Cell` здесь не годится: она никогда не `Sync`, а тело команды Tauri
+/// должно остаться `Send`-совместимым future (значение живёт внутри одного
+/// вызова команды и никогда не покидает поток исполнителя одновременно).
+struct StageCell(std::sync::Mutex<&'static str>);
+
+impl StageCell {
+    fn new(value: &'static str) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    fn set(&self, value: &'static str) {
+        *self.0.lock().unwrap() = value;
+    }
+
+    fn get(&self) -> &'static str {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// S-008: журнал неуспешной попытки подключения - вид подключения, последний
+/// подтверждённый этап, длительность и машиночитаемый вид ошибки; ни пароль,
+/// ни код OAuth, ни полный адрес в запись не попадают.
+fn log_connect_failure(
+    connection_kind: &str,
+    stage: &str,
+    started: std::time::Instant,
+    email: &str,
+    error: &ApiError,
+) {
+    let parts = error.parts();
+    tracing::warn!(
+        connection_kind,
+        stage,
+        duration_ms = started.elapsed().as_millis() as u64,
+        error_kind = parts.kind,
+        email = %truemail_core::logging::mask_email(email),
+        "попытка подключения аккаунта не удалась"
+    );
+}
+
 #[tauri::command]
 pub async fn begin_account_connection(
     app: AppHandle,
     state: State<'_, AppState>,
     email: String,
+    attempt_id: i64,
 ) -> CmdResult<PendingOAuthResponse> {
     let core = core(&state).await?;
     let email = email.trim().to_lowercase();
-    let config = truemail_core::account::discover_provider(&email).await;
+    // S-015: реестр активных попыток общий для мастера и настроек - вторая
+    // попытка того же адреса из любого другого окна отклоняется, пока не
+    // завершится первая.
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    // Последний подтверждённый этап и вид подключения - только для записи в
+    // журнал неуспешной попытки (S-008); на успешный путь не влияют.
+    let stage = StageCell::new("detecting");
+    let connection_kind = StageCell::new("detect");
+    // Определение провайдера - быстрый сетевой шаг (DNS), укладывается в
+    // общий предел команды (S-004) целиком. discover_provider не возвращает
+    // Result - оборачиваем в async-блок, чтобы совпасть с сигнатурой
+    // with_connect_timeout.
+    let config = match with_connect_timeout(async {
+        Ok(truemail_core::account::discover_provider(&email).await)
+    })
+    .await
+    {
+        Ok(config) => config,
+        Err(error) => {
+            log_connect_failure(connection_kind.get(), stage.get(), started, &email, &error);
+            return Err(error);
+        }
+    };
+    // S-004: предел один на весь вызов, а не отдельный на каждый его этап -
+    // время, уже потраченное на определение провайдера, вычитается из бюджета
+    // второй сетевой части (обмен кода на токен и сохранение аккаунта), иначе
+    // медленный DNS и медленный обмен токена вместе получили бы до 240 секунд.
+    let phase1_elapsed = started.elapsed();
     let pkce = truemail_core::account::generate_pkce();
     let oauth_state = truemail_core::account::generate_state();
-    match config.provider {
-        truemail_core::model::Provider::Yandex => {
-            let client_id = yandex_client_id()?;
-            // Redirect URI должен быть зарегистрирован в OAuth-приложении
-            // Яндекса с точным scheme/host/port/path.
-            let redirect_uri = configured_yandex_redirect_uri();
-            let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
-                message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
-            })?;
-            if redirect.scheme() != "http"
-                || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
-            {
-                return Err(ApiError {
-                    message: "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
-                        .into(),
-                });
+    let outcome: CmdResult<PendingOAuthResponse> = async {
+        match config.provider {
+            truemail_core::model::Provider::Yandex => {
+                connection_kind.set("yandex_oauth");
+                let client_id = yandex_client_id()?;
+                // Redirect URI должен быть зарегистрирован в OAuth-приложении
+                // Яндекса с точным scheme/host/port/path.
+                let redirect_uri = configured_yandex_redirect_uri();
+                let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
+                    message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
+                })?;
+                if redirect.scheme() != "http"
+                    || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
+                {
+                    return Err(ApiError {
+                        message:
+                            "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
+                                .into(),
+                    });
+                }
+                let port = redirect.port().ok_or_else(|| ApiError {
+                    message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
+                })?;
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!(
+                            "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
+                        ),
+                    })?;
+                let url = truemail_core::account::yandex_authorize_url(
+                    &client_id,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                // S-009: время, пока пользователь входит в браузере, не считается
+                // в общий предел команды - у ожидания свой предел (300 секунд)
+                // внутри receive_oauth_callback.
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
+                let code =
+                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_yandex_code(
+                        &client_id,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
+                    let connected = core
+                        .accounts
+                        .add_yandex_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
+                .await?;
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
             }
-            let port = redirect.port().ok_or_else(|| ApiError {
-                message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
-            })?;
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!(
-                        "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
-                    ),
-                })?;
-            let url = truemail_core::account::yandex_authorize_url(
-                &client_id,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
-            let token = truemail_core::account::exchange_yandex_code(
-                &client_id,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_yandex_oauth(&email, &display_name, token)
+            truemail_core::model::Provider::Gmail => {
+                connection_kind.set("gmail_oauth");
+                let (client_id, client_secret) = google_client_credentials()?;
+                let client_secret = Zeroizing::new(client_secret);
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                    })?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось определить OAuth callback: {error}"),
+                    })?
+                    .port();
+                let redirect_uri = format!("http://127.0.0.1:{port}/oauth/google/callback");
+                let url = truemail_core::account::google_authorize_url(
+                    &client_id,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
+                let code =
+                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_google_code(
+                        &client_id,
+                        &client_secret,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
+                    let connected = core
+                        .accounts
+                        .add_gmail_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
                 .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        truemail_core::model::Provider::Gmail => {
-            let (client_id, client_secret) = google_client_credentials()?;
-            let client_secret = Zeroizing::new(client_secret);
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
-                })?;
-            let port = listener
-                .local_addr()
-                .map_err(|error| ApiError {
-                    message: format!("не удалось определить OAuth callback: {error}"),
-                })?
-                .port();
-            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/google/callback");
-            let url = truemail_core::account::google_authorize_url(
-                &client_id,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
-            let token = truemail_core::account::exchange_google_code(
-                &client_id,
-                &client_secret,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_gmail_oauth(&email, &display_name, token)
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
+            }
+            truemail_core::model::Provider::Outlook => {
+                connection_kind.set("outlook_oauth");
+                let client_id = microsoft_client_id()?;
+                let tenant = configured_microsoft_tenant();
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                    })?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось определить OAuth callback: {error}"),
+                    })?
+                    .port();
+                let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
+                let url = truemail_core::account::microsoft_authorize_url(
+                    &client_id,
+                    &tenant,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
+                let code = Zeroizing::new(
+                    receive_oauth_callback(listener, &oauth_state, "Microsoft").await?,
+                );
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_microsoft_code(
+                        &client_id,
+                        &tenant,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
+                    let connected = core
+                        .accounts
+                        .add_outlook_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
                 .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        truemail_core::model::Provider::Outlook => {
-            let client_id = microsoft_client_id()?;
-            let tenant = configured_microsoft_tenant();
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
-                })?;
-            let port = listener
-                .local_addr()
-                .map_err(|error| ApiError {
-                    message: format!("не удалось определить OAuth callback: {error}"),
-                })?
-                .port();
-            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
-            let url = truemail_core::account::microsoft_authorize_url(
-                &client_id,
-                &tenant,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Microsoft").await?);
-            let token = truemail_core::account::exchange_microsoft_code(
-                &client_id,
-                &tenant,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_outlook_oauth(&email, &display_name, token)
-                .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        Provider::Mailru | Provider::Icloud | Provider::Generic => {
-            let domain = email.rsplit('@').next().unwrap_or_default();
-            Ok(PendingOAuthResponse {
-                mode: "password".into(),
-                state: None,
-                connected: None,
-                password_config: Some(PasswordConnectionInfo {
-                    provider: config.provider,
-                    backend_kind: config.backend_kind,
-                    username: email.clone(),
-                    imap: if config.backend_kind == BackendKind::Jmap {
-                        None
-                    } else {
-                        Some(config.imap.unwrap_or(ServerConfig {
-                            host: format!("imap.{domain}"),
-                            port: 993,
-                            security: Security::Ssl,
-                        }))
-                    },
-                    smtp: if config.backend_kind == BackendKind::Jmap {
-                        None
-                    } else {
-                        config.smtp.or_else(|| {
-                            (!domain.is_empty()).then(|| ServerConfig {
-                                host: format!("smtp.{domain}"),
-                                port: 465,
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
+            }
+            Provider::Mailru | Provider::Icloud | Provider::Generic => {
+                connection_kind.set("password_detect");
+                let domain = email.rsplit('@').next().unwrap_or_default();
+                Ok(PendingOAuthResponse {
+                    mode: "password".into(),
+                    state: None,
+                    connected: None,
+                    password_config: Some(PasswordConnectionInfo {
+                        provider: config.provider,
+                        backend_kind: config.backend_kind,
+                        username: email.clone(),
+                        imap: if config.backend_kind == BackendKind::Jmap {
+                            None
+                        } else {
+                            Some(config.imap.unwrap_or(ServerConfig {
+                                host: format!("imap.{domain}"),
+                                port: 993,
                                 security: Security::Ssl,
+                            }))
+                        },
+                        smtp: if config.backend_kind == BackendKind::Jmap {
+                            None
+                        } else {
+                            config.smtp.or_else(|| {
+                                (!domain.is_empty()).then(|| ServerConfig {
+                                    host: format!("smtp.{domain}"),
+                                    port: 465,
+                                    security: Security::Ssl,
+                                })
                             })
-                        })
-                    },
-                    jmap_url: config.jmap_url,
-                    ews_url: None,
-                }),
-            })
+                        },
+                        jmap_url: config.jmap_url,
+                        ews_url: None,
+                    }),
+                })
+            }
+            Provider::Exchange => {
+                connection_kind.set("password_detect");
+                Ok(PendingOAuthResponse {
+                    mode: "password".into(),
+                    state: None,
+                    connected: None,
+                    // Autodiscover уточнит адрес EWS с учётными данными; из discover
+                    // приходит только предполагаемый URL как подсказка для поля.
+                    password_config: Some(PasswordConnectionInfo {
+                        provider: Provider::Exchange,
+                        backend_kind: BackendKind::Ews,
+                        username: email.clone(),
+                        imap: None,
+                        smtp: None,
+                        jmap_url: None,
+                        ews_url: config.ews_url,
+                    }),
+                })
+            }
         }
-        Provider::Exchange => Ok(PendingOAuthResponse {
-            mode: "password".into(),
-            state: None,
-            connected: None,
-            // Autodiscover уточнит адрес EWS с учётными данными; из discover
-            // приходит только предполагаемый URL как подсказка для поля.
-            password_config: Some(PasswordConnectionInfo {
-                provider: Provider::Exchange,
-                backend_kind: BackendKind::Ews,
-                username: email.clone(),
-                imap: None,
-                smtp: None,
-                jmap_url: None,
-                ews_url: config.ews_url,
-            }),
-        }),
     }
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure(connection_kind.get(), stage.get(), started, &email, error);
+    }
+    outcome
 }
 
 fn parse_security(value: &str) -> CmdResult<Security> {
@@ -4426,57 +4888,71 @@ pub async fn complete_password_imap(
     smtp_host: String,
     smtp_port: u16,
     smtp_security: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() || imap_host.trim().is_empty() {
-        return Err(ApiError {
-            message: "укажите имя пользователя и IMAP-сервер".into(),
-        });
-    }
-    if !matches!(
-        provider,
-        Provider::Mailru | Provider::Icloud | Provider::Generic
-    ) {
-        return Err(ApiError {
-            message: "этот способ входа не подходит выбранному провайдеру".into(),
-        });
-    }
-    let config = truemail_core::account::ProviderConfig {
-        provider,
-        backend_kind: BackendKind::Imap,
-        auth_kind: if provider == Provider::Generic {
-            AuthKind::Password
-        } else {
-            AuthKind::AppPassword
-        },
-        imap: Some(ServerConfig {
-            host: imap_host.trim().to_owned(),
-            port: imap_port,
-            security: parse_security(&imap_security)?,
-        }),
-        smtp: (!smtp_host.trim().is_empty())
-            .then(|| {
-                Ok::<_, ApiError>(ServerConfig {
-                    host: smtp_host.trim().to_owned(),
-                    port: smtp_port,
-                    security: parse_security(&smtp_security)?,
+    // S-015: одна активная попытка на адрес во всей программе.
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() || imap_host.trim().is_empty() {
+            return Err(ApiError {
+                message: "укажите имя пользователя и IMAP-сервер".into(),
+            });
+        }
+        if !matches!(
+            provider,
+            Provider::Mailru | Provider::Icloud | Provider::Generic
+        ) {
+            return Err(ApiError {
+                message: "этот способ входа не подходит выбранному провайдеру".into(),
+            });
+        }
+        let config = truemail_core::account::ProviderConfig {
+            provider,
+            backend_kind: BackendKind::Imap,
+            auth_kind: if provider == Provider::Generic {
+                AuthKind::Password
+            } else {
+                AuthKind::AppPassword
+            },
+            imap: Some(ServerConfig {
+                host: imap_host.trim().to_owned(),
+                port: imap_port,
+                security: parse_security(&imap_security)?,
+            }),
+            smtp: (!smtp_host.trim().is_empty())
+                .then(|| {
+                    Ok::<_, ApiError>(ServerConfig {
+                        host: smtp_host.trim().to_owned(),
+                        port: smtp_port,
+                        security: parse_security(&smtp_security)?,
+                    })
                 })
-            })
-            .transpose()?,
-        ews_url: None,
-        jmap_url: None,
-    };
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_password_imap(&email, &display_name, username, &password, &config)
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+                .transpose()?,
+            ews_url: None,
+            jmap_url: None,
+        };
+        let core = core(&state).await?;
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
+        let connected = core
+            .accounts
+            .add_password_imap(&email, &display_name, username, &password, &config)
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("imap", "checking_server", started, &email, error);
+    }
+    outcome
 }
 
 #[tauri::command]
@@ -4487,30 +4963,46 @@ pub async fn complete_exchange_ews(
     username: String,
     password: String,
     server_hint: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() {
-        return Err(ApiError {
-            message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
-        });
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() {
+            return Err(ApiError {
+                message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
+            });
+        }
+        let core = core(&state).await?;
+        // Автопоиск (S-012) и проверка учётных данных (S-013) на пониженных
+        // пределах одного соединения (S-014) выполняются внутри add_exchange_ews;
+        // с точки зрения интерфейса это один этап "проверяю сервер".
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
+        let connected = core
+            .accounts
+            .add_exchange_ews(
+                &email,
+                &display_name,
+                username,
+                &password,
+                (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
+            )
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("ews", "checking_server", started, &email, error);
     }
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_exchange_ews(
-            &email,
-            &display_name,
-            username,
-            &password,
-            (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
-        )
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+    outcome
 }
 
 #[tauri::command]
@@ -4521,30 +5013,43 @@ pub async fn complete_jmap(
     username: String,
     password: String,
     session_url: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() || session_url.trim().is_empty() {
-        return Err(ApiError {
-            message: "укажите имя пользователя и JMAP Session URL".into(),
-        });
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() || session_url.trim().is_empty() {
+            return Err(ApiError {
+                message: "укажите имя пользователя и JMAP Session URL".into(),
+            });
+        }
+        let core = core(&state).await?;
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
+        let connected = core
+            .accounts
+            .add_jmap_password(
+                &email,
+                &display_name,
+                username,
+                &password,
+                session_url.trim(),
+            )
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("jmap", "checking_server", started, &email, error);
     }
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_jmap_password(
-            &email,
-            &display_name,
-            username,
-            &password,
-            session_url.trim(),
-        )
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+    outcome
 }
 
 #[tauri::command]
@@ -4553,6 +5058,7 @@ pub async fn complete_yandex_oauth(
     state: State<'_, AppState>,
     oauth_state: String,
     code: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let code = Zeroizing::new(code);
     let core = core(&state).await?;
@@ -4565,24 +5071,36 @@ pub async fn complete_yandex_oauth(
         .ok_or_else(|| ApiError {
             message: "OAuth-сессия не найдена или устарела".into(),
         })?;
-    let token = truemail_core::account::exchange_yandex_code(
-        &pending.client_id,
-        &code,
-        &pending.verifier,
-        "https://oauth.yandex.ru/verification_code",
-    )
-    .await?;
-    state.oauth.lock().await.remove(&oauth_state);
     let email = pending.email.trim().to_lowercase();
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_yandex_oauth(&email, &display_name, token)
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
+        let token = truemail_core::account::exchange_yandex_code(
+            &pending.client_id,
+            &code,
+            &pending.verifier,
+            "https://oauth.yandex.ru/verification_code",
+        )
         .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+        state.oauth.lock().await.remove(&oauth_state);
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
+        let connected = core
+            .accounts
+            .add_yandex_oauth(&email, &display_name, token)
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("yandex_oauth", "checking_server", started, &email, error);
+    }
+    outcome
 }
 
 /// Список инструментов внешнего API (для справки/настроек).
@@ -5143,5 +5661,236 @@ mod attachment_name_tests {
     #[test]
     fn trims_trailing_dots_and_spaces() {
         assert_eq!(safe_attachment_name("evil.. "), "evil");
+    }
+}
+
+#[cfg(test)]
+mod api_error_tests {
+    use super::*;
+    use truemail_core::ErrorKind;
+
+    #[test]
+    fn api_error_serializes_required_and_optional_fields() {
+        let retry_at = chrono::Utc::now() + chrono::Duration::minutes(2);
+        let error = ApiError::from(truemail_core::Error::RateLimited {
+            backend: "test".into(),
+            retry_at,
+            message: "token=secret".into(),
+        })
+        .with_account_id(17);
+        let value = serde_json::to_value(error).unwrap();
+        assert_eq!(value["kind"], "rate_limited");
+        assert_eq!(value["account_id"], 17);
+        assert_eq!(value["retry_at"], retry_at.to_rfc3339());
+        assert!(value["message"].as_str().unwrap().contains("[скрыто]"));
+        assert!(!value["message"].as_str().unwrap().contains("secret"));
+
+        let legacy = serde_json::to_value(api_error("plain failure")).unwrap();
+        assert_eq!(legacy["kind"], "unknown");
+        assert!(legacy.get("account_id").is_none());
+        assert!(legacy.get("retry_at").is_none());
+    }
+
+    #[test]
+    fn sync_error_event_keeps_old_fields_and_adds_kind_and_message() {
+        let cases = [
+            (
+                truemail_core::Error::classified_backend(
+                    "imap",
+                    ErrorKind::InvalidCredentials,
+                    "login",
+                ),
+                "invalid_credentials",
+            ),
+            (
+                truemail_core::Error::RateLimited {
+                    backend: "gmail".into(),
+                    retry_at: chrono::Utc::now(),
+                    message: "quota".into(),
+                },
+                "rate_limited",
+            ),
+            (
+                truemail_core::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NetworkUnreachable,
+                    "offline",
+                )),
+                "network_unavailable",
+            ),
+        ];
+        for (error, kind) in cases {
+            let value = sync_error_state(9, "mail", "error", &error);
+            assert_eq!(value["account_id"], 9);
+            assert_eq!(value["scope"], "mail");
+            assert_eq!(value["status"], "error");
+            assert_eq!(value["error_kind"], kind);
+            assert_eq!(value["error"], value["error_message"]);
+        }
+    }
+
+    // mail-sync-visible-state.md, S-013: в цикле sync_accounts почта аккаунта
+    // не синхронизировалась, а вспомогательные данные - да. Опубликованное
+    // событие в этой ветке (commands.rs, match (mail, auxiliary) =>
+    // (Err(mail_error), Ok(aux)) if supports_auxiliary) сообщает статус
+    // "ready" с текстом ошибки внутри warnings - но запись в базу строится по
+    // MailSyncOutcome::from_result(&mail) отдельно, до этого match, и не
+    // должна превращаться в успех только из-за того, что итоговое событие
+    // выглядит благополучно.
+    #[test]
+    fn partial_cycle_outcome_records_mail_failure_even_when_event_says_ready() {
+        let mail: truemail_core::Result<()> = Err(truemail_core::Error::classified_backend(
+            "imap",
+            ErrorKind::Timeout,
+            "нет ответа",
+        ));
+        let auxiliary: truemail_core::Result<truemail_core::storage::repo::AuxiliarySaveResult> =
+            Ok(truemail_core::storage::repo::AuxiliarySaveResult::default());
+
+        // Событие для этой ветки в sync_accounts - "ready" с предупреждением,
+        // как и в реальном коде.
+        let message =
+            truemail_core::error::sanitize_error_message(&mail.as_ref().unwrap_err().to_string());
+        let event = serde_json::json!({"account_id": 1, "scope": "all", "status": "ready", "warnings": [message], "error_kind": "timeout"});
+        assert_eq!(event["status"], "ready");
+        assert!(auxiliary.is_ok());
+
+        // А запись в базу - неуспех именно почты, независимо от статуса события.
+        match MailSyncOutcome::from_result(&mail) {
+            MailSyncOutcome::Failure {
+                kind, needs_reauth, ..
+            } => {
+                assert_eq!(kind, "timeout");
+                assert!(!needs_reauth);
+            }
+            MailSyncOutcome::Success => panic!("почта завершилась ошибкой - ожидался Failure"),
+        }
+    }
+
+    // F6: ChangePasswordApiError::message должен проходить ту же очистку,
+    // что и общий ApiError, а не error.to_string() как есть - код (`code`) не
+    // должен меняться по смыслу.
+    #[test]
+    fn f6_change_password_api_error_message_is_sanitized() {
+        let source = truemail_core::account::ChangePasswordError::BackendUnavailable(
+            "сервер ответил: token=secret123 login failed".into(),
+        );
+        let error: ChangePasswordApiError = source.into();
+        assert_eq!(error.code, "backend_unavailable");
+        assert!(!error.message.contains("secret123"), "{}", error.message);
+        assert!(error.message.contains("[скрыто]"), "{}", error.message);
+    }
+}
+
+#[cfg(test)]
+mod connect_progress_tests {
+    //! Проверки видимого хода подключения аккаунта
+    //! (specs/account-connect-progress.md): общий предел времени вызова,
+    //! вид ошибки при его истечении и единственная активная попытка на адрес.
+    //! ApiError намеренно не реализует Debug (в нём сырой текст ошибки),
+    //! поэтому результаты здесь разбираются match-ом, а не unwrap/expect.
+    use super::*;
+
+    fn expect_ok<T>(result: CmdResult<T>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("ожидался успех, получена ошибка: {}", error.safe_message()),
+        }
+    }
+
+    fn expect_err_kind<T>(result: CmdResult<T>) -> String {
+        match result {
+            Ok(_) => panic!("ожидалась ошибка, получен успех"),
+            Err(error) => error.parts().kind.to_owned(),
+        }
+    }
+
+    // F7: событие этапа подключения несёт номер попытки - интерфейс сверяет
+    // его с активной попыткой на экране и отбрасывает событие чужой попытки.
+    #[test]
+    fn f7_connect_stage_event_carries_attempt_id() {
+        let value = serde_json::to_value(ConnectStageEvent {
+            email: "user@example.com",
+            stage: "saving",
+            attempt_id: 42,
+        })
+        .expect("событие сериализуется");
+        assert_eq!(value["attempt_id"], 42);
+        assert_eq!(value["stage"], "saving");
+        assert_eq!(value["email"], "user@example.com");
+    }
+
+    /// S-004, S-006: истечение общего предела даёт машиночитаемый вид
+    /// `timeout` и тот самый текст, что описан в спецификации, - интерфейс
+    /// не разбирает текст и берёт действие "Повторить" по виду ошибки.
+    #[test]
+    fn timeout_error_has_timeout_kind_and_spec_message() {
+        let value = serde_json::to_value(connect_timeout_error()).expect("ошибка сериализуется");
+        assert_eq!(value["kind"], "timeout");
+        assert_eq!(
+            value["message"],
+            "Подключение заняло слишком много времени. Проверьте сеть и адрес сервера, затем повторите попытку"
+        );
+    }
+
+    /// S-004: вызов, уложившийся в предел, возвращает свой результат как есть.
+    #[tokio::test]
+    async fn fast_call_passes_through_the_timeout_wrapper() {
+        let result = expect_ok(with_connect_timeout(async { Ok::<_, ApiError>(42) }).await);
+        assert_eq!(result, 42);
+    }
+
+    /// S-004: предел один на весь вызов - если он уже израсходован раньше в
+    /// этом же вызове, оставшаяся часть не ждёт ещё 120 секунд, а сразу
+    /// завершается видом ошибки `timeout`.
+    #[tokio::test]
+    async fn exhausted_budget_fails_immediately_with_timeout() {
+        let spent = CONNECT_COMMAND_TIMEOUT + std::time::Duration::from_secs(1);
+        let kind = expect_err_kind(
+            with_connect_timeout_remaining(spent, async {
+                std::future::pending::<CmdResult<()>>().await
+            })
+            .await,
+        );
+        assert_eq!(kind, "timeout");
+    }
+
+    /// S-015: вторая попытка того же адреса отклоняется, пока первая активна;
+    /// другой адрес при этом подключается свободно.
+    #[tokio::test]
+    async fn second_attempt_for_the_same_address_is_rejected() {
+        let registry = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let first = expect_ok(ConnectAttemptGuard::acquire(&registry, "user@example.com").await);
+        assert!(
+            ConnectAttemptGuard::acquire(&registry, "user@example.com")
+                .await
+                .is_err(),
+            "вторая попытка того же адреса обязана быть отклонена"
+        );
+        let other = expect_ok(ConnectAttemptGuard::acquire(&registry, "other@example.com").await);
+        drop(other);
+        drop(first);
+    }
+
+    /// S-015: после завершения попытки (уничтожения guard) адрес снова
+    /// свободен - запись снимается из реестра отдельной задачей.
+    #[tokio::test]
+    async fn address_is_free_again_after_the_attempt_ends() {
+        let registry = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let guard = expect_ok(ConnectAttemptGuard::acquire(&registry, "user@example.com").await);
+        drop(guard);
+        // Drop синхронный, снятие записи уходит в отдельную задачу - даём ей
+        // выполниться, прежде чем проверять реестр.
+        for _ in 0..64 {
+            if registry.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.lock().await.is_empty(), "реестр должен опустеть");
+        let again = ConnectAttemptGuard::acquire(&registry, "user@example.com").await;
+        assert!(
+            again.is_ok(),
+            "после завершения попытки адрес снова доступен"
+        );
     }
 }

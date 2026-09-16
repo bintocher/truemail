@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260909-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260916-2`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -81,10 +81,104 @@ function relocalizeDynamic(){
 }
 function wzGo(n){document.querySelectorAll('.wzstep').forEach(s=>s.classList.remove('active'));document.getElementById('wz'+n).classList.add('active');
   document.querySelectorAll('.wzdot').forEach((d,i)=>d.classList.toggle('on',i<n));}
+
+// --- Выход из повторного мастера (specs/setup-wizard-exit.md) ---
+// Возвратное представление, режим обязательности и номер попытки открытия
+// мастера запоминаются здесь: кнопка закрытия и Escape восстанавливают прежний
+// экран, а поздний ответ команды подключения, запущенной из мастера (S-009,
+// account-connect-progress.md, S-016), не должен менять экран мастера, который
+// уже закрыт или заново открыт с другим номером попытки.
+let wizardReturnView='mailView';
+let wizardMandatory=true;
+let wizardAttemptGeneration=0;
+window.currentWizardAttempt=()=>wizardAttemptGeneration;
+// Мастер всё ещё тот же самый экран, что запускал попытку: номер попытки не
+// сменился (не было переоткрытия) и представление мастера сейчас показано
+// (не было простого закрытия). Оба условия нужны для S-009.
+window.isWizardAttemptCurrent=attempt=>attempt===wizardAttemptGeneration&&document.getElementById('welcomeView')?.classList.contains('active');
+window.wizardEscapeState=()=>({wizardOpen:document.getElementById('welcomeView')?.classList.contains('active')||false,wizardExitAvailable:!wizardMandatory});
+// account-connect-progress.md, S-010, S-016: подключение аккаунта из настроек
+// (мастер добавления, а не первичный мастер) использует то же поколение
+// попытки, что и первичный мастер, - оба экрана не могут быть открыты
+// одновременно, второе поколение заводить незачем. "Экран ещё тот же" здесь
+// значит, что диалог добавления аккаунта в настройках не закрыт (см.
+// showAccountWizard/closeAccountWizard в этом же файле).
+window.isSettingsConnectAttemptCurrent=attempt=>attempt===wizardAttemptGeneration&&document.querySelector('.settings')?.classList.contains('account-wizard-mode');
+
+function currentViewId(){const active=document.querySelector('.view.active');return active&&active.id!=='welcomeView'?active.id:'mailView';}
+
+// S-010: временные сообщения и незавершённое состояние подключения из
+// предыдущего открытия не должны быть видны в новом открытии мастера. В
+// частности, закрытие мастера кнопкой или Escape во время незавершённого
+// запроса подключения (S-003, S-004) не должно оставлять кнопку "Подключить"
+// заблокированной при следующем открытии - её мог заблокировать брошенный
+// запрос прежнего поколения попытки.
+function clearWizardTransientMessages(){
+  document.querySelectorAll('#welcomeView .wz-connect-status').forEach(el=>{el.textContent='';delete el.dataset.kind;});
+  const connectButton=document.getElementById('wzConnect');if(connectButton)window.setConnectBusy?.(connectButton,null,null,false);
+  const confirmButton=document.getElementById('wzConfirm');if(confirmButton)window.setConnectBusy?.(confirmButton,null,null,false);
+  document.getElementById('wzCodeBox')?.classList.add('hidden');
+  const oauthCode=document.getElementById('wzOauthCode');if(oauthCode)oauthCode.value='';
+  pendingOauthState='';
+}
+
+function updateWizardCloseButton(visible){
+  const button=document.getElementById('wzClose');
+  if(!button)return;
+  button.classList.toggle('hidden',!visible);
+  button.disabled=!visible;
+}
+
+// S-008, S-012: пересчитывает готовность окна нового письма по сохранённому
+// признаку настройки и наличию аккаунта (а не по устаревшим window-флагам),
+// затем один раз предлагает обработать очередь ожидающих файлов. Общая для
+// закрытия повторного мастера и для позднего ответа подключения, который
+// пришёл уже после закрытия мастера.
+async function refreshComposerReadiness(){
+  let completed=false;
+  try{completed=(await window.tm?.getSetting('onboarding_completed'))==='true';}
+  catch(error){console.error(error);}
+  window.tmOnboardingDone=completed;
+  window.tmComposerReady=completed&&typeof coreAccounts!=='undefined'&&coreAccounts.length>0;
+  window.consumePendingAttachments?.();
+}
+window.refreshComposerReadiness=refreshComposerReadiness;
+
 // Пока открыт мастер, файлы из меню "Отправить" ждут в очереди ядра: композер
 // поверх незаконченной настройки выдёргивал бы пользователя из мастера.
-function showWizard(step=1){window.tmComposerReady=false;showView('welcomeView');wzGo(step);}
+// Обязательность мастера и разрешение выхода определяются заново по
+// сохранённому onboarding_completed при каждом открытии (S-007) - вызывающий
+// код не решает это сам, чтобы устаревший вызов не включил выход не вовремя.
+function showWizard(step=1){
+  wizardAttemptGeneration++;
+  const openedFromView=currentViewId();
+  clearWizardTransientMessages();
+  window.tmComposerReady=false;showView('welcomeView');wzGo(step);
+  // Безопасный дефолт синхронно, пока не пришёл ответ ядра: и кнопка, и Escape
+  // должны считать мастер обязательным, а не донашивать решение предыдущего
+  // открытия (S-002, S-005).
+  wizardMandatory=true;
+  updateWizardCloseButton(false);
+  Promise.resolve(window.tm?.getSetting('onboarding_completed')).then(value=>{
+    wizardMandatory=!wizardExit.wizardExitAllowed(value);
+    wizardReturnView=wizardMandatory?'mailView':openedFromView;
+    updateWizardCloseButton(!wizardMandatory);
+  }).catch(error=>{console.error(error);wizardMandatory=true;wizardReturnView='mailView';updateWizardCloseButton(false);});
+}
 window.showWizard=showWizard;
+
+// S-003, S-004: общая функция для кнопки закрытия и для Escape
+// (calendar-contacts.js, единый обработчик). Обязательный мастер выхода не
+// даёт (S-005) - onboarding_completed при выходе не меняется.
+function closeWizard(){
+  if(wizardMandatory)return false;
+  const target=document.getElementById(wizardReturnView)?wizardReturnView:'mailView';
+  showView(target);
+  refreshComposerReadiness();
+  return true;
+}
+window.closeWizard=closeWizard;
+document.getElementById('wzClose').onclick=closeWizard;
 document.querySelectorAll('[data-wz]').forEach(b=>b.onclick=()=>wzGo(b.dataset.wz));
 document.querySelectorAll('[data-wlang]').forEach(o=>o.onclick=async()=>{await window.localizationReady;applyWizardLanguage(o.dataset.wlang);});
 if(wizardLocale&&wizardText[wizardLocale])applyWizardLanguage(wizardLocale,false);
@@ -127,14 +221,14 @@ document.getElementById('wzChooseDataDir').onclick=async()=>{
   try{
     const chosen=await window.tm?.chooseDataDir(document.getElementById('wzDataDir').value||window.tmDefaultDataDir);
     if(typeof chosen==='string'&&chosen){document.getElementById('wzDataDir').value=chosen;selectedDataDir=chosen;status.textContent='';}
-  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 };
 document.getElementById('wzChooseBackup').onclick=async()=>{
   const status=document.getElementById('wzRestoreStatus');
   try{
     const chosen=await window.tm?.chooseKeyBackup(selectedBackupPath||selectedDataDir);
     if(typeof chosen==='string'&&chosen){selectedBackupPath=chosen;document.getElementById('wzBackupPath').value=chosen;status.textContent='';}
-  }catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 };
 document.getElementById('wzRestoreKeys').onclick=async()=>{
   const button=document.getElementById('wzRestoreKeys'),status=document.getElementById('wzRestoreStatus'),passwordInput=document.getElementById('wzRestorePassword');
@@ -144,7 +238,7 @@ document.getElementById('wzRestoreKeys').onclick=async()=>{
     button.disabled=true;status.textContent=wizardLocale==='en'?'Opening encrypted archive…':'Открываю зашифрованный архив…';status.dataset.kind='';
     await window.tm.restoreKeyBackup(selectedDataDir,selectedBackupPath,password);
     passwordInput.value='';window.tmStorageReady=true;status.textContent='';configureStorageWizard(await window.tm.bootstrapStatus());wzGo(5);
-  }catch(error){passwordInput.value='';status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){passwordInput.value='';status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
   finally{button.disabled=false;}
 };
 document.getElementById('wzStorageNext').onclick=()=>{
@@ -182,13 +276,18 @@ async function createStorageFromEntropy(){
     createKeysButton.disabled=true;status.textContent=wt('creatingStorage');status.dataset.kind='';
     await window.tm.initializeStorage(selectedDataDir,wizardLocale||'ru',Array.from(entropy));
     window.tmStorageReady=true;entropy.fill(0);entropyChunks.forEach(chunk=>chunk.fill(0));entropyChunks.length=0;entropyBytes=0;lastEntropySample=null;status.textContent='';wzGo(5);
-  }catch(error){entropy.fill(0);entropyCreationStarted=false;createKeysButton.disabled=false;status.textContent=error.message||String(error);status.dataset.kind='error';}
+  }catch(error){entropy.fill(0);entropyCreationStarted=false;createKeysButton.disabled=false;status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
 }
 createKeysButton.onclick=createStorageFromEntropy;
 function showAccountWizard(prefillEmail=''){
+  // S-010, S-016: новое открытие диалога добавления аккаунта в настройках -
+  // новое поколение попытки (общее с первичным мастером, см. пояснение выше
+  // у isSettingsConnectAttemptCurrent) - поздний ответ прежнего открытия не
+  // должен тронуть уже другой (или закрытый) экран.
+  wizardAttemptGeneration++;
   accountOauthState='';accountPasswordProvider='generic';
   const status=document.getElementById('accountOauthStatus'),start=document.getElementById('accountOauthStart'),confirm=document.getElementById('accountOauthConfirm'),code=document.getElementById('accountOauthCode');
-  status.textContent='';status.dataset.kind='';start.disabled=false;confirm.disabled=false;code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
+  status.textContent='';status.dataset.kind='';window.setConnectBusy?.(start,null,null,false);window.setConnectBusy?.(confirm,null,null,false);window.setConnectBusy?.(document.getElementById('accountPasswordConfirm'),null,null,false);code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
   document.querySelector('.settings').classList.add('account-wizard-mode');showView('settingsView');setSection('addacct');
 }
 function closeAccountWizard(){document.querySelector('.settings').classList.remove('account-wizard-mode');setSection('accounts');}

@@ -41,8 +41,50 @@ function recipientToken(value){return String(value||'').split(/[;,]/).at(-1).tri
 function chooseRecipient(input,contact){addRecipientEntry(input.id,recipientFormat({name:contact.name,email:contact.email}));input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();scheduleDraftSave();}
 ['compTo','compCc','compBcc'].forEach(id=>{const input=document.getElementById(id),menu=input.parentElement.querySelector('.recipient-suggestions');let active=-1;const render=()=>{const query=recipientToken(input.value),used=new Set([...recipientModel[id].map(entry=>entry.email.toLocaleLowerCase()),...splitAddresses(input.value).map(value=>(value.match(/<([^>]+)>/)?.[1]||value).trim().toLocaleLowerCase())]),matches=personSearch.suggestRecipients(contactAddresses(),query,used,8,contact=>composerContactKeysCache.get(contact.email.toLocaleLowerCase(),()=>`${contact.name} ${contact.email}`));active=-1;menu.innerHTML='';matches.forEach((contact,index)=>{const option=document.createElement('button');option.type='button';option.className='recipient-option';option.innerHTML='<span></span><small></small>';option.querySelector('span').textContent=contact.name||contact.email;option.querySelector('small').textContent=contact.email;option.onmousedown=event=>{event.preventDefault();chooseRecipient(input,contact);menu.classList.remove('open');};option.dataset.index=index;menu.appendChild(option);});menu.classList.toggle('open',matches.length>0);};input.addEventListener('input',render);input.addEventListener('focus',render);input.addEventListener('keydown',event=>{const options=[...menu.querySelectorAll('.recipient-option')];if((event.key===','||event.key===';')&&!(active>=0&&options.length)){event.preventDefault();commitRecipientInput(id);menu.classList.remove('open');render();return;}if(event.key==='Backspace'&&!input.value&&recipientModel[id].length){event.preventDefault();removeRecipientEntry(id,recipientModel[id].length-1);return;}if(!options.length){if(event.key==='Enter'&&input.value.trim()){event.preventDefault();commitRecipientInput(id);}return;}if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();active=(active+(event.key==='ArrowDown'?1:-1)+options.length)%options.length;options.forEach((option,index)=>option.classList.toggle('active',index===active));options[active].scrollIntoView({block:'nearest'});}else if(event.key==='Enter'){event.preventDefault();if(active>=0)options[active].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));else{commitRecipientInput(id);menu.classList.remove('open');}}else if(event.key==='Escape')menu.classList.remove('open');});input.addEventListener('blur',()=>{if(input.value.trim())commitRecipientInput(id);});});
 document.addEventListener('click',event=>{if(!event.target.closest('.recipient-input'))document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));});
-function showToast(message,actionLabel,action){document.querySelector('.app-toast')?.remove();const toast=document.createElement('div');toast.className='app-toast';const text=document.createElement('span');text.textContent=message;toast.appendChild(text);if(action){const button=document.createElement('button');button.type='button';button.textContent=actionLabel;button.onclick=async()=>{button.disabled=true;await action();toast.remove();};toast.appendChild(button);}document.body.appendChild(toast);setTimeout(()=>toast.remove(),9000);}
-window.handleSyncState=function(state){if(!state)return;const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}const message=state.status==='error'?(state.error||L('Ошибка синхронизации','Sync error')):(state.warnings?.join(' ')||'');if(!message)return;if(/ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes|insufficientPermissions/i.test(message)){const account=coreAccounts.find(item=>item.id===Number(state.account_id));showToast(L('Google не выдал приложению доступ к календарю, контактам и задачам. Переподключите аккаунт и подтвердите все запрошенные разрешения.','Google did not grant access to calendar, contacts and tasks. Reconnect the account and approve all requested permissions.'),L('Переподключить','Reconnect'),()=>showAccountWizard(account?.email||''));return;}showToast(message);};
+let toastCards=[];
+let toastSequence=0;
+const toastTimers=new Map();
+function errorTranslations(){return typeof wizardText==='undefined'?undefined:wizardText;}
+function removeToastCard(id){toastCards=toastCards.filter(card=>card.id!==id);renderToastCards();}
+function errorAction(presented,context={}){
+  if(context.action)return context.action;
+  const account=coreAccounts.find(item=>item.id===Number(presented.accountId));
+  if(presented.action==='reconnect'||presented.action==='check_and_retry')return ()=>showAccountWizard(account?.email||context.email||'');
+  if(presented.action==='retry'||presented.action==='wait')return context.retry||(()=>window.tm?.syncAccounts());
+  if(presented.action==='settings')return ()=>{showView('settingsView');setSection('addacct');};
+  return ()=>window.tm?.openDataDir();
+}
+function renderToastCards(){
+  toastTimers.forEach(timer=>clearTimeout(timer));toastTimers.clear();
+  let stack=document.querySelector('.app-toast-stack');
+  if(!toastCards.length){stack?.remove();return;}
+  if(!stack){stack=document.createElement('div');stack.className='app-toast-stack';document.body.appendChild(stack);}
+  stack.innerHTML='';
+  toastCards.forEach(card=>{
+    const toast=document.createElement('div');toast.className='app-toast';toast.dataset.toastId=card.id;
+    const body=document.createElement('div');body.className='app-toast-body';
+    const line=document.createElement('div');line.className='app-toast-line';
+    const text=document.createElement('span');text.textContent=card.text;line.appendChild(text);
+    if(card.repeatCount>1){const count=document.createElement('span');count.className='app-toast-count';count.textContent=`x${card.repeatCount}`;line.appendChild(count);}
+    body.appendChild(line);
+    if(card.details){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=card.details;details.append(summary,pre);body.appendChild(details);}
+    toast.appendChild(body);
+    if(card.hasAction){const button=document.createElement('button');button.type='button';button.textContent=card.actionLabel;const waitUntil=card.action==='wait'&&card.retryAt?Date.parse(card.retryAt):0;button.disabled=card.action==='wait'&&(!waitUntil||waitUntil>Date.now());button.onclick=async()=>{button.disabled=true;try{await card.callback?.();removeToastCard(card.id);}catch(error){showToast(error);}};toast.appendChild(button);if(waitUntil>Date.now()){const timer=setTimeout(()=>renderToastCards(),waitUntil-Date.now());toastTimers.set(`wait-${card.id}`,timer);}}
+    const close=document.createElement('button');close.type='button';close.className='app-toast-close';close.textContent='x';close.title=wt('close');close.onclick=()=>removeToastCard(card.id);toast.appendChild(close);stack.appendChild(toast);
+    if(card.expiresAt){const timer=setTimeout(()=>removeToastCard(card.id),Math.max(0,card.expiresAt-Date.now()));toastTimers.set(card.id,timer);}
+  });
+}
+function enqueueToast(item){item.id=`toast-${++toastSequence}`;const result=window.errorPresentation.planToastQueue(toastCards,item,Date.now());toastCards=result.cards;renderToastCards();return result;}
+function showApiError(error,context={}){const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:errorTranslations(),connected:context.connected});return enqueueToast({kind:presented.kind,accountId:presented.accountId,text:presented.text,details:presented.message,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context)});}
+function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return enqueueToast({kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action});}
+window.showApiError=showApiError;
+window.handleSyncState=function(state){if(!state)return;
+  // Постоянное состояние (needs_reauth/last_sync_error) читается из аккаунта
+  // после перезагрузки данных; переходные статусы "syncing"/"retrying" видны
+  // раньше - сразу по этому событию, без ожидания truemail-data-changed
+  // (mail-sync-visible-state.md, S-006, S-011).
+  if(window.mailSyncIndicator?.isMailSyncScope(state.scope)){window.mailSyncTransient=window.mailSyncIndicator.nextMailSyncTransient(window.mailSyncTransient,state);window.refreshAccountSyncIndicator?.(state.account_id);}
+  const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}if(state.error_kind||['error','retrying'].includes(state.status)){showApiError({kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at},{connected:true});return;}const warning=state.warnings?.join(' ')||'';if(warning)showToast(warning);};
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;
@@ -51,7 +93,7 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
   if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
   try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(ids);await window.reloadCoreData();
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
-    showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error.message||String(error));}}
+    showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 window.performMessageActionForIds=performMessageActionForIds;
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];return performMessageActionForIds(action,ids);}
 function selectAllCurrentMessages(){currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();}
@@ -59,7 +101,7 @@ document.getElementById('bulkSelectAll').onclick=selectAllCurrentMessages;
 document.getElementById('bulkClear').onclick=clearMessageSelection;
 document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
-document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),true);clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error.message||String(error));}};
+document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),true);clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error);}};
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
 /* Потолок на всё письмо разом - вложения и байты встроенных картинок в теле
    вместе (S-007, S-018, S-038; тот же предел, что и при сборке письма в ядре):
@@ -107,7 +149,7 @@ async function attachFilesToComposer(paths){
   const generation=composerGeneration;
   for(const path of paths){
     if(generation!==composerGeneration)return;
-    try{await addCompFilePath(path,generation);}catch(error){showToast(error.message||String(error));}
+    try{await addCompFilePath(path,generation);}catch(error){showToast(error);}
   }
   if(!composing)document.getElementById('compTo')?.focus();
 }
@@ -126,7 +168,7 @@ function queueCompFiles(files){
   // Поколение берём в момент выбора файлов, а не когда до них дойдёт очередь:
   // иначе второй файл дочитался бы уже в другое письмо.
   const generation=composerGeneration;
-  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file,generation)).catch(error=>showToast(error.message||String(error)));
+  for(const file of files)attachChain=attachChain.then(()=>addCompFile(file,generation)).catch(error=>showToast(error));
   return attachChain;
 }
 /* Файлы, брошенные в окно (S-015, S-016): то же поведение, что и у "Отправить"
@@ -152,7 +194,7 @@ async function attachDroppedFiles(files){
   let added=0;
   for(const file of files){
     if(generation!==composerGeneration)return;
-    try{await addCompFile(file,generation);added++;}catch(error){showToast(error.message||String(error));}
+    try{await addCompFile(file,generation);added++;}catch(error){showToast(error);}
   }
   // Сообщение после цикла, а не до него: раньше оно обещало добавление даже
   // тогда, когда все файлы отклонены по пределу.
@@ -289,7 +331,7 @@ async function insertClipboardImages(files,initialRange,generation){
   for(const file of files){
     if(generation!==composerGeneration)return;
     let dataUrl;
-    try{dataUrl=await fileToDataUrl(file);}catch(error){showToast(error.message||String(error));continue;}
+    try{dataUrl=await fileToDataUrl(file);}catch(error){showToast(error);continue;}
     if(generation!==composerGeneration)return;
     const parsed=composerBody.parseDataUrl(dataUrl);
     if(!parsed)continue; // тип не разобрался как поддерживаемая картинка - пропускаем без сообщения, отбор уже прошёл clipboardImageItems
@@ -309,7 +351,7 @@ document.getElementById('compAttach').onclick=()=>document.getElementById('compF
 document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};
   const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{document.getElementById('compSubj').value=template.subject||'';compEditEl.innerHTML=template.body_html||'';await applyComposerSignature(composerSignatureKind);scheduleDraftSave();close();};const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
-  overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error.message||String(error));}};try{await render();}catch(error){close();showToast(error.message||String(error));}}
+  overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error);}};try{await render();}catch(error){close();showToast(error);}}
 document.getElementById('compTemplates').onclick=openTemplateDialog;
 document.querySelectorAll('[data-format]').forEach(button=>button.onclick=()=>{compEditEl.focus();document.execCommand(button.dataset.format,false);scheduleDraftSave();});
 /* вставка ссылки через кастомную модалку: текст + URL, по центру, с сохранением выделения */
@@ -360,8 +402,7 @@ document.getElementById('compSend').onclick=async()=>{
   // Окно закрываем сразу, письмо уходит в фоне. Итог показываем коротким toast.
   resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
   try{await window.tm.sendMessage(request);showToast(L('Письмо отправлено','Message sent'));}
-  catch(error){showToast(error.message||String(error));}
+  catch(error){showToast(error);}
 };
-document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=error.message||String(error);status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};
-

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod diagnostics;
 
 use commands::AppState;
 use std::sync::Arc;
@@ -272,6 +273,8 @@ fn run() -> anyhow::Result<()> {
         allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         pending_update: Arc::new(tokio::sync::Mutex::new(None)),
         installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        diagnostics_running: std::sync::atomic::AtomicBool::new(false),
+        connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -556,6 +559,7 @@ fn run() -> anyhow::Result<()> {
             commands::move_storage,
             commands::open_data_dir,
             commands::clear_local_data,
+            diagnostics::create_diagnostics_bundle,
             commands::sync_accounts,
             commands::sync_auxiliary_accounts,
             commands::start_realtime,

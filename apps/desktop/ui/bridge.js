@@ -91,6 +91,9 @@ window.corePageSize = 100;
     moveStorage: (target) => invoke("move_storage", { target }),
     openDataDir: () => invoke("open_data_dir"),
     clearLocalData: (scope) => invoke("clear_local_data", { scope }),
+    // specs/diagnostics-bundle.md, S-001: одна команда ядра без передачи
+    // журналов через JavaScript - интерфейс только запускает сбор и получает путь.
+    createDiagnosticsBundle: () => invoke("create_diagnostics_bundle"),
     syncAccounts: () => invoke("sync_accounts"),
     syncAuxiliaryAccounts: () => invoke("sync_auxiliary_accounts"),
     startRealtime: () => invoke("start_realtime"),
@@ -118,12 +121,16 @@ window.corePageSize = 100;
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     openExternal: (url) => invoke("open_external_url", { url }),
-    beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
+    // F7: attemptId - номер попытки подключения (см. wizardAttemptGeneration
+    // в i18n-onboarding.js) - Rust возвращает его в каждом событии
+    // truemail-connect-stage, чтобы интерфейс отличал этап новой попытки от
+    // позднего события прежней попытки того же адреса.
+    beginAccountConnection: (email, attemptId) => invoke("begin_account_connection", { email, attemptId }),
     completePasswordImap: (config) => invoke("complete_password_imap", config),
     completeExchangeEws: (config) => invoke("complete_exchange_ews", config),
     completeJmap: (config) => invoke("complete_jmap", config),
-    beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
-    completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
+    beginYandexOauth: (email, attemptId) => invoke("begin_account_connection", { email, attemptId }),
+    completeYandexOauth: (state, code, attemptId) => invoke("complete_yandex_oauth", { oauthState: state, code, attemptId }),
     apiTools: () => invoke("api_tools"),
     externalApiStatus: () => invoke("external_api_status"),
     startExternalApi: (port) => invoke("start_external_api", { port }),
@@ -255,6 +262,10 @@ window.corePageSize = 100;
   });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
+  // account-connect-progress.md, S-002, S-003: этап попытки подключения,
+  // подтверждённый ядром в ходе одного вызова команды (например, переход к
+  // ожиданию кода OAuth в браузере или к проверке сервера).
+  tauri.event?.listen("truemail-connect-stage", event => window.handleConnectStage?.(event.payload)).catch(console.error);
   tauri.event?.listen("truemail-storage-moved", async () => {
     await window.reloadCoreData?.();
     await window.tm.startRealtime();

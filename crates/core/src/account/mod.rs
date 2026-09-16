@@ -26,10 +26,11 @@ pub use oauth::{
     refresh_microsoft_token, refresh_yandex_token, yandex_authorize_url,
 };
 
+use crate::ErrorKind;
 use crate::Result;
 use crate::backend::{
-    EwsBackend, GenericImapBackend, GmailBackend, JmapBackend, MailBackend, OutlookBackend,
-    SendOutcome, YandexBackend,
+    EwsBackend, EwsTimeouts, GenericImapBackend, GmailBackend, JmapBackend, MailBackend,
+    OutlookBackend, SendOutcome, YandexBackend,
 };
 use crate::model::{
     Account, AuthKind, BackendKind, FolderRole, NewAccount, Provider, Security, ServerConfig,
@@ -251,6 +252,10 @@ mod sync_registry_tests {
             color: None,
             retention_days: 30,
             enabled: true,
+            last_sync_at: None,
+            last_sync_error: None,
+            last_sync_error_kind: None,
+            needs_reauth: false,
         }
     }
 
@@ -475,8 +480,8 @@ impl SecretStore for SystemSecretStore {
 }
 
 /// Коды ошибок тихой смены пароля (S-010, accounts-accordion-password.md).
-/// Отдельный тип, а не `crate::Error`: интерфейс различает случаи по коду, а
-/// общий `Error` кода не несёт.
+/// Отдельный тип, а не `crate::Error`: прежний контракт смены пароля сохраняет
+/// собственные более подробные коды.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChangePasswordError {
     #[error("неверные учётные данные: {0}")]
@@ -515,12 +520,26 @@ impl ChangePasswordError {
             Self::BackendUnavailable(_) => "backend_unavailable",
         }
     }
+
+    /// Соответствие общему набору видов для других экранов приложения.
+    pub fn general_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::InvalidCredentials(_) => Some("invalid_credentials"),
+            Self::UnsupportedAuthKind | Self::AccountChanged => Some("account_config"),
+            Self::AccountNotFound => Some("unknown"),
+            Self::MissingSecretRef => Some("needs_reauth"),
+            Self::SecretStoreWriteFailed | Self::SecretStoreStateUnknown => {
+                Some("secret_store_error")
+            }
+            Self::ChangeInProgress => None,
+            Self::BackendUnavailable(_) => Some("server_unavailable"),
+        }
+    }
 }
 
-/// Отказ входа при проверке нового пароля классифицируется по тексту
-/// транспортной ошибки (`Error::Backend` кода не несёт). Консервативно: если
-/// признаков отказа авторизации нет, считаем сервер недоступным - ложное
-/// "неверный пароль" хуже честного "сервер недоступен" (S-010).
+/// Запасная классификация старой нетипизированной транспортной ошибки.
+/// Типизированные ошибки проверяются по коду, а текст остается только для
+/// библиотек, которые пока не дают отдельного вида отказа входа.
 fn classify_validation_error(message: &str) -> bool {
     let lower = message.to_lowercase();
     const AUTH_MARKERS: [&str; 9] = [
@@ -870,6 +889,8 @@ impl AccountManager {
                     .username
                     .clone()
                     .unwrap_or_else(|| account.email.clone()),
+                // Фоновая синхронизация - прежние 10/30/30 (S-014).
+                timeouts: crate::backend::EwsTimeouts::background(),
             })),
         }
     }
@@ -1483,7 +1504,13 @@ impl AccountManager {
             .username
             .clone()
             .unwrap_or_else(|| account.email.clone());
-        let backend = EwsBackend { endpoint, username };
+        let backend = EwsBackend {
+            endpoint,
+            username,
+            // Фоновая синхронизация, наблюдение и вспомогательные операции -
+            // прежние 10/30/30 (S-014).
+            timeouts: crate::backend::EwsTimeouts::background(),
+        };
         let cursors = self.db.auxiliary_sync_cursors(account.id).await?;
         let data = backend.auxiliary(&credential, &cursors).await?;
         self.db
@@ -1561,7 +1588,13 @@ impl AccountManager {
                     .username
                     .clone()
                     .unwrap_or_else(|| account.email.clone());
-                let backend = EwsBackend { endpoint, username };
+                let backend = EwsBackend {
+                    endpoint,
+                    username,
+                    // Фоновая синхронизация, наблюдение и вспомогательные операции -
+                    // прежние 10/30/30 (S-014).
+                    timeouts: crate::backend::EwsTimeouts::background(),
+                };
                 let remote_url = remote.remote_url.ok_or_else(|| {
                     crate::Error::AccountConfig("у события нет серверного идентификатора".into())
                 })?;
@@ -1596,7 +1629,13 @@ impl AccountManager {
             .username
             .clone()
             .unwrap_or_else(|| account.email.clone());
-        Ok(EwsBackend { endpoint, username })
+        Ok(EwsBackend {
+            endpoint,
+            username,
+            // Фоновая синхронизация, наблюдение и вспомогательные операции -
+            // прежние 10/30/30 (S-014).
+            timeouts: crate::backend::EwsTimeouts::background(),
+        })
     }
 
     /// Идентификатор элемента EWS из remote_url. Читающая сторона (ews.rs)
@@ -1950,6 +1989,38 @@ impl AccountManager {
         Ok(completed)
     }
 
+    /// Предел проверки учётных данных на уже определённом сервере -
+    /// account-connect-progress.md, S-013: 45 секунд независимо от
+    /// транспорта (IMAP, EWS, JMAP используют одну и ту же функцию).
+    const CREDENTIAL_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+    /// Предел автопоиска адреса сервера Exchange - account-connect-progress.md,
+    /// S-012: 60 секунд на перебор адресов и схем входа.
+    const EWS_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Общая проверка учётных данных с пределом времени (S-013): значение
+    /// вида ошибки не переопределяется по тексту - истечение предела всегда
+    /// даёт `timeout` (error-kinds-and-messages.md).
+    async fn validate_with_timeout(
+        backend: &dyn MailBackend,
+        email: &str,
+        credential: &str,
+    ) -> Result<()> {
+        match tokio::time::timeout(
+            Self::CREDENTIAL_CHECK_TIMEOUT,
+            backend.validate(email, credential),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::Error::classified_backend(
+                "connect",
+                ErrorKind::Timeout,
+                "проверка учётных данных заняла слишком много времени",
+            )),
+        }
+    }
+
     /// Подключить обычный IMAP/SMTP-аккаунт по паролю приложения. Пароль
     /// проверяется на сервере и хранится только в системном keychain.
     pub async fn add_password_imap(
@@ -1971,7 +2042,7 @@ impl AccountManager {
             imap: imap.clone(),
             smtp: config.smtp.clone(),
         };
-        backend.validate(email, password).await?;
+        Self::validate_with_timeout(&backend, email, password).await?;
 
         let secret_ref = format!("mail-password:{}", email.to_lowercase());
         let previous_secret_ref = self.existing_secret_ref(email).await;
@@ -2034,13 +2105,36 @@ impl AccountManager {
         if password.is_empty() {
             return Err(crate::Error::AccountConfig("пароль не указан".into()));
         }
-        let endpoint =
-            crate::backend::discover_ews_url(email, username, password, server_hint).await?;
+        // S-012: автопоиск адреса EWS ограничен 60 секундами - часть общего
+        // предела в 120 секунд, не сверх него. Одно HTTP-соединение внутри
+        // автопоиска использует сниженные пределы EwsTimeouts::connect() (S-014).
+        let endpoint = match tokio::time::timeout(
+            Self::EWS_DISCOVERY_TIMEOUT,
+            crate::backend::discover_ews_url(
+                email,
+                username,
+                password,
+                server_hint,
+                EwsTimeouts::connect(),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(crate::Error::classified_backend(
+                    "ews",
+                    ErrorKind::Timeout,
+                    "автопоиск адреса Exchange занял слишком много времени",
+                ));
+            }
+        };
         let backend = EwsBackend {
             endpoint: endpoint.clone(),
             username: username.to_owned(),
+            timeouts: EwsTimeouts::connect(),
         };
-        backend.validate(email, password).await?;
+        Self::validate_with_timeout(&backend, email, password).await?;
         let secret_ref = format!("exchange-password:{}", email.to_lowercase());
         let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
@@ -2101,7 +2195,7 @@ impl AccountManager {
             session_url: session_url.trim().to_owned(),
             username: username.to_owned(),
         };
-        backend.validate(email, password).await?;
+        Self::validate_with_timeout(&backend, email, password).await?;
         let secret_ref = format!("jmap-password:{}", email.to_lowercase());
         let previous_secret_ref = self.existing_secret_ref(email).await;
         let entry = keyring::Entry::new("truemail", &secret_ref)
@@ -2460,12 +2554,15 @@ impl AccountManager {
         let backend = Self::mail_backend(&account)
             .map_err(|error| ChangePasswordError::BackendUnavailable(error.to_string()))?;
         if let Err(error) = backend.validate(&account.email, new_password).await {
+            let invalid_credentials = error.requires_reauth()
+                || matches!(&error, crate::Error::Backend { .. })
+                    && classify_validation_error(&error.to_string());
             let message = error.to_string();
             tracing::info!(
                 account = %crate::logging::mask_email(&account.email),
                 "смена пароля: сервер отклонил новый пароль"
             );
-            return Err(if classify_validation_error(&message) {
+            return Err(if invalid_credentials {
                 ChangePasswordError::InvalidCredentials(message)
             } else {
                 ChangePasswordError::BackendUnavailable(message)
@@ -2685,6 +2782,27 @@ impl AccountManager {
             contacts: 0,
             warnings,
         })
+    }
+}
+
+#[cfg(test)]
+mod connect_progress_timeout_tests {
+    //! Проверки пределов времени подключения аккаунта
+    //! (account-connect-progress.md, S-012, S-013): значения самих констант
+    //! фиксируются тестом, чтобы случайная правка не сдвинула предел незаметно.
+    //! Поведение таймаута под нагрузкой (реально зависающий транспорт)
+    //! проверяется вручную - тестовый рантайм этого крейта не собран с
+    //! `tokio` `test-util`, поэтому управляемое время здесь недоступно.
+    use super::AccountManager;
+
+    #[test]
+    fn s012_ews_discovery_timeout_is_sixty_seconds() {
+        assert_eq!(AccountManager::EWS_DISCOVERY_TIMEOUT.as_secs(), 60);
+    }
+
+    #[test]
+    fn s013_credential_check_timeout_is_forty_five_seconds() {
+        assert_eq!(AccountManager::CREDENTIAL_CHECK_TIMEOUT.as_secs(), 45);
     }
 }
 
@@ -2991,6 +3109,39 @@ mod change_password_tests {
             ChangePasswordError::BackendUnavailable("x".into()).code(),
             "backend_unavailable"
         );
+    }
+
+    #[test]
+    fn password_errors_map_to_general_error_kinds() {
+        let cases = [
+            (
+                ChangePasswordError::InvalidCredentials("x".into()),
+                Some("invalid_credentials"),
+            ),
+            (
+                ChangePasswordError::UnsupportedAuthKind,
+                Some("account_config"),
+            ),
+            (ChangePasswordError::AccountNotFound, Some("unknown")),
+            (ChangePasswordError::MissingSecretRef, Some("needs_reauth")),
+            (
+                ChangePasswordError::SecretStoreWriteFailed,
+                Some("secret_store_error"),
+            ),
+            (
+                ChangePasswordError::SecretStoreStateUnknown,
+                Some("secret_store_error"),
+            ),
+            (ChangePasswordError::ChangeInProgress, None),
+            (ChangePasswordError::AccountChanged, Some("account_config")),
+            (
+                ChangePasswordError::BackendUnavailable("x".into()),
+                Some("server_unavailable"),
+            ),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.general_error_code(), kind);
+        }
     }
 
     // ---------- S-017: блокировка на аккаунт ----------

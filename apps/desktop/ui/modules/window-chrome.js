@@ -113,7 +113,7 @@
     }
   };
   updateButton?.addEventListener('click',()=>{
-    window.startUpdateInstall().catch(error=>showToast(error.message||String(error)));
+    window.startUpdateInstall().catch(error=>showToast(error));
   });
 
   /* Версия в строке состояния окна. Номер и адрес выпуска зашиты в интерфейс
@@ -126,7 +126,7 @@
     versionButton.textContent=`v${version}`;
     versionButton.addEventListener('click',()=>{
       if(!releaseUrl||!window.tm?.openExternal)return;
-      window.tm.openExternal(releaseUrl).catch(error=>showToast(error.message||String(error)));
+      window.tm.openExternal(releaseUrl).catch(error=>showToast(error));
     });
   }
 })();

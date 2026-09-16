@@ -73,6 +73,18 @@ pub struct Account {
     /// Глубина локального кэша писем в днях; 0 - без ограничений.
     pub retention_days: i64,
     pub enabled: bool,
+    /// Время последнего успешного прохода синхронизации почты
+    /// (mail-sync-visible-state.md). None - успешных проходов ещё не было.
+    pub last_sync_at: Option<String>,
+    /// Безопасный текст последней ошибки синхронизации почты; очищается при
+    /// следующем успешном проходе.
+    pub last_sync_error: Option<String>,
+    /// Машиночитаемый вид последней ошибки (error-kinds-and-messages.md).
+    pub last_sync_error_kind: Option<String>,
+    /// Синхронизация не сможет продолжиться без обновления учётных данных
+    /// пользователем - вид последней ошибки входит в список требующих
+    /// повторного входа.
+    pub needs_reauth: bool,
 }
 
 /// Provider-neutral account configuration accepted by the storage layer.
