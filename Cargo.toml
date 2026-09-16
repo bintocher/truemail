@@ -54,6 +54,8 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 base64 = "0.23.1"
 roxmltree = "0.21.1"
 quoted_printable = "0.5.2"
+# Обезличивание строк журнала для архива диагностики (specs/diagnostics-bundle.md).
+regex = "1.13.1"
 
 # крипто и секреты
 keyring = "4.1.4"

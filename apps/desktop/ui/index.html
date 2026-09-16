@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260916-2">
+  <link rel="stylesheet" href="styles.css?v=20260916-3">
 </head>
 <body>
 
@@ -216,7 +216,7 @@
               <div class="account-connect-actions"><button class="btn primary" id="accountPasswordConfirm"><i data-i="check"></i><span data-i18n="connect">Подключить</span></button></div>
             </div>
           </div>
-          <div class="wz-connect-status" id="accountOauthStatus" aria-live="polite"></div>
+          <div class="wz-connect-status" id="accountOauthStatus" role="status" aria-live="polite"></div>
         </div></div>
         <div class="btn-row"><button class="btn" id="accountWizardCancel" data-i18n="cancel">Отмена</button></div>
       </div>
@@ -310,6 +310,10 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="backupPassword">Пароль backup</div><div class="d" data-i18n="backupPasswordDesc">Не менее 12 символов. Без этого пароля восстановление невозможно.</div></div><div class="fc"><input class="inp" id="keyBackupPassword" type="password" autocomplete="new-password"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="backupPasswordConfirm">Повторите пароль</div></div><div class="fc"><input class="inp" id="keyBackupPasswordConfirm" type="password" autocomplete="new-password"></div></div>
           <div class="frow"><div class="fl"><div class="d" id="keyBackupStatus" aria-live="polite"></div></div><div class="fc"><button class="btn sm" id="exportKeyBackup"><i data-i="save"></i><span data-i18n="exportKeyBackup">Сохранить backup ключей</span></button></div></div>
+        </div></div>
+        <div class="card"><div class="ch"><i data-i="shield"></i><span data-i18n="diagnosticsTitle">Диагностика</span></div><div class="cb">
+          <p class="note-muted" data-i18n="diagnosticsDesc">Собирает архив журналов работы приложения, где адреса, серверы, папки, пути и внутренние идентификаторы заменены псевдонимами. Архив сохраняется на диск - отправка остаётся на ваше усмотрение.</p>
+          <div class="frow"><div class="fl"><div class="d" id="diagStatus" role="status" aria-live="polite"></div></div><div class="fc"><button class="btn sm" id="collectDiagnostics"><i data-i="save"></i><span data-i18n="collectDiagnostics">Собрать диагностику</span></button></div></div>
         </div></div>
         <div class="card"><div class="ch"><i data-i="trash"></i><span data-i18n="freeUpSpace">Освободить место</span></div><div class="cb">
           <div class="frow"><div class="fl"><div class="t" data-i18n="oldAttachments">Вложения старше года</div><div class="d" data-i18n="oldAttachmentsDesc">Останутся на сервере, скачаются при открытии</div></div><div class="fc fc-inline"><span class="size-num" data-i18n="zeroBytes">0 Б</span><button class="btn sm" data-clear="old_attachments" data-i18n="clear">Очистить</button></div></div>
@@ -475,6 +479,19 @@
       <div class="pw-status" id="pwStatus"></div>
     </div>
     <div class="mf"><button class="btn primary" id="pwSubmit"><i data-i="check"></i><span id="pwSubmitLabel"></span></button><button class="btn confirm-cancel" id="pwCancel"></button></div>
+  </div>
+</div>
+
+<!-- диалог перед сбором диагностики (specs/diagnostics-bundle.md, S-014) -->
+<div class="overlay" id="diagOverlay" role="dialog" aria-modal="true" aria-labelledby="diagTitle" data-no-i18n="1">
+  <div class="modal compact-modal">
+    <div class="mh"><i data-i="shield"></i><h3 id="diagTitle"></h3><button class="iconbtn x" id="diagClose"><i data-i="back"></i></button></div>
+    <div class="mb">
+      <p class="note-muted" id="diagIntro"></p>
+      <ul class="diag-categories" id="diagCategories"></ul>
+      <p class="note-muted" id="diagCaveat"></p>
+    </div>
+    <div class="mf"><button class="btn primary" id="diagStart"><i data-i="save"></i><span id="diagStartLabel"></span></button><button class="btn confirm-cancel" id="diagCancel"></button></div>
   </div>
 </div>
 
@@ -654,9 +671,9 @@
         <p class="sub" data-i18n="connectSub">Введите любой адрес — truemail определит провайдера и выберет способ входа.</p>
         <div class="left"><input class="inp mb-10" id="wzEmail" type="email" placeholder="you@example.com" data-i18n-placeholder="emailPlaceholder">
           <button class="btn primary btn-full" id="wzConnect"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button>
-          <div id="wzCodeBox" class="hidden"><input class="inp mb-10" id="wzOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codePlaceholder" placeholder="Код подтверждения">
+          <div id="wzCodeBox" class="hidden"><p class="note-muted" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</p><input class="inp mb-10" id="wzOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codePlaceholder" placeholder="Код подтверждения">
             <button class="btn primary btn-full" id="wzConfirm"><i data-i="check"></i><span data-i18n="confirm">Подтвердить подключение</span></button></div>
-          <div class="wz-connect-status" id="wzConnectStatus" aria-live="polite"></div>
+          <div class="wz-connect-status" id="wzConnectStatus" role="status" aria-live="polite"></div>
         </div>
         <div class="wznav"><button class="btn" data-wz="4"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzAccountNext" data-wz="6" disabled data-i18n="next">Далее</button><button class="wz-skip-btn" data-wz="6" data-i18n="skip">Пропустить</button></div>
       </div>
@@ -703,18 +720,20 @@
 <script src="modules/person-search.js?v=20260905-1"></script>
 <script src="modules/commands-accessibility.js?v=20260916-1"></script>
 <script src="modules/smart-rules.js?v=20260916-1"></script>
-<script src="modules/i18n-onboarding.js?v=20260916-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260916-2"></script>
 <script src="modules/error-presentation.js?v=20260916-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
-<script src="modules/mail.js?v=20260916-2"></script>
+<script src="modules/connect-progress.js?v=20260916-1"></script>
+<script src="modules/diagnostics-categories.js?v=20260916-1"></script>
+<script src="modules/mail.js?v=20260916-3"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
 <script src="modules/composer.js?v=20260916-2"></script>
 <script src="modules/account-cards.js?v=20260905-1"></script>
-<script src="modules/settings.js?v=20260916-2"></script>
+<script src="modules/settings.js?v=20260916-3"></script>
 <script src="modules/window-chrome.js?v=20260916-1"></script>
-<script src="bridge.js?v=20260910-1"></script>
+<script src="bridge.js?v=20260916-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

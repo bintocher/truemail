@@ -581,6 +581,27 @@
   button.wz-opt{width:100%;background:var(--bg);color:var(--text);font:inherit;}
   .wz-connect-status{min-height:20px;margin-top:10px;color:var(--text-3);font-size:12.5px;line-height:1.45;}
   .wz-connect-status[data-kind="error"]{color:var(--danger);}.wz-connect-status[data-kind="success"]{color:var(--good);}
+  /* Заметная область хода подключения (account-connect-progress.md, S-002):
+     пока этап не пуст, строка получает фон, рамку и более крупный шрифт - не
+     только мелкий приглушённый текст, как раньше. Правило намеренно задано по
+     двум идентификаторам, а не по классу .wz-connect-status: тот же класс
+     носят статусные строки календаря, контактов и шагов хранилища мастера, и
+     их вид эта задача не меняет. Пустая строка (попытки нет) остаётся
+     невидимой, чтобы не показывать пустую рамку между полями формы. */
+  #wzConnectStatus:not(:empty),#accountOauthStatus:not(:empty){padding:8px 12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--panel2);font-size:13px;font-weight:500;}
+  #wzConnectStatus[data-kind="error"]:not(:empty),#accountOauthStatus[data-kind="error"]:not(:empty){border-color:var(--danger);}
+  #wzConnectStatus[data-kind="success"]:not(:empty),#accountOauthStatus[data-kind="success"]:not(:empty){border-color:var(--good);}
+  /* Значок ожидания внутри самой кнопки подключения (S-001): .btn уже flex
+     с gap - спиннер и подпись этапа встают на место обычной иконки и текста. */
+  .btn .spinner{flex:none;}
+  /* Список категорий обезличивания в предупреждении перед сбором диагностики
+     (diagnostics-bundle.md, S-014). */
+  .diag-categories{margin:10px 0;padding-left:20px;color:var(--text-2);font-size:13px;line-height:1.6;}
+  /* Итог сбора диагностики и выгрузки ключей в разделе хранилища: успех,
+     частичный архив и ошибка должны отличаться не только текстом. */
+  #set-storage .d[data-kind="success"]{color:var(--good);}
+  #set-storage .d[data-kind="warning"]{color:var(--warn,var(--text-2));}
+  #set-storage .d[data-kind="error"]{color:var(--danger);}
   .mail-empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:40px;color:var(--text);}
   .mail-empty h2{margin:4px 0 8px}.mail-empty p{margin:0 0 20px;color:var(--text-3);}
   .settings.account-wizard-mode{grid-template-columns:1fr;background:var(--panel2);}

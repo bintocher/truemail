@@ -8,6 +8,7 @@ pub mod account;
 pub mod api;
 pub mod backend;
 pub mod crypto;
+pub mod diagnostics;
 pub mod error;
 pub mod i18n;
 pub mod logging;

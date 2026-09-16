@@ -74,6 +74,16 @@ pub struct AppState {
     // соглашается прочитать. Иначе команда была бы примитивом чтения любого
     // файла пользователя для произвольного кода в окне.
     pub allowed_attachments: Arc<std::sync::Mutex<HashSet<String>>>,
+    // Сбор диагностики (diagnostics-bundle.md): одновременно разрешён только
+    // один сбор, повторное нажатие видит уже активное состояние (границы
+    // задачи, "Скорость и потребление ресурсов").
+    pub diagnostics_running: std::sync::atomic::AtomicBool,
+    // Адреса почты с активной попыткой подключения (account-connect-progress.md,
+    // S-015): вторая попытка того же адреса из любого окна отклоняется, пока
+    // первая не завершится. Не переживает перезапуск программы и не пишется в БД.
+    // Arc - ConnectAttemptGuard клонирует ссылку на реестр, чтобы снять свою
+    // запись из отдельной задачи в Drop (async-освобождение при синхронном drop).
+    pub connecting_addresses: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 /// Скачанный пакет обновления: версия, файл в каталоге данных и отпечаток
@@ -210,6 +220,7 @@ pub struct ConnectedAccount {
     warnings: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct ApiError {
     pub(crate) message: String,
 }
@@ -4362,6 +4373,147 @@ fn open_in_yandex_browser(app: &AppHandle, url: &str) -> CmdResult<()> {
     }
 }
 
+// --- Видимый ход подключения аккаунта (issue #68, account-connect-progress.md) ---
+
+/// Общий предел одного вызова команды подключения (S-004). Время, пока
+/// пользователь сам входит в браузере или вводит код OAuth, сюда не входит -
+/// у этого ожидания свой отдельный предел (S-009).
+const CONNECT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn connect_timeout_error() -> ApiError {
+    ApiError::from_parts(
+        "Подключение заняло слишком много времени. Проверьте сеть и адрес сервера, затем повторите попытку",
+        "timeout",
+        None,
+        None,
+    )
+}
+
+/// Оборачивает часть попытки подключения общим пределом времени (S-004) и
+/// превращает истечение в вид ошибки `timeout` - error-kinds-and-messages.md
+/// не переопределяется, код ошибки берётся из уже существующего набора.
+async fn with_connect_timeout<F, T>(future: F) -> CmdResult<T>
+where
+    F: std::future::Future<Output = CmdResult<T>>,
+{
+    match tokio::time::timeout(CONNECT_COMMAND_TIMEOUT, future).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_timeout_error()),
+    }
+}
+
+/// Та же обёртка, но с бюджетом, уменьшенным на `elapsed_before` - часть
+/// попытки, которая уже прошла раньше в этом же вызове команды (S-004: предел
+/// один на весь вызов целиком, а не отдельный на каждый его сетевой этап).
+/// Используется там, где после исключённого из предела ожидания (S-009, вход
+/// в браузере) идёт вторая сетевая часть одного и того же вызова.
+async fn with_connect_timeout_remaining<F, T>(
+    elapsed_before: std::time::Duration,
+    future: F,
+) -> CmdResult<T>
+where
+    F: std::future::Future<Output = CmdResult<T>>,
+{
+    let remaining = CONNECT_COMMAND_TIMEOUT.saturating_sub(elapsed_before);
+    match tokio::time::timeout(remaining, future).await {
+        Ok(result) => result,
+        Err(_) => Err(connect_timeout_error()),
+    }
+}
+
+/// Сообщает интерфейсу подтверждённый этап попытки подключения (S-002, S-003).
+/// Событие адресовано конкретному адресу почты - экран решает сам, относится
+/// ли оно к попытке, которая на нём сейчас активна (S-016).
+#[derive(Clone, Serialize)]
+struct ConnectStageEvent<'a> {
+    email: &'a str,
+    stage: &'a str,
+}
+
+fn emit_connect_stage(app: &AppHandle, email: &str, stage: &str) {
+    let _ = app.emit("truemail-connect-stage", ConnectStageEvent { email, stage });
+}
+
+/// S-015: не более одной активной попытки подключения на адрес почты во всей
+/// программе - реестр общий для мастера и настроек, поэтому вторая попытка из
+/// любого другого окна отклоняется, пока не завершится первая. Запись в
+/// реестре снимается при уничтожении guard - успехом, ошибкой или истечением
+/// общего предела времени.
+struct ConnectAttemptGuard {
+    registry: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    email: String,
+}
+
+impl ConnectAttemptGuard {
+    async fn acquire(
+        registry: &Arc<tokio::sync::Mutex<HashSet<String>>>,
+        email: &str,
+    ) -> CmdResult<Self> {
+        let mut active = registry.lock().await;
+        if !active.insert(email.to_owned()) {
+            return Err(api_error(
+                "Подключение этого адреса уже выполняется в другом окне. Дождитесь его завершения.",
+            ));
+        }
+        Ok(Self {
+            registry: registry.clone(),
+            email: email.to_owned(),
+        })
+    }
+}
+
+impl Drop for ConnectAttemptGuard {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let email = std::mem::take(&mut self.email);
+        // Drop синхронный - снятие записи из реестра уходит отдельной задачей.
+        tokio::spawn(async move {
+            registry.lock().await.remove(&email);
+        });
+    }
+}
+
+/// Последний подтверждённый этап и вид подключения для S-008 - обычная
+/// `Cell` здесь не годится: она никогда не `Sync`, а тело команды Tauri
+/// должно остаться `Send`-совместимым future (значение живёт внутри одного
+/// вызова команды и никогда не покидает поток исполнителя одновременно).
+struct StageCell(std::sync::Mutex<&'static str>);
+
+impl StageCell {
+    fn new(value: &'static str) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+
+    fn set(&self, value: &'static str) {
+        *self.0.lock().unwrap() = value;
+    }
+
+    fn get(&self) -> &'static str {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// S-008: журнал неуспешной попытки подключения - вид подключения, последний
+/// подтверждённый этап, длительность и машиночитаемый вид ошибки; ни пароль,
+/// ни код OAuth, ни полный адрес в запись не попадают.
+fn log_connect_failure(
+    connection_kind: &str,
+    stage: &str,
+    started: std::time::Instant,
+    email: &str,
+    error: &ApiError,
+) {
+    let parts = error.parts();
+    tracing::warn!(
+        connection_kind,
+        stage,
+        duration_ms = started.elapsed().as_millis() as u64,
+        error_kind = parts.kind,
+        email = %truemail_core::logging::mask_email(email),
+        "попытка подключения аккаунта не удалась"
+    );
+}
+
 #[tauri::command]
 pub async fn begin_account_connection(
     app: AppHandle,
@@ -4370,217 +4522,288 @@ pub async fn begin_account_connection(
 ) -> CmdResult<PendingOAuthResponse> {
     let core = core(&state).await?;
     let email = email.trim().to_lowercase();
-    let config = truemail_core::account::discover_provider(&email).await;
+    // S-015: реестр активных попыток общий для мастера и настроек - вторая
+    // попытка того же адреса из любого другого окна отклоняется, пока не
+    // завершится первая.
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    // Последний подтверждённый этап и вид подключения - только для записи в
+    // журнал неуспешной попытки (S-008); на успешный путь не влияют.
+    let stage = StageCell::new("detecting");
+    let connection_kind = StageCell::new("detect");
+    // Определение провайдера - быстрый сетевой шаг (DNS), укладывается в
+    // общий предел команды (S-004) целиком. discover_provider не возвращает
+    // Result - оборачиваем в async-блок, чтобы совпасть с сигнатурой
+    // with_connect_timeout.
+    let config = match with_connect_timeout(async {
+        Ok(truemail_core::account::discover_provider(&email).await)
+    })
+    .await
+    {
+        Ok(config) => config,
+        Err(error) => {
+            log_connect_failure(connection_kind.get(), stage.get(), started, &email, &error);
+            return Err(error);
+        }
+    };
+    // S-004: предел один на весь вызов, а не отдельный на каждый его этап -
+    // время, уже потраченное на определение провайдера, вычитается из бюджета
+    // второй сетевой части (обмен кода на токен и сохранение аккаунта), иначе
+    // медленный DNS и медленный обмен токена вместе получили бы до 240 секунд.
+    let phase1_elapsed = started.elapsed();
     let pkce = truemail_core::account::generate_pkce();
     let oauth_state = truemail_core::account::generate_state();
-    match config.provider {
-        truemail_core::model::Provider::Yandex => {
-            let client_id = yandex_client_id()?;
-            // Redirect URI должен быть зарегистрирован в OAuth-приложении
-            // Яндекса с точным scheme/host/port/path.
-            let redirect_uri = configured_yandex_redirect_uri();
-            let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
-                message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
-            })?;
-            if redirect.scheme() != "http"
-                || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
-            {
-                return Err(ApiError {
-                    message: "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
-                        .into(),
-                });
+    let outcome: CmdResult<PendingOAuthResponse> = async {
+        match config.provider {
+            truemail_core::model::Provider::Yandex => {
+                connection_kind.set("yandex_oauth");
+                let client_id = yandex_client_id()?;
+                // Redirect URI должен быть зарегистрирован в OAuth-приложении
+                // Яндекса с точным scheme/host/port/path.
+                let redirect_uri = configured_yandex_redirect_uri();
+                let redirect = url::Url::parse(&redirect_uri).map_err(|error| ApiError {
+                    message: format!("неверный TRUEMAIL_YANDEX_REDIRECT_URI: {error}"),
+                })?;
+                if redirect.scheme() != "http"
+                    || !matches!(redirect.host_str(), Some("127.0.0.1" | "localhost"))
+                {
+                    return Err(ApiError {
+                        message:
+                            "Яндекс OAuth callback должен быть локальным http://127.0.0.1 адресом"
+                                .into(),
+                    });
+                }
+                let port = redirect.port().ok_or_else(|| ApiError {
+                    message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
+                })?;
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!(
+                            "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
+                        ),
+                    })?;
+                let url = truemail_core::account::yandex_authorize_url(
+                    &client_id,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                // S-009: время, пока пользователь входит в браузере, не считается
+                // в общий предел команды - у ожидания свой предел (300 секунд)
+                // внутри receive_oauth_callback.
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code");
+                let code =
+                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server");
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_yandex_code(
+                        &client_id,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    let connected = core
+                        .accounts
+                        .add_yandex_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
+                .await?;
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
             }
-            let port = redirect.port().ok_or_else(|| ApiError {
-                message: "в TRUEMAIL_YANDEX_REDIRECT_URI должен быть указан порт".into(),
-            })?;
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!(
-                        "не удалось открыть Яндекс OAuth callback на порту {port}: {error}"
-                    ),
-                })?;
-            let url = truemail_core::account::yandex_authorize_url(
-                &client_id,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
-            let token = truemail_core::account::exchange_yandex_code(
-                &client_id,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_yandex_oauth(&email, &display_name, token)
+            truemail_core::model::Provider::Gmail => {
+                connection_kind.set("gmail_oauth");
+                let (client_id, client_secret) = google_client_credentials()?;
+                let client_secret = Zeroizing::new(client_secret);
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                    })?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось определить OAuth callback: {error}"),
+                    })?
+                    .port();
+                let redirect_uri = format!("http://127.0.0.1:{port}/oauth/google/callback");
+                let url = truemail_core::account::google_authorize_url(
+                    &client_id,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code");
+                let code =
+                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server");
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_google_code(
+                        &client_id,
+                        &client_secret,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    let connected = core
+                        .accounts
+                        .add_gmail_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
                 .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        truemail_core::model::Provider::Gmail => {
-            let (client_id, client_secret) = google_client_credentials()?;
-            let client_secret = Zeroizing::new(client_secret);
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
-                })?;
-            let port = listener
-                .local_addr()
-                .map_err(|error| ApiError {
-                    message: format!("не удалось определить OAuth callback: {error}"),
-                })?
-                .port();
-            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/google/callback");
-            let url = truemail_core::account::google_authorize_url(
-                &client_id,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
-            let token = truemail_core::account::exchange_google_code(
-                &client_id,
-                &client_secret,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_gmail_oauth(&email, &display_name, token)
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
+            }
+            truemail_core::model::Provider::Outlook => {
+                connection_kind.set("outlook_oauth");
+                let client_id = microsoft_client_id()?;
+                let tenant = configured_microsoft_tenant();
+                let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось открыть локальный OAuth callback: {error}"),
+                    })?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| ApiError {
+                        message: format!("не удалось определить OAuth callback: {error}"),
+                    })?
+                    .port();
+                let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
+                let url = truemail_core::account::microsoft_authorize_url(
+                    &client_id,
+                    &tenant,
+                    &email,
+                    &oauth_state,
+                    &pkce.challenge,
+                    &redirect_uri,
+                )?;
+                open_in_yandex_browser(&app, &url)?;
+                stage.set("waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code");
+                let code = Zeroizing::new(
+                    receive_oauth_callback(listener, &oauth_state, "Microsoft").await?,
+                );
+                stage.set("checking_server");
+                emit_connect_stage(&app, &email, "checking_server");
+                let connected = with_connect_timeout_remaining(phase1_elapsed, async {
+                    let token = truemail_core::account::exchange_microsoft_code(
+                        &client_id,
+                        &tenant,
+                        &code,
+                        &pkce.verifier,
+                        &redirect_uri,
+                    )
+                    .await?;
+                    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    let connected = core
+                        .accounts
+                        .add_outlook_oauth(&email, &display_name, token)
+                        .await?;
+                    Ok(connected)
+                })
                 .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        truemail_core::model::Provider::Outlook => {
-            let client_id = microsoft_client_id()?;
-            let tenant = configured_microsoft_tenant();
-            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .await
-                .map_err(|error| ApiError {
-                    message: format!("не удалось открыть локальный OAuth callback: {error}"),
-                })?;
-            let port = listener
-                .local_addr()
-                .map_err(|error| ApiError {
-                    message: format!("не удалось определить OAuth callback: {error}"),
-                })?
-                .port();
-            let redirect_uri = format!("http://127.0.0.1:{port}/oauth/microsoft/callback");
-            let url = truemail_core::account::microsoft_authorize_url(
-                &client_id,
-                &tenant,
-                &email,
-                &oauth_state,
-                &pkce.challenge,
-                &redirect_uri,
-            )?;
-            open_in_yandex_browser(&app, &url)?;
-            let code =
-                Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Microsoft").await?);
-            let token = truemail_core::account::exchange_microsoft_code(
-                &client_id,
-                &tenant,
-                &code,
-                &pkce.verifier,
-                &redirect_uri,
-            )
-            .await?;
-            let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-            let connected = core
-                .accounts
-                .add_outlook_oauth(&email, &display_name, token)
-                .await?;
-            let account = connected.account.clone();
-            let response = connected_response(connected);
-            spawn_initial_mail_sync(&app, &state, core, account).await;
-            Ok(PendingOAuthResponse {
-                mode: "connected".into(),
-                state: None,
-                connected: Some(response),
-                password_config: None,
-            })
-        }
-        Provider::Mailru | Provider::Icloud | Provider::Generic => {
-            let domain = email.rsplit('@').next().unwrap_or_default();
-            Ok(PendingOAuthResponse {
-                mode: "password".into(),
-                state: None,
-                connected: None,
-                password_config: Some(PasswordConnectionInfo {
-                    provider: config.provider,
-                    backend_kind: config.backend_kind,
-                    username: email.clone(),
-                    imap: if config.backend_kind == BackendKind::Jmap {
-                        None
-                    } else {
-                        Some(config.imap.unwrap_or(ServerConfig {
-                            host: format!("imap.{domain}"),
-                            port: 993,
-                            security: Security::Ssl,
-                        }))
-                    },
-                    smtp: if config.backend_kind == BackendKind::Jmap {
-                        None
-                    } else {
-                        config.smtp.or_else(|| {
-                            (!domain.is_empty()).then(|| ServerConfig {
-                                host: format!("smtp.{domain}"),
-                                port: 465,
+                let account = connected.account.clone();
+                let response = connected_response(connected);
+                spawn_initial_mail_sync(&app, &state, core, account).await;
+                Ok(PendingOAuthResponse {
+                    mode: "connected".into(),
+                    state: None,
+                    connected: Some(response),
+                    password_config: None,
+                })
+            }
+            Provider::Mailru | Provider::Icloud | Provider::Generic => {
+                connection_kind.set("password_detect");
+                let domain = email.rsplit('@').next().unwrap_or_default();
+                Ok(PendingOAuthResponse {
+                    mode: "password".into(),
+                    state: None,
+                    connected: None,
+                    password_config: Some(PasswordConnectionInfo {
+                        provider: config.provider,
+                        backend_kind: config.backend_kind,
+                        username: email.clone(),
+                        imap: if config.backend_kind == BackendKind::Jmap {
+                            None
+                        } else {
+                            Some(config.imap.unwrap_or(ServerConfig {
+                                host: format!("imap.{domain}"),
+                                port: 993,
                                 security: Security::Ssl,
+                            }))
+                        },
+                        smtp: if config.backend_kind == BackendKind::Jmap {
+                            None
+                        } else {
+                            config.smtp.or_else(|| {
+                                (!domain.is_empty()).then(|| ServerConfig {
+                                    host: format!("smtp.{domain}"),
+                                    port: 465,
+                                    security: Security::Ssl,
+                                })
                             })
-                        })
-                    },
-                    jmap_url: config.jmap_url,
-                    ews_url: None,
-                }),
-            })
+                        },
+                        jmap_url: config.jmap_url,
+                        ews_url: None,
+                    }),
+                })
+            }
+            Provider::Exchange => {
+                connection_kind.set("password_detect");
+                Ok(PendingOAuthResponse {
+                    mode: "password".into(),
+                    state: None,
+                    connected: None,
+                    // Autodiscover уточнит адрес EWS с учётными данными; из discover
+                    // приходит только предполагаемый URL как подсказка для поля.
+                    password_config: Some(PasswordConnectionInfo {
+                        provider: Provider::Exchange,
+                        backend_kind: BackendKind::Ews,
+                        username: email.clone(),
+                        imap: None,
+                        smtp: None,
+                        jmap_url: None,
+                        ews_url: config.ews_url,
+                    }),
+                })
+            }
         }
-        Provider::Exchange => Ok(PendingOAuthResponse {
-            mode: "password".into(),
-            state: None,
-            connected: None,
-            // Autodiscover уточнит адрес EWS с учётными данными; из discover
-            // приходит только предполагаемый URL как подсказка для поля.
-            password_config: Some(PasswordConnectionInfo {
-                provider: Provider::Exchange,
-                backend_kind: BackendKind::Ews,
-                username: email.clone(),
-                imap: None,
-                smtp: None,
-                jmap_url: None,
-                ews_url: config.ews_url,
-            }),
-        }),
     }
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure(connection_kind.get(), stage.get(), started, &email, error);
+    }
+    outcome
 }
 
 fn parse_security(value: &str) -> CmdResult<Security> {
@@ -4610,55 +4833,69 @@ pub async fn complete_password_imap(
     smtp_security: String,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() || imap_host.trim().is_empty() {
-        return Err(ApiError {
-            message: "укажите имя пользователя и IMAP-сервер".into(),
-        });
-    }
-    if !matches!(
-        provider,
-        Provider::Mailru | Provider::Icloud | Provider::Generic
-    ) {
-        return Err(ApiError {
-            message: "этот способ входа не подходит выбранному провайдеру".into(),
-        });
-    }
-    let config = truemail_core::account::ProviderConfig {
-        provider,
-        backend_kind: BackendKind::Imap,
-        auth_kind: if provider == Provider::Generic {
-            AuthKind::Password
-        } else {
-            AuthKind::AppPassword
-        },
-        imap: Some(ServerConfig {
-            host: imap_host.trim().to_owned(),
-            port: imap_port,
-            security: parse_security(&imap_security)?,
-        }),
-        smtp: (!smtp_host.trim().is_empty())
-            .then(|| {
-                Ok::<_, ApiError>(ServerConfig {
-                    host: smtp_host.trim().to_owned(),
-                    port: smtp_port,
-                    security: parse_security(&smtp_security)?,
+    // S-015: одна активная попытка на адрес во всей программе.
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() || imap_host.trim().is_empty() {
+            return Err(ApiError {
+                message: "укажите имя пользователя и IMAP-сервер".into(),
+            });
+        }
+        if !matches!(
+            provider,
+            Provider::Mailru | Provider::Icloud | Provider::Generic
+        ) {
+            return Err(ApiError {
+                message: "этот способ входа не подходит выбранному провайдеру".into(),
+            });
+        }
+        let config = truemail_core::account::ProviderConfig {
+            provider,
+            backend_kind: BackendKind::Imap,
+            auth_kind: if provider == Provider::Generic {
+                AuthKind::Password
+            } else {
+                AuthKind::AppPassword
+            },
+            imap: Some(ServerConfig {
+                host: imap_host.trim().to_owned(),
+                port: imap_port,
+                security: parse_security(&imap_security)?,
+            }),
+            smtp: (!smtp_host.trim().is_empty())
+                .then(|| {
+                    Ok::<_, ApiError>(ServerConfig {
+                        host: smtp_host.trim().to_owned(),
+                        port: smtp_port,
+                        security: parse_security(&smtp_security)?,
+                    })
                 })
-            })
-            .transpose()?,
-        ews_url: None,
-        jmap_url: None,
-    };
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_password_imap(&email, &display_name, username, &password, &config)
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+                .transpose()?,
+            ews_url: None,
+            jmap_url: None,
+        };
+        let core = core(&state).await?;
+        // S-003: единственный наблюдаемый этап для готового набора серверов -
+        // проверка учётных данных (сохранение аккаунта быстрее и отдельно не
+        // выделяется, см. account-connect-progress.md).
+        emit_connect_stage(&app, &email, "checking_server");
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        let connected = core
+            .accounts
+            .add_password_imap(&email, &display_name, username, &password, &config)
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("imap", "checking_server", started, &email, error);
+    }
+    outcome
 }
 
 #[tauri::command]
@@ -4671,28 +4908,41 @@ pub async fn complete_exchange_ews(
     server_hint: String,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() {
-        return Err(ApiError {
-            message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
-        });
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() {
+            return Err(ApiError {
+                message: "укажите DOMAIN\\user, UPN или адрес пользователя Exchange".into(),
+            });
+        }
+        let core = core(&state).await?;
+        // Автопоиск (S-012) и проверка учётных данных (S-013) на пониженных
+        // пределах одного соединения (S-014) выполняются внутри add_exchange_ews;
+        // с точки зрения интерфейса это один этап "проверяю сервер".
+        emit_connect_stage(&app, &email, "checking_server");
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        let connected = core
+            .accounts
+            .add_exchange_ews(
+                &email,
+                &display_name,
+                username,
+                &password,
+                (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
+            )
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("ews", "checking_server", started, &email, error);
     }
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_exchange_ews(
-            &email,
-            &display_name,
-            username,
-            &password,
-            (!server_hint.trim().is_empty()).then_some(server_hint.trim()),
-        )
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+    outcome
 }
 
 #[tauri::command]
@@ -4705,28 +4955,38 @@ pub async fn complete_jmap(
     session_url: String,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
-    let username = username.trim();
-    if username.is_empty() || session_url.trim().is_empty() {
-        return Err(ApiError {
-            message: "укажите имя пользователя и JMAP Session URL".into(),
-        });
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        let username = username.trim();
+        if username.is_empty() || session_url.trim().is_empty() {
+            return Err(ApiError {
+                message: "укажите имя пользователя и JMAP Session URL".into(),
+            });
+        }
+        let core = core(&state).await?;
+        emit_connect_stage(&app, &email, "checking_server");
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        let connected = core
+            .accounts
+            .add_jmap_password(
+                &email,
+                &display_name,
+                username,
+                &password,
+                session_url.trim(),
+            )
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("jmap", "checking_server", started, &email, error);
     }
-    let core = core(&state).await?;
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_jmap_password(
-            &email,
-            &display_name,
-            username,
-            &password,
-            session_url.trim(),
-        )
-        .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+    outcome
 }
 
 #[tauri::command]
@@ -4747,24 +5007,34 @@ pub async fn complete_yandex_oauth(
         .ok_or_else(|| ApiError {
             message: "OAuth-сессия не найдена или устарела".into(),
         })?;
-    let token = truemail_core::account::exchange_yandex_code(
-        &pending.client_id,
-        &code,
-        &pending.verifier,
-        "https://oauth.yandex.ru/verification_code",
-    )
-    .await?;
-    state.oauth.lock().await.remove(&oauth_state);
     let email = pending.email.trim().to_lowercase();
-    let display_name = email.split('@').next().unwrap_or(&email).to_owned();
-    let connected = core
-        .accounts
-        .add_yandex_oauth(&email, &display_name, token)
+    let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
+    let started = std::time::Instant::now();
+    let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
+        emit_connect_stage(&app, &email, "checking_server");
+        let token = truemail_core::account::exchange_yandex_code(
+            &pending.client_id,
+            &code,
+            &pending.verifier,
+            "https://oauth.yandex.ru/verification_code",
+        )
         .await?;
-    let account = connected.account.clone();
-    let response = connected_response(connected);
-    spawn_initial_mail_sync(&app, &state, core, account).await;
-    Ok(response)
+        state.oauth.lock().await.remove(&oauth_state);
+        let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        let connected = core
+            .accounts
+            .add_yandex_oauth(&email, &display_name, token)
+            .await?;
+        let account = connected.account.clone();
+        let response = connected_response(connected);
+        spawn_initial_mail_sync(&app, &state, core, account).await;
+        Ok(response)
+    })
+    .await;
+    if let Err(error) = &outcome {
+        log_connect_failure("yandex_oauth", "checking_server", started, &email, error);
+    }
+    outcome
 }
 
 /// Список инструментов внешнего API (для справки/настроек).
@@ -5428,5 +5698,104 @@ mod api_error_tests {
             }
             MailSyncOutcome::Success => panic!("почта завершилась ошибкой - ожидался Failure"),
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_progress_tests {
+    //! Проверки видимого хода подключения аккаунта
+    //! (specs/account-connect-progress.md): общий предел времени вызова,
+    //! вид ошибки при его истечении и единственная активная попытка на адрес.
+    //! ApiError намеренно не реализует Debug (в нём сырой текст ошибки),
+    //! поэтому результаты здесь разбираются match-ом, а не unwrap/expect.
+    use super::*;
+
+    fn expect_ok<T>(result: CmdResult<T>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("ожидался успех, получена ошибка: {}", error.safe_message()),
+        }
+    }
+
+    fn expect_err_kind<T>(result: CmdResult<T>) -> String {
+        match result {
+            Ok(_) => panic!("ожидалась ошибка, получен успех"),
+            Err(error) => error.parts().kind.to_owned(),
+        }
+    }
+
+    /// S-004, S-006: истечение общего предела даёт машиночитаемый вид
+    /// `timeout` и тот самый текст, что описан в спецификации, - интерфейс
+    /// не разбирает текст и берёт действие "Повторить" по виду ошибки.
+    #[test]
+    fn timeout_error_has_timeout_kind_and_spec_message() {
+        let value = serde_json::to_value(connect_timeout_error()).expect("ошибка сериализуется");
+        assert_eq!(value["kind"], "timeout");
+        assert_eq!(
+            value["message"],
+            "Подключение заняло слишком много времени. Проверьте сеть и адрес сервера, затем повторите попытку"
+        );
+    }
+
+    /// S-004: вызов, уложившийся в предел, возвращает свой результат как есть.
+    #[tokio::test]
+    async fn fast_call_passes_through_the_timeout_wrapper() {
+        let result = expect_ok(with_connect_timeout(async { Ok::<_, ApiError>(42) }).await);
+        assert_eq!(result, 42);
+    }
+
+    /// S-004: предел один на весь вызов - если он уже израсходован раньше в
+    /// этом же вызове, оставшаяся часть не ждёт ещё 120 секунд, а сразу
+    /// завершается видом ошибки `timeout`.
+    #[tokio::test]
+    async fn exhausted_budget_fails_immediately_with_timeout() {
+        let spent = CONNECT_COMMAND_TIMEOUT + std::time::Duration::from_secs(1);
+        let kind = expect_err_kind(
+            with_connect_timeout_remaining(spent, async {
+                std::future::pending::<CmdResult<()>>().await
+            })
+            .await,
+        );
+        assert_eq!(kind, "timeout");
+    }
+
+    /// S-015: вторая попытка того же адреса отклоняется, пока первая активна;
+    /// другой адрес при этом подключается свободно.
+    #[tokio::test]
+    async fn second_attempt_for_the_same_address_is_rejected() {
+        let registry = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let first = expect_ok(ConnectAttemptGuard::acquire(&registry, "user@example.com").await);
+        assert!(
+            ConnectAttemptGuard::acquire(&registry, "user@example.com")
+                .await
+                .is_err(),
+            "вторая попытка того же адреса обязана быть отклонена"
+        );
+        let other = expect_ok(ConnectAttemptGuard::acquire(&registry, "other@example.com").await);
+        drop(other);
+        drop(first);
+    }
+
+    /// S-015: после завершения попытки (уничтожения guard) адрес снова
+    /// свободен - запись снимается из реестра отдельной задачей.
+    #[tokio::test]
+    async fn address_is_free_again_after_the_attempt_ends() {
+        let registry = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let guard = expect_ok(ConnectAttemptGuard::acquire(&registry, "user@example.com").await);
+        drop(guard);
+        // Drop синхронный, снятие записи уходит в отдельную задачу - даём ей
+        // выполниться, прежде чем проверять реестр.
+        for _ in 0..64 {
+            if registry.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(registry.lock().await.is_empty(), "реестр должен опустеть");
+        let again = ConnectAttemptGuard::acquire(&registry, "user@example.com").await;
+        assert!(
+            again.is_ok(),
+            "после завершения попытки адрес снова доступен"
+        );
     }
 }

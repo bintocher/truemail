@@ -91,6 +91,9 @@ window.corePageSize = 100;
     moveStorage: (target) => invoke("move_storage", { target }),
     openDataDir: () => invoke("open_data_dir"),
     clearLocalData: (scope) => invoke("clear_local_data", { scope }),
+    // specs/diagnostics-bundle.md, S-001: одна команда ядра без передачи
+    // журналов через JavaScript - интерфейс только запускает сбор и получает путь.
+    createDiagnosticsBundle: () => invoke("create_diagnostics_bundle"),
     syncAccounts: () => invoke("sync_accounts"),
     syncAuxiliaryAccounts: () => invoke("sync_auxiliary_accounts"),
     startRealtime: () => invoke("start_realtime"),
@@ -255,6 +258,10 @@ window.corePageSize = 100;
   });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
+  // account-connect-progress.md, S-002, S-003: этап попытки подключения,
+  // подтверждённый ядром в ходе одного вызова команды (например, переход к
+  // ожиданию кода OAuth в браузере или к проверке сервера).
+  tauri.event?.listen("truemail-connect-stage", event => window.handleConnectStage?.(event.payload)).catch(console.error);
   tauri.event?.listen("truemail-storage-moved", async () => {
     await window.reloadCoreData?.();
     await window.tm.startRealtime();

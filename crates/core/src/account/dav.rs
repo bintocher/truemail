@@ -327,7 +327,10 @@ async fn dav_request_optional(
         return Err(Error::from_http_status(
             "dav",
             response.status.as_u16(),
-            format!("{method} {url}: HTTP {}: {}", response.status, response.body),
+            format!(
+                "{method} {url}: HTTP {}: {}",
+                response.status, response.body
+            ),
         ));
     }
     Ok(Some(response.body))

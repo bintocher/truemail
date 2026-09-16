@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260916-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260916-2`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -97,6 +97,13 @@ window.currentWizardAttempt=()=>wizardAttemptGeneration;
 // (не было простого закрытия). Оба условия нужны для S-009.
 window.isWizardAttemptCurrent=attempt=>attempt===wizardAttemptGeneration&&document.getElementById('welcomeView')?.classList.contains('active');
 window.wizardEscapeState=()=>({wizardOpen:document.getElementById('welcomeView')?.classList.contains('active')||false,wizardExitAvailable:!wizardMandatory});
+// account-connect-progress.md, S-010, S-016: подключение аккаунта из настроек
+// (мастер добавления, а не первичный мастер) использует то же поколение
+// попытки, что и первичный мастер, - оба экрана не могут быть открыты
+// одновременно, второе поколение заводить незачем. "Экран ещё тот же" здесь
+// значит, что диалог добавления аккаунта в настройках не закрыт (см.
+// showAccountWizard/closeAccountWizard в этом же файле).
+window.isSettingsConnectAttemptCurrent=attempt=>attempt===wizardAttemptGeneration&&document.querySelector('.settings')?.classList.contains('account-wizard-mode');
 
 function currentViewId(){const active=document.querySelector('.view.active');return active&&active.id!=='welcomeView'?active.id:'mailView';}
 
@@ -108,8 +115,8 @@ function currentViewId(){const active=document.querySelector('.view.active');ret
 // запрос прежнего поколения попытки.
 function clearWizardTransientMessages(){
   document.querySelectorAll('#welcomeView .wz-connect-status').forEach(el=>{el.textContent='';delete el.dataset.kind;});
-  const connectButton=document.getElementById('wzConnect');if(connectButton)connectButton.disabled=false;
-  const confirmButton=document.getElementById('wzConfirm');if(confirmButton)confirmButton.disabled=false;
+  const connectButton=document.getElementById('wzConnect');if(connectButton)window.setConnectBusy?.(connectButton,null,null,false);
+  const confirmButton=document.getElementById('wzConfirm');if(confirmButton)window.setConnectBusy?.(confirmButton,null,null,false);
   document.getElementById('wzCodeBox')?.classList.add('hidden');
   const oauthCode=document.getElementById('wzOauthCode');if(oauthCode)oauthCode.value='';
   pendingOauthState='';
@@ -273,9 +280,14 @@ async function createStorageFromEntropy(){
 }
 createKeysButton.onclick=createStorageFromEntropy;
 function showAccountWizard(prefillEmail=''){
+  // S-010, S-016: новое открытие диалога добавления аккаунта в настройках -
+  // новое поколение попытки (общее с первичным мастером, см. пояснение выше
+  // у isSettingsConnectAttemptCurrent) - поздний ответ прежнего открытия не
+  // должен тронуть уже другой (или закрытый) экран.
+  wizardAttemptGeneration++;
   accountOauthState='';accountPasswordProvider='generic';
   const status=document.getElementById('accountOauthStatus'),start=document.getElementById('accountOauthStart'),confirm=document.getElementById('accountOauthConfirm'),code=document.getElementById('accountOauthCode');
-  status.textContent='';status.dataset.kind='';start.disabled=false;confirm.disabled=false;code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
+  status.textContent='';status.dataset.kind='';window.setConnectBusy?.(start,null,null,false);window.setConnectBusy?.(confirm,null,null,false);window.setConnectBusy?.(document.getElementById('accountPasswordConfirm'),null,null,false);code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
   document.querySelector('.settings').classList.add('account-wizard-mode');showView('settingsView');setSection('addacct');
 }
 function closeAccountWizard(){document.querySelector('.settings').classList.remove('account-wizard-mode');setSection('accounts');}

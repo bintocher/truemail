@@ -295,6 +295,55 @@ document.getElementById('apiAuditClear').onclick=async()=>{if(await confirmActio
 
 function confirmAction(message){return new Promise(resolve=>{const overlay=document.createElement('div');overlay.className='overlay open';const modal=document.createElement('div');modal.className='modal compact-modal';const body=document.createElement('div');body.className='mb';body.textContent=message;const foot=document.createElement('div');foot.className='mf';const ok=document.createElement('button');ok.className='btn primary';ok.textContent=L('Продолжить','Continue');const cancel=document.createElement('button');cancel.className='btn confirm-cancel';cancel.textContent=L('Отмена','Cancel');const done=value=>{overlay.remove();resolve(value);};ok.onclick=()=>done(true);cancel.onclick=()=>done(false);overlay.onclick=e=>{if(e.target===overlay)done(false);};foot.append(ok,cancel);modal.append(body,foot);overlay.appendChild(modal);document.body.appendChild(overlay);cancel.focus();});}
 document.getElementById('openDataDir').onclick=()=>window.tm?.openDataDir().catch(error=>showToast(error));document.getElementById('changeDataDir').onclick=async()=>{try{const current=document.querySelector('#set-storage .d.mono').textContent,chosen=await window.tm.chooseDataDir(current);if(chosen){await window.tm.moveStorage(chosen);showToast(L('Данные перенесены, новый путь уже используется.','Data moved, the new path is now in use.'));document.querySelector('#set-storage .d.mono').textContent=chosen;}}catch(error){showToast(error);}};document.querySelectorAll('[data-clear]').forEach(button=>button.onclick=async()=>{if(!await confirmAction(L('Очистить выбранные локальные данные? Данные на сервере не удаляются.','Clear the selected local data? Data on the server is not deleted.')))return;try{await window.tm.clearLocalData(button.dataset.clear);await window.reloadCoreData();showToast(L('Локальные данные очищены','Local data cleared'));}catch(error){showToast(error);}});
+// Сбор диагностики (specs/diagnostics-bundle.md). Список категорий и текст
+// предупреждения статичны (S-014) - хранятся в diagnostics-categories.js,
+// отдельная команда ядра для показа диалога не нужна.
+const diagnosticsCategoryLabels={
+  diagnosticsCategoryEmail:L('адреса электронной почты','email addresses'),
+  diagnosticsCategoryHost:L('домены и имена серверов','domains and server names'),
+  diagnosticsCategoryPath:L('пути к файлам и папкам на диске','file and folder paths on disk'),
+  diagnosticsCategoryFolder:L('имена папок почтового ящика','mailbox folder names'),
+  diagnosticsCategoryIds:L('внутренние идентификаторы аккаунтов, писем и папок','internal account, message and folder identifiers'),
+};
+function openDiagnosticsDialog(){
+  document.getElementById('diagTitle').textContent=L('Перед сбором диагностики','Before collecting diagnostics');
+  document.getElementById('diagIntro').textContent=L('В архив попадут журналы работы приложения. Следующие сведения в них будут заменены псевдонимами:','The archive will include application logs. The following details in them will be replaced with aliases:');
+  const list=document.getElementById('diagCategories');list.innerHTML='';
+  window.diagnosticsCategories.DIAGNOSTICS_CATEGORY_KEYS.forEach(key=>{const item=document.createElement('li');item.textContent=diagnosticsCategoryLabels[key];list.appendChild(item);});
+  document.getElementById('diagCaveat').textContent=L('Это не гарантирует, что в архиве не останется иных сведений: произвольный текст ответа сервера в журнале по категориям не разбирается.','This does not guarantee no other details remain: arbitrary server response text in the log is not parsed by category.');
+  document.getElementById('diagStartLabel').textContent=L('Собрать','Collect');
+  document.getElementById('diagCancel').textContent=L('Отмена','Cancel');
+  document.getElementById('diagOverlay').classList.add('open');
+}
+function closeDiagnosticsDialog(){document.getElementById('diagOverlay').classList.remove('open');}
+document.getElementById('collectDiagnostics').onclick=openDiagnosticsDialog;
+document.getElementById('diagClose').onclick=closeDiagnosticsDialog;
+document.getElementById('diagCancel').onclick=closeDiagnosticsDialog;
+document.getElementById('diagStart').onclick=async()=>{
+  closeDiagnosticsDialog();
+  const button=document.getElementById('collectDiagnostics'),status=document.getElementById('diagStatus');
+  // S-001: одновременно разрешён только один сбор - кнопка отключается сразу.
+  button.disabled=true;status.textContent=L('Собираю диагностику…','Collecting diagnostics…');status.dataset.kind='';
+  try{
+    const result=await window.tm.createDiagnosticsBundle();
+    // skipped_files - число пропущенных журналов (usize в Rust), а не список:
+    // .length здесь всегда undefined, поэтому предупреждение о частичном
+    // архиве (S-008) не показывалось бы вовсе.
+    const skipped=result.skipped_files||0;
+    if(skipped){
+      status.textContent=L(`Архив собран частично: не удалось прочитать ${skipped} журн. Сохранён: ${result.archive_path}`,`Archive collected partially: ${skipped} log file(s) could not be read. Saved: ${result.archive_path}`);
+      status.dataset.kind='warning';
+    }else{
+      status.textContent=L(`Архив диагностики сохранён: ${result.archive_path}`,`Diagnostics archive saved: ${result.archive_path}`);
+      status.dataset.kind='success';
+    }
+    if(!result.folder_opened)status.textContent+=' '+L('Папку с архивом не удалось открыть автоматически.','The archive folder could not be opened automatically.');
+  }catch(error){
+    status.textContent='';status.dataset.kind='';showToast(error);
+  }finally{
+    button.disabled=false;
+  }
+};
 document.getElementById('exportKeyBackup').onclick=async()=>{
   const passwordInput=document.getElementById('keyBackupPassword'),confirmInput=document.getElementById('keyBackupPasswordConfirm'),status=document.getElementById('keyBackupStatus'),button=document.getElementById('exportKeyBackup');
   const password=passwordInput.value;

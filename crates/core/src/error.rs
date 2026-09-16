@@ -165,7 +165,11 @@ impl Error {
     /// Вид ошибки по коду ответа HTTP: единое правило для всех транспортов,
     /// которые общаются по HTTP (JMAP, Gmail API, CalDAV и CardDAV, отправка
     /// Gmail). Успешные коды сюда не приходят.
-    pub fn from_http_status(backend: impl Into<String>, status: u16, message: impl Into<String>) -> Self {
+    pub fn from_http_status(
+        backend: impl Into<String>,
+        status: u16,
+        message: impl Into<String>,
+    ) -> Self {
         let backend = backend.into();
         let message = message.into();
         match status {
