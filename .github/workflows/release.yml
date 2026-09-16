@@ -188,6 +188,12 @@ jobs:
         # присутствуют не только в основном бинарнике, но и во всех прочих
         # исполняемых файлах и библиотеках внутри .app - иначе универсальный
         # пакет мог бы оказаться собран лишь наполовину.
+        # F8: lipo вызывается только для файлов, которые `file` определяет как
+        # Mach-O - обычный ресурс или Info.plist внутри Contents/Frameworks
+        # (не Mach-O) иначе завалил бы весь выпуск, хотя к архитектурам
+        # никакого отношения не имеет. Отдельно проверяем, что основной
+        # исполняемый файл приложения найден и действительно прошёл проверку
+        # архитектур, а не был случайно пропущен вместе с посторонними файлами.
         run: |
           set -e
           bundle_dir="target/universal-apple-darwin/release/bundle"
@@ -197,19 +203,40 @@ jobs:
             exit 1
           fi
           app_path=$(find "$bundle_dir/macos" -maxdepth 1 -type d -name '*.app')
+          executable_name=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")
+          main_executable="$app_path/Contents/MacOS/$executable_name"
+          if [ ! -f "$main_executable" ]; then
+            echo "не найден основной исполняемый файл: $main_executable" >&2
+            exit 1
+          fi
+          checked_count=0
+          main_checked=0
           check_arch() {
             local f="$1"
+            case "$(file -b "$f")" in
+              Mach-O*) ;;
+              *) return 0 ;;
+            esac
             local archs
             archs=$(lipo -archs "$f" 2>/dev/null || true)
             case "$archs" in
               *arm64*x86_64*|*x86_64*arm64*) echo "ок: $f -> $archs" ;;
               *) echo "нет обеих архитектур (arm64, x86_64) в $f (найдено: $archs)" >&2; exit 1 ;;
             esac
+            checked_count=$((checked_count + 1))
+            if [ "$f" = "$main_executable" ]; then
+              main_checked=1
+            fi
           }
           while IFS= read -r -d '' f; do check_arch "$f"; done < <(find "$app_path/Contents/MacOS" -type f -print0)
           if [ -d "$app_path/Contents/Frameworks" ]; then
             while IFS= read -r -d '' f; do check_arch "$f"; done < <(find "$app_path/Contents/Frameworks" -type f -print0)
           fi
+          if [ "$main_checked" -ne 1 ]; then
+            echo "основной исполняемый файл не был проверен: $main_executable" >&2
+            exit 1
+          fi
+          echo "проверено файлов Mach-O: $checked_count (основной исполняемый файл: $main_executable)"
       - name: Залить ассеты
         # S-004/S-006: источник - только каталог universal-apple-darwin;
         # ровно один .dmg и ровно один архив .app.tar.gz с подписью, иначе

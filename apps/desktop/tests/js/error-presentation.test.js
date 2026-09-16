@@ -44,9 +44,30 @@ test('S-007 S-011: неизвестный и старый ответ не кла
   const strange=presentError({kind:'future_kind',message:'password rejected'},{locale:'ru',translations});
   assert.equal(old.kind,'unknown');
   assert.equal(strange.kind,'unknown');
-  assert.equal(old.text,translations.ru.errorUnknown);
+  // F11: вид остаётся unknown (S-011 - никакого разбора текста ради вида), но
+  // раз собственный текст ошибки есть и не пуст, он и показывается - иначе
+  // локальные причины (проверка полей, отказ второй попытки подключения,
+  // отказ файловой операции) терялись бы за общим текстом.
+  assert.equal(old.text,'invalid_grant rateLimitExceeded');
   assert.equal(old.message,'invalid_grant rateLimitExceeded');
   assert.equal(old.action,'diagnostics');
+});
+
+test('F11: unknown без текста показывает общий текст, unknown с текстом - свой',()=>{
+  const withText=presentError({kind:'unknown',message:'укажите имя пользователя и IMAP-сервер'},{locale:'ru',translations});
+  assert.equal(withText.text,'укажите имя пользователя и IMAP-сервер');
+  const withoutText=presentError({kind:'unknown',message:''},{locale:'ru',translations});
+  assert.equal(withoutText.text,translations.ru.errorUnknown);
+  const noMessageAtAll=presentError({kind:'unknown'},{locale:'ru',translations});
+  assert.equal(noMessageAtAll.text,translations.ru.errorUnknown);
+  const blankMessage=presentError({kind:'unknown',message:'   '},{locale:'ru',translations});
+  assert.equal(blankMessage.text,translations.ru.errorUnknown);
+});
+
+test('F11: у известного вида текст всегда по таблице, а не собственный',()=>{
+  const known=presentError({kind:'timeout',message:'какой-то внутренний текст'},{locale:'ru',translations});
+  assert.equal(known.text,translations.ru.errorTimeout);
+  assert.notEqual(known.text,'какой-то внутренний текст');
 });
 
 test('S-016: только два вида требуют повторного входа',()=>{

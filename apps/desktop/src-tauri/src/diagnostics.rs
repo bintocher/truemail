@@ -96,7 +96,7 @@ fn collect_diagnostics_bundle_with_limit(
         .map_err(|error| format!("не удалось создать папку diagnostics: {error}"))?;
     cleanup_stale_tmp(&diagnostics_dir);
 
-    let candidates = discover_log_candidates(&logs_dir)
+    let (candidates, foreign_names) = discover_log_candidates(&logs_dir)
         .map_err(|error| format!("не удалось прочитать каталог журналов: {error}"))?;
 
     let file_name = format!(
@@ -109,6 +109,7 @@ fn collect_diagnostics_bundle_with_limit(
 
     match write_bundle(
         &candidates,
+        foreign_names,
         &tmp_path,
         app_version,
         os_label,
@@ -141,7 +142,16 @@ fn collect_diagnostics_bundle_with_limit(
     }
 }
 
-/// Удаляет только СВОИ устаревшие `.tmp`-файлы (старше суток) - брошенные
+/// Имя строго по шаблону временного архива этого модуля -
+/// `truemail-diagnostics-<...>.zip.tmp` (см. сборку `file_name`/`tmp_path`
+/// выше). Отличает СВОИ брошенные файлы от чужого `.tmp` (F10): расширение
+/// `.tmp` само по себе ничего не говорит о происхождении файла - в той же
+/// папке мог оказаться временный файл другой программы или пользователя.
+fn is_own_tmp_archive_name(name: &str) -> bool {
+    name.starts_with("truemail-diagnostics-") && name.ends_with(".zip.tmp")
+}
+
+/// Удаляет только СВОИ устаревшие временные архивы (старше суток) - брошенные
 /// прошлым прерванным сбором после неожиданного завершения процесса.
 fn cleanup_stale_tmp(diagnostics_dir: &Path) {
     let Ok(entries) = fs::read_dir(diagnostics_dir) else {
@@ -150,7 +160,8 @@ fn cleanup_stale_tmp(diagnostics_dir: &Path) {
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("tmp") {
+        let name = entry.file_name();
+        if !is_own_tmp_archive_name(&name.to_string_lossy()) {
             continue;
         }
         let Ok(metadata) = entry.metadata() else {
@@ -174,27 +185,61 @@ fn random_suffix() -> String {
         .collect()
 }
 
+/// Проверяет, что имя файла - ровно `truemail.log` или `truemail.log.ГГГГ-ММ-ДД`
+/// (F2): это единственные два имени, которые создаёт сам журнал (см.
+/// `crates/core/src/logging.rs`, суточная ротация). Любое иное имя,
+/// начинающееся с того же префикса (например, имя `truemail.log-user@example.com`,
+/// подсунутое кем-то другим в тот же каталог), могло бы раскрыть адрес прямо
+/// в имени файла архива и в `manifest.json`, поэтому дальше строгого
+/// совпадения формата проверка не идёт.
+fn is_own_log_file_name(name: &str) -> bool {
+    if name == "truemail.log" {
+        return true;
+    }
+    let Some(suffix) = name.strip_prefix("truemail.log.") else {
+        return false;
+    };
+    let bytes = suffix.as_bytes();
+    // ГГГГ-ММ-ДД: ровно 10 символов, цифры и дефисы на фиксированных местах.
+    bytes.len() == 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
 /// Перечисляет файлы журналов, лежащие непосредственно в `logs_dir`, чьё имя
-/// начинается с `truemail.log` (S-002). Не заходит во вложенные каталоги;
-/// собственно защита от символических ссылок - при открытии по дескриптору
-/// в [`open_regular_file_no_follow`], не здесь: список путей отсюда может
-/// устареть до открытия, и решение принимается заново по уже открытому файлу.
-fn discover_log_candidates(logs_dir: &Path) -> io::Result<Vec<PathBuf>> {
+/// строго совпадает с `truemail.log` или `truemail.log.ГГГГ-ММ-ДД` (S-002, F2).
+/// Не заходит во вложенные каталоги; собственно защита от символических
+/// ссылок - при открытии по дескриптору в [`open_regular_file_no_follow`], не
+/// здесь: список путей отсюда может устареть до открытия, и решение
+/// принимается заново по уже открытому файлу. Прочие файлы каталога (не
+/// строгого имени) не попадают ни в архив, ни в его имя - только в
+/// предупреждения `manifest.json` через `foreign_names`, без самого
+/// постороннего имени в тексте (F2).
+fn discover_log_candidates(logs_dir: &Path) -> io::Result<(Vec<PathBuf>, usize)> {
     let entries = match fs::read_dir(logs_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(error) => return Err(error),
     };
     let mut paths = Vec::new();
+    let mut foreign_names = 0usize;
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with("truemail.log") {
+        let name = name.to_string_lossy();
+        if is_own_log_file_name(&name) {
             paths.push(entry.path());
+        } else if name.starts_with("truemail.log") {
+            // Похоже на наш журнал по префиксу, но имя не строгого формата -
+            // пропускаем и считаем в предупреждениях, само имя в архив не идёт.
+            foreign_names += 1;
         }
     }
     paths.sort();
-    Ok(paths)
+    Ok((paths, foreign_names))
 }
 
 /// Открывает файл по пути и сразу проверяет тип уже открытого дескриптора -
@@ -277,6 +322,7 @@ type Bundle = (Vec<String>, usize, BTreeMap<String, u64>);
 
 fn write_bundle(
     candidates: &[PathBuf],
+    foreign_names: usize,
     tmp_path: &Path,
     app_version: &str,
     os_label: &str,
@@ -303,6 +349,15 @@ fn write_bundle(
     let mut included = Vec::new();
     let mut skipped = Vec::new();
     let mut warnings = Vec::new();
+    if foreign_names > 0 {
+        // F2: посторонние файлы каталога журналов (имя не строгого формата
+        // truemail.log/truemail.log.ГГГГ-ММ-ДД) в архив не попадают - их
+        // количество видно в предупреждении, а сами имена нет, чтобы не
+        // раскрыть то, ради чего их и пропустили.
+        warnings.push(format!(
+            "в каталоге журналов пропущено файлов постороннего имени: {foreign_names}"
+        ));
+    }
 
     for path in candidates {
         let name = path
@@ -319,7 +374,14 @@ fn write_bundle(
             &mut warnings,
         ) {
             Ok(summary) => included.push(summary),
-            Err(reason) => skipped.push(SkippedLog { name, reason }),
+            Err(LogWriteError::BeforeWrite(reason)) => skipped.push(SkippedLog { name, reason }),
+            Err(LogWriteError::MidWrite(reason)) => {
+                // F9: запись файла в zip уже началась - частично записанная
+                // запись сделала бы архив нечитаемым или лгущим о своём
+                // содержимом; вся сборка отменяется как одна ошибка, внешний
+                // вызывающий код удалит временный файл целиком (S-016).
+                return Err(format!("{name}: {reason}"));
+            }
         }
     }
 
@@ -354,6 +416,19 @@ fn write_bundle(
     ))
 }
 
+/// Ошибка одного журнала (F9): до вызова `zip.start_file` в архиве ещё нет
+/// записи этого файла - такую ошибку можно честно перечислить в пропусках и
+/// продолжить остальными файлами (S-008). После `start_file` в zip уже
+/// появилась запись файла (заголовок, а обычно и часть содержимого) - если
+/// чтение или запись оборвутся здесь, "пропуск" на самом деле оставил бы в
+/// архиве частично записанный, нечитаемый или лгущий о своём размере кусок;
+/// такую ошибку нельзя лечить пропуском одного файла, вся сборка отменяется
+/// целиком (S-016 diagnostics-bundle.md).
+enum LogWriteError {
+    BeforeWrite(String),
+    MidWrite(String),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_one_log(
     zip: &mut ZipWriter<LimitedFile>,
@@ -363,16 +438,19 @@ fn write_one_log(
     path: &Path,
     name: &str,
     warnings: &mut Vec<String>,
-) -> Result<IncludedLog, String> {
-    let file = open_regular_file_no_follow(path).map_err(|error| error.to_string())?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("не удалось прочитать метаданные: {error}"))?;
+) -> Result<IncludedLog, LogWriteError> {
+    let file = open_regular_file_no_follow(path)
+        .map_err(|error| LogWriteError::BeforeWrite(error.to_string()))?;
+    let metadata = file.metadata().map_err(|error| {
+        LogWriteError::BeforeWrite(format!("не удалось прочитать метаданные: {error}"))
+    })?;
     // S-013: снимок длины на момент открытия - активный журнал может расти
     // дальше, но читаем не больше того, что было на момент открытия.
     let initial_len = metadata.len();
+    // F9: с этой точки в zip уже есть запись файла - дальнейшие ошибки идут
+    // как MidWrite, не BeforeWrite.
     zip.start_file(name, options)
-        .map_err(|error| format!("zip: {error}"))?;
+        .map_err(|error| LogWriteError::MidWrite(format!("zip: {error}")))?;
     let mut reader = BufReader::new(file).take(initial_len);
     let mut final_bytes: u64 = 0;
     loop {
@@ -389,13 +467,17 @@ fn write_one_log(
                 }
                 let anonymized = diagnostics::anonymize_line(&text, salt, counts);
                 zip.write_all(anonymized.as_bytes())
-                    .map_err(|error| format!("zip: {error}"))?;
+                    .map_err(|error| LogWriteError::MidWrite(format!("zip: {error}")))?;
                 zip.write_all(b"\n")
-                    .map_err(|error| format!("zip: {error}"))?;
+                    .map_err(|error| LogWriteError::MidWrite(format!("zip: {error}")))?;
                 final_bytes += anonymized.len() as u64 + 1;
             }
             Ok(None) => break,
-            Err(error) => return Err(format!("ошибка чтения журнала: {error}")),
+            Err(error) => {
+                return Err(LogWriteError::MidWrite(format!(
+                    "ошибка чтения журнала: {error}"
+                )));
+            }
         }
     }
     Ok(IncludedLog {
@@ -624,18 +706,65 @@ mod tests {
         .unwrap();
         let target = root.join("outside-target.log");
         fs::write(&target, b"secret target content ivan@example.com\n").unwrap();
+        // Имя строгого формата (F2) - иначе символическая ссылка отсеялась бы
+        // уже по имени и не дошла бы до проверки типа дескриптора, которую и
+        // проверяет этот тест.
         #[cfg(windows)]
         {
-            let _ = std::os::windows::fs::symlink_file(&target, logs_dir.join("truemail.log.link"));
+            let _ = std::os::windows::fs::symlink_file(
+                &target,
+                logs_dir.join("truemail.log.2026-01-01"),
+            );
         }
         #[cfg(unix)]
         {
-            let _ = std::os::unix::fs::symlink(&target, logs_dir.join("truemail.log.link"));
+            let _ = std::os::unix::fs::symlink(&target, logs_dir.join("truemail.log.2026-01-01"));
         }
         let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
         assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
         let content = read_zip_entry(&result.archive_path, "truemail.log");
         assert_eq!(content.trim_end(), "regular ok");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn f2_foreign_name_in_logs_dir_is_excluded_and_never_named() {
+        // F2: файл с посторонним именем (мог бы раскрыть адрес почты прямо в
+        // имени) не попадает в архив, а его имя не встречается нигде - ни в
+        // included_files, ни в manifest.json, только счётчик в warnings.
+        let root = temp_dir("f2-foreign-name");
+        let data_dir = root.join("data");
+        let logs_dir = data_dir.join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(logs_dir.join("truemail.log"), b"ok line\n").unwrap();
+        let foreign_name = "truemail.log-user@example.com";
+        fs::write(logs_dir.join(foreign_name), "постороннее содержимое\n").unwrap();
+        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
+        assert_eq!(result.skipped_files, 0);
+        let names = read_zip_names(&result.archive_path);
+        assert!(!names.contains(&foreign_name.to_owned()));
+        let manifest = read_zip_entry(&result.archive_path, "manifest.json");
+        assert!(!manifest.contains(foreign_name));
+        assert!(!manifest.contains("user@example.com"));
+        assert!(manifest.contains("постороннего имени"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn f2_dated_rotation_name_is_accepted() {
+        // truemail.log.ГГГГ-ММ-ДД - второй формат имени, который создаёт сама
+        // ротация журнала, и он обязан оставаться разрешённым.
+        let root = temp_dir("f2-dated");
+        let data_dir = root.join("data");
+        let logs_dir = data_dir.join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(logs_dir.join("truemail.log.2026-09-15"), b"old day\n").unwrap();
+        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        assert_eq!(
+            result.included_files,
+            vec!["truemail.log.2026-09-15".to_owned()]
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -646,9 +775,9 @@ mod tests {
         let logs_dir = data_dir.join("logs");
         fs::create_dir_all(&logs_dir).unwrap();
         fs::write(logs_dir.join("truemail.log"), b"ok line\n").unwrap();
-        // Каталог с именем truemail.log.dir не должен читаться как файл -
+        // Каталог со строгим именем даты (F2) не должен читаться как файл -
         // это тоже "не обычный файл" по S-002, что и создаёт частичный сбор.
-        fs::create_dir_all(logs_dir.join("truemail.log.dir")).unwrap();
+        fs::create_dir_all(logs_dir.join("truemail.log.2026-01-02")).unwrap();
         let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
         assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
         assert_eq!(result.skipped_files, 1);
@@ -687,6 +816,47 @@ mod tests {
     }
 
     #[test]
+    fn f9_mid_write_failure_aborts_whole_bundle_even_after_one_included_log() {
+        // F9: первый журнал маленький и успевает полностью войти в архив,
+        // второй - достаточно большой и малосжимаемый, чтобы запись его
+        // содержимого упёрлась в предел архива уже ПОСЛЕ zip.start_file. Это
+        // ошибка "после начала записи" (MidWrite) - вся сборка должна
+        // отмениться целиком, а не отметить второй файл "пропущенным" с
+        // частично записанной, испорченной записью в архиве.
+        let root = temp_dir("f9-mid-write");
+        let data_dir = root.join("data");
+        let logs_dir = data_dir.join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        fs::write(logs_dir.join("truemail.log"), b"ok\n").unwrap();
+        let mut second = String::new();
+        {
+            use rand::RngExt as _;
+            let mut rng = rand::rng();
+            for _ in 0..8000 {
+                second.push((b'a' + rng.random_range(0..26)) as char);
+            }
+        }
+        fs::write(logs_dir.join("truemail.log.2026-02-02"), second + "\n").unwrap();
+        let error =
+            collect_diagnostics_bundle_with_limit(&data_dir, "1.0.0", "test-os", 512).unwrap_err();
+        assert!(error.contains("zip"), "неожиданный текст ошибки: {error}");
+        let diagnostics_dir = data_dir.join("diagnostics");
+        let leftovers: Vec<_> = fs::read_dir(&diagnostics_dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "не должно остаться ни временного, ни частичного архива: {leftovers:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn limited_file_rejects_writes_past_its_cap() {
         let root = temp_dir("limited-file");
         let path = root.join("probe.bin");
@@ -712,15 +882,21 @@ mod tests {
         let stale = diagnostics_dir.join("truemail-diagnostics-old.zip.tmp");
         let fresh = diagnostics_dir.join("truemail-diagnostics-fresh.zip.tmp");
         let kept_zip = diagnostics_dir.join("truemail-diagnostics-done.zip");
+        // F10: чужой .tmp того же возраста - не наш файл по имени и не должен
+        // удаляться, даже если тоже старше суток.
+        let foreign_stale_tmp = diagnostics_dir.join("some-other-app.tmp");
         fs::write(&stale, b"stale").unwrap();
         fs::write(&fresh, b"fresh").unwrap();
         fs::write(&kept_zip, b"done").unwrap();
+        fs::write(&foreign_stale_tmp, b"not ours").unwrap();
         let old_time = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
         set_mtime(&stale, old_time);
+        set_mtime(&foreign_stale_tmp, old_time);
         cleanup_stale_tmp(&diagnostics_dir);
         assert!(!stale.exists());
         assert!(fresh.exists());
         assert!(kept_zip.exists());
+        assert!(foreign_stale_tmp.exists(), "чужой .tmp не должен удаляться");
         let _ = fs::remove_dir_all(&root);
     }
 

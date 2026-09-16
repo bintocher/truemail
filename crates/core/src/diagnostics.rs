@@ -57,7 +57,7 @@ impl Category {
             "folder_id" => Some(Self::FolderId),
             "message_id" => Some(Self::MessageId),
             "uid" => Some(Self::Uid),
-            "collection" | "folder" | "mailbox" => Some(Self::Folder),
+            "collection" | "folder" | "mailbox" | "remote_path" => Some(Self::Folder),
             _ => None,
         }
     }
@@ -124,7 +124,7 @@ static_regex!(
 );
 static_regex!(
     field_folder_re,
-    r#"(?i)\b(collection|folder|mailbox)\s*=\s*("[^"]*"|[^\s,;}]+)"#
+    r#"(?i)\b(collection|folder|mailbox|remote_path)\s*=\s*("[^"]*"|[^\s,;}]+)"#
 );
 // Пути: якорь (начало строки или пробел/кавычка/скобка/знак равенства) не
 // входит в замену - иначе разделитель перед путём терялся бы. Без якоря путь
@@ -134,6 +134,25 @@ static_regex!(unc_path_re, r#"(?:^|[\s"'=(<])(\\\\[^\s"'<>]+)"#);
 static_regex!(
     unix_path_re,
     r#"(?:^|[\s"'=(<])(/(?:[^\s"'<>/]+/)+[^\s"'<>]*)"#
+);
+// Домашний каталог: общий шаблон пути выше обрывается на первом пробеле, а
+// имя пользователя в нём может быть составным ("Ivan Petrov") - тогда
+// фамилия оставалась бы открытой в архиве вместе с остатком пути. Эти три
+// шаблона идут раньше общих путей (regex::Regex::replace_all применяет их по
+// порядку вызова в anonymize_line) и позволяют имени внутри `Users`/`home`
+// содержать пробелы вплоть до следующего разделителя пути, кавычки или конца
+// строки, захватывая весь путь целиком - как и общий шаблон, одним псевдонимом.
+static_regex!(
+    windows_home_re,
+    r#"(?:^|[\s"'=(<])([A-Za-z]:\\Users\\[^\\"'<>]+(?:\\[^\s"'<>]*)?)"#
+);
+static_regex!(
+    unix_home_re,
+    r#"(?:^|[\s"'=(<])(/home/[^/"'<>]+(?:/[^\s"'<>]*)?)"#
+);
+static_regex!(
+    macos_home_re,
+    r#"(?:^|[\s"'=(<])(/Users/[^/"'<>]+(?:/[^\s"'<>]*)?)"#
 );
 static_regex!(
     email_re,
@@ -145,6 +164,17 @@ static_regex!(
 static_regex!(
     host_re,
     r"\b(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}\b"
+);
+
+// Сервер могут задать голым адресом IP - для читателя архива это такой же
+// узел, как и имя: без этого шаблона адрес остался бы в архиве открытым.
+static_regex!(ipv4_re, r"\b(?:\d{1,3}\.){3}\d{1,3}\b");
+// Только полная форма из восьми групп и сжатая форма с двойным
+// двоеточием: более свободный шаблон съедал бы время в самой записи
+// журнала - 20:56:39 выглядит как три группы адреса.
+static_regex!(
+    ipv6_re,
+    r"(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|(?i)\b[0-9a-f]{0,4}::[0-9a-f:]{2,}\b"
 );
 
 fn replace_whole_match(
@@ -222,11 +252,18 @@ pub fn anonymize_line(line: &str, salt: &[u8; 16], counts: &mut ReplacementCount
     text = replace_whole_match(uuid_re(), Category::Uuid, salt, &text, counts);
     text = replace_named_field(field_id_re(), salt, &text, counts);
     text = replace_named_field(field_folder_re(), salt, &text, counts);
+    // Домашний каталог - раньше общих шаблонов пути (F1): иначе общий шаблон
+    // уже оборвал бы совпадение на первом пробеле имени пользователя.
+    text = replace_anchored_value(windows_home_re(), Category::Path, salt, &text, counts);
+    text = replace_anchored_value(unix_home_re(), Category::Path, salt, &text, counts);
+    text = replace_anchored_value(macos_home_re(), Category::Path, salt, &text, counts);
     text = replace_anchored_value(windows_path_re(), Category::Path, salt, &text, counts);
     text = replace_anchored_value(unc_path_re(), Category::Path, salt, &text, counts);
     text = replace_anchored_value(unix_path_re(), Category::Path, salt, &text, counts);
     text = replace_whole_match(email_re(), Category::Email, salt, &text, counts);
     text = replace_whole_match(host_re(), Category::Host, salt, &text, counts);
+    text = replace_whole_match(ipv4_re(), Category::Host, salt, &text, counts);
+    text = replace_whole_match(ipv6_re(), Category::Host, salt, &text, counts);
     text
 }
 
@@ -393,6 +430,87 @@ mod tests {
                 .to_owned()
         };
         assert_eq!(alias_in(&first), alias_in(&second));
+    }
+
+    #[test]
+    fn mailbox_folder_field_is_replaced() {
+        // Путь папки ящика приходит в журнал отдельным полем remote_path
+        // (догрузка старых писем, удаление папки): без него структура ящика
+        // читалась бы из архива как есть.
+        let salt = salt(7);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "remote_path=\"INBOX/Клиенты/Договоры\" folder_id=3",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("Клиенты"), "{line}");
+        assert!(!line.contains("Договоры"), "{line}");
+        assert!(line.contains("[folder-"), "{line}");
+    }
+
+    #[test]
+    fn home_directory_with_space_in_username_is_fully_hidden() {
+        // F1: имя пользователя "Ivan Petrov" содержит пробел - общий шаблон
+        // пути обрывался бы на первом пробеле, оставляя фамилию в архиве.
+        let salt = salt(11);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            r"путь C:\Users\Ivan Petrov\AppData\Local\truemail\logs\truemail.log открыт",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("Ivan"), "{line}");
+        assert!(!line.contains("Petrov"), "{line}");
+        assert!(line.contains("[path-"), "{line}");
+    }
+
+    #[test]
+    fn unix_home_directory_with_space_in_username_is_fully_hidden() {
+        let salt = salt(12);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "путь /home/Ivan Petrov/.config/truemail открыт",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("Ivan"), "{line}");
+        assert!(!line.contains("Petrov"), "{line}");
+        assert!(line.contains("[path-"), "{line}");
+    }
+
+    #[test]
+    fn macos_home_directory_with_space_in_username_is_fully_hidden() {
+        let salt = salt(13);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "путь /Users/Ivan Petrov/Library/Application Support/truemail открыт",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("Ivan"), "{line}");
+        assert!(!line.contains("Petrov"), "{line}");
+        assert!(line.contains("[path-"), "{line}");
+    }
+
+    #[test]
+    fn bare_ip_address_is_replaced() {
+        // Сервер могут задать голым адресом: он такой же узел, как и имя.
+        let salt = salt(8);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line("соединение с 192.168.31.14 разорвано", &salt, &mut counts);
+        assert!(!line.contains("192.168.31.14"), "{line}");
+        assert!(line.contains("[host-"), "{line}");
+    }
+
+    #[test]
+    fn timestamp_is_not_taken_for_an_address() {
+        // Время в самой записи журнала похоже на сжатую запись адреса IPv6;
+        // шаблон не должен его трогать, иначе архив станет нечитаемым.
+        let salt = salt(9);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line("2026-09-16T20:56:39.123456Z INFO старт", &salt, &mut counts);
+        assert!(line.contains("20:56:39"), "{line}");
     }
 
     #[test]

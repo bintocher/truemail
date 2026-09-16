@@ -121,12 +121,16 @@ window.corePageSize = 100;
     allSettings: () => invoke("all_settings"),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     openExternal: (url) => invoke("open_external_url", { url }),
-    beginAccountConnection: (email) => invoke("begin_account_connection", { email }),
+    // F7: attemptId - номер попытки подключения (см. wizardAttemptGeneration
+    // в i18n-onboarding.js) - Rust возвращает его в каждом событии
+    // truemail-connect-stage, чтобы интерфейс отличал этап новой попытки от
+    // позднего события прежней попытки того же адреса.
+    beginAccountConnection: (email, attemptId) => invoke("begin_account_connection", { email, attemptId }),
     completePasswordImap: (config) => invoke("complete_password_imap", config),
     completeExchangeEws: (config) => invoke("complete_exchange_ews", config),
     completeJmap: (config) => invoke("complete_jmap", config),
-    beginYandexOauth: (email) => invoke("begin_account_connection", { email }),
-    completeYandexOauth: (state, code) => invoke("complete_yandex_oauth", { oauthState: state, code }),
+    beginYandexOauth: (email, attemptId) => invoke("begin_account_connection", { email, attemptId }),
+    completeYandexOauth: (state, code, attemptId) => invoke("complete_yandex_oauth", { oauthState: state, code, attemptId }),
     apiTools: () => invoke("api_tools"),
     externalApiStatus: () => invoke("external_api_status"),
     startExternalApi: (port) => invoke("start_external_api", { port }),

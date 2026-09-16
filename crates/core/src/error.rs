@@ -42,6 +42,94 @@ impl ErrorKind {
     }
 }
 
+/// F3, error-kinds-and-messages.md S-014: временный разбор текста для
+/// варианта `Error::Backend`, которым по-прежнему пользуются многие места
+/// IMAP, EWS, Gmail и DAV, включая обрывы соединения и отказы сервера, и
+/// который иначе всегда давал бы `Unknown` - интерфейс тогда предлагал бы
+/// диагностику вместо повтора или переподключения. Типизированная
+/// классификация (`ClassifiedBackend`, `from_http_status`, `from_reqwest`)
+/// остаётся главной; этот разбор применяется только к тексту `Backend` и
+/// только внутри ядра - интерфейс результат такого разбора не видит иначе,
+/// чем через уже назначенный `ErrorKind`.
+fn classify_backend_message(message: &str) -> ErrorKind {
+    let text = message.to_ascii_lowercase();
+    if text.contains("authenticationfailed")
+        || text.contains("invalid credentials")
+        || text.contains("login failed")
+        || text.contains("authentication failed")
+        || text.contains("неверн")
+        || contains_number_token(&text, "401")
+    {
+        return ErrorKind::InvalidCredentials;
+    }
+    if contains_number_token(&text, "403") {
+        return ErrorKind::Forbidden;
+    }
+    if contains_number_token(&text, "429") {
+        return ErrorKind::RateLimited;
+    }
+    if contains_http_5xx(&text)
+        || text.contains("connection refused")
+        || text.contains("os error 10061")
+    {
+        return ErrorKind::ServerUnavailable;
+    }
+    if text.contains("connection reset")
+        || text.contains("os error 10054")
+        || text.contains("broken pipe")
+        || text.contains("unexpected eof")
+    {
+        return ErrorKind::NetworkUnavailable;
+    }
+    if text.contains("timed out") || text.contains("timeout") {
+        return ErrorKind::Timeout;
+    }
+    if text.contains("certificate")
+        || text.contains("tls handshake")
+        || text.contains("invalid peer certificate")
+    {
+        return ErrorKind::CertificateError;
+    }
+    ErrorKind::Unknown
+}
+
+/// Ищет `token` (короткое число вроде кода ответа HTTP) в `text` как
+/// отдельное число - соседние байты по обе стороны не должны быть цифрами,
+/// иначе, например, "403" нашёлся бы внутри произвольного "14035".
+fn contains_number_token(text: &str, token: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while let Some(relative) = text[start..].find(token) {
+        let index = start + relative;
+        let before_ok = index == 0 || !bytes[index - 1].is_ascii_digit();
+        let after = index + token.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = index + 1;
+    }
+    false
+}
+
+/// Ищет в `text` трёхзначное число 500-599 (код ответа HTTP 5xx) как
+/// отдельный токен, не являющийся частью более длинного числа.
+fn contains_http_5xx(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == b'5' && bytes[i + 1].is_ascii_digit() && bytes[i + 2].is_ascii_digit() {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_digit();
+            let after_ok = i + 3 == bytes.len() || !bytes[i + 3].is_ascii_digit();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("хранилище: {0}")]
@@ -113,7 +201,8 @@ impl Error {
                 | std::io::ErrorKind::UnexpectedEof => ErrorKind::NetworkUnavailable,
                 _ => ErrorKind::StorageError,
             },
-            Self::Json(_) | Self::Backend { .. } | Self::Other(_) => ErrorKind::Unknown,
+            Self::Json(_) | Self::Other(_) => ErrorKind::Unknown,
+            Self::Backend { message, .. } => classify_backend_message(message),
             Self::Keyring(_) => ErrorKind::SecretStoreError,
             Self::Crypto(_) => ErrorKind::CryptoError,
             Self::ClassifiedBackend { kind, .. } => *kind,
@@ -385,6 +474,46 @@ mod tests {
                 Error::classified_backend("test", kind, "x").code(),
                 kind.code()
             );
+        }
+    }
+
+    #[test]
+    fn f3_backend_message_text_is_classified_when_no_typed_kind_exists() {
+        // F3: разбор текста только для Backend - типизированная классификация
+        // (ClassifiedBackend) остаётся главной и разбору не подвергается.
+        let cases = [
+            ("AuthenticationFailed", "invalid_credentials"),
+            ("Invalid credentials for user", "invalid_credentials"),
+            ("Login failed: bad password", "invalid_credentials"),
+            ("Authentication failed", "invalid_credentials"),
+            ("HTTP 401 Unauthorized", "invalid_credentials"),
+            ("сервер вернул: неверный пароль", "invalid_credentials"),
+            ("HTTP 403 Forbidden", "forbidden"),
+            ("HTTP 429 Too Many Requests", "rate_limited"),
+            ("HTTP 503 Service Unavailable", "server_unavailable"),
+            ("HTTP 500 Internal Server Error", "server_unavailable"),
+            ("connect: Connection refused", "server_unavailable"),
+            ("os error 10061", "server_unavailable"),
+            ("Connection reset by peer", "network_unavailable"),
+            ("os error 10054", "network_unavailable"),
+            ("Broken pipe", "network_unavailable"),
+            ("unexpected eof", "network_unavailable"),
+            ("operation timed out", "timeout"),
+            ("read timeout", "timeout"),
+            ("certificate verify failed", "certificate_error"),
+            ("TLS handshake failed", "certificate_error"),
+            (
+                "invalid peer certificate: UnknownIssuer",
+                "certificate_error",
+            ),
+            ("что-то совсем непонятное", "unknown"),
+        ];
+        for (message, expected) in cases {
+            let error = Error::Backend {
+                backend: "imap".into(),
+                message: message.into(),
+            };
+            assert_eq!(error.code(), expected, "текст: {message}");
         }
     }
 

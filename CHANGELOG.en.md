@@ -7,6 +7,24 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.17] - 2026-09-16
+
+### Added
+
+- Settings now has a diagnostics button in the storage section. The app packs its own logs into a zip archive and opens the folder with it, so the file is easy to send to support. Before collecting, it shows what goes into the archive: email addresses, server names, paths, mailbox folder names and internal identifiers are replaced with pseudonyms; the same value gets the same pseudonym inside one archive and a different one in the next archive, so two archives cannot be linked together. Passwords, confirmation codes and sign-in keys never reach the archive.
+- Every account now shows its mail state at all times: syncing, ready, retrying after a drop, error, or sign-in required. The time of the last successful update and the reason for a failure survive a restart, and the "sign-in required" state leads straight to reconnecting the account.
+- The connection wizard shows progress: the button displays a waiting state and the current step instead of staying silent for the whole check. Exchange now has time limits for server discovery, password check and the attempt as a whole, so an unreachable server ends with a clear error instead of an endless wait.
+
+### Changed
+
+- Error messages now make sense. The app determines the kind of failure - password rejected, sign-in required, server unavailable, server rate limit, no network, timed out, certificate not verified - states it in plain words and offers the matching action: reconnect the account, retry, or wait. Technical details stay in the log and in expandable details. Identical messages no longer flicker one after another: repeats collapse into one with a counter, and a message carrying an action button does not disappear on its own.
+- The macOS build ships as a single package for both architectures (Apple Silicon and Intel). Since 0.2.15 the package was built for Apple Silicon only, so Intel machines saw no update - now it arrives again.
+
+### Fixed
+
+- The setup wizard can be closed. When setup is already finished, the wizard closes with a button or the Escape key and returns to mail; on the very first run there is no exit, because nothing works without setup. Escape inside a wizard input field does not close the wizard - there it cancels the input.
+- The outline around the selected message no longer stays after a mouse click. It appears only when moving through the list with the keyboard, like on buttons and fields; the selected message is still visible by its background and the stripe on the left.
+
 ## [0.2.16] - 2026-09-10
 
 ### Changed

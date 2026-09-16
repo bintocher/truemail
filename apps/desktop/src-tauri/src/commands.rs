@@ -1362,9 +1362,26 @@ async fn gmail_realtime_loop(
             }
             let synced = core.accounts.sync_mail_inbox(&account).await;
             syncing.lock().await.remove(&account.id);
+            // F4: постоянное состояние синхронизации почты аккаунта пишем и
+            // публикуем по фактическому исходу этого прохода - как и общий
+            // цикл sync_accounts, и наблюдатель за почтой у остальных
+            // провайдеров (mail-sync-visible-state.md, S-002, S-003). Без
+            // этого старая ошибка (или, наоборот, старый успех) оставались бы
+            // в базе после прохода Gmail realtime, который их не обновлял.
+            if let Err(error) = core
+                .db
+                .record_mail_sync_outcome(account.id, &MailSyncOutcome::from_result(&synced))
+                .await
+            {
+                tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
+            }
             match synced {
                 Ok(result) => {
                     pending.remove(&account.id);
+                    let _ = app.emit(
+                        "truemail-sync-state",
+                        serde_json::json!({"account_id": account.id, "scope": "mail", "status": "ready"}),
+                    );
                     let _ = app.emit("truemail-data-changed", account.id);
                     notify_new_mail(
                         &app,
@@ -1377,6 +1394,8 @@ async fn gmail_realtime_loop(
                     .await;
                 }
                 Err(error) => {
+                    let state = sync_error_state(account.id, "mail", "error", &error);
+                    let _ = app.emit("truemail-sync-state", state);
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
             }
@@ -1847,9 +1866,13 @@ pub struct ChangePasswordApiError {
 
 impl From<truemail_core::account::ChangePasswordError> for ChangePasswordApiError {
     fn from(error: truemail_core::account::ChangePasswordError) -> Self {
+        // F6: message здесь собирался из error.to_string() без очистки, в
+        // отличие от общего ApiError (см. From<truemail_core::Error> для
+        // ApiError выше) - код (code) не меняется по смыслу, обезличивается
+        // только текст.
         ChangePasswordApiError {
             code: error.code(),
-            message: error.to_string(),
+            message: truemail_core::error::sanitize_error_message(&error.to_string()),
         }
     }
 }
@@ -3727,14 +3750,29 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 || text.contains("unexpected eof")
                                 || text.contains("reset")
                                 || text.contains("принудительно разорвал");
+                            let safe_error = truemail_core::error::sanitize_error_message(&text);
                             if routine {
-                                let safe_error =
-                                    truemail_core::error::sanitize_error_message(&text);
                                 tracing::debug!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой переустанавливается");
                             } else {
-                                let safe_error =
-                                    truemail_core::error::sanitize_error_message(&text);
                                 tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error_kind = error.code(), error = %safe_error, "наблюдение за почтой будет восстановлено");
+                            }
+                            // F4: обрыв ожидания IDLE (wait_for_mail_change)
+                            // раньше публиковался только переходным "retrying"
+                            // и не писался в постоянное состояние - отказ
+                            // авторизации наблюдателя пропадал после
+                            // перезапуска программы, пока не пройдёт новый
+                            // успешный или неуспешный проход самой синхронизации.
+                            let outcome = MailSyncOutcome::Failure {
+                                message: safe_error.clone(),
+                                kind: error.code().to_owned(),
+                                needs_reauth: error.requires_reauth(),
+                            };
+                            if let Err(db_error) = watch_core
+                                .db
+                                .record_mail_sync_outcome(watch_account.id, &outcome)
+                                .await
+                            {
+                                tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error = %db_error, "не удалось сохранить состояние синхронизации почты");
                             }
                             let state =
                                 sync_error_state(watch_account.id, "mail", "retrying", &error);
@@ -4423,15 +4461,27 @@ where
 
 /// Сообщает интерфейсу подтверждённый этап попытки подключения (S-002, S-003).
 /// Событие адресовано конкретному адресу почты - экран решает сам, относится
-/// ли оно к попытке, которая на нём сейчас активна (S-016).
+/// ли оно к попытке, которая на нём сейчас активна (S-016). `attempt_id` -
+/// номер попытки, полученный от интерфейса при запуске команды (F7): интерфейс
+/// сверяет его с номером, активным сейчас на экране, а не только адрес и
+/// занятость кнопки - иначе позднее событие прежней попытки того же адреса
+/// могло бы изменить текст уже новой попытки.
 #[derive(Clone, Serialize)]
 struct ConnectStageEvent<'a> {
     email: &'a str,
     stage: &'a str,
+    attempt_id: i64,
 }
 
-fn emit_connect_stage(app: &AppHandle, email: &str, stage: &str) {
-    let _ = app.emit("truemail-connect-stage", ConnectStageEvent { email, stage });
+fn emit_connect_stage(app: &AppHandle, email: &str, stage: &str, attempt_id: i64) {
+    let _ = app.emit(
+        "truemail-connect-stage",
+        ConnectStageEvent {
+            email,
+            stage,
+            attempt_id,
+        },
+    );
 }
 
 /// S-015: не более одной активной попытки подключения на адрес почты во всей
@@ -4519,6 +4569,7 @@ pub async fn begin_account_connection(
     app: AppHandle,
     state: State<'_, AppState>,
     email: String,
+    attempt_id: i64,
 ) -> CmdResult<PendingOAuthResponse> {
     let core = core(&state).await?;
     let email = email.trim().to_lowercase();
@@ -4595,11 +4646,11 @@ pub async fn begin_account_connection(
                 // в общий предел команды - у ожидания свой предел (300 секунд)
                 // внутри receive_oauth_callback.
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
                 let code =
                     Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
                 stage.set("checking_server");
-                emit_connect_stage(&app, &email, "checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
                     let token = truemail_core::account::exchange_yandex_code(
                         &client_id,
@@ -4609,6 +4660,8 @@ pub async fn begin_account_connection(
                     )
                     .await?;
                     let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
                     let connected = core
                         .accounts
                         .add_yandex_oauth(&email, &display_name, token)
@@ -4651,11 +4704,11 @@ pub async fn begin_account_connection(
                 )?;
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
                 let code =
                     Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
                 stage.set("checking_server");
-                emit_connect_stage(&app, &email, "checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
                     let token = truemail_core::account::exchange_google_code(
                         &client_id,
@@ -4666,6 +4719,8 @@ pub async fn begin_account_connection(
                     )
                     .await?;
                     let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
                     let connected = core
                         .accounts
                         .add_gmail_oauth(&email, &display_name, token)
@@ -4709,12 +4764,12 @@ pub async fn begin_account_connection(
                 )?;
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code");
+                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
                 let code = Zeroizing::new(
                     receive_oauth_callback(listener, &oauth_state, "Microsoft").await?,
                 );
                 stage.set("checking_server");
-                emit_connect_stage(&app, &email, "checking_server");
+                emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
                     let token = truemail_core::account::exchange_microsoft_code(
                         &client_id,
@@ -4725,6 +4780,8 @@ pub async fn begin_account_connection(
                     )
                     .await?;
                     let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+                    // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+                    emit_connect_stage(&app, &email, "saving", attempt_id);
                     let connected = core
                         .accounts
                         .add_outlook_oauth(&email, &display_name, token)
@@ -4831,6 +4888,7 @@ pub async fn complete_password_imap(
     smtp_host: String,
     smtp_port: u16,
     smtp_security: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
     // S-015: одна активная попытка на адрес во всей программе.
@@ -4877,11 +4935,10 @@ pub async fn complete_password_imap(
             jmap_url: None,
         };
         let core = core(&state).await?;
-        // S-003: единственный наблюдаемый этап для готового набора серверов -
-        // проверка учётных данных (сохранение аккаунта быстрее и отдельно не
-        // выделяется, см. account-connect-progress.md).
-        emit_connect_stage(&app, &email, "checking_server");
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
         let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
         let connected = core
             .accounts
             .add_password_imap(&email, &display_name, username, &password, &config)
@@ -4906,6 +4963,7 @@ pub async fn complete_exchange_ews(
     username: String,
     password: String,
     server_hint: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
     let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
@@ -4921,8 +4979,10 @@ pub async fn complete_exchange_ews(
         // Автопоиск (S-012) и проверка учётных данных (S-013) на пониженных
         // пределах одного соединения (S-014) выполняются внутри add_exchange_ews;
         // с точки зрения интерфейса это один этап "проверяю сервер".
-        emit_connect_stage(&app, &email, "checking_server");
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
         let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
         let connected = core
             .accounts
             .add_exchange_ews(
@@ -4953,6 +5013,7 @@ pub async fn complete_jmap(
     username: String,
     password: String,
     session_url: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
     let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
@@ -4965,8 +5026,10 @@ pub async fn complete_jmap(
             });
         }
         let core = core(&state).await?;
-        emit_connect_stage(&app, &email, "checking_server");
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
         let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
         let connected = core
             .accounts
             .add_jmap_password(
@@ -4995,6 +5058,7 @@ pub async fn complete_yandex_oauth(
     state: State<'_, AppState>,
     oauth_state: String,
     code: String,
+    attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let code = Zeroizing::new(code);
     let core = core(&state).await?;
@@ -5011,7 +5075,7 @@ pub async fn complete_yandex_oauth(
     let _attempt_guard = ConnectAttemptGuard::acquire(&state.connecting_addresses, &email).await?;
     let started = std::time::Instant::now();
     let outcome: CmdResult<ConnectedAccount> = with_connect_timeout(async {
-        emit_connect_stage(&app, &email, "checking_server");
+        emit_connect_stage(&app, &email, "checking_server", attempt_id);
         let token = truemail_core::account::exchange_yandex_code(
             &pending.client_id,
             &code,
@@ -5021,6 +5085,8 @@ pub async fn complete_yandex_oauth(
         .await?;
         state.oauth.lock().await.remove(&oauth_state);
         let display_name = email.split('@').next().unwrap_or(&email).to_owned();
+        // F7: этап сохранения аккаунта раньше не публиковался вовсе.
+        emit_connect_stage(&app, &email, "saving", attempt_id);
         let connected = core
             .accounts
             .add_yandex_oauth(&email, &display_name, token)
@@ -5699,6 +5765,20 @@ mod api_error_tests {
             MailSyncOutcome::Success => panic!("почта завершилась ошибкой - ожидался Failure"),
         }
     }
+
+    // F6: ChangePasswordApiError::message должен проходить ту же очистку,
+    // что и общий ApiError, а не error.to_string() как есть - код (`code`) не
+    // должен меняться по смыслу.
+    #[test]
+    fn f6_change_password_api_error_message_is_sanitized() {
+        let source = truemail_core::account::ChangePasswordError::BackendUnavailable(
+            "сервер ответил: token=secret123 login failed".into(),
+        );
+        let error: ChangePasswordApiError = source.into();
+        assert_eq!(error.code, "backend_unavailable");
+        assert!(!error.message.contains("secret123"), "{}", error.message);
+        assert!(error.message.contains("[скрыто]"), "{}", error.message);
+    }
 }
 
 #[cfg(test)]
@@ -5722,6 +5802,21 @@ mod connect_progress_tests {
             Ok(_) => panic!("ожидалась ошибка, получен успех"),
             Err(error) => error.parts().kind.to_owned(),
         }
+    }
+
+    // F7: событие этапа подключения несёт номер попытки - интерфейс сверяет
+    // его с активной попыткой на экране и отбрасывает событие чужой попытки.
+    #[test]
+    fn f7_connect_stage_event_carries_attempt_id() {
+        let value = serde_json::to_value(ConnectStageEvent {
+            email: "user@example.com",
+            stage: "saving",
+            attempt_id: 42,
+        })
+        .expect("событие сериализуется");
+        assert_eq!(value["attempt_id"], 42);
+        assert_eq!(value["stage"], "saving");
+        assert_eq!(value["email"], "user@example.com");
     }
 
     /// S-004, S-006: истечение общего предела даёт машиночитаемый вид

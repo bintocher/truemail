@@ -76,9 +76,13 @@ function normalizeApiError(error) {
   const object=error&&typeof error==='object'?error:null;
   const requested=object&&typeof object.kind==='string'?object.kind:'';
   const kind=Object.hasOwn(ERROR_KINDS,requested)?requested:'unknown';
-  const details=object&&typeof object.message==='string'
-    ?object.message
-    :typeof error==='string'?error:String(error||'');
+  // F11: у объекта без строкового message (например {kind:'unknown'} без
+  // текста) details должен остаться пустым, а не строковым представлением
+  // самого объекта ("[object Object]") - иначе после показа собственного
+  // текста unknown-ошибок эта заглушка попала бы на экран как есть.
+  const details=object
+    ?(typeof object.message==='string'?object.message:'')
+    :typeof error==='string'?error:String(error??'');
   return {
     kind,
     message:details,
@@ -100,9 +104,20 @@ function presentError(error,options={}) {
     ?(connected?row.connectedAction:row.initialAction)
     :row.action;
   const locale=options.locale==='en'?'en':'ru';
+  // F11: у вида unknown message - это уже собственный текст программы
+  // (проверка полей, отказ второй попытки подключения, локальный отказ
+  // файловой операции), а не строка от внешнего сервера - его разбор по
+  // смыслу здесь не идёт (S-011 остаётся про определение вида, не про выбор
+  // текста), поэтому есть смысл показать его вместо общего "Не удалось
+  // выполнить действие". Общий текст остаётся только когда своего текста нет
+  // вовсе. Для всех остальных, уже классифицированных видов поведение не
+  // меняется - текст всегда локализованный по таблице.
+  const ownText=normalized.kind==='unknown'&&typeof normalized.message==='string'
+    ?normalized.message.trim()
+    :'';
   return {
     ...normalized,
-    text:localeValue(row.messageKey,locale,options.translations),
+    text:ownText||localeValue(row.messageKey,locale,options.translations),
     action,
     actionLabel:localeValue(ACTION_KEYS[action],locale,options.translations),
     requiresReauth:normalized.kind==='invalid_credentials'||normalized.kind==='needs_reauth',
