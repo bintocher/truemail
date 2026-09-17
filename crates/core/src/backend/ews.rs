@@ -4410,10 +4410,9 @@ mod throttling_tests {
     #[test]
     fn empty_body_keeps_the_old_message() {
         let error = status_error(500, "");
-        assert_eq!(error.to_string().contains("HTTP 500"), true);
+        assert!(error.to_string().contains("HTTP 500"));
         assert_eq!(error.code(), "server_unavailable");
     }
-
 
     #[test]
     fn busy_answers_are_recognised() {
