@@ -7,6 +7,19 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.18] - 2026-09-17
+
+### Fixed
+
+- Error messages now name the mailbox. With several mailboxes connected, two identical messages could appear in a row with no way to tell which one they were about.
+- The app stopped being noisy. Dropped connections, timeouts and a busy server are things it recovers from by reconnecting, so they no longer pop up: such a failure shows in the mailbox state, and a message appears only after three failed passes in a row. Only what needs a decision shows up at once: password rejected, sign-in required, access denied, certificate not verified, account settings error.
+- One cause across several mailboxes now shows as a single message listing them, instead of one message per mailbox.
+- The button inside a message no longer disappears into the background: it shows a waiting state and then the result - success or a new reason for failure.
+- Message details now show the server, the response code and the time of the attempt. The response code is exact: previously a port from the address could end up there instead of the code.
+- The message about a deferred first sync appears only right after connecting a mailbox, not during a regular mail update.
+- The diagnostics archive no longer keeps the user name from an email address: calendar and address book URLs store it in an encoded form that the anonymizer did not recognise.
+- The mailbox card in settings no longer breaks on a long error text: the state takes its own line and does not push the buttons around. Folder and calendar counts agree with the number. Mailboxes that sign in with a token offer a fresh sign-in instead of a password change - no password is stored for them.
+
 ## [0.2.17] - 2026-09-16
 
 ### Added
