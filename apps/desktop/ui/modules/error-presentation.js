@@ -197,6 +197,26 @@ function presentError(error,options={}) {
   };
 }
 
+// Память о том, про какую беду какого ящика уже сказали. Пока причина та же,
+// повторять нечего: программа продолжает пробовать сама, а человек уже знает.
+// Сообщение снова появится, если причина сменилась или ящик ожил (issue #77).
+function nextSyncToastMemo(memo, state) {
+  const next = {...(memo || {})};
+  const accountId = state?.account_id ?? state?.accountId;
+  if (accountId == null) return {memo: next, show: true};
+  const kind = state?.kind || state?.error_kind || null;
+  const healthy = !kind && ['ready', 'syncing'].includes(state?.status);
+  if (healthy) {
+    delete next[accountId];
+    return {memo: next, show: false};
+  }
+  if (!kind) return {memo: next, show: false};
+  const told = next[accountId];
+  if (told === kind) return {memo: next, show: false};
+  next[accountId] = kind;
+  return {memo: next, show: true};
+}
+
 function shouldShowSyncToast(state) {
   const kind=state?.kind||state?.error_kind||'unknown';
   if(IMMEDIATE_SYNC_KINDS.has(kind))return true;
@@ -318,6 +338,7 @@ const errorPresentation={
   formatAccountErrorText,
   formatErrorDetails,
   shouldShowSyncToast,
+  nextSyncToastMemo,
   presentConnectedWarnings,
   toastFingerprint,
   planToastQueue,

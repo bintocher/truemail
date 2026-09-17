@@ -321,6 +321,29 @@ impl Error {
         }
     }
 
+    /// Дописывает имя операции транспорта к тексту ошибки: без него отказ вида
+    /// "запрос неверен" не говорит, какой именно запрос сервер отверг.
+    pub fn with_operation(self, operation: &str) -> Self {
+        match self {
+            Self::ClassifiedBackend {
+                backend,
+                kind,
+                message,
+                response_code,
+            } => Self::ClassifiedBackend {
+                backend,
+                kind,
+                message: format!("{message} (операция {operation})"),
+                response_code,
+            },
+            Self::Backend { backend, message } => Self::Backend {
+                backend,
+                message: format!("{message} (операция {operation})"),
+            },
+            other => other,
+        }
+    }
+
     pub fn retry_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         match self {
             Self::RateLimited { retry_at, .. } => Some(*retry_at),

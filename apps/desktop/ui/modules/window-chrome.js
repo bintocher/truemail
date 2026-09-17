@@ -87,10 +87,34 @@
     window.updateMinimizeButtonLabel?.();
     if(installing&&updateText)updateText.textContent=L('Обновление…','Updating…');
   };
-  window.showUpdateButton=function(version,downloaded){
+  // Что нового в выпуске: окно показывается сразу по наведению на кнопку, без
+  // задержки и без нажатия - список изменений виден до установки (issue #83).
+  const notesBox=document.getElementById('updateNotes');
+  const notesHead=document.getElementById('updateNotesHead');
+  const notesBody=document.getElementById('updateNotesBody');
+  let updateNotes={version:'',text:''};
+  function showUpdateNotes(){
+    if(!notesBox||!updateNotes.version)return;
+    notesHead.textContent=L(`Что нового в truemail ${updateNotes.version}`,`What is new in truemail ${updateNotes.version}`);
+    notesBody.textContent=updateNotes.text||L('Описание выпуска не приложено.','The release notes are not attached.');
+    notesBox.classList.remove('hidden');
+    notesBox.setAttribute('aria-hidden','false');
+  }
+  function hideUpdateNotes(){
+    if(!notesBox)return;
+    notesBox.classList.add('hidden');
+    notesBox.setAttribute('aria-hidden','true');
+  }
+  updateButton?.addEventListener('mouseenter',showUpdateNotes);
+  updateButton?.addEventListener('focus',showUpdateNotes);
+  updateButton?.addEventListener('mouseleave',hideUpdateNotes);
+  updateButton?.addEventListener('blur',hideUpdateNotes);
+  notesBox?.addEventListener('mouseleave',hideUpdateNotes);
+  window.showUpdateButton=function(version,downloaded,notes){
     if(!updateButton||installing)return;
     updateButton.classList.remove('hidden');
     updateButton.disabled=false;
+    updateNotes={version,text:typeof notes==='string'?notes.trim():''};
     updateButton.title=downloaded
       ?L(`truemail ${version} скачан, установить и перезапустить`,`truemail ${version} is downloaded, install and restart`)
       :L(`Доступен truemail ${version} - установить`,`truemail ${version} is available - install`);

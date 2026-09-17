@@ -97,7 +97,16 @@ function errorToastItem(error,context={}){const account=coreAccounts.find(item=>
 function showApiError(error,context={}){return enqueueToast(errorToastItem(error,context));}
 function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return enqueueToast({kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action});}
 window.showApiError=showApiError;
+// Одна беда одного ящика - одно сообщение: без этого при каждом проходе
+// счётчик повторов рос до десятков, а нового человеку не сообщалось (issue #77).
+let syncToastMemo={};
+function rememberSyncToast(failure){
+  const decision=window.errorPresentation.nextSyncToastMemo(syncToastMemo,failure);
+  syncToastMemo=decision.memo;
+  return decision.show;
+}
 window.handleSyncState=function(state){if(!state)return;
+  if(!state.error_kind&&!state.error&&state.status==='ready')syncToastMemo=window.errorPresentation.nextSyncToastMemo(syncToastMemo,state).memo;
   settleSyncAction(state);
   // Постоянное состояние (needs_reauth/last_sync_error) читается из аккаунта
   // после перезагрузки данных; переходные статусы "syncing"/"retrying" видны
@@ -106,8 +115,8 @@ window.handleSyncState=function(state){if(!state)return;
   if(window.mailSyncIndicator?.isMailSyncScope(state.scope)){window.mailSyncTransient=window.mailSyncIndicator.nextMailSyncTransient(window.mailSyncTransient,state);window.refreshAccountSyncIndicator?.(state.account_id);}
   const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}
   const warnings=Array.isArray(state.warnings)?state.warnings:[];
-  if(warnings.length){warnings.forEach(warning=>{if(typeof warning==='string'){showToast(warning);return;}const failure={...warning,account_id:state.account_id,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure))showApiError(failure,{connected:true});});return;}
-  if(state.error_kind||['error','retrying'].includes(state.status)){const failure={kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure))showApiError(failure,{connected:true});}};
+  if(warnings.length){warnings.forEach(warning=>{if(typeof warning==='string'){showToast(warning);return;}const failure={...warning,account_id:state.account_id,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure)&&rememberSyncToast(failure))showApiError(failure,{connected:true});});return;}
+  if(state.error_kind||['error','retrying'].includes(state.status)){const failure={kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure)&&rememberSyncToast(failure))showApiError(failure,{connected:true});}};
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;

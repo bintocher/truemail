@@ -325,9 +325,26 @@ jobs:
               entry = platforms[key]
               if not entry.get("url") or not entry.get("signature"):
                   raise SystemExit(f"пустое поле url или signature у платформы {key}")
+
+          def release_notes(tag):
+              # Описание выпуска берём из журнала изменений: программа показывает
+              # его во всплывающем окне у кнопки обновления, и строка вида
+              # "truemail update v0.0.0" там бесполезна (issue #83).
+              version = tag.lstrip("v")
+              text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+              start = text.find(f"## [{version}]")
+              if start == -1:
+                  return f"truemail {version}"
+              rest = text[start:]
+              end = rest.find(chr(10) + "## [", 1)
+              section = rest if end == -1 else rest[:end]
+              lines = [line.rstrip() for line in section.splitlines()[1:]]
+              body = chr(10).join(lines).strip()
+              return body or f"truemail {version}"
+
           manifest = {
               "version": tag.lstrip("v"),
-              "notes": f"truemail update {tag}",
+              "notes": release_notes(tag),
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": platforms,
           }

@@ -153,7 +153,7 @@ window.corePageSize = 100;
     if (!info?.available_version) return;
     // Кнопка в строке заголовка остаётся на виду, даже когда уведомление уже
     // пропало: иначе о новой версии узнать можно было только из настроек.
-    window.showUpdateButton?.(info.available_version, info.downloaded);
+    window.showUpdateButton?.(info.available_version, info.downloaded, info.notes);
     if (offeredVersion === info.available_version) return;
     offeredVersion = info.available_version;
     const message = wizardLocale === "en" ? `truemail ${info.available_version} is available` : `Доступен truemail ${info.available_version}`;

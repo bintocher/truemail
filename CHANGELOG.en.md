@@ -7,6 +7,19 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.2.19] - 2026-09-17
+
+### Fixed
+
+- Mail from Exchange mailboxes loads again. Since September 5 the app asked the server for three message properties under wrong names, and the server rejected the whole request - no mail arrived, and the app showed only a generic error. The names are fixed, and flagging a message works again too.
+- The reason behind an Exchange refusal is no longer lost: the app reads the server answer and shows what exactly it replied and on which operation. Access denied and a protocol version mismatch are no longer passed off as an unavailable server.
+- One and the same trouble on one mailbox is reported once instead of on every attempt: the repeat counter used to climb into the dozens while saying nothing new. The message comes back if the cause changes or the mailbox recovers.
+- The mailbox card in settings no longer overlaps itself: buttons move to their own line when space runs out, a long address is trimmed, and the note about the password stands on its own.
+
+### Changed
+
+- The update button moved next to the app name, and hovering it opens the release notes right away: what is new, without installing and without opening a website.
+
 ## [0.2.18] - 2026-09-17
 
 ### Fixed
