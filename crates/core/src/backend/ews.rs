@@ -223,7 +223,7 @@ fn flag_update_fields(seen: bool, flagged: Option<bool>) -> String {
     if let Some(flagged) = flagged {
         let flag_status = if flagged { "Flagged" } else { "NotFlagged" };
         updates.push_str(&format!(
-            r#"<t:SetItemField><t:FieldURI FieldURI="message:Flag"/><t:Message><t:Flag><t:FlagStatus>{flag_status}</t:FlagStatus></t:Flag></t:Message></t:SetItemField>"#
+            r#"<t:SetItemField><t:FieldURI FieldURI="item:Flag"/><t:Message><t:Flag><t:FlagStatus>{flag_status}</t:FlagStatus></t:Flag></t:Message></t:SetItemField>"#
         ));
     }
     updates
@@ -1546,9 +1546,9 @@ const LIGHT_MESSAGE_PROPERTIES: &str = concat!(
     r#"<t:FieldURI FieldURI="message:IsRead"/>"#,
     // Признак черновика читает разбор ответа: не спросив его, мы бы сбрасывали
     // черновик в ноль при каждом проходе.
-    r#"<t:FieldURI FieldURI="message:IsDraft"/>"#,
+    r#"<t:FieldURI FieldURI="item:IsDraft"/>"#,
     r#"<t:FieldURI FieldURI="message:InternetMessageId"/>"#,
-    r#"<t:FieldURI FieldURI="message:InReplyTo"/>"#,
+    r#"<t:FieldURI FieldURI="item:InReplyTo"/>"#,
     r#"<t:FieldURI FieldURI="item:HasAttachments"/>"#,
     r#"<t:FieldURI FieldURI="item:Size"/>"#,
     r#"<t:FieldURI FieldURI="item:Body"/>"#,
@@ -4287,7 +4287,11 @@ mod light_fetch_tests {
             "message:ToRecipients",
             "message:CcRecipients",
             "message:IsRead",
-            "message:IsDraft",
+            // IsDraft и InReplyTo принадлежат типу "элемент": имена вида
+            // message:IsDraft в перечислении свойств EWS не существуют, и
+            // сервер отвергает такой запрос целиком (issue #84).
+            "item:IsDraft",
+            "item:InReplyTo",
             "message:InternetMessageId",
             "item:HasAttachments",
             "item:Size",
