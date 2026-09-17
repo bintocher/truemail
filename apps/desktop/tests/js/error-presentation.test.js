@@ -13,6 +13,7 @@ const {
   planToastQueue,
   beginToastAction,
   finishToastAction,
+  nextSyncToastMemo,
 }=require('../../ui/modules/error-presentation.js');
 
 const uiRoot=path.join(__dirname,'../../ui');
@@ -226,4 +227,29 @@ test('S-024: сразу всплывают только виды, требующ
   }
   assert.equal(shouldShowSyncToast({kind:'storage_error',retries_exhausted:true}),false);
   assert.equal(shouldShowSyncToast({kind:'server_unavailable',retries_exhausted:true}),true);
+});
+
+test('одна беда одного ящика показывается один раз',()=>{
+  const failure={account_id:7,kind:'server_unavailable',status:'error'};
+  const first=nextSyncToastMemo({},failure);
+  assert.equal(first.show,true);
+  const second=nextSyncToastMemo(first.memo,failure);
+  assert.equal(second.show,false);
+});
+
+test('смена причины у того же ящика снова показывает сообщение',()=>{
+  const memo=nextSyncToastMemo({},{account_id:7,kind:'server_unavailable'}).memo;
+  assert.equal(nextSyncToastMemo(memo,{account_id:7,kind:'invalid_credentials'}).show,true);
+});
+
+test('успешный проход снимает память о беде',()=>{
+  const memo=nextSyncToastMemo({},{account_id:7,kind:'server_unavailable'}).memo;
+  const healed=nextSyncToastMemo(memo,{account_id:7,status:'ready'});
+  assert.equal(healed.show,false);
+  assert.equal(nextSyncToastMemo(healed.memo,{account_id:7,kind:'server_unavailable'}).show,true);
+});
+
+test('разные ящики считаются отдельно',()=>{
+  const memo=nextSyncToastMemo({},{account_id:1,kind:'server_unavailable'}).memo;
+  assert.equal(nextSyncToastMemo(memo,{account_id:2,kind:'server_unavailable'}).show,true);
 });

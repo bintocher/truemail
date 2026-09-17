@@ -125,6 +125,20 @@ fn backend_error(kind: &str, message: impl ToString) -> Error {
     }
 }
 
+/// Ошибка по коду ответа вместе с причиной из тела: при отказе SOAP Exchange
+/// отвечает кодом 500, и без тела причина отказа теряется (issue #82).
+fn status_error(status: u16, body: &str) -> Error {
+    let fault = soap_fault_error(body);
+    let message = match &fault {
+        Some(reason) => format!("HTTP {status}: {reason}"),
+        None => format!("HTTP {status}"),
+    };
+    match fault.as_deref().and_then(fault_error_kind) {
+        Some(kind) => Error::classified_backend_with_code("ews-http", kind, message, Some(status)),
+        None => http_error(status, message),
+    }
+}
+
 fn http_error(status: u16, message: impl Into<String>) -> Error {
     let message = message.into();
     match status {
@@ -296,6 +310,48 @@ fn parse_ews_attendees<'a>(item: Node<'a, 'a>) -> Vec<Attendee> {
         }
     }
     attendees
+}
+
+/// Отказ SOAP: Exchange отвечает на него кодом 500, а причину кладёт в тело -
+/// `faultstring` плюс, как правило, вложенные `ResponseCode` и `MessageText`.
+/// Без разбора тела такой отказ выглядит как "сервер недоступен", хотя на деле
+/// это может быть закрытый доступ, чужая версия протокола или отсутствующий
+/// ящик (issue #82).
+fn soap_fault_error(body: &str) -> Option<String> {
+    let document = Document::parse(body).ok()?;
+    let fault = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Fault")?;
+    let code = node_text(fault, "ResponseCode").or_else(|| node_text(fault, "faultcode"));
+    let text = node_text(fault, "MessageText").or_else(|| node_text(fault, "faultstring"));
+    Some(match (code, text) {
+        (Some(code), Some(text)) if code != text => format!("{code}: {text}"),
+        (Some(code), _) => code.to_owned(),
+        (None, Some(text)) => text.to_owned(),
+        (None, None) => "Exchange вернул отказ без пояснения".to_owned(),
+    })
+}
+
+/// Вид ошибки по коду отказа Exchange: закрытый доступ и отсутствующий ящик -
+/// это не "сервер недоступен", и действие человеку нужно другое.
+fn fault_error_kind(fault: &str) -> Option<ErrorKind> {
+    let text = fault.to_ascii_lowercase();
+    if text.contains("erroraccessdenied") || text.contains("errorunauthorized") {
+        return Some(ErrorKind::Forbidden);
+    }
+    if text.contains("errornonexistentmailbox")
+        || text.contains("errormailboxmovepending")
+        || text.contains("errormailboxstoreunavailable")
+        || text.contains("errorinvalidserverversion")
+        || text.contains("errorschemavalidation")
+        || text.contains("errorinvalidrequest")
+    {
+        return Some(ErrorKind::AccountConfig);
+    }
+    if text.contains("errorserverbusy") || text.contains("errortimeoutexpired") {
+        return Some(ErrorKind::ServerUnavailable);
+    }
+    None
 }
 
 fn response_error(body: &str) -> Option<String> {
@@ -567,10 +623,7 @@ impl EwsBackend {
         // Код HTTP классифицируется до разбора тела. Текст ответа не должен
         // определять причину отказа на границе интерфейса.
         if !(200..300).contains(&response.status) {
-            return Err(http_error(
-                response.status,
-                format!("HTTP {}", response.status),
-            ));
+            return Err(status_error(response.status, &response.body));
         }
         if let Some(error) = response_error(&response.body) {
             if is_server_busy(&error) {
@@ -4316,7 +4369,45 @@ mod light_fetch_tests {
 #[cfg(test)]
 mod throttling_tests {
     //! Ошибки занятости Exchange (gmail-local-body-prefetch.md, S-009).
-    use super::{http_error, is_server_busy, server_busy_error};
+    use super::{http_error, is_server_busy, server_busy_error, status_error};
+
+    #[test]
+    fn soap_fault_explains_a_five_hundred() {
+        // Exchange отвечает кодом 500 и на отказ SOAP: без разбора тела причина
+        // отказа терялась, и любая неполадка выглядела как недоступный сервер
+        // (issue #82).
+        let body = r#"<?xml version="1.0" encoding="utf-8"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+ <s:Body><s:Fault>
+  <faultcode>s:Client</faultcode>
+  <faultstring>The request failed schema validation.</faultstring>
+  <detail><e:ResponseCode xmlns:e="http://schemas.microsoft.com/exchange/services/2006/errors">ErrorSchemaValidation</e:ResponseCode></detail>
+ </s:Fault></s:Body>
+</s:Envelope>"#;
+        let error = status_error(500, body);
+        let text = error.to_string();
+        assert!(text.contains("ErrorSchemaValidation"), "{text}");
+        assert!(text.contains("HTTP 500"), "{text}");
+        assert_eq!(error.code(), "account_config");
+        assert_eq!(error.response_code(), Some(500));
+    }
+
+    #[test]
+    fn access_denied_is_not_an_unavailable_server() {
+        let body = r#"<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault>
+  <faultstring>Access is denied.</faultstring>
+  <detail><ResponseCode>ErrorAccessDenied</ResponseCode></detail>
+ </s:Fault></s:Body></s:Envelope>"#;
+        assert_eq!(status_error(500, body).code(), "forbidden");
+    }
+
+    #[test]
+    fn empty_body_keeps_the_old_message() {
+        let error = status_error(500, "");
+        assert_eq!(error.to_string().contains("HTTP 500"), true);
+        assert_eq!(error.code(), "server_unavailable");
+    }
+
 
     #[test]
     fn busy_answers_are_recognised() {

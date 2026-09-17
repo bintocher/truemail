@@ -90,6 +90,12 @@
   .titlebar-update{position:relative;z-index:1600;display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;margin-right:6px;flex:none;
     border:0;border-radius:999px;background:var(--accent);color:var(--on-accent);font:inherit;font-size:12px;font-weight:600;cursor:pointer;}
   .titlebar-update:hover{filter:brightness(1.08);}
+  /* Что нового в выпуске: окно появляется сразу при наведении на кнопку
+     обновления - список изменений виден, не нажимая (issue #83). */
+  .titlebar-update-wrap{position:relative;display:inline-flex;align-items:center;z-index:1600;}
+  .update-notes{position:absolute;top:calc(100% + 6px);left:0;z-index:1700;width:min(420px,80vw);max-height:60vh;overflow:auto;padding:12px 14px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);color:var(--text);font-size:12.5px;line-height:1.5;text-align:left;white-space:pre-wrap;}
+  .update-notes-head{font-weight:650;margin-bottom:6px;}
+  .update-notes-body{color:var(--text-2);}
   .titlebar-update[disabled]{opacity:.7;cursor:default;filter:none;}
   .titlebar-update i svg{width:13px;height:13px;}
   .wincontrols{position:relative;z-index:1600;display:flex;align-self:stretch;flex:none;}
@@ -674,7 +680,24 @@
   .scale-input{width:76px}.compact-modal{max-width:780px}.cond-group{border:1px solid var(--border);border-radius:12px;padding:11px;margin-bottom:10px}.cond-group-head{display:flex;align-items:center;gap:8px;color:var(--text-2);margin-bottom:9px}.cond-group-title{font-weight:650;font-size:12px;margin-right:auto}.cond-group-head .logic{margin:0}.cond-group-remove{color:var(--text-3)}.smart-logic-help{font-size:12px;color:var(--text-3);line-height:1.45;margin-bottom:10px}.smart-summary{display:block;color:var(--text-3);font-size:11.5px;line-height:1.35;margin-top:3px;white-space:normal}.smart-name{min-width:0;flex:1}.smart-name .nm{display:block}.smart-list-row{align-items:flex-start}.smart-list-row>.grip,.smart-list-row>i,.smart-list-row>.btn,.smart-list-row>.ord,.smart-list-row>.toggle{margin-top:5px}.unified-toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.unified-account{border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-top:10px}.unified-account-title{padding:9px 11px;background:var(--panel);font-weight:650;font-size:12.5px}.unified-source{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:9px;padding:9px 11px;border-top:1px solid var(--border);cursor:pointer}.unified-source:first-child{border-top:0}.unified-source:hover{background:var(--hover)}.source-path{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-role{font-size:11px;color:var(--text-3);background:var(--panel);border:1px solid var(--border);border-radius:20px;padding:2px 7px}.unified-explanation{margin-bottom:12px}.icon-picker{display:grid!important;grid-template-columns:repeat(10,1fr);gap:5px;margin-top:10px;max-height:180px;overflow:auto}.icon-picker.hidden{display:none!important}.toolbar-original-hidden{display:none!important}.toolbar-action-icons span{display:none}.actions.toolbar-right .sp{order:-1}.tbrow[draggable="true"]{cursor:grab}.tbrow.pointer-dragging{opacity:.6;box-shadow:var(--shadow);cursor:grabbing}.tbrow .grip{touch-action:none;cursor:grab}.action-label-mode{margin-left:auto}.account-name{font-weight:650}.account-email{color:var(--text-3);font-size:12px}.account-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.account-card .account-stats{color:var(--text-3);font-size:12px;margin-top:3px}
 /* Аккордеон карточек аккаунтов (accounts-accordion-password.md): тело свёрнуто,
    пока карточка не раскрыта явно; шапка кликабельна вне зоны кнопок действий. */
-.account-card .ch{cursor:pointer}.account-card .cb{display:none}.account-card.open .cb{display:block}
+/* Контейнер для запросов по ширине - сама шапка карточки: ставить его на всю
+   карточку нельзя, внутри её тела есть всплывающая палитра цветов, а
+   containment сделал бы карточку точкой отсчёта для таких элементов. */
+/* Шапка карточки аккаунта подстраивается под ширину самой карточки, а не окна:
+   панель настроек уже окна, и раскладка по ширине окна ошибалась бы. Пока
+   ширины хватает, кнопки стоят справа в ряд; когда не хватает - уезжают на
+   свою строку целиком, а имя, адрес и подпись занимают всю ширину
+   (issue #81). */
+.account-card .ch{container-type:inline-size;cursor:pointer;flex-wrap:wrap;align-items:flex-start;row-gap:10px}
+.account-card .ch>.grow{flex:1 1 240px;min-width:0}
+.account-card .account-email{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.account-card .account-stats{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.account-card .account-actions{flex:1 1 100%;justify-content:flex-start}
+.account-card .account-note{flex:1 1 100%;color:var(--text-3);font-size:11.5px;line-height:1.4}
+@container (min-width: 620px){
+  .account-card .account-actions{flex:0 0 auto;justify-content:flex-end;margin-left:auto}
+}
+.account-card .cb{display:none}.account-card.open .cb{display:block}
 .account-toggle{flex:none;background:transparent;border:0;color:var(--text-2);transition:transform .15s ease}
 .account-card.open .account-toggle{transform:rotate(180deg)}
 .account-actions{cursor:default}

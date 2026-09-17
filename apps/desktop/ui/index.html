@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260917-1">
+  <link rel="stylesheet" href="styles.css?v=20260917-4">
 </head>
 <body>
 
@@ -14,8 +14,11 @@
 <div class="titlebar" id="titlebar" data-tauri-drag-region="deep">
   <span class="titlebar-logo"><svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><clipPath id="titlebar-envelope-shape"><rect width="1024" height="768" rx="128"/></clipPath></defs><g transform="translate(0 128)" clip-path="url(#titlebar-envelope-shape)"><rect width="1024" height="768" rx="128" fill="#5B63D3"/><path fill="#fff" d="M0 88 328 336h368l328-248v96L736 416H592v352H432V416H288L0 184Z"/></g></svg></span>
   <span class="titlebar-title">truemail</span>
+  <div class="titlebar-update-wrap">
+    <button type="button" class="titlebar-update hidden" id="titlebarUpdate"><i data-i="sync"></i><span id="titlebarUpdateText" data-i18n="updateAvailableButton">Обновить</span></button>
+    <div class="update-notes hidden" id="updateNotes" role="tooltip" aria-hidden="true"><div class="update-notes-head" id="updateNotesHead"></div><div class="update-notes-body" id="updateNotesBody"></div></div>
+  </div>
   <span class="titlebar-drag"></span>
-  <button type="button" class="titlebar-update hidden" id="titlebarUpdate"><i data-i="sync"></i><span id="titlebarUpdateText" data-i18n="updateAvailableButton">Обновить</span></button>
   <div class="wincontrols">
     <button type="button" class="winbtn" id="winMinimize" data-i18n-title="windowMinimize" data-i18n-aria="windowMinimize" title="Свернуть в трей" aria-label="Свернуть в трей"><svg viewBox="0 0 12 12" aria-hidden="true"><path d="M1 6h10"/></svg></button>
     <button type="button" class="winbtn" id="winMaximize" data-i18n-title="windowMaximize" data-i18n-aria="windowMaximize" title="Развернуть" aria-label="Развернуть"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="1.5" width="9" height="9" rx="1"/></svg></button>
@@ -710,7 +713,7 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.2.16"></script>
+<script src="modules/app-version.js?v=0.2.18"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
@@ -721,7 +724,7 @@
 <script src="modules/commands-accessibility.js?v=20260916-1"></script>
 <script src="modules/smart-rules.js?v=20260916-1"></script>
 <script src="modules/i18n-onboarding.js?v=20260917-1"></script>
-<script src="modules/error-presentation.js?v=20260917-2"></script>
+<script src="modules/error-presentation.js?v=20260917-4"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
@@ -729,11 +732,11 @@
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
 <script src="modules/mail.js?v=20260917-1"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
-<script src="modules/composer.js?v=20260917-1"></script>
+<script src="modules/composer.js?v=20260917-4"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260917-2"></script>
-<script src="modules/window-chrome.js?v=20260916-1"></script>
-<script src="bridge.js?v=20260916-2"></script>
+<script src="modules/settings.js?v=20260917-4"></script>
+<script src="modules/window-chrome.js?v=20260917-4"></script>
+<script src="bridge.js?v=20260917-4"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>
