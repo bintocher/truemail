@@ -3,7 +3,13 @@
 'use strict';
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {nextOpenAccountId, restoreOpenAccountId, canChangeAccountPassword} = require('../../ui/modules/account-cards.js');
+const {
+  nextOpenAccountId,
+  restoreOpenAccountId,
+  canChangeAccountPassword,
+  isOAuthAccount,
+  accountStatsText,
+} = require('../../ui/modules/account-cards.js');
 
 // S-002: переключение аккордеона.
 test('S-002: первый клик раскрывает карточку', () => {
@@ -46,4 +52,23 @@ test('S-008: canChangeAccountPassword по всем значениям auth_kind
   assert.equal(canChangeAccountPassword(null), false);
   assert.equal(canChangeAccountPassword('unknown_kind'), false);
   assert.equal(canChangeAccountPassword(''), false);
+});
+
+test('issue 79: число папок и календарей согласовано по-русски', () => {
+  assert.equal(accountStatsText(1, 1, 'ru'), '1 папка · 1 календарь');
+  assert.equal(accountStatsText(2, 2, 'ru'), '2 папки · 2 календаря');
+  assert.equal(accountStatsText(8, 8, 'ru'), '8 папок · 8 календарей');
+  assert.equal(accountStatsText(21, 14, 'ru'), '21 папка · 14 календарей');
+});
+
+test('issue 79: английское множественное число зависит от единицы', () => {
+  assert.equal(accountStatsText(1, 2, 'en'), '1 folder · 2 calendars');
+  assert.equal(accountStatsText(3, 1, 'en'), '3 folders · 1 calendar');
+});
+
+test('issue 79: повторный вход показывается только для OAuth', () => {
+  assert.equal(isOAuthAccount('oauth2'), true);
+  assert.equal(isOAuthAccount('password'), false);
+  assert.equal(isOAuthAccount('app_password'), false);
+  assert.equal(isOAuthAccount('ntlm'), false);
 });

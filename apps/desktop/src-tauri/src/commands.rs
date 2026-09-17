@@ -217,7 +217,7 @@ pub struct ConnectedAccount {
     calendars: usize,
     events: usize,
     contacts: usize,
-    warnings: Vec<String>,
+    warnings: Vec<truemail_core::account::SyncWarning>,
 }
 
 #[derive(Debug)]
@@ -357,6 +357,90 @@ fn sync_error_state(
         "error_kind": error.code(),
         "error_message": message,
     })
+}
+
+fn account_server_address(account: &Account, scope: &str, backend: Option<&str>) -> Option<String> {
+    if backend.is_some_and(|value| value.contains("smtp")) {
+        return account
+            .smtp
+            .as_ref()
+            .map(|server| format!("{}:{}", server.host, server.port));
+    }
+    if matches!(scope, "auxiliary" | "dav") {
+        return account
+            .caldav_url
+            .clone()
+            .or_else(|| account.carddav_url.clone())
+            .or_else(|| backend.map(str::to_owned));
+    }
+    match account.backend_kind {
+        BackendKind::Imap => account
+            .imap
+            .as_ref()
+            .map(|server| format!("{}:{}", server.host, server.port))
+            .or_else(|| match account.provider {
+                Provider::Gmail => Some("gmail.googleapis.com".to_owned()),
+                Provider::Yandex => Some("imap.yandex.ru".to_owned()),
+                _ => backend.map(str::to_owned),
+            }),
+        BackendKind::Ews => account
+            .ews_url
+            .clone()
+            .or_else(|| backend.map(str::to_owned)),
+        BackendKind::Jmap => account
+            .jmap_url
+            .clone()
+            .or_else(|| backend.map(str::to_owned)),
+    }
+}
+
+fn account_sync_error_state(
+    account: &Account,
+    scope: &str,
+    status: &str,
+    error: &truemail_core::Error,
+    retries_exhausted: bool,
+) -> serde_json::Value {
+    let mut value = sync_error_state(account.id, scope, status, error);
+    let object = value
+        .as_object_mut()
+        .expect("состояние синхронизации всегда является объектом");
+    object.insert(
+        "attempted_at".into(),
+        serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    );
+    object.insert("retries_exhausted".into(), retries_exhausted.into());
+    if let Some(server) = account_server_address(account, scope, error.backend()) {
+        object.insert("server".into(), server.into());
+    }
+    if let Some(code) = error.response_code() {
+        object.insert("response_code".into(), code.into());
+    }
+    value
+}
+
+fn sync_warning_values(
+    account: &Account,
+    scope: &str,
+    warnings: &[truemail_core::account::SyncWarning],
+    attempted_at: &str,
+) -> Vec<serde_json::Value> {
+    warnings
+        .iter()
+        .map(|warning| {
+            let mut value =
+                serde_json::to_value(warning).expect("SyncWarning всегда сериализуется в объект");
+            let object = value
+                .as_object_mut()
+                .expect("SyncWarning всегда сериализуется в объект");
+            object.insert("attempted_at".into(), attempted_at.into());
+            if let Some(server) = account_server_address(account, scope, warning.backend.as_deref())
+            {
+                object.insert("server".into(), server.into());
+            }
+            value
+        })
+        .collect()
 }
 
 const DEFAULT_UPDATE_ENDPOINT: &str =
@@ -1394,7 +1478,7 @@ async fn gmail_realtime_loop(
                     .await;
                 }
                 Err(error) => {
-                    let state = sync_error_state(account.id, "mail", "error", &error);
+                    let state = account_sync_error_state(&account, "mail", "error", &error, false);
                     let _ = app.emit("truemail-sync-state", state);
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
@@ -3446,6 +3530,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             {
                 tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая догрузка тел писем отложена");
             }
+            let attempted_at = chrono::Utc::now().to_rfc3339();
             let state = match (mail, auxiliary) {
                 (Ok(result), Ok(aux)) => {
                     if !aux.changes.is_empty() {
@@ -3461,12 +3546,22 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         .await;
                     }
                     tracing::info!(account = %truemail_core::logging::mask_email(&account.email), calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "инкрементальный sync завершён");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    let warnings =
+                        sync_warning_values(&account, "all", &result.warnings, &attempted_at);
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Ok(mut result), Err(error)) => {
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "почта обновлена, вспомогательный sync будет повторён");
-                    result.warnings.push(error.to_string());
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": result.warnings})
+                    result.warnings.push(truemail_core::account::SyncWarning {
+                        kind: error.code().to_owned(),
+                        message: truemail_core::error::sanitize_error_message(&error.to_string()),
+                        backend: error.backend().map(str::to_owned),
+                        response_code: error.response_code(),
+                        sync_phase: None,
+                    });
+                    let warnings =
+                        sync_warning_values(&account, "auxiliary", &result.warnings, &attempted_at);
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true})
                 }
                 (Err(mail_error), Ok(aux)) if supports_auxiliary => {
                     let message =
@@ -3483,20 +3578,34 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         )
                         .await;
                     }
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": [message.clone()], "error_kind": mail_error.code(), "error_message": message, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    let warning = truemail_core::account::SyncWarning {
+                        kind: mail_error.code().to_owned(),
+                        message,
+                        backend: mail_error.backend().map(str::to_owned),
+                        response_code: mail_error.response_code(),
+                        sync_phase: Some("regular"),
+                    };
+                    let warnings = sync_warning_values(&account, "all", &[warning], &attempted_at);
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
                     let error = truemail_core::error::sanitize_error_message(&format!(
                         "почта: {mail_error}; календарь/контакты: {auxiliary_error}"
                     ));
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %error, "фоновая синхронизация не удалась");
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "error", "error": error.clone(), "error_kind": mail_error.code(), "error_message": error})
+                    let mut state =
+                        account_sync_error_state(&account, "all", "error", &mail_error, true);
+                    if let Some(object) = state.as_object_mut() {
+                        object.insert("error".into(), error.clone().into());
+                        object.insert("error_message".into(), error.into());
+                    }
+                    state
                 }
                 (Err(error), Ok(_)) => {
                     let safe_error =
                         truemail_core::error::sanitize_error_message(&error.to_string());
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "фоновая синхронизация не удалась");
-                    sync_error_state(account.id, "all", "error", &error)
+                    account_sync_error_state(&account, "all", "error", &error, true)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3558,7 +3667,7 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
                     let safe_error =
                         truemail_core::error::sanitize_error_message(&error.to_string());
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "синхронизация календаря, задач и контактов не удалась");
-                    sync_error_state(account.id, "auxiliary", "error", &error)
+                    account_sync_error_state(&account, "auxiliary", "error", &error, true)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3715,11 +3824,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     // лишняя перезагрузка дешевле, чем список,
                                     // застрявший до следующего удачного прохода.
                                     mail_changed = true;
-                                    error_state = Some(sync_error_state(
-                                        watch_account.id,
+                                    error_state = Some(account_sync_error_state(
+                                        &watch_account,
                                         "mail",
                                         "error",
                                         &error,
+                                        false,
                                     ));
                                     let safe_error = truemail_core::error::sanitize_error_message(
                                         &error.to_string(),
@@ -3774,8 +3884,13 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             {
                                 tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error = %db_error, "не удалось сохранить состояние синхронизации почты");
                             }
-                            let state =
-                                sync_error_state(watch_account.id, "mail", "retrying", &error);
+                            let state = account_sync_error_state(
+                                &watch_account,
+                                "mail",
+                                "retrying",
+                                &error,
+                                false,
+                            );
                             let _ = watch_app.emit("truemail-sync-state", state);
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
@@ -4311,7 +4426,7 @@ async fn spawn_initial_mail_sync(
         serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
     );
     tokio::spawn(async move {
-        let mail_result = core.accounts.sync_mail_account(&account).await;
+        let mail_result = core.accounts.sync_initial_mail_account(&account).await;
         // Постоянное состояние - по факту Ok/Err этого прохода (S-002, S-003).
         if let Err(error) = core
             .db
@@ -4323,12 +4438,15 @@ async fn spawn_initial_mail_sync(
         let sync_state = match &mail_result {
             Ok(result) => {
                 tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена");
-                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready"})
+                let attempted_at = chrono::Utc::now().to_rfc3339();
+                let warnings =
+                    sync_warning_values(&account, "all", &result.warnings, &attempted_at);
+                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "initial_sync": true})
             }
             Err(error) => {
                 let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
                 tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась");
-                sync_error_state(account.id, "all", "error", error)
+                account_sync_error_state(&account, "all", "error", error, true)
             }
         };
         let _ = sync_app.emit("truemail-sync-state", sync_state);

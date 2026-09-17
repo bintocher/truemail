@@ -967,6 +967,7 @@ window.handleConnectStage=function(payload){
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
+function connectedWarningText(connected){return window.errorPresentation.presentConnectedWarnings(connected?.warnings,{locale:wizardLocale,translations:wizardText,connected:true,account:connected?.account}).join(' ');}
 document.getElementById('accountOauthStart').onclick=async()=>{
   const email=document.getElementById('accountEmail').value.trim(),status=document.getElementById('accountOauthStatus');
   const button=document.getElementById('accountOauthStart');
@@ -985,7 +986,7 @@ document.getElementById('accountOauthStart').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
+    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
     if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается, а
     // заметная область показывает отдельное подтверждённое состояние.
@@ -1008,7 +1009,7 @@ document.getElementById('accountPasswordConfirm').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
+    status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
     setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);
   }catch(error){
     await refreshAccountsAndComposerReadiness();
@@ -1025,7 +1026,7 @@ document.getElementById('accountOauthConfirm').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    status.textContent=connected.warnings?.length?connected.warnings.join(' '):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
+    status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';
     setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);
   }
   catch(e){
@@ -1056,7 +1057,7 @@ document.getElementById('wzConnect').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
+    if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
     if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается (уже
     // сделано выше), а заметная область показывает отдельное состояние.
@@ -1076,7 +1077,7 @@ document.getElementById('wzConfirm').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    status.textContent=connected.warnings?.length?connected.warnings.join(' '):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;
+    status.textContent=connected.warnings?.length?connectedWarningText(connected):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;
   }catch(e){
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;

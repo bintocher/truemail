@@ -8,7 +8,11 @@ const path=require('node:path');
 const {
   ERROR_KINDS,
   presentError,
+  formatErrorDetails,
+  shouldShowSyncToast,
   planToastQueue,
+  beginToastAction,
+  finishToastAction,
 }=require('../../ui/modules/error-presentation.js');
 
 const uiRoot=path.join(__dirname,'../../ui');
@@ -112,4 +116,90 @@ test('S-008 S-009: вид, аккаунт, текст и действие вхо
 test('S-015: карточка с действием не получает время автоматического скрытия',()=>{
   const result=planToastQueue([],item('a','timeout','Ошибка',1,'retry',true),1000);
   assert.equal(result.cards[0].expiresAt,null);
+});
+
+test('S-017: основной текст называет нужный аккаунт',()=>{
+  const account={id:2,email:'work@example.com',display_name:'Работа'};
+  const shown=presentError(
+    {kind:'server_unavailable',account_id:2,message:'HTTP 500'},
+    {locale:'ru',translations,account},
+  );
+  assert.match(shown.text,/Работа \(work@example\.com\)/);
+  assert.doesNotMatch(shown.text,/HTTP 500/);
+  const unnamed=presentError(
+    {kind:'timeout',account_id:3,message:'timeout'},
+    {locale:'ru',translations,account:{id:3,email:'home@example.com',display_name:''}},
+  );
+  assert.match(unnamed.text,/^home@example\.com:/);
+});
+
+test('S-018: предупреждение использует общую таблицу, транспорт остаётся в подробностях',()=>{
+  const warning={kind:'server_unavailable',message:'транспорт (ews-http): HTTP 500'};
+  const shown=presentError(warning,{locale:'ru',translations});
+  assert.equal(shown.text,translations.ru.errorServerUnavailable);
+  assert.match(shown.details,/HTTP 500/);
+});
+
+test('S-019: подробности содержат сервер, код, местное время и транспорт',()=>{
+  const details=formatErrorDetails({
+    kind:'server_unavailable',
+    message:'transport failed',
+    server:'mail.example.com:443',
+    response_code:503,
+    attempted_at:'2026-09-17T10:20:30Z',
+  },{locale:'ru',translations});
+  assert.match(details,/Сервер: mail\.example\.com:443/);
+  assert.match(details,/Код ответа: 503/);
+  assert.match(details,/Время попытки:/);
+  assert.match(details,/Причина транспорта: transport failed/);
+  assert.doesNotMatch(details,/2026-09-17T10:20:30Z/);
+});
+
+test('S-020: действие меняет ту же карточку на ожидание и исход',()=>{
+  const original=[{id:'a',text:'Ошибка',hasAction:true,expiresAt:null}];
+  const pending=beginToastAction(original,'a','Выполняется...');
+  assert.equal(pending[0].id,'a');
+  assert.equal(pending[0].actionState,'pending');
+  assert.equal(pending[0].actionStatus,'Выполняется...');
+  const success=finishToastAction(pending,'a',{ok:true,text:'Действие выполнено.'},1000);
+  assert.equal(success[0].id,'a');
+  assert.equal(success[0].text,'Действие выполнено.');
+  assert.equal(success[0].hasAction,false);
+  const failed=finishToastAction(pending,'a',{ok:false,item:{text:'Новая причина',hasAction:true}},1000);
+  assert.equal(failed[0].id,'a');
+  assert.equal(failed[0].text,'Новая причина');
+  assert.equal(failed[0].actionState,'failed');
+});
+
+test('S-021: первый и очередной проход имеют разные формулировки',()=>{
+  const first=presentError({kind:'timeout',message:'raw',sync_phase:'initial'},{locale:'ru',translations});
+  const regular=presentError({kind:'timeout',message:'raw',sync_phase:'regular'},{locale:'ru',translations});
+  assert.match(first.text,/Первая синхронизация отложена/);
+  assert.match(regular.text,/Очередная синхронизация отложена/);
+  assert.doesNotMatch(regular.text,/Первая/);
+});
+
+test('S-022: временный сбой до исчерпания повторов не всплывает',()=>{
+  for(const kind of ['network_unavailable','timeout','server_unavailable','rate_limited']){
+    assert.equal(shouldShowSyncToast({kind,retries_exhausted:false}),false,kind);
+  }
+});
+
+test('S-023: один вид объединяет аккаунты в одной карточке',()=>{
+  const first={...item('a','server_unavailable','one',1),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:1,email:'one@example.com'}],locale:'ru',translations};
+  const second={...item('b','server_unavailable','two',2),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:2,email:'two@example.com'}],locale:'ru',translations};
+  let cards=planToastQueue([],first,1000).cards;
+  cards=planToastQueue(cards,second,2000).cards;
+  assert.equal(cards.length,1);
+  assert.deepEqual(cards[0].accountIds,[1,2]);
+  assert.match(cards[0].text,/one@example\.com/);
+  assert.match(cards[0].text,/two@example\.com/);
+});
+
+test('S-024: сразу всплывают только виды, требующие решения человека',()=>{
+  for(const kind of ['invalid_credentials','needs_reauth','forbidden','certificate_error','account_config']){
+    assert.equal(shouldShowSyncToast({kind,retries_exhausted:false}),true,kind);
+  }
+  assert.equal(shouldShowSyncToast({kind:'storage_error',retries_exhausted:true}),false);
+  assert.equal(shouldShowSyncToast({kind:'server_unavailable',retries_exhausted:true}),true);
 });

@@ -282,9 +282,46 @@ impl Error {
         }
     }
 
+    /// Имя транспорта, если ошибка пришла от удалённого сервера.
+    pub fn backend(&self) -> Option<&str> {
+        match self {
+            Self::Backend { backend, .. }
+            | Self::ClassifiedBackend { backend, .. }
+            | Self::RateLimited { backend, .. } => Some(backend),
+            _ => None,
+        }
+    }
+
+    /// Код ответа, если транспорт сохранил его в безопасном тексте ошибки.
+    /// Старые варианты Error не несут отдельного поля статуса, поэтому здесь
+    /// извлекается только самостоятельный трёхзначный код после HTTP.
+    pub fn response_code(&self) -> Option<u16> {
+        let message = match self {
+            Self::Backend { message, .. }
+            | Self::ClassifiedBackend { message, .. }
+            | Self::RateLimited { message, .. } => message,
+            _ => return None,
+        };
+        http_response_code(message)
+    }
+
     pub fn requires_reauth(&self) -> bool {
         self.kind().requires_reauth()
     }
+}
+
+fn http_response_code(message: &str) -> Option<u16> {
+    let lower = message.to_ascii_lowercase();
+    let http = lower.find("http")?;
+    lower[http + 4..]
+        .split(|character: char| !character.is_ascii_digit())
+        .find_map(|token| {
+            if token.len() != 3 {
+                return None;
+            }
+            let value = token.parse::<u16>().ok()?;
+            (100..=599).contains(&value).then_some(value)
+        })
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -515,6 +552,21 @@ mod tests {
             };
             assert_eq!(error.code(), expected, "текст: {message}");
         }
+    }
+
+    #[test]
+    fn response_code_is_returned_only_when_http_code_is_known() {
+        let http = Error::Backend {
+            backend: "ews-http".into(),
+            message: "HTTP 500 Internal Server Error".into(),
+        };
+        let network = Error::Backend {
+            backend: "imap-idle".into(),
+            message: "os error 10054".into(),
+        };
+        assert_eq!(http.response_code(), Some(500));
+        assert_eq!(network.response_code(), None);
+        assert_eq!(http.backend(), Some("ews-http"));
     }
 
     #[test]

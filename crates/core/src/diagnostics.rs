@@ -158,6 +158,13 @@ static_regex!(
     email_re,
     r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 );
+// Адрес внутри URL часто записан с кодированным знаком @. Такой адрес надо
+// забрать целиком раньше шаблона узла, иначе домен заменится отдельно, а
+// локальная часть останется в архиве открытой.
+static_regex!(
+    encoded_email_re,
+    r"(?i)\b[A-Za-z0-9._+%-]+%40[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+);
 // Узел: домен или имя сервера - в тексте журнала неразличимы (одна
 // категория). Идёт последним: email и путь уже забрали свои совпадения, так
 // что имена файлов внутри путей ("truemail.log") сюда не попадают.
@@ -189,6 +196,18 @@ fn replace_whole_match(
         alias(salt, category, &caps[0])
     })
     .into_owned()
+}
+
+fn replace_encoded_email(salt: &[u8; 16], text: &str, counts: &mut ReplacementCounts) -> String {
+    encoded_email_re()
+        .replace_all(text, |caps: &Captures<'_>| {
+            counts.increment(Category::Email);
+            // Для обычной и URL-кодированной записи одного адреса используется
+            // один исходный текст, поэтому псевдоним внутри архива совпадает.
+            let canonical = caps[0].replace("%40", "@");
+            alias(salt, Category::Email, &canonical)
+        })
+        .into_owned()
 }
 
 fn replace_anchored_value(
@@ -260,6 +279,7 @@ pub fn anonymize_line(line: &str, salt: &[u8; 16], counts: &mut ReplacementCount
     text = replace_anchored_value(windows_path_re(), Category::Path, salt, &text, counts);
     text = replace_anchored_value(unc_path_re(), Category::Path, salt, &text, counts);
     text = replace_anchored_value(unix_path_re(), Category::Path, salt, &text, counts);
+    text = replace_encoded_email(salt, &text, counts);
     text = replace_whole_match(email_re(), Category::Email, salt, &text, counts);
     text = replace_whole_match(host_re(), Category::Host, salt, &text, counts);
     text = replace_whole_match(ipv4_re(), Category::Host, salt, &text, counts);
@@ -430,6 +450,26 @@ mod tests {
                 .to_owned()
         };
         assert_eq!(alias_in(&first), alias_in(&second));
+    }
+
+    #[test]
+    fn encoded_email_in_dav_url_is_replaced_as_one_value() {
+        let salt = salt(17);
+        let mut counts = ReplacementCounts::default();
+        let line = "транспорт (dav): error sending request for url (https://mail.example/calendars/schernov%40yandex.ru/)";
+        let out = anonymize_line(line, &salt, &mut counts);
+        assert!(!out.contains("schernov"), "{out}");
+        assert!(!out.contains("40yandex.ru"), "{out}");
+        assert!(out.contains("/calendars/[email-"), "{out}");
+    }
+
+    #[test]
+    fn plain_and_encoded_email_share_one_alias() {
+        let salt = salt(18);
+        let mut counts = ReplacementCounts::default();
+        let plain = anonymize_line("schernov@yandex.ru", &salt, &mut counts);
+        let encoded = anonymize_line("schernov%40yandex.ru", &salt, &mut counts);
+        assert_eq!(plain, encoded);
     }
 
     #[test]
