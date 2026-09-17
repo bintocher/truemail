@@ -157,6 +157,11 @@ pub enum Error {
         backend: String,
         kind: ErrorKind,
         message: String,
+        /// Код ответа HTTP, если он известен месту, где создана ошибка -
+        /// напрямую, а не разбором текста (G2, error-kinds-and-messages.md).
+        /// `response_code()` полагается на это поле и только при его
+        /// отсутствии откатывается на разбор текста.
+        response_code: Option<u16>,
     },
 
     /// Сервер запретил повторные запросы до указанного абсолютного момента.
@@ -167,6 +172,8 @@ pub enum Error {
         backend: String,
         retry_at: chrono::DateTime<chrono::Utc>,
         message: String,
+        /// См. ClassifiedBackend::response_code - тот же смысл.
+        response_code: Option<u16>,
     },
 
     #[error("аккаунт не настроен: {0}")]
@@ -217,10 +224,23 @@ impl Error {
         kind: ErrorKind,
         message: impl Into<String>,
     ) -> Self {
+        Self::classified_backend_with_code(backend, kind, message, None)
+    }
+
+    /// То же самое, но код ответа HTTP уже известен вызывающему коду - его
+    /// не нужно (и не всегда можно надёжно) вычислять разбором текста
+    /// сообщения (G2, error-kinds-and-messages.md).
+    pub fn classified_backend_with_code(
+        backend: impl Into<String>,
+        kind: ErrorKind,
+        message: impl Into<String>,
+        response_code: Option<u16>,
+    ) -> Self {
         Self::ClassifiedBackend {
             backend: backend.into(),
             kind,
             message: message.into(),
+            response_code,
         }
     }
 
@@ -262,16 +282,42 @@ impl Error {
         let backend = backend.into();
         let message = message.into();
         match status {
-            401 => Self::classified_backend(backend, ErrorKind::InvalidCredentials, message),
-            403 => Self::classified_backend(backend, ErrorKind::Forbidden, message),
-            408 => Self::classified_backend(backend, ErrorKind::Timeout, message),
+            401 => Self::classified_backend_with_code(
+                backend,
+                ErrorKind::InvalidCredentials,
+                message,
+                Some(status),
+            ),
+            403 => Self::classified_backend_with_code(
+                backend,
+                ErrorKind::Forbidden,
+                message,
+                Some(status),
+            ),
+            408 => Self::classified_backend_with_code(
+                backend,
+                ErrorKind::Timeout,
+                message,
+                Some(status),
+            ),
             429 => Self::RateLimited {
                 backend,
                 retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
                 message,
+                response_code: Some(status),
             },
-            500..=599 => Self::classified_backend(backend, ErrorKind::ServerUnavailable, message),
-            _ => Self::classified_backend(backend, ErrorKind::Unknown, message),
+            500..=599 => Self::classified_backend_with_code(
+                backend,
+                ErrorKind::ServerUnavailable,
+                message,
+                Some(status),
+            ),
+            _ => Self::classified_backend_with_code(
+                backend,
+                ErrorKind::Unknown,
+                message,
+                Some(status),
+            ),
         }
     }
 
@@ -292,17 +338,25 @@ impl Error {
         }
     }
 
-    /// Код ответа, если транспорт сохранил его в безопасном тексте ошибки.
-    /// Старые варианты Error не несут отдельного поля статуса, поэтому здесь
-    /// извлекается только самостоятельный трёхзначный код после HTTP.
+    /// Код ответа HTTP. Сначала - поле, заполненное на месте создания
+    /// ошибки (G2: там код известен точно), и только если поля нет
+    /// (старый Backend или ClassifiedBackend/RateLimited, для которых код не
+    /// передали) - запасной разбор текста сообщения.
     pub fn response_code(&self) -> Option<u16> {
-        let message = match self {
-            Self::Backend { message, .. }
-            | Self::ClassifiedBackend { message, .. }
-            | Self::RateLimited { message, .. } => message,
-            _ => return None,
-        };
-        http_response_code(message)
+        match self {
+            Self::ClassifiedBackend {
+                response_code,
+                message,
+                ..
+            }
+            | Self::RateLimited {
+                response_code,
+                message,
+                ..
+            } => response_code.or_else(|| http_response_code(message)),
+            Self::Backend { message, .. } => http_response_code(message),
+            _ => None,
+        }
     }
 
     pub fn requires_reauth(&self) -> bool {
@@ -310,18 +364,42 @@ impl Error {
     }
 }
 
+/// Запасной разбор текста - только для ошибок без отдельного поля кода.
+/// Ищет не любое вхождение подстроки "http" (она находится и внутри адреса,
+/// например в порте "https://host:443/...", откуда раньше и брался
+/// ошибочный код), а токен "HTTP" с ровно одним пробелом и трёхзначным
+/// числом сразу после него - как в реальных сообщениях транспорта вида
+/// "HTTP 503: ...".
 fn http_response_code(message: &str) -> Option<u16> {
-    let lower = message.to_ascii_lowercase();
-    let http = lower.find("http")?;
-    lower[http + 4..]
-        .split(|character: char| !character.is_ascii_digit())
-        .find_map(|token| {
-            if token.len() != 3 {
-                return None;
-            }
-            let value = token.parse::<u16>().ok()?;
-            (100..=599).contains(&value).then_some(value)
-        })
+    let upper = message.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    let mut start = 0;
+    while let Some(relative) = upper[start..].find("HTTP") {
+        let index = start + relative;
+        let after_marker = index + 4;
+        if bytes.get(after_marker) == Some(&b' ')
+            && let Some(code) = parse_three_digit_code(bytes, after_marker + 1)
+        {
+            return Some(code);
+        }
+        start = index + 4;
+    }
+    None
+}
+
+/// Разбирает ровно три цифры начиная с `start` как код ответа HTTP -
+/// соседние байты по обе стороны не должны быть цифрами, иначе число длиннее
+/// трёх знаков (например, порт "44300").
+fn parse_three_digit_code(bytes: &[u8], start: usize) -> Option<u16> {
+    let digits = bytes.get(start..start + 3)?;
+    if !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes.get(start + 3).is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let value: u16 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+    (100..=599).contains(&value).then_some(value)
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -490,6 +568,7 @@ mod tests {
                     backend: "x".into(),
                     retry_at: chrono::Utc::now(),
                     message: "x".into(),
+                    response_code: None,
                 },
                 "rate_limited",
             ),
@@ -567,6 +646,33 @@ mod tests {
         assert_eq!(http.response_code(), Some(500));
         assert_eq!(network.response_code(), None);
         assert_eq!(http.backend(), Some("ews-http"));
+    }
+
+    // G2: response_code() берётся из поля, а не разбором текста. Раньше
+    // запасной разбор искал любую подстроку "http" и находил её внутри
+    // адреса из https://..., откуда брал порт (443) вместо настоящего кода
+    // ответа (503) чуть дальше в том же сообщении.
+    #[test]
+    fn from_http_status_carries_the_real_code_even_with_a_port_in_the_message() {
+        let error = Error::from_http_status(
+            "dav",
+            503,
+            "GET https://caldav.example.com:443/dav/calendars/: HTTP 503: Service Unavailable",
+        );
+        assert_eq!(error.response_code(), Some(503));
+    }
+
+    // Тот же случай для запасного разбора текста (ошибки без поля кода) -
+    // он должен опираться на "HTTP <код>", а не на любое вхождение "http".
+    #[test]
+    fn fallback_text_parsing_ignores_a_port_that_looks_like_a_response_code() {
+        let error = Error::Backend {
+            backend: "dav".into(),
+            message:
+                "GET https://caldav.example.com:443/dav/calendars/: HTTP 503: Service Unavailable"
+                    .into(),
+        };
+        assert_eq!(error.response_code(), Some(503));
     }
 
     #[test]

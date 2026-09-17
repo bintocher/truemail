@@ -402,6 +402,7 @@ fn oauth_response_error(
             backend: backend.into(),
             retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
             message,
+            response_code: Some(status.as_u16()),
         };
     }
     let kind = if status == reqwest::StatusCode::UNAUTHORIZED
@@ -415,7 +416,8 @@ fn oauth_response_error(
     } else {
         ErrorKind::Unknown
     };
-    Error::classified_backend(backend, kind, message)
+    // Код ответа известен здесь напрямую (G2, error-kinds-and-messages.md).
+    Error::classified_backend_with_code(backend, kind, message, Some(status.as_u16()))
 }
 
 impl From<OAuthToken> for StoredOAuthCredential {

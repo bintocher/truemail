@@ -235,7 +235,17 @@ function planToastQueue(cards,item,now=Date.now()) {
     if(!alreadyIncluded&&item.accounts?.[0])accounts.push(item.accounts[0]);
     grouped.accounts=accounts;
     grouped.accountIds=[...new Set([...(grouped.accountIds||[grouped.accountId]),item.accountId])];
-    grouped.callbacks=[...(grouped.callbacks||[grouped.callback]).filter(Boolean),...(item.callbacks||[item.callback]).filter(Boolean)];
+    if(!alreadyIncluded){
+      // Обработчик действия добавляется только для нового аккаунта в карточке -
+      // повторный сбой уже учтённого аккаунта не должен плодить в списке
+      // ещё одну копию того же callback, которая сработает по тому же
+      // нажатию (G3, error-kinds-and-messages.md).
+      grouped.callbacks=[...(grouped.callbacks||[grouped.callback]).filter(Boolean),...(item.callbacks||[item.callback]).filter(Boolean)];
+      // Подробности относились только к первому аккаунту и вводили в
+      // заблуждение насчёт второго - при объединении общие подробности не
+      // показываем, они остаются только у карточки с одним аккаунтом (G4).
+      grouped.details='';
+    }
     grouped.text=formatAccountErrorText(grouped.baseText||item.baseText,accounts,item.locale,item.translations);
     if(alreadyIncluded)grouped.repeatCount=(grouped.repeatCount||1)+1;
     grouped.lastSeen=now;

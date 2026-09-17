@@ -325,6 +325,7 @@ mod sync_registry_tests {
                     backend: "gmail-api".into(),
                     retry_at,
                     message: "test quota".into(),
+                    response_code: Some(429),
                 },
             )
             .await;
@@ -340,6 +341,7 @@ mod sync_registry_tests {
                 backend,
                 retry_at: stored,
                 message,
+                ..
             } => {
                 assert_eq!(backend, "gmail-api");
                 assert_eq!(stored.timestamp_millis(), retry_at.timestamp_millis());
@@ -778,6 +780,9 @@ impl AccountManager {
             message: format!(
                 "сохранённый Retry-After ещё действует ({seconds} с); HTTP-запрос не отправлен"
             ),
+            // Локальная проверка сохранённого дедлайна - без нового запроса к
+            // серверу, поэтому актуального кода ответа тут нет.
+            response_code: None,
         })
     }
 

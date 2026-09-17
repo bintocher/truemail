@@ -84,6 +84,38 @@ pub struct AppState {
     // Arc - ConnectAttemptGuard клонирует ссылку на реестр, чтобы снять свою
     // запись из отдельной задачи в Drop (async-освобождение при синхронном drop).
     pub connecting_addresses: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    // Сколько проходов синхронизации почты подряд закончились сбоем у каждого
+    // аккаунта (error-kinds-and-messages.md, S-022, S-024). Пока повторы не
+    // исчерпаны, временный сбой не всплывает: программа сама переподключается,
+    // и человеку показывать нечего. Успешный проход обнуляет счёт.
+    pub mail_failures: Arc<tokio::sync::Mutex<HashMap<i64, u32>>>,
+}
+
+/// Сколько сбоев подряд по одному аккаунту считаются исчерпанными повторами:
+/// три прохода - это уже не случайный обрыв связи, а устойчивая неполадка,
+/// про которую пора сказать (error-kinds-and-messages.md, S-022).
+pub const MAIL_FAILURES_BEFORE_TOAST: u32 = 3;
+
+/// Реестр счётчиков сбоев почты по аккаунту (см. `AppState::mail_failures`).
+/// Функции ниже принимают саму ссылку на реестр, а не всё `AppState` - все
+/// пути синхронизации почты работают внутри `tokio::spawn`-задач или
+/// отдельных фоновых циклов (`gmail_realtime_loop`), куда `State<'_, AppState>`
+/// со своим временем жизни не переносится, и берут с собой только клон этого
+/// одного поля - как и с остальными полями AppState в этих же местах.
+pub type MailFailures = Arc<tokio::sync::Mutex<HashMap<i64, u32>>>;
+
+/// Отмечает сбой прохода почты и говорит, исчерпаны ли повторы по этому
+/// аккаунту.
+pub async fn note_mail_failure(mail_failures: &MailFailures, account_id: i64) -> bool {
+    let mut failures = mail_failures.lock().await;
+    let counter = failures.entry(account_id).or_insert(0);
+    *counter = counter.saturating_add(1);
+    *counter >= MAIL_FAILURES_BEFORE_TOAST
+}
+
+/// Успешный проход: счёт сбоев подряд обнуляется.
+pub async fn reset_mail_failures(mail_failures: &MailFailures, account_id: i64) {
+    mail_failures.lock().await.remove(&account_id);
 }
 
 /// Скачанный пакет обновления: версия, файл в каталоге данных и отпечаток
@@ -1402,6 +1434,7 @@ async fn gmail_realtime_loop(
     app: AppHandle,
     syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     notified: Arc<tokio::sync::Mutex<HashSet<i64>>>,
+    mail_failures: MailFailures,
 ) {
     let mut observed: HashMap<i64, HashSet<String>> = HashMap::new();
     let mut pending: HashMap<i64, HashSet<String>> = HashMap::new();
@@ -1462,6 +1495,8 @@ async fn gmail_realtime_loop(
             match synced {
                 Ok(result) => {
                     pending.remove(&account.id);
+                    // Почта прошла успешно - счёт сбоев подряд обнуляется (G1).
+                    reset_mail_failures(&mail_failures, account.id).await;
                     let _ = app.emit(
                         "truemail-sync-state",
                         serde_json::json!({"account_id": account.id, "scope": "mail", "status": "ready"}),
@@ -1478,7 +1513,16 @@ async fn gmail_realtime_loop(
                     .await;
                 }
                 Err(error) => {
-                    let state = account_sync_error_state(&account, "mail", "error", &error, false);
+                    // Настоящий сбой почты - признак исчерпания повторов из
+                    // счётчика, а не литералом (G1).
+                    let retries_exhausted = note_mail_failure(&mail_failures, account.id).await;
+                    let state = account_sync_error_state(
+                        &account,
+                        "mail",
+                        "error",
+                        &error,
+                        retries_exhausted,
+                    );
                     let _ = app.emit("truemail-sync-state", state);
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
@@ -3465,6 +3509,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
         let sync_app = app.clone();
         let sync_notified = state.notified_messages.clone();
         let sync_calendar_notified = state.notified_calendar_changes.clone();
+        let sync_mail_failures = state.mail_failures.clone();
         let _ = app.emit(
             "truemail-sync-state",
             serde_json::json!({"account_id": account.id, "scope": "all", "status": "syncing"}),
@@ -3546,12 +3591,21 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         .await;
                     }
                     tracing::info!(account = %truemail_core::logging::mask_email(&account.email), calendars = aux.calendars, events = aux.events, contacts = aux.contacts, "инкрементальный sync завершён");
+                    // Почта прошла успешно - счёт сбоев подряд обнуляется
+                    // (G1, error-kinds-and-messages.md, S-022).
+                    reset_mail_failures(&sync_mail_failures, account.id).await;
                     let warnings =
                         sync_warning_values(&account, "all", &result.warnings, &attempted_at);
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    // Предупреждения успешного прохода сбоем почты не считаются:
+                    // retries_exhausted тут всегда false, а не признак исчерпания
+                    // повторов (G1).
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": false, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Ok(mut result), Err(error)) => {
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "почта обновлена, вспомогательный sync будет повторён");
+                    // Почта прошла успешно (сбоил только вспомогательный sync) -
+                    // счёт сбоев почты обнуляется (G1).
+                    reset_mail_failures(&sync_mail_failures, account.id).await;
                     result.warnings.push(truemail_core::account::SyncWarning {
                         kind: error.code().to_owned(),
                         message: truemail_core::error::sanitize_error_message(&error.to_string()),
@@ -3561,7 +3615,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     });
                     let warnings =
                         sync_warning_values(&account, "auxiliary", &result.warnings, &attempted_at);
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": false})
                 }
                 (Err(mail_error), Ok(aux)) if supports_auxiliary => {
                     let message =
@@ -3578,6 +3632,10 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         )
                         .await;
                     }
+                    // Почта не прошла - отмечаем сбой и берём признак
+                    // исчерпания повторов из счётчика, а не литералом (G1).
+                    let retries_exhausted =
+                        note_mail_failure(&sync_mail_failures, account.id).await;
                     let warning = truemail_core::account::SyncWarning {
                         kind: mail_error.code().to_owned(),
                         message,
@@ -3586,15 +3644,22 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         sync_phase: Some("regular"),
                     };
                     let warnings = sync_warning_values(&account, "all", &[warning], &attempted_at);
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": retries_exhausted, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
                     let error = truemail_core::error::sanitize_error_message(&format!(
                         "почта: {mail_error}; календарь/контакты: {auxiliary_error}"
                     ));
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %error, "фоновая синхронизация не удалась");
-                    let mut state =
-                        account_sync_error_state(&account, "all", "error", &mail_error, true);
+                    let retries_exhausted =
+                        note_mail_failure(&sync_mail_failures, account.id).await;
+                    let mut state = account_sync_error_state(
+                        &account,
+                        "all",
+                        "error",
+                        &mail_error,
+                        retries_exhausted,
+                    );
                     if let Some(object) = state.as_object_mut() {
                         object.insert("error".into(), error.clone().into());
                         object.insert("error_message".into(), error.into());
@@ -3605,7 +3670,9 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     let safe_error =
                         truemail_core::error::sanitize_error_message(&error.to_string());
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "фоновая синхронизация не удалась");
-                    account_sync_error_state(&account, "all", "error", &error, true)
+                    let retries_exhausted =
+                        note_mail_failure(&sync_mail_failures, account.id).await;
+                    account_sync_error_state(&account, "all", "error", &error, retries_exhausted)
                 }
             };
             sync_set.lock().await.remove(&account.id);
@@ -3701,8 +3768,16 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         let gmail_app = app.clone();
         let gmail_syncing = state.syncing.clone();
         let gmail_notified = state.notified_messages.clone();
+        let gmail_mail_failures = state.mail_failures.clone();
         tokio::spawn(async move {
-            gmail_realtime_loop(gmail_core, gmail_app, gmail_syncing, gmail_notified).await
+            gmail_realtime_loop(
+                gmail_core,
+                gmail_app,
+                gmail_syncing,
+                gmail_notified,
+                gmail_mail_failures,
+            )
+            .await
         });
     }
     for account in core.db.list_accounts().await? {
@@ -3725,6 +3800,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
             let watch_account = account.clone();
             let watch_generation = state.generation.clone();
             let watch_notified = state.notified_messages.clone();
+            let watch_mail_failures = state.mail_failures.clone();
             let generation = watch_generation.load(std::sync::atomic::Ordering::SeqCst);
             tokio::spawn(async move {
                 let mut retry_delay = std::time::Duration::from_secs(2);
@@ -3786,6 +3862,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             let mut error_state = None;
                             match inbox_sync {
                                 Ok(result) => {
+                                    // Почта прошла успешно - счёт сбоев подряд
+                                    // обнуляется (G1).
+                                    reset_mail_failures(&watch_mail_failures, watch_account.id)
+                                        .await;
                                     let ids = notification_ids(&result);
                                     mail_changed = result.changed || !ids.is_empty();
                                     if !ids.is_empty() {
@@ -3824,12 +3904,17 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     // лишняя перезагрузка дешевле, чем список,
                                     // застрявший до следующего удачного прохода.
                                     mail_changed = true;
+                                    // Настоящий сбой почты - признак исчерпания
+                                    // повторов из счётчика, а не литералом (G1).
+                                    let retries_exhausted =
+                                        note_mail_failure(&watch_mail_failures, watch_account.id)
+                                            .await;
                                     error_state = Some(account_sync_error_state(
                                         &watch_account,
                                         "mail",
                                         "error",
                                         &error,
-                                        false,
+                                        retries_exhausted,
                                     ));
                                     let safe_error = truemail_core::error::sanitize_error_message(
                                         &error.to_string(),
@@ -3884,12 +3969,17 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             {
                                 tracing::warn!(account = %truemail_core::logging::mask_email(&watch_account.email), error = %db_error, "не удалось сохранить состояние синхронизации почты");
                             }
+                            // Обрыв ожидания IDLE - тоже сбой почты этого
+                            // аккаунта: считаем его тем же счётчиком, что и
+                            // сбои самой синхронизации (G1).
+                            let retries_exhausted =
+                                note_mail_failure(&watch_mail_failures, watch_account.id).await;
                             let state = account_sync_error_state(
                                 &watch_account,
                                 "mail",
                                 "retrying",
                                 &error,
-                                false,
+                                retries_exhausted,
                             );
                             let _ = watch_app.emit("truemail-sync-state", state);
                             tokio::time::sleep(retry_delay).await;
@@ -4417,6 +4507,7 @@ async fn spawn_initial_mail_sync(
     let sync_set = state.syncing.clone();
     let aux_sync_set = state.syncing_aux.clone();
     let sync_app = app.clone();
+    let sync_mail_failures = state.mail_failures.clone();
     // S-012: первая синхронизация тоже сообщает о начале и об исходе, тем же
     // событием и той же областью "all", что и цикл sync_accounts - иначе между
     // "аккаунт подключён" и первым исходом синхронизации в интерфейсе нет
@@ -4438,15 +4529,25 @@ async fn spawn_initial_mail_sync(
         let sync_state = match &mail_result {
             Ok(result) => {
                 tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена");
+                // Почта прошла успешно - счёт сбоев подряд обнуляется (G1).
+                reset_mail_failures(&sync_mail_failures, account.id).await;
                 let attempted_at = chrono::Utc::now().to_rfc3339();
                 let warnings =
                     sync_warning_values(&account, "all", &result.warnings, &attempted_at);
+                // Здесь, в отличие от периодической синхронизации,
+                // retries_exhausted остаётся true всегда: это первая попытка
+                // сразу после подключения, человек ждёт результата на экране,
+                // и предупреждение уместно показать сразу же (G1,
+                // error-kinds-and-messages.md, S-022).
                 serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "initial_sync": true})
             }
             Err(error) => {
                 let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
                 tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась");
-                account_sync_error_state(&account, "all", "error", error, true)
+                // Настоящий сбой почты - признак исчерпания повторов берём из
+                // счётчика, как и везде (G1), а не литералом.
+                let retries_exhausted = note_mail_failure(&sync_mail_failures, account.id).await;
+                account_sync_error_state(&account, "all", "error", error, retries_exhausted)
             }
         };
         let _ = sync_app.emit("truemail-sync-state", sync_state);
@@ -5794,6 +5895,7 @@ mod api_error_tests {
             backend: "test".into(),
             retry_at,
             message: "token=secret".into(),
+            response_code: Some(429),
         })
         .with_account_id(17);
         let value = serde_json::to_value(error).unwrap();
@@ -5825,6 +5927,7 @@ mod api_error_tests {
                     backend: "gmail".into(),
                     retry_at: chrono::Utc::now(),
                     message: "quota".into(),
+                    response_code: Some(429),
                 },
                 "rate_limited",
             ),
@@ -5896,6 +5999,64 @@ mod api_error_tests {
         assert_eq!(error.code, "backend_unavailable");
         assert!(!error.message.contains("secret123"), "{}", error.message);
         assert!(error.message.contains("[скрыто]"), "{}", error.message);
+    }
+}
+
+// G1, G6 (error-kinds-and-messages.md, S-022): признак исчерпания повторов
+// должен браться из реального счёта сбоев подряд по аккаунту, а не быть
+// литералом. Три сбоя подряд исчерпывают повторы, успешный проход счёт
+// обнуляет, и разные аккаунты друг другу не мешают.
+#[cfg(test)]
+mod mail_failures_tests {
+    use super::{MAIL_FAILURES_BEFORE_TOAST, MailFailures, note_mail_failure, reset_mail_failures};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn empty_registry() -> MailFailures {
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn three_failures_in_a_row_exhaust_retries() {
+        let failures = empty_registry();
+        assert_eq!(MAIL_FAILURES_BEFORE_TOAST, 3);
+        assert!(
+            !note_mail_failure(&failures, 1).await,
+            "первый сбой - рано шуметь"
+        );
+        assert!(
+            !note_mail_failure(&failures, 1).await,
+            "второй сбой - тоже рано"
+        );
+        assert!(
+            note_mail_failure(&failures, 1).await,
+            "третий сбой подряд исчерпывает повторы"
+        );
+        // Повторы уже исчерпаны - счёт продолжает расти, признак остаётся true.
+        assert!(note_mail_failure(&failures, 1).await);
+    }
+
+    #[tokio::test]
+    async fn success_resets_the_failure_count() {
+        let failures = empty_registry();
+        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1).await);
+        reset_mail_failures(&failures, 1).await;
+        // Счёт сброшен - следующие два сбоя снова не исчерпывают повторы.
+        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(note_mail_failure(&failures, 1).await);
+    }
+
+    #[tokio::test]
+    async fn accounts_do_not_share_a_counter() {
+        let failures = empty_registry();
+        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(note_mail_failure(&failures, 1).await);
+        // Другой аккаунт начинает с чистого счёта, даже если первый уже
+        // исчерпал повторы.
+        assert!(!note_mail_failure(&failures, 2).await);
     }
 }
 

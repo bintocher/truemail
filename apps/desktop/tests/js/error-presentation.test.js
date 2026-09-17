@@ -196,6 +196,30 @@ test('S-023: один вид объединяет аккаунты в одной
   assert.match(cards[0].text,/two@example\.com/);
 });
 
+test('G3: повторный сбой того же аккаунта не дублирует обработчик действия',()=>{
+  const callbackA1=()=>{};
+  const first={...item('a','server_unavailable','one',1),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:1,email:'one@example.com'}],locale:'ru',translations,callback:callbackA1};
+  const callbackA2=()=>{};
+  const repeat={...item('b','server_unavailable','one-again',1),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:1,email:'one@example.com'}],locale:'ru',translations,callback:callbackA2};
+  let cards=planToastQueue([],first,1000).cards;
+  cards=planToastQueue(cards,repeat,2000).cards;
+  assert.equal(cards.length,1);
+  // Аккаунт уже учтён в карточке - второй обработчик того же аккаунта не
+  // добавляется, иначе одно нажатие запускало бы действие дважды.
+  assert.deepEqual(cards[0].callbacks,[callbackA1]);
+});
+
+test('G4: объединение карточки очищает подробности от первого аккаунта',()=>{
+  const first={...item('a','server_unavailable','one',1),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:1,email:'one@example.com'}],locale:'ru',translations,details:'Код ответа: 503'};
+  const second={...item('b','server_unavailable','two',2),groupByKind:true,baseText:'Сервер недоступен',accounts:[{id:2,email:'two@example.com'}],locale:'ru',translations,details:'Код ответа: 500'};
+  let cards=planToastQueue([],first,1000).cards;
+  assert.equal(cards[0].details,'Код ответа: 503');
+  cards=planToastQueue(cards,second,2000).cards;
+  // Подробности были только от первого аккаунта - при объединении общие
+  // подробности не показываем, а не оставляем чужие для второго аккаунта.
+  assert.equal(cards[0].details,'');
+});
+
 test('S-024: сразу всплывают только виды, требующие решения человека',()=>{
   for(const kind of ['invalid_credentials','needs_reauth','forbidden','certificate_error','account_config']){
     assert.equal(shouldShowSyncToast({kind,retries_exhausted:false}),true,kind);

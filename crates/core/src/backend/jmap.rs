@@ -78,22 +78,33 @@ fn request_error(scope: &str, error: reqwest::Error) -> Error {
 
 fn http_error(scope: &str, status: reqwest::StatusCode, message: String) -> Error {
     let backend = format!("jmap-{scope}");
+    // Код ответа известен здесь напрямую (G2, error-kinds-and-messages.md).
+    let code = Some(status.as_u16());
     match status {
-        reqwest::StatusCode::UNAUTHORIZED => {
-            Error::classified_backend(backend, ErrorKind::InvalidCredentials, message)
-        }
+        reqwest::StatusCode::UNAUTHORIZED => Error::classified_backend_with_code(
+            backend,
+            ErrorKind::InvalidCredentials,
+            message,
+            code,
+        ),
         reqwest::StatusCode::FORBIDDEN => {
-            Error::classified_backend(backend, ErrorKind::Forbidden, message)
+            Error::classified_backend_with_code(backend, ErrorKind::Forbidden, message, code)
         }
         reqwest::StatusCode::REQUEST_TIMEOUT => {
-            Error::classified_backend(backend, ErrorKind::Timeout, message)
+            Error::classified_backend_with_code(backend, ErrorKind::Timeout, message, code)
         }
         reqwest::StatusCode::TOO_MANY_REQUESTS => Error::RateLimited {
             backend,
             retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
             message,
+            response_code: code,
         },
-        _ => Error::classified_backend(backend, ErrorKind::ServerUnavailable, message),
+        _ => Error::classified_backend_with_code(
+            backend,
+            ErrorKind::ServerUnavailable,
+            message,
+            code,
+        ),
     }
 }
 

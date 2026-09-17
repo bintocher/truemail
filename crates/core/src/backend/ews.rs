@@ -128,12 +128,37 @@ fn backend_error(kind: &str, message: impl ToString) -> Error {
 fn http_error(status: u16, message: impl Into<String>) -> Error {
     let message = message.into();
     match status {
-        401 => Error::classified_backend("ews-http", ErrorKind::InvalidCredentials, message),
-        403 => Error::classified_backend("ews-http", ErrorKind::Forbidden, message),
-        408 => Error::classified_backend("ews-http", ErrorKind::Timeout, message),
-        429 => server_busy_error(&message),
-        500..=599 => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
-        _ => Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, message),
+        401 => Error::classified_backend_with_code(
+            "ews-http",
+            ErrorKind::InvalidCredentials,
+            message,
+            Some(status),
+        ),
+        403 => Error::classified_backend_with_code(
+            "ews-http",
+            ErrorKind::Forbidden,
+            message,
+            Some(status),
+        ),
+        408 => Error::classified_backend_with_code(
+            "ews-http",
+            ErrorKind::Timeout,
+            message,
+            Some(status),
+        ),
+        429 => server_busy_error(&message, Some(status)),
+        500..=599 => Error::classified_backend_with_code(
+            "ews-http",
+            ErrorKind::ServerUnavailable,
+            message,
+            Some(status),
+        ),
+        _ => Error::classified_backend_with_code(
+            "ews-http",
+            ErrorKind::ServerUnavailable,
+            message,
+            Some(status),
+        ),
     }
 }
 
@@ -149,11 +174,15 @@ fn is_server_busy(message: &str) -> bool {
 }
 
 /// Ошибка "сервер занят": до конца прохода к серверу больше не ходим.
-fn server_busy_error(message: &str) -> Error {
+/// `response_code` - настоящий код ответа HTTP, если он известен: SOAP-отказ
+/// с тем же смыслом (`is_server_busy`) приходит и при HTTP 200, где кода
+/// ответа, отражающего занятость, попросту нет (G2, error-kinds-and-messages.md).
+fn server_busy_error(message: &str, response_code: Option<u16>) -> Error {
     Error::RateLimited {
         backend: "ews".into(),
         retry_at: chrono::Utc::now() + chrono::Duration::minutes(5),
         message: format!("Exchange занят, запросы отложены: {message}"),
+        response_code,
     }
 }
 
@@ -545,7 +574,9 @@ impl EwsBackend {
         }
         if let Some(error) = response_error(&response.body) {
             if is_server_busy(&error) {
-                return Err(server_busy_error(&error));
+                // SOAP-отказ приходит при HTTP 200 (см. проверку выше) -
+                // настоящего кода ответа, отражающего занятость, тут нет.
+                return Err(server_busy_error(&error, None));
             }
             return Err(backend_error("soap", error));
         }
@@ -4298,8 +4329,9 @@ mod throttling_tests {
 
     #[test]
     fn busy_answer_becomes_a_rate_limit() {
-        let error = server_busy_error("ErrorServerBusy");
+        let error = server_busy_error("ErrorServerBusy", Some(429));
         assert!(matches!(error, crate::Error::RateLimited { .. }));
+        assert_eq!(error.response_code(), Some(429));
     }
 
     #[test]
