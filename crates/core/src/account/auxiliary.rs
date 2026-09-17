@@ -90,25 +90,32 @@ fn backend_error(backend: &str, message: impl Into<String>) -> Error {
 }
 
 fn http_error(backend: &str, status: reqwest::StatusCode, message: String) -> Error {
+    // Код ответа известен здесь напрямую - сохраняем его в поле ошибки
+    // вместо того, чтобы потом разбирать текст (G2, error-kinds-and-messages.md).
+    let code = Some(status.as_u16());
     match status {
         reqwest::StatusCode::UNAUTHORIZED => {
-            Error::classified_backend(backend, ErrorKind::NeedsReauth, message)
+            Error::classified_backend_with_code(backend, ErrorKind::NeedsReauth, message, code)
         }
         reqwest::StatusCode::FORBIDDEN => {
-            Error::classified_backend(backend, ErrorKind::Forbidden, message)
+            Error::classified_backend_with_code(backend, ErrorKind::Forbidden, message, code)
         }
         reqwest::StatusCode::REQUEST_TIMEOUT => {
-            Error::classified_backend(backend, ErrorKind::Timeout, message)
+            Error::classified_backend_with_code(backend, ErrorKind::Timeout, message, code)
         }
         reqwest::StatusCode::TOO_MANY_REQUESTS => Error::RateLimited {
             backend: backend.into(),
             retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
             message,
+            response_code: code,
         },
-        _ if status.is_server_error() => {
-            Error::classified_backend(backend, ErrorKind::ServerUnavailable, message)
-        }
-        _ => Error::classified_backend(backend, ErrorKind::Unknown, message),
+        _ if status.is_server_error() => Error::classified_backend_with_code(
+            backend,
+            ErrorKind::ServerUnavailable,
+            message,
+            code,
+        ),
+        _ => Error::classified_backend_with_code(backend, ErrorKind::Unknown, message, code),
     }
 }
 

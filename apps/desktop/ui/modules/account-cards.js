@@ -30,5 +30,36 @@ function canChangeAccountPassword(authKind) {
   return authKind === 'password' || authKind === 'app_password' || authKind === 'ntlm';
 }
 
-const accountCards = { nextOpenAccountId, restoreOpenAccountId, canChangeAccountPassword };
+function isOAuthAccount(authKind) {
+  return authKind === 'oauth2';
+}
+
+function russianCountForm(value, one, few, many) {
+  const count = Math.abs(Number(value)) || 0;
+  const mod100 = count % 100;
+  const mod10 = count % 10;
+  if (mod100 >= 11 && mod100 <= 14) return many;
+  if (mod10 === 1) return one;
+  if (mod10 >= 2 && mod10 <= 4) return few;
+  return many;
+}
+
+// Статистика карточки строится без DOM, чтобы формы слов для обоих языков
+// проверялись отдельно от отрисовки настроек.
+function accountStatsText(folderCount, calendarCount, locale) {
+  const folders = Number(folderCount) || 0;
+  const calendars = Number(calendarCount) || 0;
+  if (locale === 'en') {
+    return `${folders} ${folders === 1 ? 'folder' : 'folders'} · ${calendars} ${calendars === 1 ? 'calendar' : 'calendars'}`;
+  }
+  return `${folders} ${russianCountForm(folders, 'папка', 'папки', 'папок')} · ${calendars} ${russianCountForm(calendars, 'календарь', 'календаря', 'календарей')}`;
+}
+
+const accountCards = {
+  nextOpenAccountId,
+  restoreOpenAccountId,
+  canChangeAccountPassword,
+  isOAuthAccount,
+  accountStatsText,
+};
 if (typeof module !== 'undefined' && module.exports) module.exports = accountCards;

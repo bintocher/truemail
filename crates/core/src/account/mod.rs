@@ -325,6 +325,7 @@ mod sync_registry_tests {
                     backend: "gmail-api".into(),
                     retry_at,
                     message: "test quota".into(),
+                    response_code: Some(429),
                 },
             )
             .await;
@@ -340,6 +341,7 @@ mod sync_registry_tests {
                 backend,
                 retry_at: stored,
                 message,
+                ..
             } => {
                 assert_eq!(backend, "gmail-api");
                 assert_eq!(stored.timestamp_millis(), retry_at.timestamp_millis());
@@ -615,7 +617,75 @@ pub struct ConnectedAccountSync {
     pub calendars: usize,
     pub events: usize,
     pub contacts: usize,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<SyncWarning>,
+}
+
+/// Структурированное предупреждение частично успешного прохода. Вид ошибки
+/// нужен интерфейсу для общей таблицы текста, а исходная причина остаётся
+/// только в подробностях.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncWarning {
+    pub kind: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_code: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_phase: Option<&'static str>,
+}
+
+impl SyncWarning {
+    fn from_error(prefix: &str, error: &crate::Error, sync_phase: Option<&'static str>) -> Self {
+        let raw = if prefix.is_empty() {
+            error.to_string()
+        } else {
+            format!("{prefix}: {error}")
+        };
+        Self {
+            kind: error.code().to_owned(),
+            message: crate::error::sanitize_error_message(&raw),
+            backend: error.backend().map(str::to_owned),
+            response_code: error.response_code(),
+            sync_phase,
+        }
+    }
+
+    fn classified(kind: ErrorKind, message: impl Into<String>, backend: Option<&str>) -> Self {
+        Self {
+            kind: kind.code().to_owned(),
+            message: message.into(),
+            backend: backend.map(str::to_owned),
+            response_code: None,
+            sync_phase: None,
+        }
+    }
+}
+
+fn mail_sync_phase(initial: bool) -> &'static str {
+    if initial { "initial" } else { "regular" }
+}
+
+#[cfg(test)]
+mod sync_warning_tests {
+    use super::{SyncWarning, mail_sync_phase};
+    use crate::{Error, ErrorKind};
+
+    #[test]
+    fn warning_keeps_error_kind_and_transport_details() {
+        let error = Error::classified_backend("ews-http", ErrorKind::ServerUnavailable, "HTTP 500");
+        let warning = SyncWarning::from_error("", &error, Some(mail_sync_phase(true)));
+        assert_eq!(warning.kind, "server_unavailable");
+        assert_eq!(warning.backend.as_deref(), Some("ews-http"));
+        assert_eq!(warning.response_code, Some(500));
+        assert!(warning.message.contains("HTTP 500"));
+    }
+
+    #[test]
+    fn only_initial_pass_has_initial_phase() {
+        assert_eq!(mail_sync_phase(true), "initial");
+        assert_eq!(mail_sync_phase(false), "regular");
+    }
 }
 
 impl AccountManager {
@@ -710,6 +780,9 @@ impl AccountManager {
             message: format!(
                 "сохранённый Retry-After ещё действует ({seconds} с); HTTP-запрос не отправлен"
             ),
+            // Локальная проверка сохранённого дедлайна - без нового запроса к
+            // серверу, поэтому актуального кода ответа тут нет.
+            response_code: None,
         })
     }
 
@@ -2085,7 +2158,11 @@ impl AccountManager {
             events: 0,
             contacts: 0,
             warnings: if config.smtp.is_none() {
-                vec!["SMTP-сервер не найден: чтение работает, отправку нужно настроить".into()]
+                vec![SyncWarning::classified(
+                    ErrorKind::AccountConfig,
+                    "SMTP-сервер не найден: чтение работает, отправку нужно настроить",
+                    Some("smtp"),
+                )]
             } else {
                 Vec::new()
             },
@@ -2305,10 +2382,18 @@ impl AccountManager {
         );
         let mut warnings = Vec::new();
         if let Err(error) = mail_access {
-            warnings.push(format!("Проверка доступа к почте: {error}"));
+            warnings.push(SyncWarning::from_error(
+                "Проверка доступа к почте",
+                &error,
+                None,
+            ));
         }
         if let Err(error) = dav_access {
-            warnings.push(format!("Проверка календаря и контактов: {error}"));
+            warnings.push(SyncWarning::from_error(
+                "Проверка календаря и контактов",
+                &error,
+                None,
+            ));
         }
 
         Ok(ConnectedAccountSync {
@@ -2397,7 +2482,11 @@ impl AccountManager {
 
         let mut warnings = Vec::new();
         if let Err(error) = GmailBackend.validate(email, &access_token).await {
-            warnings.push(format!("Проверка доступа к Gmail: {error}"));
+            warnings.push(SyncWarning::from_error(
+                "Проверка доступа к Gmail",
+                &error,
+                None,
+            ));
         }
         Ok(ConnectedAccountSync {
             account,
@@ -2478,7 +2567,11 @@ impl AccountManager {
 
         let mut warnings = Vec::new();
         if let Err(error) = OutlookBackend.validate(email, &access_token).await {
-            warnings.push(format!("Проверка доступа к Outlook: {error}"));
+            warnings.push(SyncWarning::from_error(
+                "Проверка доступа к Outlook",
+                &error,
+                None,
+            ));
         }
         Ok(ConnectedAccountSync {
             account,
@@ -2630,12 +2723,31 @@ impl AccountManager {
             .exclusive(
                 account.id,
                 SyncKind::Mail,
-                self.sync_mail_account_inner(account),
+                self.sync_mail_account_inner(account, false),
             )
             .await
     }
 
-    async fn sync_mail_account_inner(&self, account: &Account) -> Result<ConnectedAccountSync> {
+    /// Первый проход сразу после подключения отличается только формулировкой
+    /// предупреждения. Обычные фоновые проходы не должны называться первыми.
+    pub async fn sync_initial_mail_account(
+        &self,
+        account: &Account,
+    ) -> Result<ConnectedAccountSync> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Mail,
+                self.sync_mail_account_inner(account, true),
+            )
+            .await
+    }
+
+    async fn sync_mail_account_inner(
+        &self,
+        account: &Account,
+        initial: bool,
+    ) -> Result<ConnectedAccountSync> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
@@ -2647,7 +2759,11 @@ impl AccountManager {
             .await
             && let Err(error) = self.db.save_discovered_folders(account.id, &folders).await
         {
-            warnings.push(format!("Папки почты не сохранились: {error}"));
+            warnings.push(SyncWarning::from_error(
+                "Папки почты не сохранились",
+                &error,
+                None,
+            ));
         }
         let imap_result = backend
             .discover(
@@ -2662,7 +2778,11 @@ impl AccountManager {
                 // Обрыв связи посреди обхода папок (imap-reconnect-resilience.md).
                 match skipped_folders_outcome(&imap.skipped_folders, imap.folders.len()) {
                     SkippedFolders::None => {}
-                    SkippedFolders::Warn(text) => warnings.push(text),
+                    SkippedFolders::Warn(text) => warnings.push(SyncWarning::classified(
+                        ErrorKind::NetworkUnavailable,
+                        text,
+                        Some("imap"),
+                    )),
                     SkippedFolders::Failed(text) => {
                         return Err(crate::Error::Backend {
                             backend: "imap-sync".into(),
@@ -2691,21 +2811,33 @@ impl AccountManager {
                                     .reconcile_discovered_folders(account.id, &imap.folders)
                                     .await
                                 {
-                                    warnings.push(format!("Удалённые папки не очищены: {error}"));
+                                    warnings.push(SyncWarning::from_error(
+                                        "Удалённые папки не очищены",
+                                        &error,
+                                        None,
+                                    ));
                                 }
                                 if let Err(error) = self
                                     .db
                                     .apply_imap_vanished(account.id, &imap.deleted_uids)
                                     .await
                                 {
-                                    warnings.push(format!("Удаления IMAP не сохранились: {error}"));
+                                    warnings.push(SyncWarning::from_error(
+                                        "Удаления IMAP не сохранились",
+                                        &error,
+                                        None,
+                                    ));
                                 }
                                 if let Err(error) = self
                                     .db
                                     .apply_imap_flag_updates(account.id, &imap.flag_updates)
                                     .await
                                 {
-                                    warnings.push(format!("Флаги писем не сохранились: {error}"));
+                                    warnings.push(SyncWarning::from_error(
+                                        "Флаги писем не сохранились",
+                                        &error,
+                                        None,
+                                    ));
                                 }
                                 match self
                                     .db
@@ -2761,15 +2893,21 @@ impl AccountManager {
                 match saved {
                     Ok(()) => imap.folders.len(),
                     Err(error) => {
-                        warnings.push(format!("Почта подключена, но не сохранилась: {error}"));
+                        warnings.push(SyncWarning::from_error(
+                            "Почта загружена, но не сохранилась",
+                            &error,
+                            None,
+                        ));
                         0
                     }
                 }
             }
             Err(error) => {
                 self.remember_gmail_rate_limit(account, &error).await;
-                warnings.push(format!(
-                    "Почта подключена, первая синхронизация отложена: {error}"
+                warnings.push(SyncWarning::from_error(
+                    "",
+                    &error,
+                    Some(mail_sync_phase(initial)),
                 ));
                 0
             }

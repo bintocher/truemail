@@ -44,13 +44,30 @@ document.addEventListener('click',event=>{if(!event.target.closest('.recipient-i
 let toastCards=[];
 let toastSequence=0;
 const toastTimers=new Map();
+const syncActionWaiters=new Map();
 function errorTranslations(){return typeof wizardText==='undefined'?undefined:wizardText;}
 function removeToastCard(id){toastCards=toastCards.filter(card=>card.id!==id);renderToastCards();}
+function waitForAccountSync(accountId){
+  if(accountId==null)return window.tm?.syncAccounts();
+  return new Promise((resolve,reject)=>{
+    const id=Number(accountId),timer=setTimeout(()=>{syncActionWaiters.delete(id);reject({kind:'timeout',account_id:id,message:'sync result timeout'});},120000);
+    syncActionWaiters.set(id,{resolve,reject,timer});
+    Promise.resolve(window.tm?.syncAccounts()).catch(error=>{clearTimeout(timer);syncActionWaiters.delete(id);reject(error);});
+  });
+}
+function settleSyncAction(state){
+  const waiter=syncActionWaiters.get(Number(state?.account_id));
+  if(!waiter||['syncing','retrying'].includes(state.status))return;
+  clearTimeout(waiter.timer);syncActionWaiters.delete(Number(state.account_id));
+  const warning=Array.isArray(state.warnings)?state.warnings.find(item=>item&&typeof item==='object'):null;
+  if(state.error_kind||state.status==='error'||warning)waiter.reject(warning||{kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at});
+  else waiter.resolve(state);
+}
 function errorAction(presented,context={}){
   if(context.action)return context.action;
   const account=coreAccounts.find(item=>item.id===Number(presented.accountId));
   if(presented.action==='reconnect'||presented.action==='check_and_retry')return ()=>showAccountWizard(account?.email||context.email||'');
-  if(presented.action==='retry'||presented.action==='wait')return context.retry||(()=>window.tm?.syncAccounts());
+  if(presented.action==='retry'||presented.action==='wait')return context.retry||(()=>waitForAccountSync(presented.accountId));
   if(presented.action==='settings')return ()=>{showView('settingsView');setSection('addacct');};
   return ()=>window.tm?.openDataDir();
 }
@@ -68,23 +85,29 @@ function renderToastCards(){
     if(card.repeatCount>1){const count=document.createElement('span');count.className='app-toast-count';count.textContent=`x${card.repeatCount}`;line.appendChild(count);}
     body.appendChild(line);
     if(card.details){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=card.details;details.append(summary,pre);body.appendChild(details);}
+    if(card.actionStatus){const status=document.createElement('div');status.className='app-toast-action-status';status.textContent=card.actionStatus;body.appendChild(status);}
     toast.appendChild(body);
-    if(card.hasAction){const button=document.createElement('button');button.type='button';button.textContent=card.actionLabel;const waitUntil=card.action==='wait'&&card.retryAt?Date.parse(card.retryAt):0;button.disabled=card.action==='wait'&&(!waitUntil||waitUntil>Date.now());button.onclick=async()=>{button.disabled=true;try{await card.callback?.();removeToastCard(card.id);}catch(error){showToast(error);}};toast.appendChild(button);if(waitUntil>Date.now()){const timer=setTimeout(()=>renderToastCards(),waitUntil-Date.now());toastTimers.set(`wait-${card.id}`,timer);}}
+    if(card.hasAction){const button=document.createElement('button');button.type='button';button.textContent=card.actionState==='pending'?wt('errorActionPending'):card.actionLabel;const waitUntil=card.action==='wait'&&card.retryAt?Date.parse(card.retryAt):0;button.disabled=card.actionState==='pending'||(card.action==='wait'&&(!waitUntil||waitUntil>Date.now()));button.onclick=async()=>{toastCards=window.errorPresentation.beginToastAction(toastCards,card.id,wt('errorActionPending'));renderToastCards();try{await Promise.all((card.callbacks||[card.callback]).filter(Boolean).map(callback=>callback()));toastCards=window.errorPresentation.finishToastAction(toastCards,card.id,{ok:true,text:wt('errorActionSucceeded')},Date.now());}catch(error){const item=errorToastItem(error,{connected:true});toastCards=window.errorPresentation.finishToastAction(toastCards,card.id,{ok:false,item},Date.now());}renderToastCards();};toast.appendChild(button);if(waitUntil>Date.now()){const timer=setTimeout(()=>renderToastCards(),waitUntil-Date.now());toastTimers.set(`wait-${card.id}`,timer);}}
     const close=document.createElement('button');close.type='button';close.className='app-toast-close';close.textContent='x';close.title=wt('close');close.onclick=()=>removeToastCard(card.id);toast.appendChild(close);stack.appendChild(toast);
     if(card.expiresAt){const timer=setTimeout(()=>removeToastCard(card.id),Math.max(0,card.expiresAt-Date.now()));toastTimers.set(card.id,timer);}
   });
 }
 function enqueueToast(item){item.id=`toast-${++toastSequence}`;const result=window.errorPresentation.planToastQueue(toastCards,item,Date.now());toastCards=result.cards;renderToastCards();return result;}
-function showApiError(error,context={}){const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:errorTranslations(),connected:context.connected});return enqueueToast({kind:presented.kind,accountId:presented.accountId,text:presented.text,details:presented.message,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context)});}
+function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,locale:presented.locale,translations};}
+function showApiError(error,context={}){return enqueueToast(errorToastItem(error,context));}
 function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return enqueueToast({kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action});}
 window.showApiError=showApiError;
 window.handleSyncState=function(state){if(!state)return;
+  settleSyncAction(state);
   // Постоянное состояние (needs_reauth/last_sync_error) читается из аккаунта
   // после перезагрузки данных; переходные статусы "syncing"/"retrying" видны
   // раньше - сразу по этому событию, без ожидания truemail-data-changed
   // (mail-sync-visible-state.md, S-006, S-011).
   if(window.mailSyncIndicator?.isMailSyncScope(state.scope)){window.mailSyncTransient=window.mailSyncIndicator.nextMailSyncTransient(window.mailSyncTransient,state);window.refreshAccountSyncIndicator?.(state.account_id);}
-  const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}if(state.error_kind||['error','retrying'].includes(state.status)){showApiError({kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at},{connected:true});return;}const warning=state.warnings?.join(' ')||'';if(warning)showToast(warning);};
+  const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}
+  const warnings=Array.isArray(state.warnings)?state.warnings:[];
+  if(warnings.length){warnings.forEach(warning=>{if(typeof warning==='string'){showToast(warning);return;}const failure={...warning,account_id:state.account_id,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure))showApiError(failure,{connected:true});});return;}
+  if(state.error_kind||['error','retrying'].includes(state.status)){const failure={kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure))showApiError(failure,{connected:true});}};
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;

@@ -10,6 +10,8 @@
   "accentTeal": "Бирюза",
   "accentViolet": "Фиолет",
   "accountsLead": "Подключённые почтовые ящики. Клик - настройки аккаунта, подпись и серверы.",
+  "accountOauthReauth": "Войти снова",
+  "accountOauthPasswordNotStored": "Пароль для этого ящика не хранится.",
   "accountWizardTitle": "Мастер подключения аккаунта",
   "applicationUpdates": "Обновления программы",
   "applicationUpdatesDesc": "Новые подписанные версии проверяются автоматически.",
@@ -488,5 +490,14 @@
   "errorActionWait": "Повторить позже",
   "errorActionSettings": "Открыть настройки",
   "errorActionDiagnostics": "Открыть диагностику",
-  "errorDetails": "Подробности"
+  "errorDetails": "Подробности",
+  "errorAccountsPrefix": "Аккаунты",
+  "errorSyncInitialDeferred": "Первая синхронизация отложена.",
+  "errorSyncRegularDeferred": "Очередная синхронизация отложена.",
+  "errorDetailServer": "Сервер",
+  "errorDetailResponseCode": "Код ответа",
+  "errorDetailAttemptedAt": "Время попытки",
+  "errorDetailTransport": "Причина транспорта",
+  "errorActionPending": "Выполняется...",
+  "errorActionSucceeded": "Действие выполнено."
 }

@@ -10,6 +10,8 @@
   "accentTeal": "Teal",
   "accentViolet": "Violet",
   "accountsLead": "Connected mailboxes. Click for account settings, signature and servers.",
+  "accountOauthReauth": "Sign in again",
+  "accountOauthPasswordNotStored": "The password for this mailbox is not stored.",
   "accountWizardTitle": "Account connection wizard",
   "applicationUpdates": "Application updates",
   "applicationUpdatesDesc": "New signed versions are checked automatically.",
@@ -488,5 +490,14 @@
   "errorActionWait": "Retry later",
   "errorActionSettings": "Open settings",
   "errorActionDiagnostics": "Open diagnostics",
-  "errorDetails": "Details"
+  "errorDetails": "Details",
+  "errorAccountsPrefix": "Accounts",
+  "errorSyncInitialDeferred": "The first synchronization was postponed.",
+  "errorSyncRegularDeferred": "The current synchronization was postponed.",
+  "errorDetailServer": "Server",
+  "errorDetailResponseCode": "Response code",
+  "errorDetailAttemptedAt": "Attempt time",
+  "errorDetailTransport": "Transport reason",
+  "errorActionPending": "Working...",
+  "errorActionSucceeded": "Action completed."
 }

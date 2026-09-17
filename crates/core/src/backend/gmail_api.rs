@@ -317,11 +317,15 @@ fn retryable_response(status: StatusCode, body: &str) -> bool {
 
 fn response_error(status: StatusCode, body: String) -> Error {
     let message = format!("HTTP {status}: {body}");
+    // Код ответа известен здесь напрямую - сохраняем его в поле ошибки
+    // вместо того, чтобы потом разбирать текст (G2, error-kinds-and-messages.md).
+    let code = Some(status.as_u16());
     if quota_limited_response(status, &body) {
         return Error::RateLimited {
             backend: "gmail-api".into(),
             retry_at: chrono::Utc::now() + chrono::Duration::minutes(1),
             message,
+            response_code: code,
         };
     }
     let kind = match status {
@@ -331,7 +335,7 @@ fn response_error(status: StatusCode, body: String) -> Error {
         _ if status.is_server_error() => ErrorKind::ServerUnavailable,
         _ => ErrorKind::ServerUnavailable,
     };
-    Error::classified_backend("gmail-api", kind, message)
+    Error::classified_backend_with_code("gmail-api", kind, message, code)
 }
 
 fn retry_timestamp_delay(value: &str) -> Option<Duration> {
@@ -386,6 +390,10 @@ fn throttled_error(
     let seconds = remaining
         .as_secs()
         .saturating_add(u64::from(remaining.subsec_nanos() > 0));
+    // Локальная пауза - не ответ сервера на этот запрос (он вообще не
+    // отправлен), поэтому код ответа берём только если известна причина
+    // паузы (реальный код предыдущего ответа), а не выдумываем свой.
+    let response_code = cause.map(|status| status.as_u16());
     let cause = cause
         .map(|status| format!(" после HTTP {status}"))
         .unwrap_or_default();
@@ -396,6 +404,7 @@ fn throttled_error(
             "Gmail API локально приостановлен{cause} до {} (ещё {seconds} с); HTTP-запрос не отправлен",
             retry_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         ),
+        response_code,
     }
 }
 
