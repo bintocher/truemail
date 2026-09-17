@@ -623,7 +623,9 @@ impl EwsBackend {
         // Код HTTP классифицируется до разбора тела. Текст ответа не должен
         // определять причину отказа на границе интерфейса.
         if !(200..300).contains(&response.status) {
-            return Err(status_error(response.status, &response.body));
+            // Имя операции в сообщении: отказ Exchange без него не даёт понять,
+            // какой именно запрос сервер счёл неверным (issue #82).
+            return Err(status_error(response.status, &response.body).with_operation(action));
         }
         if let Some(error) = response_error(&response.body) {
             if is_server_busy(&error) {
