@@ -2,6 +2,7 @@
 
 use crate::model::Security;
 use crate::{Error, Result};
+use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
@@ -13,7 +14,7 @@ pub struct OutgoingAttachment {
     pub data: Vec<u8>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct OutgoingMessage {
     pub from: String,
     pub to: Vec<String>,
@@ -23,6 +24,15 @@ pub struct OutgoingMessage {
     pub body_text: String,
     pub body_html: Option<String>,
     pub attachments: Vec<OutgoingAttachment>,
+    /// Закреплённый идентификатор письма: очередь отправки выбирает его один
+    /// раз и повторяет при каждой попытке, иначе повторная доставка выглядела
+    /// бы для сервера получателя новым письмом (specs/undo-send.md, S-045).
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Дополнительные заголовки служебного письма: ими автоответ помечает себя
+    /// и связывается с исходным письмом (specs/out-of-office.md, S-056 - S-058).
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
 }
 
 /// Поддерживаемые типы встроенных картинок (S-004, S-035): svg+xml намеренно
@@ -267,6 +277,7 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
 }
 
 pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
+    let extra_headers = message.headers.clone();
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
@@ -294,9 +305,12 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
             "суммарный размер вложений и встроенных картинок превышает 25 МБ".into(),
         ));
     }
+    // S-045: закреплённый идентификатор письма приходит из очереди отправки.
+    // Без него повторная попытка собрала бы письмо с новым Message-ID, и
+    // сервер получателя принял бы его как второе письмо.
     let mut builder = Message::builder()
         .from(mailbox(&message.from)?)
-        .message_id(None)
+        .message_id(message.message_id.clone())
         .subject(message.subject);
     for address in &message.to {
         builder = builder.to(mailbox(address)?);
@@ -339,10 +353,33 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
             .unwrap_or(ContentType::parse("application/octet-stream").expect("valid MIME"));
         mixed = mixed.singlepart(Attachment::new(item.filename).body(item.data, content_type));
     }
-    builder.multipart(mixed).map_err(|error| Error::Backend {
+    let mut email = builder.multipart(mixed).map_err(|error| Error::Backend {
         backend: "smtp-message".into(),
         message: error.to_string(),
-    })
+    })?;
+    // Служебные заголовки автоответа типизированных представлений в lettre не
+    // имеют, поэтому добавляются сырыми значениями уже к собранному письму.
+    for (name, value) in extra_headers {
+        let Ok(name) = HeaderName::new_from_ascii(name) else {
+            continue;
+        };
+        email
+            .headers_mut()
+            .insert_raw(HeaderValue::new(name, value));
+    }
+    Ok(email)
+}
+
+/// Проверить адресатов письма до записи операции отправки: непригодный адрес
+/// не должен создавать ожидающее письмо вовсе (specs/undo-send.md, S-005).
+pub fn validate_outgoing(message: &OutgoingMessage) -> Result<()> {
+    if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
+        return Err(Error::AccountConfig("не указан получатель".into()));
+    }
+    for address in message.to.iter().chain(&message.cc).chain(&message.bcc) {
+        mailbox(address)?;
+    }
+    Ok(())
 }
 
 fn mailbox(value: &str) -> Result<Mailbox> {
@@ -487,6 +524,7 @@ mod tests {
             body_text: String::new(),
             body_html: None,
             attachments: vec![],
+            ..Default::default()
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         assert!(runtime.block_on(send_yandex(message, "token")).is_err());
@@ -503,6 +541,7 @@ mod tests {
             body_text: "body".into(),
             body_html: None,
             attachments: vec![],
+            ..Default::default()
         })
         .expect("message")
         .formatted();
@@ -526,6 +565,7 @@ mod tests {
             body_text: "plain text version".into(),
             body_html,
             attachments,
+            ..Default::default()
         }
     }
 

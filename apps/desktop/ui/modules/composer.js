@@ -32,6 +32,33 @@ async function openComposerForMessage(action){if(!activeMessage)return;resetComp
   const fromSel=document.querySelector('.from-sel');if(fromSel&&activeMessage.account_id&&[...fromSel.options].some(opt=>opt.value===String(activeMessage.account_id)))fromSel.value=String(activeMessage.account_id);
   const reply=action!=='forward',from=activeFullMessage?.meta?.from?.email||activeMessage.from?.email||'',subject=activeMessage.subject||'',prefix=action==='forward'?'Fwd: ':'Re: ';document.getElementById('compTitle').textContent=action==='forward'?L('Переслать','Forward'):L('Ответить','Reply');document.getElementById('compSubj').value=new RegExp(`^${prefix}`,'i').test(subject)?subject:prefix+subject;if(reply&&from)setRecipients('compTo',[{name:activeFullMessage?.meta?.from?.name||'',email:from}]);if(action==='replyall'){const own=new Set(coreAccounts.map(account=>account.email.toLowerCase()));const others=[...(activeFullMessage?.meta?.to||[]),...(activeFullMessage?.meta?.cc||[])].filter(address=>address.email&&!own.has(address.email.toLowerCase())&&address.email.toLowerCase()!==from.toLowerCase());const seen=new Set();const uniq=others.filter(a=>{const k=a.email.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});setRecipients('compCc',uniq.map(a=>({name:a.name||'',email:a.email})));setRecipientFieldVisible('compCc',uniq.length>0);}const dateStr=activeMessage.date?new Date(activeMessage.date).toLocaleString(document.documentElement.lang):'';const bodyHtml=activeFullMessage?.body_html,bodyText=activeFullMessage?.body_text||activeMessage.preview||'';const quote=bodyHtml?bodyHtml:escapeHtml(bodyText).replace(/\n/g,'<br>');const header=`${escapeHtml(dateStr)}${dateStr?', ':''}${escapeHtml(activeFullMessage?.meta?.from?.name||from)} &lt;${escapeHtml(from)}&gt;:`;compEditEl.innerHTML=`<p><br></p><div class="mail-quote-head" style="color:var(--text-3,#888)">${header}</div><blockquote style="margin:6px 0 0;padding:0 0 0 12px;border-left:2px solid var(--border,#ccc)">${quote}</blockquote>`;showView('composeView');await applyComposerSignature('reply');const range=document.createRange(),sel=window.getSelection();range.setStart(compEditEl.firstChild,0);range.collapse(true);sel.removeAllRanges();sel.addRange(range);compEditEl.focus();}
 function contactAddresses(){const seen=new Set(),result=[];coreContacts.forEach(contact=>(contact.emails||[]).forEach(item=>{const email=String(item.email||'').trim(),key=email.toLocaleLowerCase();if(!email||seen.has(key))return;seen.add(key);result.push({name:contact.display_name||'',email});}));return result;}
+/* Кандидаты подсказки получателей: ядро объединяет историю выбранного ящика с
+   контактами и упорядочивает их по частоте и давности переписки
+   (recipient-history.md, S-029 - S-031). До ответа ядра подсказка работает по
+   одним контактам: отсутствие истории ей не мешает. */
+let recipientCandidates=[];
+let recipientCandidatesAccount=0;
+async function loadRecipientCandidates(accountId){
+  const id=Number(accountId)||0;
+  if(!id||!window.tm?.recipientCandidates)return;
+  try{
+    recipientCandidates=await window.tm.recipientCandidates(id);
+    recipientCandidatesAccount=id;
+    // S-056: кэш ключей подсказки принадлежит прежнему набору кандидатов.
+    composerContactKeysCache.invalidate();
+  }catch(error){console.error(error);}
+}
+window.loadRecipientCandidates=loadRecipientCandidates;
+function composerCandidates(){
+  const accountId=Number(document.querySelector('.from-sel')?.value)||0;
+  // S-041: до загрузки истории нового ящика подсказка показывает контакты, а не
+  // чужую историю.
+  if(accountId&&accountId!==recipientCandidatesAccount){
+    loadRecipientCandidates(accountId);
+    return contactAddresses();
+  }
+  return recipientCandidates.length?recipientCandidates:contactAddresses();
+}
 // Ключи транслитерации по адресу (S-012 person-search-translit.md): контакт
 // пересчитывается при каждом вводе, поэтому кэш ведём по email, а не по ссылке
 // на объект. Сбрасывается в reloadCoreData (mail.js) вместе с coreContacts.
@@ -39,7 +66,7 @@ const composerContactKeysCache=personSearch.createPersonSearchCache();
 window.invalidateComposerContactCache=()=>composerContactKeysCache.invalidate();
 function recipientToken(value){return String(value||'').split(/[;,]/).at(-1).trim();}
 function chooseRecipient(input,contact){addRecipientEntry(input.id,recipientFormat({name:contact.name,email:contact.email}));input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();scheduleDraftSave();}
-['compTo','compCc','compBcc'].forEach(id=>{const input=document.getElementById(id),menu=input.parentElement.querySelector('.recipient-suggestions');let active=-1;const render=()=>{const query=recipientToken(input.value),used=new Set([...recipientModel[id].map(entry=>entry.email.toLocaleLowerCase()),...splitAddresses(input.value).map(value=>(value.match(/<([^>]+)>/)?.[1]||value).trim().toLocaleLowerCase())]),matches=personSearch.suggestRecipients(contactAddresses(),query,used,8,contact=>composerContactKeysCache.get(contact.email.toLocaleLowerCase(),()=>`${contact.name} ${contact.email}`));active=-1;menu.innerHTML='';matches.forEach((contact,index)=>{const option=document.createElement('button');option.type='button';option.className='recipient-option';option.innerHTML='<span></span><small></small>';option.querySelector('span').textContent=contact.name||contact.email;option.querySelector('small').textContent=contact.email;option.onmousedown=event=>{event.preventDefault();chooseRecipient(input,contact);menu.classList.remove('open');};option.dataset.index=index;menu.appendChild(option);});menu.classList.toggle('open',matches.length>0);};input.addEventListener('input',render);input.addEventListener('focus',render);input.addEventListener('keydown',event=>{const options=[...menu.querySelectorAll('.recipient-option')];if((event.key===','||event.key===';')&&!(active>=0&&options.length)){event.preventDefault();commitRecipientInput(id);menu.classList.remove('open');render();return;}if(event.key==='Backspace'&&!input.value&&recipientModel[id].length){event.preventDefault();removeRecipientEntry(id,recipientModel[id].length-1);return;}if(!options.length){if(event.key==='Enter'&&input.value.trim()){event.preventDefault();commitRecipientInput(id);}return;}if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();active=(active+(event.key==='ArrowDown'?1:-1)+options.length)%options.length;options.forEach((option,index)=>option.classList.toggle('active',index===active));options[active].scrollIntoView({block:'nearest'});}else if(event.key==='Enter'){event.preventDefault();if(active>=0)options[active].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));else{commitRecipientInput(id);menu.classList.remove('open');}}else if(event.key==='Escape')menu.classList.remove('open');});input.addEventListener('blur',()=>{if(input.value.trim())commitRecipientInput(id);});});
+['compTo','compCc','compBcc'].forEach(id=>{const input=document.getElementById(id),menu=input.parentElement.querySelector('.recipient-suggestions');let active=-1;const render=()=>{const query=recipientToken(input.value),used=new Set([...recipientModel[id].map(entry=>entry.email.toLocaleLowerCase()),...splitAddresses(input.value).map(value=>(value.match(/<([^>]+)>/)?.[1]||value).trim().toLocaleLowerCase())]),matches=window.recipientHistoryModel.historySuggestions(composerCandidates(),query,used,contact=>composerContactKeysCache.get(contact.email.toLocaleLowerCase(),()=>`${contact.name} ${contact.email}`),personSearch);active=-1;menu.innerHTML='';matches.forEach((contact,index)=>{const option=document.createElement('button');option.type='button';option.className='recipient-option';option.innerHTML='<span></span><small></small>';option.querySelector('span').textContent=window.recipientHistoryModel.historyCandidateLabel(contact);const badge=window.recipientHistoryModel.historyCandidateBadge(contact,composerLang());option.querySelector('small').textContent=badge?`${contact.email} - ${badge}`:contact.email;option.onmousedown=event=>{event.preventDefault();chooseRecipient(input,contact);menu.classList.remove('open');};option.dataset.index=index;menu.appendChild(option);});menu.classList.toggle('open',matches.length>0);};input.addEventListener('input',render);input.addEventListener('focus',render);input.addEventListener('keydown',event=>{const options=[...menu.querySelectorAll('.recipient-option')];if((event.key===','||event.key===';')&&!(active>=0&&options.length)){event.preventDefault();commitRecipientInput(id);menu.classList.remove('open');render();return;}if(event.key==='Backspace'&&!input.value&&recipientModel[id].length){event.preventDefault();removeRecipientEntry(id,recipientModel[id].length-1);return;}if(!options.length){if(event.key==='Enter'&&input.value.trim()){event.preventDefault();commitRecipientInput(id);}return;}if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();active=(active+(event.key==='ArrowDown'?1:-1)+options.length)%options.length;options.forEach((option,index)=>option.classList.toggle('active',index===active));options[active].scrollIntoView({block:'nearest'});}else if(event.key==='Enter'){event.preventDefault();if(active>=0)options[active].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));else{commitRecipientInput(id);menu.classList.remove('open');}}else if(event.key==='Escape')menu.classList.remove('open');});input.addEventListener('blur',()=>{if(input.value.trim())commitRecipientInput(id);});});
 document.addEventListener('click',event=>{if(!event.target.closest('.recipient-input'))document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));});
 let toastCards=[];
 let toastSequence=0;
@@ -459,6 +486,96 @@ function draftPayload(){return {account_id:+document.querySelector('.from-sel').
 function scheduleDraftSave(){clearTimeout(draftSaveTimer);draftSaveTimer=setTimeout(()=>window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload())).catch(console.error),500);}
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
 function composerRequest(){const draft=draftPayload(),to=splitAddresses(draft.to),cc=splitAddresses(draft.cc),bcc=splitAddresses(draft.bcc),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
+/* Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
+   второй отправки не создаёт (undo-send.md, S-053). Ключ живёт до
+   подтверждённой записи письма в очередь. */
+let composerRequestKey='';
+function composerLang(){return wizardLocale==='en'?'en':'ru';}
+/* Карточка окна отмены с обратным отсчётом (S-017, S-018). Срок карточки
+   определяет срок отмены, а не общий срок исчезновения карточек. */
+function showUndoSendCard(queued,request){
+  const lang=composerLang();
+  const seconds=window.outboxModel.remainingUndoSeconds(queued.cancel_until,Date.now());
+  if(!window.outboxModel.showsUndoAction({...queued,origin:'ordinary'},Date.now())){
+    // S-019: при нулевом окне отмены действия "Отменить" нет вовсе.
+    showToast(L('Письмо принято, отправка началась','The message is accepted and is being sent'));
+    return;
+  }
+  const item={kind:'notice',accountId:null,
+    text:window.outboxModel.undoCardText(request,seconds,lang),
+    details:'',action:'undo',actionLabel:L('Отменить','Cancel'),hasAction:true,
+    callback:async()=>{
+      const outcome=await window.tm.cancelSend(queued.account_id,queued.operation_id);
+      showToast(window.outboxModel.cancelOutcomeText(outcome,composerLang()));
+      if(outcome==='cancelled')await restoreCancelledSend(queued.account_id,queued.operation_id);
+    }};
+  enqueueToast(item);
+  const cardId=item.id;
+  const timer=setInterval(()=>{
+    const card=toastCards.find(value=>value.id===cardId);
+    const left=window.outboxModel.remainingUndoSeconds(queued.cancel_until,Date.now());
+    if(!card||left<=0){clearInterval(timer);if(card)removeToastCard(cardId);return;}
+    card.text=window.outboxModel.undoCardText(request,left,composerLang());
+    card.baseText=card.text;
+    renderToastCards();
+  },1000);
+}
+/* Возврат отменённого письма в композер целиком: адресаты, тема, оформленное
+   тело и все вложения (S-040, S-041). */
+async function restoreCancelledSend(accountId,operationId){
+  if(composerHasContent()){
+    // S-041: несохранённое письмо в композере не затирается, отменённое
+    // остаётся в разделе "Исходящие".
+    showToast(L('В композере есть другое письмо. Отменённое ждёт в разделе "Исходящие".','The composer holds another message. The cancelled one waits in Outbox.'));
+    return;
+  }
+  try{
+    const message=await window.tm.openCancelledSend(accountId,operationId);
+    applyCancelledSendToComposer(message);
+    // Операция больше не нужна: письмо целиком лежит в композере. Неудачный
+    // возврат её не трогает, поэтому письмо не пропадает.
+    await window.tm.deleteSend(accountId,operationId);
+    showView('composeView');
+  }catch(error){showToast(error);}
+}
+function applyCancelledSendToComposer(message){
+  const draft=window.outboxModel.composerDraftFromCancelled(message);
+  resetComposer();
+  const fromSel=document.querySelector('.from-sel');
+  if(fromSel&&draft.account_id&&[...fromSel.options].some(option=>option.value===String(draft.account_id)))fromSel.value=String(draft.account_id);
+  setRecipients('compTo',draft.to);
+  setRecipients('compCc',draft.cc);
+  setRecipients('compBcc',draft.bcc);
+  setRecipientFieldVisible('compCc',draft.cc.length>0);
+  setRecipientFieldVisible('compBcc',draft.bcc.length>0);
+  document.getElementById('compSubj').value=draft.subject;
+  compEditEl.innerHTML=draft.body_html||escapeHtml(draft.body_text).replace(/\n/g,'<br>');
+  composerAttachments=draft.attachments.map(item=>({filename:item.filename,mime_type:item.mime_type,data:item.data}));
+  compAtt.innerHTML='';composerAttachments.forEach(renderComposerAttachment);
+  scheduleDraftSave();
+}
+window.restoreCancelledSend=restoreCancelledSend;
+/* Состояние очереди отправки при запуске программы (S-034 - S-036). */
+async function restoreUndoWindows(){
+  if(!window.tm?.startupSendState)return;
+  const state=await window.tm.startupSendState();
+  const lang=composerLang();
+  (state.pending||[]).forEach(queued=>{
+    // Тема и адресаты ожидающего письма в список не передаются: карточка
+    // показывает то, что уже известно очереди.
+    const entry=(outboxEntriesForCard||[]).find(item=>item.id===queued.operation_id);
+    showUndoSendCard({...queued,origin:'ordinary'},{subject:entry?.subject||'',to:entry?.to||[]});
+  });
+  if(state.expired>0)showToast(window.outboxModel.expiredWindowsText(state.expired,lang));
+  if(state.uncertain>0){
+    showToast(L(`Писем с неизвестным итогом передачи: ${state.uncertain}`,`Messages with an unknown outcome: ${state.uncertain}`));
+  }
+}
+/* Список очереди, прочитанный разделом "Исходящие": карточка окна отмены берёт
+   из него тему и адресатов восстановленного письма. */
+let outboxEntriesForCard=[];
+window.setOutboxEntriesForCard=entries=>{outboxEntriesForCard=entries||[];};
+window.restoreUndoWindows=restoreUndoWindows;
 document.getElementById('compSend').onclick=async()=>{
   // Крупный файл может ещё дочитываться: без ожидания письмо ушло бы без него,
   // а вложение легло бы в уже очищенный композер. Если за это время открыли
@@ -466,11 +583,20 @@ document.getElementById('compSend').onclick=async()=>{
   const generation=composerGeneration;
   await settleAttachments();
   if(generation!==composerGeneration)return;
-  const request=composerRequest();
-  // Окно закрываем сразу, письмо уходит в фоне. Итог показываем коротким toast.
+  let request;
+  // S-005: адресаты проверяются до записи операции.
+  try{request=composerRequest();}catch(error){showToast(error);return;}
+  if(!composerRequestKey)composerRequestKey=`send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let queued;
+  try{queued=await window.tm.sendMessage(request,composerRequestKey);}
+  catch(error){
+    // S-003: письмо не принято - композер и черновик остаются нетронутыми.
+    showToast(error);return;
+  }
+  // S-002: композер очищается только после подтверждённой записи в очередь.
+  composerRequestKey='';
   resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
-  try{await window.tm.sendMessage(request);showToast(L('Письмо отправлено','Message sent'));}
-  catch(error){showToast(error);}
+  showUndoSendCard(queued,request);
 };
 document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};

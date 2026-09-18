@@ -108,6 +108,28 @@ window.corePageSize = 100;
     continueSenderSweepJob: (jobId) => invoke("continue_sender_sweep_job", { jobId }),
     cancelSenderSweepJob: (jobId) => invoke("cancel_sender_sweep_job", { jobId }),
     pendingSenderSweepJobs: () => invoke("pending_sender_sweep_jobs"),
+    // Очередь отправки: окно отмены, раздел "Исходящие" и возврат отменённого
+    // письма в композер (specs/undo-send.md).
+    undoSendSeconds: () => invoke("undo_send_seconds"),
+    setUndoSendSeconds: (seconds) => invoke("set_undo_send_seconds", { seconds }),
+    listOutboxSends: (accountId, limit, offset) => invoke("list_outbox_sends", { accountId, limit, offset }),
+    cancelSend: (accountId, operationId) => invoke("cancel_send", { accountId, operationId }),
+    openCancelledSend: (accountId, operationId) => invoke("open_cancelled_send", { accountId, operationId }),
+    deleteSend: (accountId, operationId) => invoke("delete_send", { accountId, operationId }),
+    retrySend: (accountId, operationId) => invoke("retry_send", { accountId, operationId }),
+    startupSendState: () => invoke("startup_send_state"),
+    releaseUndoWindows: () => invoke("release_undo_windows"),
+    // Автоответ "нет на месте" (specs/out-of-office.md).
+    outOfOffice: (accountId) => invoke("out_of_office", { accountId }),
+    saveOutOfOffice: (input) => invoke("save_out_of_office", { input }),
+    disableOutOfOffice: (accountId) => invoke("disable_out_of_office", { accountId }),
+    listOutOfOfficeReplies: (accountId, limit) => invoke("list_out_of_office_replies", { accountId, limit }),
+    // История получателей (specs/recipient-history.md).
+    recipientCandidates: (accountId) => invoke("recipient_candidates", { accountId }),
+    listRecipientHistory: (accountId, limit, offset) => invoke("list_recipient_history", { accountId, limit, offset }),
+    updateRecipientHistory: (accountId, entryId, name, address) => invoke("update_recipient_history", { accountId, entryId, name, address }),
+    deleteRecipientHistoryEntry: (accountId, entryId) => invoke("delete_recipient_history_entry", { accountId, entryId }),
+    clearRecipientHistory: (accountId) => invoke("clear_recipient_history", { accountId }),
     failedMessageOperations: () => invoke("failed_message_operations"),
     retryMessageOperation: (operationId) => invoke("retry_message_operation", { operationId }),
     discardMessageOperation: (operationId) => invoke("discard_message_operation", { operationId }),
@@ -133,7 +155,9 @@ window.corePageSize = 100;
     syncAccounts: () => invoke("sync_accounts"),
     syncAuxiliaryAccounts: () => invoke("sync_auxiliary_accounts"),
     startRealtime: () => invoke("start_realtime"),
-    sendMessage: (request) => invoke("send_message", { request }),
+    // Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
+    // второй операции не создаёт (specs/undo-send.md, S-053).
+    sendMessage: (request, requestKey) => invoke("send_message", { request, requestKey }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
     markFlagged: (messageId, flagged) => invoke("mark_flagged", { messageId, flagged }),
@@ -366,6 +390,12 @@ window.corePageSize = 100;
       window.markSettingsLoaded?.();
       await window.reloadMailRules?.();
       await window.reloadSenderSections?.();
+      await window.reloadQueueSections?.();
+      await window.loadUndoSendSetting?.();
+      // undo-send.md S-034 - S-036: незакончившиеся окна отмены восстанавливаются
+      // карточкой с фактически оставшимся временем, а письма с истёкшим окном
+      // показываются одним сообщением, а не карточкой на каждое письмо.
+      window.restoreUndoWindows?.().catch(console.error);
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
       // Стартовая загрузка тоже наполняет список: пока она идёт, освобождение

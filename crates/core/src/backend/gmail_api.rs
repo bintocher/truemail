@@ -845,6 +845,14 @@ fn metadata_projection_raw(message: &RawMessage) -> Vec<u8> {
         "Received-SPF",
         "List-Unsubscribe",
         "List-Unsubscribe-Post",
+        // specs/out-of-office.md, S-063: заголовки правил молчания входят в
+        // облегчённую проекцию. Без них автоответ либо загружал бы тело письма
+        // из сети, либо отвечал бы рассылке.
+        "Reply-To",
+        "Auto-Submitted",
+        "Precedence",
+        "Return-Path",
+        "X-Auto-Response-Suppress",
     ];
     let mut raw = String::new();
     for header in &message.payload.headers {

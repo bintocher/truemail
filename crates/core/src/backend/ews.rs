@@ -1552,7 +1552,43 @@ const LIGHT_MESSAGE_PROPERTIES: &str = concat!(
     r#"<t:FieldURI FieldURI="item:HasAttachments"/>"#,
     r#"<t:FieldURI FieldURI="item:Size"/>"#,
     r#"<t:FieldURI FieldURI="item:Body"/>"#,
+    r#"<t:FieldURI FieldURI="message:ReplyTo"/>"#,
+    // specs/out-of-office.md, S-063: заголовки правил молчания приходят
+    // расширенными свойствами, иначе стадия автоответа либо загружала бы тело
+    // письма из сети, либо отвечала бы рассылке.
+    r#"<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="List-Unsubscribe" PropertyType="String"/>"#,
+    r#"<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="Auto-Submitted" PropertyType="String"/>"#,
+    r#"<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="Precedence" PropertyType="String"/>"#,
+    r#"<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="Return-Path" PropertyType="String"/>"#,
+    r#"<t:ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="X-Auto-Response-Suppress" PropertyType="String"/>"#,
 );
+
+/// Заголовки правил молчания, запрашиваемые расширенными свойствами письма.
+const SILENCE_HEADERS: [&str; 5] = [
+    "List-Unsubscribe",
+    "Auto-Submitted",
+    "Precedence",
+    "Return-Path",
+    "X-Auto-Response-Suppress",
+];
+
+/// Значение расширенного свойства заголовка из ответа сервера.
+fn extended_header(message: Node<'_, '_>, name: &str) -> Option<String> {
+    message
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "ExtendedProperty")
+        .find(|node| {
+            node.descendants().any(|child| {
+                child.is_element()
+                    && child.tag_name().name() == "ExtendedFieldURI"
+                    && child.attribute("PropertyName") == Some(name)
+            })
+        })
+        .and_then(|node| node_text(node, "Value"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
 
 /// Длина отрывка текста письма для строки списка (S-004).
 const LIGHT_PREVIEW_CHARS: usize = 200;
@@ -1642,6 +1678,15 @@ fn light_message_projection(message: Node<'_, '_>) -> Vec<u8> {
     }
     if let Some(in_reply_to) = node_text(message, "InReplyTo") {
         push("In-Reply-To", &header_value(in_reply_to));
+    }
+    let reply_to = mailbox_list(message, "ReplyTo").join(", ");
+    push("Reply-To", &reply_to);
+    // Заголовки правил молчания переносятся в собранное письмо как есть: их
+    // читает разбор при сохранении письма (specs/out-of-office.md, S-063).
+    for name in SILENCE_HEADERS {
+        if let Some(value) = extended_header(message, name) {
+            push(name, &header_value(&value));
+        }
     }
     raw.push_str("MIME-Version: 1.0\r\n");
     raw.push_str("Content-Type: text/plain; charset=utf-8\r\n");
@@ -3401,9 +3446,182 @@ impl MailBackend for EwsBackend {
     }
 }
 
+/// Состояние отсутствия на сервере Exchange (specs/out-of-office.md).
+/// Общий интерфейс почтового модуля этими операциями не расширяется: их
+/// поддерживает только Exchange, а остальным пяти модулям достались бы пустые
+/// заглушки (S-009).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OofState {
+    pub enabled: bool,
+    /// Период во всемирном времени (S-013).
+    pub starts_at: String,
+    pub ends_at: String,
+    pub internal_text: String,
+    pub external_text: String,
+}
+
+/// Тело запроса чтения настроек отсутствия. Адрес ящика уходит через ту же
+/// функцию экранирования, что и остальные запросы Exchange (S-019).
+fn get_oof_body(mailbox: &str) -> String {
+    format!(
+        r#"<m:GetUserOofSettingsRequest><t:Mailbox><t:Address>{}</t:Address></t:Mailbox></m:GetUserOofSettingsRequest>"#,
+        escape(mailbox)
+    )
+}
+
+/// Тело запроса записи настроек отсутствия. Внешняя аудитория - все внешние
+/// отправители, а не только известные (S-015).
+fn set_oof_body(mailbox: &str, state: &OofState) -> String {
+    let status = if state.enabled {
+        "Scheduled"
+    } else {
+        "Disabled"
+    };
+    format!(
+        r#"<m:SetUserOofSettingsRequest><t:Mailbox><t:Address>{}</t:Address></t:Mailbox><t:UserOofSettings><t:OofState>{status}</t:OofState><t:ExternalAudience>All</t:ExternalAudience><t:Duration><t:StartTime>{}</t:StartTime><t:EndTime>{}</t:EndTime></t:Duration><t:InternalReply><t:Message>{}</t:Message></t:InternalReply><t:ExternalReply><t:Message>{}</t:Message></t:ExternalReply></t:UserOofSettings></m:SetUserOofSettingsRequest>"#,
+        escape(mailbox),
+        escape(&state.starts_at),
+        escape(&state.ends_at),
+        escape(&state.internal_text),
+        escape(&state.external_text),
+    )
+}
+
+/// Разобрать ответ сервера на чтение настроек отсутствия.
+fn parse_oof_response(xml: &str) -> Result<OofState> {
+    let document = Document::parse(xml).map_err(|error| backend_error("oof", error.to_string()))?;
+    let root = document.root_element();
+    let status = node_text(root, "OofState").unwrap_or("Disabled");
+    let message_of = |tag: &str| {
+        root.descendants()
+            .find(|node| node.is_element() && node.tag_name().name() == tag)
+            .and_then(|node| node_text(node, "Message"))
+            .map(str::to_owned)
+            .unwrap_or_default()
+    };
+    Ok(OofState {
+        // Значение Enabled означает бессрочное отсутствие, Scheduled - период.
+        enabled: status == "Enabled" || status == "Scheduled",
+        starts_at: node_text(root, "StartTime").unwrap_or_default().to_owned(),
+        ends_at: node_text(root, "EndTime").unwrap_or_default().to_owned(),
+        internal_text: message_of("InternalReply"),
+        external_text: message_of("ExternalReply"),
+    })
+}
+
+impl EwsBackend {
+    /// Прочитать действующее состояние отсутствия с сервера (S-011).
+    pub async fn read_oof_settings(&self, password: &str, mailbox: &str) -> Result<OofState> {
+        let response = self
+            .soap(password, "GetUserOofSettings", &get_oof_body(mailbox))
+            .await?;
+        parse_oof_response(&response)
+    }
+
+    /// Записать состояние отсутствия и перечитать его: объявлять успех по
+    /// молчанию сервера нельзя, потерянный ответ разрешается перечитыванием
+    /// (S-016).
+    pub async fn write_oof_settings(
+        &self,
+        password: &str,
+        mailbox: &str,
+        state: &OofState,
+    ) -> Result<OofState> {
+        self.soap(
+            password,
+            "SetUserOofSettings",
+            &set_oof_body(mailbox, state),
+        )
+        .await?;
+        self.read_oof_settings(password, mailbox).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// out-of-office.md S-063: облегчённая проекция письма Exchange несёт
+    /// заголовки правил молчания и адрес для ответа. Без них автоответ ответил
+    /// бы рассылке, а ответ ушёл бы не на тот адрес.
+    #[test]
+    fn light_projection_carries_the_silence_headers() {
+        let xml = r#"<?xml version="1.0"?>
+<Message xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">
+  <Subject>Скидки</Subject>
+  <DateTimeSent>2026-09-18T10:00:00Z</DateTimeSent>
+  <From><Mailbox><Name>Магазин</Name><EmailAddress>shop@partner.test</EmailAddress></Mailbox></From>
+  <ToRecipients><Mailbox><EmailAddress>me@example.test</EmailAddress></Mailbox></ToRecipients>
+  <ReplyTo><Mailbox><EmailAddress>answers@partner.test</EmailAddress></Mailbox></ReplyTo>
+  <ExtendedProperty>
+    <ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="List-Unsubscribe" PropertyType="String"/>
+    <Value>&lt;https://partner.test/off&gt;</Value>
+  </ExtendedProperty>
+  <ExtendedProperty>
+    <ExtendedFieldURI DistinguishedPropertySetId="InternetHeaders" PropertyName="Precedence" PropertyType="String"/>
+    <Value>bulk</Value>
+  </ExtendedProperty>
+</Message>"#;
+        let document = Document::parse(xml).expect("разбор ответа");
+        let projection = light_message_projection(document.root_element());
+        let text = String::from_utf8_lossy(&projection);
+        assert!(text.contains("Reply-To: answers@partner.test"), "{text}");
+        assert!(
+            text.contains("List-Unsubscribe: <https://partner.test/off>"),
+            "{text}"
+        );
+        assert!(text.contains("Precedence: bulk"), "{text}");
+        // Запрос свойств и разбор ответа перечисляют одни и те же заголовки.
+        for name in SILENCE_HEADERS {
+            assert!(
+                LIGHT_MESSAGE_PROPERTIES.contains(name),
+                "заголовок {name} не запрашивается у сервера"
+            );
+        }
+    }
+
+    /// out-of-office.md S-013 - S-015, S-019: период уходит во всемирном
+    /// времени, тексты - отдельными значениями, внешняя аудитория - все
+    /// внешние отправители, а любое значение проходит через общее
+    /// экранирование. Подставленный в текст XML разорвал бы запрос.
+    #[test]
+    fn out_of_office_request_escapes_every_value_it_carries() {
+        let state = OofState {
+            enabled: true,
+            starts_at: "2026-10-01T00:00:00Z".into(),
+            ends_at: "2026-10-10T00:00:00Z".into(),
+            internal_text: "Я в отпуске <до 10-го> & недоступен".into(),
+            external_text: "Out of office".into(),
+        };
+        let body = set_oof_body("user@example.test", &state);
+        assert!(body.contains("<t:OofState>Scheduled</t:OofState>"));
+        assert!(body.contains("<t:ExternalAudience>All</t:ExternalAudience>"));
+        assert!(body.contains("<t:StartTime>2026-10-01T00:00:00Z</t:StartTime>"));
+        assert!(body.contains("&lt;до 10-го&gt; &amp; недоступен"));
+        assert!(!body.contains("<до"));
+        let disabled = set_oof_body("user@example.test", &OofState::default());
+        assert!(disabled.contains("<t:OofState>Disabled</t:OofState>"));
+    }
+
+    /// S-011, S-016: показывается только то, что подтвердил сервер, поэтому
+    /// ответ разбирается целиком - вместе с обоими текстами и периодом.
+    #[test]
+    fn out_of_office_response_is_read_from_the_server_answer() {
+        let xml = r#"<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+ <s:Body><GetUserOofSettingsResponse><OofSettings>
+   <OofState>Scheduled</OofState>
+   <ExternalAudience>All</ExternalAudience>
+   <Duration><StartTime>2026-10-01T00:00:00Z</StartTime><EndTime>2026-10-10T00:00:00Z</EndTime></Duration>
+   <InternalReply><Message>Внутренним</Message></InternalReply>
+   <ExternalReply><Message>Внешним</Message></ExternalReply>
+ </OofSettings></GetUserOofSettingsResponse></s:Body></s:Envelope>"#;
+        let state = parse_oof_response(xml).expect("разбор ответа");
+        assert!(state.enabled);
+        assert_eq!(state.starts_at, "2026-10-01T00:00:00Z");
+        assert_eq!(state.internal_text, "Внутренним");
+        assert_eq!(state.external_text, "Внешним");
+    }
 
     /// S-014 (account-connect-progress.md): автопоиск и проверка учётных
     /// данных при подключении держат сниженные пределы одного соединения EWS,
