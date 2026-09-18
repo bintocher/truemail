@@ -66,6 +66,13 @@ pub struct SenderSweepRule {
     pub job_state: Option<String>,
     #[sqlx(default)]
     pub last_error: Option<String>,
+    /// Письма, перемещение которых дошло до постоянного отказа очереди уже
+    /// после успешного прохода (S-044).
+    #[sqlx(default)]
+    pub queue_failed: i64,
+    /// Причина последнего постоянного отказа очереди (S-044).
+    #[sqlx(default)]
+    pub queue_error: Option<String>,
 }
 
 /// Что интерфейс просит создать: вид уборки, область и согласие на архив.

@@ -104,6 +104,48 @@ async fn closed_by(db: &Db, message_id: i64) -> Option<String> {
         .0
 }
 
+/// Приметы письма, унесённого очередью: по ним возврат ищет его в корзине.
+struct MovedHeaders {
+    from: String,
+    date: String,
+    message_id: String,
+}
+
+/// Выполнить всю очередь ящика настоящим путём: операция забирается работником
+/// и закрывается успехом, а успешное перемещение удаляет и операцию, и
+/// локальную строку письма. Возвращает приметы перемещённых писем.
+async fn complete_queue(db: &Db, account_id: i64) -> Vec<MovedHeaders> {
+    let operations = db
+        .claim_outbox_operations(account_id, 500)
+        .await
+        .expect("забрать операции");
+    let mut moved = Vec::new();
+    for operation in &operations {
+        if let Some(message_id) = operation.message_id {
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT from_addr, date, rfc822_message_id FROM messages WHERE id=?",
+            )
+            .bind(message_id)
+            .fetch_optional(&db.pool)
+            .await
+            .expect("приметы письма");
+            if let Some((from, date, header)) = row
+                && let (Some(from), Some(date), Some(header)) = (from, date, header)
+            {
+                moved.push(MovedHeaders {
+                    from,
+                    date,
+                    message_id: header,
+                });
+            }
+        }
+        db.complete_outbox_operation(operation)
+            .await
+            .expect("операция выполнена");
+    }
+    moved
+}
+
 fn days_ago(days: i64) -> String {
     (chrono::Utc::now() - chrono::Duration::days(days))
         .format("%Y-%m-%dT%H:%M:%S+00:00")
@@ -464,11 +506,9 @@ async fn sweep_follows_the_snapshot_and_release_cancels_pending_moves() {
         "письмо после снимка уборкой не берётся"
     );
     db.process_sync_batch_stages().await.expect("стадии");
-    assert_eq!(
-        takeaways(&db, after_snapshot).await.len(),
-        1,
-        "письмо после снимка уводит стадия списков"
-    );
+    let late = takeaways(&db, after_snapshot).await;
+    assert_eq!(late.len(), 1, "письмо после снимка уводит стадия списков");
+    assert_eq!(late[0].2, Some(trash), "письмо уходит в корзину");
 
     // Одна операция уже ушла на сервер: отменить её нельзя, и её число
     // называется пользователю (S-042).
@@ -497,7 +537,20 @@ async fn sweep_follows_the_snapshot_and_release_cancels_pending_moves() {
             .await
             .expect("остаток очереди");
     assert_eq!(left.0, 0);
-    assert_eq!(trash, trash);
+    // Отмена вернула письма стадиям: признак закрывшей стадии снят, иначе
+    // письмо осталось бы закрытым навсегда и выпало бы из разбора и из
+    // уведомления о новой почте.
+    let still_closed: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM messages WHERE folder_id=? AND closed_by_stage IS NOT NULL",
+    )
+    .bind(inbox)
+    .fetch_one(&db.pool)
+    .await
+    .expect("закрытые письма");
+    assert_eq!(
+        still_closed.0, 1,
+        "закрытым осталось только письмо, перемещение которого уже выполняется"
+    );
     db.close().await;
 }
 
@@ -636,47 +689,103 @@ async fn ignored_conversation_sweeps_current_and_future_messages_then_returns_th
             .all(|(folder, _, header)| { *folder == Some(inbox) && header.is_some() })
     );
 
-    // Сервер выполнил перенос: письма оказались в корзине, локальная копия
-    // это увидела. Возврат ищет их там по приметам (S-037).
-    sqlx::query("UPDATE messages SET folder_id=? WHERE id IN (?, ?, ?)")
-        .bind(trash)
+    // Очередь выполнила перенос по-настоящему: успешная операция удаляет и
+    // саму себя, и локальную строку письма (S-037).
+    let moved_headers = complete_queue(&db, account).await;
+    let gone: (i64,) = sqlx::query_as("SELECT count(*) FROM messages WHERE id IN (?, ?, ?)")
         .bind(root)
         .bind(branch)
         .bind(future)
-        .execute(&db.write_pool)
+        .fetch_one(&db.pool)
         .await
-        .expect("письма в корзине");
-    sqlx::query("UPDATE outbox_ops SET status='done' WHERE status='pending'")
-        .execute(&db.write_pool)
-        .await
-        .expect("операции выполнены");
+        .expect("локальные строки писем");
+    assert_eq!(gone.0, 0, "успешное перемещение удалило локальные строки");
+
+    // Следующая синхронизация принесла письма уже в корзине: возврат ищет их
+    // там по приметам, а не по прежнему номеру строки. Одно письмо в корзине
+    // так и не появилось - его возврат остаётся ждать синхронизации (S-041).
+    for (index, header) in moved_headers
+        .iter()
+        .filter(|header| !header.message_id.contains("old@example.test"))
+        .enumerate()
+    {
+        seed_message(
+            &db,
+            account,
+            trash,
+            100 + index as i64,
+            Seed {
+                from: &header.from,
+                subject: "в корзине",
+                date: Some(&header.date),
+                message_id: Some(&header.message_id),
+                ..Seed::default()
+            },
+        )
+        .await;
+    }
 
     let report = db
         .disable_ignore_conversation(record.id, true)
         .await
         .expect("прекращение с возвратом");
-    assert_eq!(report.queued, 3, "опознанные письма возвращаются");
-    assert!(
-        report.skipped >= 1,
-        "письмо, не найденное в корзине, честно считается пропущенным"
+    assert_eq!(
+        report.queued, 0,
+        "возврат не считается выполненным до ответа очереди"
     );
-    for message in [root, branch, future] {
-        let ops = takeaways(&db, message).await;
-        let back = ops.last().expect("операция возврата");
-        assert_eq!(back.2, Some(inbox), "письмо возвращается в свою папку");
-    }
+    assert!(report.remaining >= 3, "письма ждут выполнения возврата");
+    // S-035: повторная команда во время возврата второго задания не заводит.
+    assert!(
+        db.disable_ignore_conversation(record.id, true)
+            .await
+            .is_err(),
+        "повторное прекращение во время возврата отклоняется"
+    );
+    let jobs: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM ignored_conversation_jobs WHERE conversation_id=? AND kind='return'",
+    )
+    .bind(record.id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("задания возврата");
+    assert_eq!(jobs.0, 1, "второго задания возврата не появилось");
+
+    // Очередь выполнила возврат: только теперь письма считаются возвращёнными.
+    complete_queue(&db, account).await;
+    db.process_sync_batch_stages().await.expect("стадии");
     let after = db
         .ignored_conversation(record.id)
         .await
         .expect("запись после возврата");
-    assert_eq!(after.returned, 3);
-    assert_eq!(after.skipped, 1);
+    assert_eq!(after.returned, 3, "возврат подтверждён результатом очереди");
+    assert_eq!(
+        after.state, IGNORE_STATE_RETURNING,
+        "ненайденное письмо держит запись в состоянии возврата"
+    );
+
+    // S-042, S-043: за семь суток письмо в корзине так и не появилось - его
+    // возврат переходит в отказ, а запись в состояние неполного возврата.
+    sqlx::query(
+        "UPDATE ignored_conversation_moves
+            SET return_requested_at=datetime('now', '-8 days')
+          WHERE conversation_id=? AND return_state='waiting_sync'",
+    )
+    .bind(record.id)
+    .execute(&db.write_pool)
+    .await
+    .expect("истёкший срок ожидания");
+    db.process_sync_batch_stages().await.expect("стадии");
+    let expired = db
+        .ignored_conversation(record.id)
+        .await
+        .expect("запись после срока");
+    assert_eq!(expired.failed, 1, "непрошедшее возврат письмо названо");
+    assert_eq!(expired.state, IGNORE_STATE_RETURN_FAILED);
     db.close().await;
 }
 
 /// Собственное письмо в папке отправленных снимает игнорирование переписки
-/// (S-030), а предел числа идентификаторов переводит запись в частичное
-/// покрытие (S-028).
+/// (S-030).
 #[tokio::test]
 async fn sent_message_disables_ignoring() {
     let db = test_db("stage-ignore-sent").await;
@@ -903,7 +1012,25 @@ async fn sweep_modes_keep_the_last_message_and_respect_dates() {
         days: None,
         sweep_archive: false,
     };
-    db.start_sender_sweep(new_now, "").await.expect("правило");
+    // S-010, S-011: режим "новые сразу" идёт общим путём подтверждения, и ключ
+    // снимка расходуется неделимо.
+    let new_now_preview = db
+        .preview_sender_sweep(new_now.clone())
+        .await
+        .expect("предпросмотр режима \"новые сразу\"");
+    assert!(
+        db.start_sender_sweep(new_now.clone(), "").await.is_err(),
+        "без ключа снимка правило не создаётся"
+    );
+    db.start_sender_sweep(new_now.clone(), &new_now_preview.snapshot_key)
+        .await
+        .expect("правило");
+    assert!(
+        db.start_sender_sweep(new_now, &new_now_preview.snapshot_key)
+            .await
+            .is_err(),
+        "тот же ключ снимка второй раз не принимается"
+    );
     let rules = db.list_mail_rules().await.expect("список правил");
     let created = rules
         .iter()
@@ -913,6 +1040,102 @@ async fn sweep_modes_keep_the_last_message_and_respect_dates() {
     assert_eq!(created.groups[0].conditions[0].op, "equals");
     assert!(created.actions.iter().any(|action| action.kind == "trash"));
     assert!(created.actions.iter().any(|action| action.kind == "stop"));
+
+    // S-036: приход письма проверяет запись, но полным проходом не считается.
+    // Отметка прохода старится намеренно: событийное задание не должно её
+    // обновить, иначе суточный полный проход не наступит никогда.
+    sqlx::query("UPDATE sender_sweep_rules SET last_full_pass_at=datetime('now', '-12 hours')")
+        .execute(&db.write_pool)
+        .await
+        .expect("прежний полный проход");
+    let aged = db.list_sender_sweep_rules().await.expect("записи")[0]
+        .last_full_pass_at
+        .clone();
+    let newest = seed_message(
+        &db,
+        account,
+        inbox,
+        20,
+        Seed {
+            from: "news@example.test",
+            subject: "самое новое",
+            // Дата заведомо позже дат прежних писем этого отправителя.
+            date: Some("2030-01-01T00:00:00+00:00"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    db.process_sync_batch_stages().await.expect("стадии");
+    assert!(
+        takeaways(&db, newest).await.is_empty(),
+        "новое письмо остаётся последним"
+    );
+    assert_eq!(
+        db.list_sender_sweep_rules().await.expect("записи")[0].last_full_pass_at,
+        aged,
+        "приход письма за полный проход не засчитывается"
+    );
+
+    db.close().await;
+}
+
+/// Полный проход включённой записи автоочистки выполняется при запуске
+/// программы, а не только по суточному сроку (sweep-by-sender.md S-035): у
+/// пользователя без синхронизации запись иначе не работала бы вовсе.
+#[tokio::test]
+async fn full_sweep_pass_runs_on_start() {
+    let db = test_db("stage-sweep-start").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let old = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "news@example.test",
+            subject: "прежнее",
+            date: Some(&days_ago(10)),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let last = seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Seed {
+            from: "news@example.test",
+            subject: "последнее",
+            date: Some(&days_ago(1)),
+            ..Seed::default()
+        },
+    )
+    .await;
+    // Запись заводится прямым запросом: она уже была создана в прошлом запуске,
+    // а свежий проход по ней с тех пор не выполнялся.
+    sqlx::query(
+        "INSERT INTO sender_sweep_rules(address, account_id, mode, last_full_pass_at)
+         VALUES('news@example.test', ?, 'only_last', datetime('now'))",
+    )
+    .bind(account)
+    .execute(&db.write_pool)
+    .await
+    .expect("запись автоочистки");
+
+    db.resume_stage_jobs().await.expect("запуск программы");
+    assert_eq!(
+        takeaways(&db, old).await.len(),
+        1,
+        "полный проход при запуске убрал прежнее письмо"
+    );
+    assert_eq!(takeaways(&db, old).await[0].2, Some(trash));
+    assert!(
+        takeaways(&db, last).await.is_empty(),
+        "последнее письмо остаётся"
+    );
     db.close().await;
 }
 
@@ -1084,12 +1307,414 @@ async fn busy_message_only_postpones_the_pass() {
     assert_eq!(report.queued, 1, "свободное письмо убрано");
     assert_eq!(report.skipped, 1, "занятое письмо пропущено со счётчиком");
     assert_eq!(report.state, SWEEP_JOB_WAITING);
+    assert_eq!(report.remaining, 1, "занятое письмо осталось в остатке");
     assert_eq!(
         takeaways(&db, busy).await.len(),
         1,
         "второй операции по занятому письму не появилось"
     );
     assert_eq!(takeaways(&db, free).await.len(), 1);
+
+    // Проход повторяется, пока письмо занято: остаток не тает сам собой.
+    let again = db
+        .continue_sender_sweep_job(report.id)
+        .await
+        .expect("повторный проход");
+    assert_eq!(again.state, SWEEP_JOB_WAITING);
+    assert_eq!(again.remaining, 1, "занятое письмо из остатка не выпало");
+
+    // Пользователь отменил своё перемещение: письмо освободилось, и проход
+    // возвращается именно к нему, хотя курсор давно ушёл вперёд.
+    sqlx::query("DELETE FROM outbox_ops WHERE message_id=?")
+        .bind(busy)
+        .execute(&db.write_pool)
+        .await
+        .expect("чужая операция отменена");
+    let finished = db
+        .continue_sender_sweep_job(report.id)
+        .await
+        .expect("проход после освобождения письма");
+    assert_eq!(
+        takeaways(&db, busy).await.len(),
+        1,
+        "освободившееся письмо убрано следующим проходом"
+    );
+    assert_eq!(finished.remaining, 0, "остаток сошёлся с настоящей работой");
+    assert_eq!(finished.state, SWEEP_JOB_COMPLETED);
+
+    // Пользователь передумал: отмена уборки удаляет неисполненные перемещения
+    // и возвращает письма стадиям - иначе они остались бы закрытыми навсегда.
+    db.cancel_sender_sweep_job(report.id)
+        .await
+        .expect("отмена уборки");
+    assert!(takeaways(&db, busy).await.is_empty());
+    assert!(takeaways(&db, free).await.is_empty());
+    for message in [busy, free] {
+        assert!(
+            closed_by(&db, message).await.is_none(),
+            "признак закрывшей стадии снят вместе с отменой перемещения"
+        );
+    }
+    db.close().await;
+}
+
+/// Обновление на непустой базе: запись блокировки, заведённая до первой
+/// синхронизации, не уводит в корзину всю прежнюю почту отправителя
+/// (blocked-senders.md S-021, S-030 - S-031). Стадия берёт только письма,
+/// сохранённые после обновления.
+#[tokio::test]
+async fn policy_added_before_first_sync_keeps_old_messages() {
+    let db = test_db("stage-cursor-seed").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    seed_folder(&db, account, "Trash", Some("trash")).await;
+    let mut old = Vec::new();
+    for uid in 0..5 {
+        old.push(
+            seed_message(
+                &db,
+                account,
+                inbox,
+                uid,
+                Seed {
+                    from: "news@example.test",
+                    subject: "прежний выпуск",
+                    ..Seed::default()
+                },
+            )
+            .await,
+        );
+    }
+    // База прежней версии стадий не знала и строк курсора не содержит:
+    // обновление должно завести их само.
+    sqlx::query("DELETE FROM stage_progress")
+        .execute(&db.write_pool)
+        .await
+        .expect("база до стадий");
+    db.migrate().await.expect("обновление");
+
+    db.save_sender_policy(
+        POLICY_KIND_ADDRESS,
+        "news@example.test",
+        POLICY_DECISION_BLOCKED,
+        false,
+    )
+    .await
+    .expect("запись блокировки до первой синхронизации");
+    db.process_sync_batch_stages().await.expect("стадии");
+    for message in &old {
+        assert!(
+            takeaways(&db, *message).await.is_empty(),
+            "прежняя почта остаётся на месте: согласия на её уборку не было"
+        );
+    }
+
+    // Новое письмо того же отправителя стадия уводит как обычно.
+    let fresh = seed_message(
+        &db,
+        account,
+        inbox,
+        10,
+        Seed {
+            from: "news@example.test",
+            subject: "новый выпуск",
+            ..Seed::default()
+        },
+    )
+    .await;
+    db.process_sync_batch_stages().await.expect("стадии");
+    assert_eq!(takeaways(&db, fresh).await.len(), 1);
+    db.close().await;
+}
+
+/// Подозрительная коллизия идентификатора не объединяет переписки, а связь,
+/// подтверждённая письмом одной из записей, объединяет
+/// (ignore-conversation.md S-045, S-046).
+#[tokio::test]
+async fn forged_identifier_does_not_merge_conversations() {
+    let db = test_db("stage-ignore-merge").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    seed_folder(&db, account, "Trash", Some("trash")).await;
+    let first_root = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "one@example.test",
+            subject: "Первая",
+            message_id: Some("<first@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let second_root = seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Seed {
+            from: "two@example.test",
+            subject: "Вторая",
+            message_id: Some("<second@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    for message in [first_root, second_root] {
+        let preview = db
+            .preview_ignore_conversation(message)
+            .await
+            .expect("предпросмотр");
+        db.enable_ignore_conversation(message, &preview.snapshot_key, true)
+            .await
+            .expect("включение игнорирования");
+    }
+    assert_eq!(
+        db.list_ignored_conversations().await.expect("список").len(),
+        2
+    );
+
+    // Чужое письмо со ссылками сразу на обе переписки: своим его не признаёт
+    // ни одна запись, поэтому наборы объединять нельзя.
+    let forged = seed_message(
+        &db,
+        account,
+        inbox,
+        3,
+        Seed {
+            from: "stranger@example.test",
+            subject: "Подделка",
+            message_id: Some("<forged@example.test>"),
+            references: Some("<first@example.test> <second@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let preview = db
+        .preview_ignore_conversation(forged)
+        .await
+        .expect("предпросмотр подделки");
+    let refused = db
+        .enable_ignore_conversation(forged, &preview.snapshot_key, true)
+        .await;
+    assert!(refused.is_err(), "подделанные ссылки наборы не объединяют");
+    let records = db.list_ignored_conversations().await.expect("список");
+    assert_eq!(records.len(), 2, "записи остались раздельными");
+    assert!(
+        records.iter().any(|record| record.last_error.is_some()),
+        "коллизия записана как отказ и видна пользователю"
+    );
+
+    // Настоящая связь: письмо первой переписки отвечает письму второй, поэтому
+    // первая запись признаёт его своим и цепочка подтверждена.
+    let bridge = seed_message(
+        &db,
+        account,
+        inbox,
+        4,
+        Seed {
+            from: "one@example.test",
+            subject: "Re: Первая",
+            message_id: Some("<bridge@example.test>"),
+            in_reply_to: Some("<first@example.test>"),
+            references: Some("<second@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    db.process_sync_batch_stages().await.expect("стадии");
+    let preview = db
+        .preview_ignore_conversation(bridge)
+        .await
+        .expect("предпросмотр связи");
+    db.enable_ignore_conversation(bridge, &preview.snapshot_key, true)
+        .await
+        .expect("слияние по подтверждённой цепочке");
+    assert_eq!(
+        db.list_ignored_conversations().await.expect("список").len(),
+        1,
+        "подтверждённая цепочка объединила записи"
+    );
+    db.close().await;
+}
+
+/// Пределы набора и числа записей: набор, упёршийся в предел идентификаторов,
+/// переходит в частичное покрытие, а тысяча первая переписка не включается
+/// (ignore-conversation.md S-028, S-029).
+#[tokio::test]
+async fn conversation_limits_are_enforced() {
+    let db = test_db("stage-ignore-limits").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    seed_folder(&db, account, "Trash", Some("trash")).await;
+    let references = (0..MAX_CONVERSATION_IDS + 200)
+        .map(|index| format!("<ref{index}@example.test>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let root = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "one@example.test",
+            subject: "Длинная переписка",
+            message_id: Some("<huge@example.test>"),
+            references: Some(&references),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let preview = db
+        .preview_ignore_conversation(root)
+        .await
+        .expect("предпросмотр");
+    assert!(preview.partial, "набор упёрся в предел идентификаторов");
+    let record = db
+        .enable_ignore_conversation(root, &preview.snapshot_key, true)
+        .await
+        .expect("включение");
+    assert!(record.partial);
+    assert!(
+        record.ids_count <= MAX_CONVERSATION_IDS as i64,
+        "в наборе не больше предела идентификаторов"
+    );
+
+    // Предел числа записей: остальные заводятся прямым запросом, потому что
+    // тысяча настоящих переписок в проверке не нужна.
+    for index in 0..MAX_IGNORED_CONVERSATIONS - 1 {
+        sqlx::query("INSERT INTO ignored_conversations(account_id, subject) VALUES(?, ?)")
+            .bind(account)
+            .bind(format!("переписка {index}"))
+            .execute(&db.write_pool)
+            .await
+            .expect("запись");
+    }
+    let extra = seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Seed {
+            from: "two@example.test",
+            subject: "Ещё одна",
+            message_id: Some("<extra@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let preview = db
+        .preview_ignore_conversation(extra)
+        .await
+        .expect("предпросмотр");
+    let refused = db
+        .enable_ignore_conversation(extra, &preview.snapshot_key, true)
+        .await;
+    assert!(refused.is_err(), "тысяча первая переписка не включается");
+    db.close().await;
+}
+
+/// Удаление ящика: задания, записи игнорирования и записи автоочистки этого
+/// ящика уходят каскадом, общие списки и записи всех ящиков остаются
+/// (blocked-senders.md S-049, ignore-conversation.md S-050,
+/// sweep-by-sender.md S-045).
+#[tokio::test]
+async fn removing_account_keeps_shared_lists() {
+    let db = test_db("stage-account-delete").await;
+    let first = seed_account(&db, "first@example.test").await;
+    let second = seed_account(&db, "second@example.test").await;
+    let inbox = seed_folder(&db, first, "INBOX", Some("inbox")).await;
+    seed_folder(&db, first, "Trash", Some("trash")).await;
+    seed_folder(&db, second, "INBOX", Some("inbox")).await;
+    let root = seed_message(
+        &db,
+        first,
+        inbox,
+        1,
+        Seed {
+            from: "news@example.test",
+            subject: "Переписка",
+            message_id: Some("<root@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let preview = db
+        .preview_ignore_conversation(root)
+        .await
+        .expect("предпросмотр");
+    db.enable_ignore_conversation(root, &preview.snapshot_key, true)
+        .await
+        .expect("игнорирование");
+    let policy_preview = db
+        .preview_sender_policy(POLICY_KIND_ADDRESS, "news@example.test")
+        .await
+        .expect("предпросмотр списка");
+    let policy = db
+        .save_sender_policy(
+            POLICY_KIND_ADDRESS,
+            &policy_preview.value,
+            POLICY_DECISION_BLOCKED,
+            false,
+        )
+        .await
+        .expect("запись списка");
+    db.start_sender_policy_sweep(policy.id, &policy_preview.snapshot_key, true)
+        .await
+        .expect("уборка");
+    let sweep = SenderSweepInput {
+        address: "news@example.test".into(),
+        mode: SWEEP_MODE_ONLY_LAST.into(),
+        account_id: Some(first),
+        days: None,
+        sweep_archive: false,
+    };
+    let sweep_preview = db
+        .preview_sender_sweep(sweep.clone())
+        .await
+        .expect("предпросмотр автоочистки");
+    db.start_sender_sweep(sweep, &sweep_preview.snapshot_key)
+        .await
+        .expect("запись автоочистки");
+
+    // Ящик удаляется строкой таблицы: всё остальное уносит каскад схемы.
+    sqlx::query("DELETE FROM accounts WHERE id=?")
+        .bind(first)
+        .execute(&db.write_pool)
+        .await
+        .expect("удаление ящика");
+
+    let conversations = db.list_ignored_conversations().await.expect("переписки");
+    assert!(
+        conversations.is_empty(),
+        "записи игнорирования ушли вместе с ящиком"
+    );
+    let jobs: (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE account_id=?), count(*) FILTER (WHERE account_id=?)
+           FROM sender_policy_jobs",
+    )
+    .bind(first)
+    .bind(second)
+    .fetch_one(&db.pool)
+    .await
+    .expect("задания уборки");
+    assert_eq!(jobs.0, 0, "задания уборки удалённого ящика ушли каскадом");
+    assert_eq!(jobs.1, 1, "задание уборки оставшегося ящика сохранилось");
+    assert!(
+        db.list_sender_sweep_rules()
+            .await
+            .expect("автоочистка")
+            .is_empty(),
+        "запись автоочистки области ящика удалена"
+    );
+    let policies = db.list_sender_policies().await.expect("списки");
+    assert_eq!(
+        policies.len(),
+        1,
+        "общие списки отправителей переживают удаление ящика"
+    );
     db.close().await;
 }
 
@@ -1140,6 +1765,18 @@ async fn abandoned_jobs_return_to_pending_on_start() {
         .await
         .expect("состояние задания");
     assert_eq!(state.0, "pending");
+
+    // S-035: запуск программы продвигает задания сам, без действий
+    // пользователя и без синхронизации.
+    db.resume_stage_jobs().await.expect("запуск заданий");
+    let finished: (String,) = sqlx::query_as("SELECT state FROM sender_policy_jobs LIMIT 1")
+        .fetch_one(&db.pool)
+        .await
+        .expect("состояние задания после запуска");
+    assert_eq!(
+        finished.0, "completed",
+        "брошенная уборка доведена до конца"
+    );
     db.close().await;
 }
 

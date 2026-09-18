@@ -1,4 +1,3 @@
-// truemail UI module: sender-actions.js
 /* Блокировка отправителя, игнорирование переписки и автоочистка по
    отправителю: пункты меню письма, диалоги подтверждения и разделы настроек.
    Словарь подписей и проверки состава живут в modules/sender-lists.js, здесь
@@ -42,7 +41,7 @@ async function openBlockSenderDialog(message){
   const kind=overlay.querySelector('.sender-kind'),counts=overlay.querySelector('.sender-counts'),consent=overlay.querySelector('.sender-sweep-consent');
   let preview=null;
   const refresh=async()=>{
-    counts.textContent=L('Считаю письма…','Counting messages…');
+    counts.textContent=L('Считаю письма...','Counting messages...');
     try{
       preview=await window.tm.previewSenderPolicy(kind.value,kind.value==='domain'?choice.domain:choice.address);
       const lines=preview.per_account.map(item=>`${item.email}: ${item.count}`).join('; ');
@@ -94,13 +93,16 @@ async function openSweepSenderDialog(message){
   const form=()=>({mode:mode.value,accountId:scope.value==='all'?null:Number(scope.value),days:daysValue.value,sweepArchive:archive.checked});
   const refresh=async()=>{
     days.classList.toggle('hidden',mode.value!=='older_than');
-    if(mode.value==='new_now'){preview=null;counts.textContent=L('Будет создано обычное правило: новые письма этого отправителя сразу уйдут в корзину.','An ordinary rule will be created: new messages from this sender go straight to trash.');return;}
     if(mode.value==='older_than'&&!senderListsModel.validSweepDays(daysValue.value)){preview=null;counts.textContent=L('Число дней задаётся целым от 1 до 3650','The number of days is a whole number from 1 to 3650');return;}
-    counts.textContent=L('Считаю письма…','Counting messages…');
+    counts.textContent=L('Считаю письма...','Counting messages...');
     try{
+      // S-010, S-011: все четыре режима идут общим путём просмотра, поэтому
+      // ключ снимка есть и у режима "новые сразу".
       preview=await window.tm.previewSenderSweep(senderListsModel.sweepInput(choice,form()));
       const folders=preview.folders.map(item=>`${item.name}: ${item.count}`).join('; ');
-      counts.textContent=`${L('Уйдёт в корзину писем','Messages going to trash')}: ${preview.total}${folders?` (${folders})`:''}`;
+      counts.textContent=mode.value==='new_now'
+        ?`${L('Уже получено писем','Messages already received')}: ${preview.total}${folders?` (${folders})`:''}. ${L('Они останутся на месте, в корзину пойдут только новые.','They stay where they are, only new messages go to trash.')}`
+        :`${L('Уйдёт в корзину писем','Messages going to trash')}: ${preview.total}${folders?` (${folders})`:''}`;
     }catch(error){preview=null;counts.textContent=String(error?.message||error);}
   };
   mode.onchange=refresh;scope.onchange=refresh;archive.onchange=refresh;daysValue.oninput=refresh;
@@ -108,11 +110,14 @@ async function openSweepSenderDialog(message){
   overlay.querySelector('.sender-apply').onclick=async()=>{
     const input=senderListsModel.sweepInput(choice,form());
     if(input.mode==='older_than'&&!senderListsModel.validSweepDays(input.days)){showToast(L('Число дней задаётся целым от 1 до 3650','The number of days is a whole number from 1 to 3650'));return;}
-    if(input.mode!=='new_now'&&!preview){showToast(L('Список писем устарел, откройте окно заново','The message list is out of date, open the dialog again'));return;}
+    if(!preview){showToast(L('Список писем устарел, откройте окно заново','The message list is out of date, open the dialog again'));return;}
     // S-010: подтверждение с числом писем требуется всегда, даже когда их мало.
-    if(input.mode!=='new_now'&&!await confirmAction(`${L('Убрать в корзину писем','Move to trash')}: ${preview.total}. ${L('Продолжить?','Continue?')}`))return;
+    const question=input.mode==='new_now'
+      ?`${L('Новые письма этого отправителя пойдут в корзину. Уже полученных писем','New messages from this sender go to trash. Messages already received')}: ${preview.total}, ${L('они останутся на месте.','they stay where they are.')} ${L('Продолжить?','Continue?')}`
+      :`${L('Убрать в корзину писем','Move to trash')}: ${preview.total}. ${L('Продолжить?','Continue?')}`;
+    if(!await confirmAction(question))return;
     try{
-      const report=await window.tm.startSenderSweep(input,preview?preview.snapshot_key:'');
+      const report=await window.tm.startSenderSweep(input,preview.snapshot_key);
       showToast(`${L('Автоочистка запущена','Clean-up started')}: ${senderListsModel.sweepReportText(report,senderLang())}`);
       close();await reloadSenderSections();
     }catch(error){showToast(error);}
@@ -174,6 +179,10 @@ function renderSenderPolicies(){
       if(policy.job_state)text.textContent+=` - ${L('идёт уборка','clean-up in progress')}`;
       if(policy.last_error)text.textContent+=` - ${policy.last_error}`;
       if(policy.failed)text.textContent+=` - ${L('необработанных писем','unprocessed messages')}: ${policy.failed}`;
+      // S-048: поздний отказ очереди виден здесь же - письмо осталось на
+      // месте уже после успешного прохода.
+      const queue=senderListsModel.queueFailureText(policy,senderLang());
+      if(queue)text.textContent+=` - ${queue}`;
       const remove=document.createElement('button');remove.type='button';remove.className='btn sm';
       remove.textContent=L('Удалить','Delete');
       remove.onclick=async()=>{
@@ -200,15 +209,15 @@ function renderIgnoredConversations(){
   ignoredConversations.forEach(record=>{
     const row=document.createElement('div');row.className='rule-failed-row';
     const text=document.createElement('span');
-    const partial=record.partial?` - ${L('частичное покрытие','partial coverage')}`:'';
-    const failed=record.failed?`, ${L('не вернулось','not returned')}: ${record.failed}`:'';
-    const skipped=record.skipped?`, ${L('пропущено','skipped')}: ${record.skipped}`:'';
-    text.textContent=`${record.subject||L('без темы','no subject')} (${record.account_email}) - ${senderListsModel.ignoreStateText(record.state,senderLang())}${partial}, ${L('убрано писем','messages moved')}: ${record.moved}${skipped}${failed}`;
-    if(record.last_error)text.textContent+=` - ${record.last_error}`;
+    // S-031: участники и дата включения нужны, чтобы отличить похожие
+    // переписки до прекращения игнорирования.
+    text.textContent=senderListsModel.ignoreRowText(record,senderLang());
     row.appendChild(text);
-    if(record.state!=='disabled'){
+    // S-032, S-035: команда прекращения показывается только там, где она
+    // допустима. Пока идёт возврат, повтор завёл бы второе задание.
+    if(record.state==='enabled'||record.state==='return_failed'){
       const stop=document.createElement('button');stop.type='button';stop.className='btn sm';
-      stop.textContent=L('Прекратить','Stop');
+      stop.textContent=record.state==='return_failed'?L('Повторить возврат','Retry return'):L('Прекратить','Stop');
       stop.onclick=()=>openStopIgnoringDialog(record.id);
       row.appendChild(stop);
     }
@@ -234,6 +243,13 @@ function renderSenderSweepRules(){
     const failed=rule.failed?`, ${L('отказов','failures')}: ${rule.failed}`:'';
     text.textContent=`${rule.address} - ${senderListsModel.sweepModeText(rule.mode,rule.days,senderLang())} (${senderListsModel.sweepScopeText(rule,coreAccounts,senderLang())}), ${L('убрано писем','messages moved')}: ${rule.queued}${failed}${pass}`;
     if(rule.last_error)text.textContent+=` - ${rule.last_error}`;
+    const queue=senderListsModel.queueFailureText(rule,senderLang());
+    if(queue)text.textContent+=` - ${queue}`;
+    // S-028: режим, число дней и согласие на архив меняются правкой записи, а
+    // не удалением и созданием заново.
+    const edit=document.createElement('button');edit.type='button';edit.className='btn sm';
+    edit.textContent=L('Изменить','Edit');
+    edit.onclick=()=>openSweepRuleDialog(rule);
     const remove=document.createElement('button');remove.type='button';remove.className='btn sm';
     remove.textContent=L('Удалить','Delete');
     remove.onclick=async()=>{
@@ -241,9 +257,37 @@ function renderSenderSweepRules(){
       if(!await confirmAction(L('Удалить автоочистку? Уже убранные письма останутся в корзине.','Delete the clean-up? Messages already moved stay in trash.')))return;
       try{await window.tm.deleteSenderSweepRule(rule.id);await reloadSenderSections();}catch(error){showToast(error);}
     };
-    row.append(toggle,text,remove);host.appendChild(row);
+    row.append(toggle,text,edit,remove);host.appendChild(row);
   });
   renderIcons(host);
+}
+
+/* Правка записи автоочистки: режим, число дней и согласие на архив меняются
+   одной командой ядра (S-028). */
+function openSweepRuleDialog(rule){
+  const lang=senderLang();
+  const modes=senderListsModel.SWEEP_MODES
+    .filter(mode=>mode.id==='only_last'||mode.id==='older_than')
+    .map(mode=>`<option value="${mode.id}">${escapeHtml(lang==='en'?mode.en:mode.ru)}</option>`).join('');
+  const body=`<p class="note-muted">${escapeHtml(L('Отправитель','Sender'))}: ${escapeHtml(rule.address)}</p>
+    <div class="fld"><label>${escapeHtml(L('Что делать','What to do'))}</label><select class="sel sweep-mode">${modes}</select></div>
+    <div class="fld sweep-days hidden"><label>${escapeHtml(L('Старше скольких дней','Older than how many days'))}</label><input class="inp sweep-days-value" type="number" min="1" max="3650" step="1" value="30"></div>
+    <label class="aux-check"><input type="checkbox" class="sweep-archive"> <span>${escapeHtml(L('Убирать письма и из архива','Clean up archived messages too'))}</span></label>`;
+  const {overlay,close}=senderDialog(L('Изменить автоочистку','Edit clean-up'),body,L('Сохранить','Save'));
+  const mode=overlay.querySelector('.sweep-mode'),days=overlay.querySelector('.sweep-days');
+  const daysValue=overlay.querySelector('.sweep-days-value'),archive=overlay.querySelector('.sweep-archive');
+  mode.value=rule.mode;archive.checked=Boolean(rule.sweep_archive);
+  if(rule.days)daysValue.value=String(rule.days);
+  const toggleDays=()=>days.classList.toggle('hidden',mode.value!=='older_than');
+  mode.onchange=toggleDays;toggleDays();
+  overlay.querySelector('.sender-apply').onclick=async()=>{
+    const wanted=mode.value==='older_than'?Number(daysValue.value):null;
+    if(mode.value==='older_than'&&!senderListsModel.validSweepDays(daysValue.value)){showToast(L('Число дней задаётся целым от 1 до 3650','The number of days is a whole number from 1 to 3650'));return;}
+    try{
+      await window.tm.updateSenderSweepMode(rule.id,mode.value,wanted,archive.checked);
+      close();await reloadSenderSections();
+    }catch(error){showToast(error);}
+  };
 }
 
 /* Незавершённые уборки: продолжение не должно зависеть от окна, в котором
@@ -282,8 +326,13 @@ async function reloadSenderSections(){
 }
 window.reloadSenderSections=reloadSenderSections;
 /* Смена языка перерисовывает уже прочитанные записи, не обращаясь к ядру
-   заново: подписи собраны в коде и сами по себе не меняются. */
-window.relocalizeSenderSections=()=>{renderSenderPolicies();renderIgnoredConversations();renderSenderSweepRules();};
+   заново: подписи собраны в коде и сами по себе не меняются. Блок
+   незавершённых уборок перерисовывается вместе с разделами, иначе он остался
+   бы на прежнем языке (S-051, S-052, S-048 автоочистки). */
+window.relocalizeSenderSections=()=>{
+  renderSenderPolicies();renderIgnoredConversations();renderSenderSweepRules();
+  return renderSenderJobs();
+};
 
 /* Ручное добавление значения в список (S-045). */
 async function addSenderPolicyByHand(decision){

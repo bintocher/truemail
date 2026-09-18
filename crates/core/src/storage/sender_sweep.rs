@@ -8,8 +8,8 @@
 
 use super::Db;
 use super::stages::{
-    STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, WORKING_FOLDERS,
-    WORKING_FOLDERS_WITH_ARCHIVE,
+    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage,
+    WORKING_FOLDERS, WORKING_FOLDERS_WITH_ARCHIVE, needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -21,10 +21,27 @@ use sqlx::AssertSqlSafe;
 /// Вид снимка кандидатов уборки в общей таблице снимков.
 const SNAPSHOT_KIND: &str = "sender_sweep";
 
+/// Вид отложенных писем: у каждого рода заданий свой, номера заданий разных
+/// родов совпадают.
+const DEFERRAL_KIND: &str = "sender_sweep";
+
 /// Метка операции очереди, поставленной автоочисткой: по ней отменяются
 /// неисполненные перемещения и считаются неотменимые (S-041, S-042).
 fn sweep_marker(job_id: i64) -> String {
     format!("sender_sweep:{job_id}")
+}
+
+/// Состав уборки в ключе снимка: ключ, выданный для одной области, числа дней
+/// и согласия на архив, к другой уборке не подходит (S-011).
+fn sweep_payload(address: &str, input: &SenderSweepInput) -> String {
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        address.to_lowercase(),
+        input.mode,
+        input.account_id.unwrap_or(-1),
+        input.days.unwrap_or(0),
+        input.sweep_archive as i64
+    )
 }
 
 /// Граница возраста письма для режима "старше N дней": дата письма меньше
@@ -46,10 +63,14 @@ struct SweepJobRow {
     mode: String,
     days: Option<i64>,
     sweep_archive: i64,
+    snapshot_key: String,
     max_message_id: i64,
     cursor_message_id: i64,
     state: String,
     waits: i64,
+    /// Проход заведён приходом письма: полным проходом записи он не считается
+    /// (S-035, S-036).
+    triggered_by_message: i64,
 }
 
 /// Запись автоочистки в том объёме, который нужен стадии и полному проходу
@@ -68,6 +89,9 @@ struct SweepRuleRow {
 /// запроса не попадают.
 struct SweepScope {
     filter: String,
+    /// Только условие рабочих папок: уборка по снимку отбирает письма по его
+    /// строкам, но служебные папки не берёт и тогда.
+    folders: &'static str,
     address: String,
     account_id: Option<i64>,
     border: Option<String>,
@@ -107,6 +131,7 @@ impl SweepScope {
         }
         Self {
             filter,
+            folders,
             address: address.to_lowercase(),
             account_id,
             border,
@@ -193,41 +218,51 @@ impl Db {
             input.sweep_archive,
             keep,
         );
-        let folders = if input.mode == SWEEP_MODE_NEW_NOW {
-            Vec::new()
-        } else {
-            let sql = format!(
-                "SELECT m.folder_id, m.account_id, f.display_name, f.role, count(*)
-                   FROM messages m JOIN folders f ON f.id=m.folder_id
-                  WHERE {filter}
-                  GROUP BY m.folder_id ORDER BY count(*) DESC",
-                filter = scope.filter
-            );
-            let query = scope.bind(sqlx::query_as::<
+        // S-010, S-011: все четыре режима идут общим путём просмотра, и снимок
+        // хранит сами письма-кандидаты, а не только их число. Для режима
+        // "новые сразу" это уже полученные письма: они останутся на месте, но
+        // пользователь видит, скольких писем правило не коснётся.
+        let sql = format!(
+            "SELECT m.id, m.folder_id, m.account_id, f.display_name, f.role
+               FROM messages m JOIN folders f ON f.id=m.folder_id
+              WHERE {filter}
+              ORDER BY m.id",
+            filter = scope.filter
+        );
+        let rows = scope
+            .bind(sqlx::query_as::<
                 _,
-                (i64, i64, Option<String>, Option<String>, i64),
-            >(AssertSqlSafe(sql)));
-            query
-                .fetch_all(&mut *tx)
-                .await?
-                .into_iter()
-                .map(
-                    |(folder_id, account_id, name, role, count)| SenderSweepFolderCount {
-                        folder_id,
-                        account_id,
-                        name: name.unwrap_or_default(),
-                        role,
-                        count,
-                    },
-                )
-                .collect()
-        };
-        let total = folders.iter().map(|folder| folder.count).sum();
+                (i64, i64, i64, Option<String>, Option<String>),
+            >(AssertSqlSafe(sql)))
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut folders: Vec<SenderSweepFolderCount> = Vec::new();
+        let mut candidates: Vec<i64> = Vec::with_capacity(rows.len());
+        for (id, folder_id, account_id, name, role) in rows {
+            candidates.push(id);
+            match folders.iter_mut().find(|item| item.folder_id == folder_id) {
+                Some(found) => found.count += 1,
+                None => folders.push(SenderSweepFolderCount {
+                    folder_id,
+                    account_id,
+                    name: name.unwrap_or_default(),
+                    role,
+                    count: 1,
+                }),
+            }
+        }
+        folders.sort_by_key(|folder| std::cmp::Reverse(folder.count));
+        let total = candidates.len() as i64;
         let max_message_id = Self::max_message_id(&mut tx).await?;
-        let payload = format!("{}\n{}", address.to_lowercase(), input.mode);
-        let snapshot_key =
-            Self::save_stage_snapshot(&mut tx, SNAPSHOT_KIND, &payload, max_message_id, total)
-                .await?;
+        let payload = sweep_payload(&address, &input);
+        let snapshot_key = Self::save_stage_snapshot(
+            &mut tx,
+            SNAPSHOT_KIND,
+            &payload,
+            max_message_id,
+            &candidates,
+        )
+        .await?;
         tx.commit().await?;
         Ok(SenderSweepPreview {
             address,
@@ -251,22 +286,27 @@ impl Db {
         validate_sweep_input(&input).map_err(crate::Error::AccountConfig)?;
         let address =
             normalize_policy_address(&input.address).map_err(crate::Error::AccountConfig)?;
+        let mut tx = self.begin_write().await?;
+        // S-011: ключ снимка расходуется неделимо и для всех четырёх режимов,
+        // поэтому подтверждение нельзя применить к другой области, другому
+        // числу дней или другому согласию на архив.
+        let (payload, max_message_id, total) =
+            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        if payload != sweep_payload(&address, &input) {
+            return Err(crate::Error::AccountConfig(
+                "список писем относится к другой уборке, откройте подтверждение заново".into(),
+            ));
+        }
         if input.mode == SWEEP_MODE_NEW_NOW {
             // S-023, S-024: режим "новые сразу" целиком выражается обычным
-            // правилом и живёт в общем списке правил.
+            // правилом и живёт в общем списке правил. Уже полученные письма он
+            // не трогает, поэтому задание уборки не заводится.
+            tx.commit().await?;
             self.create_new_now_rule(&address, input.account_id).await?;
             return Ok(SenderSweepJobReport {
                 state: SWEEP_JOB_COMPLETED.into(),
                 ..SenderSweepJobReport::default()
             });
-        }
-        let mut tx = self.begin_write().await?;
-        let (payload, max_message_id, total) =
-            Self::take_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
-        if payload != format!("{}\n{}", address.to_lowercase(), input.mode) {
-            return Err(crate::Error::AccountConfig(
-                "список писем относится к другой уборке, откройте подтверждение заново".into(),
-            ));
         }
         // S-012: под уборку не подошло ни одного письма - разовая уборка не
         // создаётся.
@@ -316,7 +356,6 @@ impl Db {
         .bind(max_message_id)
         .fetch_one(&mut *tx)
         .await?;
-        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         self.continue_sender_sweep_job(job.0).await
     }
@@ -370,7 +409,20 @@ impl Db {
                     coalesce((SELECT sum(j.failed) FROM sender_sweep_jobs j WHERE j.rule_id=r.id), 0) AS failed,
                     (SELECT j.state FROM sender_sweep_jobs j
                       WHERE j.rule_id=r.id ORDER BY j.id DESC LIMIT 1) AS job_state,
-                    r.last_error
+                    r.last_error,
+                    (SELECT count(*) FROM outbox_ops o
+                      WHERE o.status='failed'
+                        AND (json_extract(o.payload, '$.rule_id')='sender_sweep_rule:' || r.id
+                             OR json_extract(o.payload, '$.rule_id') IN
+                                (SELECT 'sender_sweep:' || j.id FROM sender_sweep_jobs j
+                                  WHERE j.rule_id=r.id))) AS queue_failed,
+                    (SELECT o.last_error FROM outbox_ops o
+                      WHERE o.status='failed'
+                        AND (json_extract(o.payload, '$.rule_id')='sender_sweep_rule:' || r.id
+                             OR json_extract(o.payload, '$.rule_id') IN
+                                (SELECT 'sender_sweep:' || j.id FROM sender_sweep_jobs j
+                                  WHERE j.rule_id=r.id))
+                      ORDER BY o.id DESC LIMIT 1) AS queue_error
                FROM sender_sweep_rules r
               ORDER BY r.created_at, r.id",
         )
@@ -454,8 +506,8 @@ impl Db {
     pub async fn continue_sender_sweep_job(&self, job_id: i64) -> Result<SenderSweepJobReport> {
         let mut tx = self.begin_write().await?;
         let job: Option<SweepJobRow> = sqlx::query_as(
-            "SELECT rule_id, account_id, address, mode, days, sweep_archive, max_message_id,
-                    cursor_message_id, state, waits
+            "SELECT rule_id, account_id, address, mode, days, sweep_archive, snapshot_key,
+                    max_message_id, cursor_message_id, state, waits, triggered_by_message
                FROM sender_sweep_jobs WHERE id=?",
         )
         .bind(job_id)
@@ -473,10 +525,12 @@ impl Db {
             mode,
             days,
             sweep_archive,
+            snapshot_key,
             max_message_id,
             cursor_message_id: cursor,
             state,
             waits,
+            triggered_by_message,
         } = job;
         if matches!(state.as_str(), "completed" | "cancelled" | "failed") {
             return self.sender_sweep_job_report(job_id).await;
@@ -507,26 +561,48 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         let sweep_archive = sweep_archive != 0;
-        let keep = if mode == SWEEP_MODE_ONLY_LAST {
+        // Уборка по подтверждению идёт по строкам снимка: в корзину уходят
+        // ровно показанные пользователю письма. У полного прохода записи
+        // снимка нет, и он отбирает письма условием самой записи.
+        let uses_snapshot = !snapshot_key.is_empty();
+        let keep = if mode == SWEEP_MODE_ONLY_LAST && !uses_snapshot {
             // Последнее письмо вычисляется внутри неделимой операции: приход
             // двух писем подряд заново определяет его до постановки
-            // перемещений.
+            // перемещений. Снимку это не нужно: последнее письмо в него не
+            // попало ещё при подсчёте.
             Self::last_message_of_sender(&mut tx, &address, account_id, sweep_archive).await?
         } else {
             None
         };
         let scope = SweepScope::build(&address, account_id, &mode, days, sweep_archive, keep);
+        let (join, filter) = if uses_snapshot {
+            (
+                "JOIN stage_snapshot_messages s ON s.message_id=m.id AND s.key=?",
+                scope.folders.to_owned(),
+            )
+        } else {
+            ("", scope.filter.clone())
+        };
+        // S-019: письмо, отложенное чужой незавершённой операцией, читается
+        // наравне с письмами после курсора, поэтому движение курсора не выводит
+        // его из остатка навсегда.
         let sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
-               FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE {filter} AND m.id>? AND m.id<=?
-              ORDER BY m.id LIMIT ?",
-            filter = scope.filter
+               FROM messages m JOIN folders f ON f.id=m.folder_id {join}
+              WHERE {filter} AND m.id<=? AND (m.id>? OR {DEFERRED_MESSAGES})
+              ORDER BY m.id LIMIT ?"
         );
-        let batch = scope
-            .bind(sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql)))
-            .bind(cursor)
+        let mut query = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql));
+        query = if uses_snapshot {
+            query.bind(&snapshot_key)
+        } else {
+            scope.bind(query)
+        };
+        let batch = query
             .bind(max_message_id)
+            .bind(cursor)
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
             .bind(STAGE_BATCH)
             .fetch_all(&mut *tx)
             .await?;
@@ -536,13 +612,15 @@ impl Db {
         let mut trash_missing = false;
         let marker = sweep_marker(job_id);
         for message in &batch {
-            last_id = message.id;
+            last_id = last_id.max(message.id);
             let trash = resolve_role_folder(&mut tx, message.account_id, "trash").await?;
             let Some((folder_id, path)) = trash else {
                 // S-003: ящик без корзины даёт отказ прохода для этого ящика,
-                // а письмо продолжает путь к правилам обработки.
+                // а письмо продолжает путь к правилам обработки. Повторять его
+                // незачем: без назначенной корзины отказ повторится тот же.
                 trash_missing = true;
                 counters.failed += 1;
+                Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
                 continue;
             };
             let outcome = queue_takeaway_operation(
@@ -558,12 +636,12 @@ impl Db {
             )
             .await?;
             // S-019: письмо с чужой незавершённой операцией пропускается в
-            // текущем проходе и остаётся в остатке.
-            if matches!(
-                outcome,
-                TakeawayOutcome::Conflict | TakeawayOutcome::Busy | TakeawayOutcome::Failed
-            ) {
+            // текущем проходе и повторяется следующим.
+            if needs_retry(&outcome) {
                 busy += 1;
+                Self::defer_stage_message(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+            } else {
+                Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
             }
             if counters.account(&outcome) {
                 sqlx::query("UPDATE messages SET closed_by_stage=? WHERE id=?")
@@ -574,14 +652,20 @@ impl Db {
             }
         }
         let remaining_sql = format!(
-            "SELECT count(*) FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE {filter} AND m.id>? AND m.id<=?",
-            filter = scope.filter
+            "SELECT count(*) FROM messages m JOIN folders f ON f.id=m.folder_id {join}
+              WHERE {filter} AND m.id<=? AND (m.id>? OR {DEFERRED_MESSAGES})"
         );
-        let remaining: (i64,) = scope
-            .bind(sqlx::query_as::<_, (i64,)>(AssertSqlSafe(remaining_sql)))
-            .bind(last_id)
+        let mut remaining_query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(remaining_sql));
+        remaining_query = if uses_snapshot {
+            remaining_query.bind(&snapshot_key)
+        } else {
+            scope.bind(remaining_query)
+        };
+        let remaining: (i64,) = remaining_query
             .bind(max_message_id)
+            .bind(last_id)
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
             .fetch_one(&mut *tx)
             .await?;
         // S-020, S-021: ожидание чужой операции назначается не раньше чем через
@@ -618,7 +702,9 @@ impl Db {
         .bind(counters.queued)
         .bind(counters.skipped)
         .bind(counters.failed)
-        .bind(remaining.0 + busy)
+        // Остаток уже включает отложенные письма: второй раз их считать
+        // нельзя, иначе пользователю показывается несуществующая работа.
+        .bind(remaining.0)
         .bind(if trash_missing {
             Some("в ящике нет папки с ролью корзины")
         } else {
@@ -627,8 +713,17 @@ impl Db {
         .bind(job_id)
         .execute(&mut *tx)
         .await?;
+        if matches!(
+            next_state,
+            SWEEP_JOB_COMPLETED | SWEEP_JOB_FAILED | SWEEP_JOB_CANCELLED
+        ) {
+            Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
+        }
         if let Some(rule_id) = rule_id
             && next_state == SWEEP_JOB_COMPLETED
+            // S-036: проход, заведённый приходом письма, полным не считается и
+            // суточный срок записи не сбрасывает.
+            && triggered_by_message == 0
         {
             // S-035: полный проход записи отмечается временем завершения.
             sqlx::query(
@@ -654,20 +749,10 @@ impl Db {
     pub async fn cancel_sender_sweep_job(&self, job_id: i64) -> Result<SenderSweepJobReport> {
         let mut tx = self.begin_write().await?;
         let marker = sweep_marker(job_id);
-        let irreversible: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=? AND status NOT IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "DELETE FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=? AND status IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .execute(&mut *tx)
-        .await?;
+        let irreversible = Self::count_irreversible_operations(&mut tx, &marker).await?;
+        // Признак закрывшей стадии снимается вместе с отменой перемещения:
+        // иначе письмо осталось бы закрытым навсегда.
+        Self::cancel_marked_operations(&mut tx, &marker).await?;
         let changed = sqlx::query(
             "UPDATE sender_sweep_jobs SET state='cancelled', updated_at=datetime('now')
               WHERE id=?",
@@ -680,9 +765,10 @@ impl Db {
                 "проход уборки не найден".into(),
             ));
         }
+        Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
         tx.commit().await?;
         let mut report = self.sender_sweep_job_report(job_id).await?;
-        report.irreversible = irreversible.0;
+        report.irreversible = irreversible;
         Ok(report)
     }
 
@@ -721,6 +807,29 @@ impl Db {
         )
         .execute(&self.write_pool)
         .await?;
+        Ok(())
+    }
+
+    /// Полный проход каждой включённой записи при запуске программы (S-035).
+    /// По одному лишь суточному сроку он бы не начался, и запись, заведённая
+    /// без работающей синхронизации, не срабатывала бы вовсе.
+    pub(crate) async fn start_sender_sweep_full_passes(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let max_message_id = Self::max_message_id(&mut tx).await?;
+        sqlx::query(
+            "INSERT INTO sender_sweep_jobs(rule_id, account_id, address, mode, days,
+                                           sweep_archive, max_message_id)
+             SELECT r.id, r.account_id, r.address, r.mode, r.days, r.sweep_archive, ?
+               FROM sender_sweep_rules r
+              WHERE r.enabled=1
+                AND NOT EXISTS (SELECT 1 FROM sender_sweep_jobs j
+                                 WHERE j.rule_id=r.id
+                                   AND j.state IN ('pending','running','waiting_operation'))",
+        )
+        .bind(max_message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -817,10 +926,19 @@ impl Db {
                 continue;
             };
             let address = canonical_sender_address(address).to_lowercase();
-            let Some(rule) = rules.iter().find(|rule| {
-                rule.address.to_lowercase() == address
-                    && rule.account_id.is_none_or(|id| id == message.account_id)
-            }) else {
+            // S-026: запись своего ящика точнее записи всех ящиков, поэтому
+            // пересекающиеся области применяются в явном порядке, а не в
+            // случайном порядке чтения базы.
+            let same_address = |rule: &&SweepRuleRow| rule.address.to_lowercase() == address;
+            let Some(rule) = rules
+                .iter()
+                .find(|rule| same_address(rule) && rule.account_id == Some(message.account_id))
+                .or_else(|| {
+                    rules
+                        .iter()
+                        .find(|rule| same_address(rule) && rule.account_id.is_none())
+                })
+            else {
                 continue;
             };
             let (rule_id, account_id, mode, days) =
@@ -919,8 +1037,9 @@ impl Db {
             }
             sqlx::query(
                 "INSERT INTO sender_sweep_jobs(rule_id, account_id, address, mode, days,
-                                               sweep_archive, max_message_id)
-                 SELECT id, account_id, address, mode, days, sweep_archive, ?
+                                               sweep_archive, max_message_id,
+                                               triggered_by_message)
+                 SELECT id, account_id, address, mode, days, sweep_archive, ?, 1
                    FROM sender_sweep_rules WHERE id=? AND enabled=1",
             )
             .bind(max_message_id)

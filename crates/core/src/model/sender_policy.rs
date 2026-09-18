@@ -55,9 +55,16 @@ pub struct SenderPolicy {
     /// Причина отказа последней уборки или стадии (S-003, S-048).
     #[sqlx(default)]
     pub last_error: Option<String>,
-    /// Число писем, по которым операция дошла до отказа (S-048).
+    /// Число писем, по которым не удалось поставить перемещение (S-048).
     #[sqlx(default)]
     pub failed: i64,
+    /// Число писем, перемещение которых дошло до постоянного отказа очереди уже
+    /// после успешного прохода (S-048).
+    #[sqlx(default)]
+    pub queue_failed: i64,
+    /// Причина последнего постоянного отказа очереди (S-048).
+    #[sqlx(default)]
+    pub queue_error: Option<String>,
 }
 
 /// Предварительный просмотр блокировки: канонический вид значения, ключ
@@ -172,6 +179,15 @@ pub fn normalize_policy_address(value: &str) -> Result<String, String> {
             if trimmed[open + 1..close].contains('<') || trimmed[open + 1..close].contains('>') {
                 return Err("в значении несколько адресов".into());
             }
+            // S-013: текст после закрывающей скобки и адрес в отображаемом
+            // имени отклоняются. Молча отброшенный хвост создал бы запись не
+            // для того адреса, который видит пользователь.
+            if !trimmed[close + 1..].trim().is_empty() {
+                return Err("в значении есть лишний текст после адреса".into());
+            }
+            if trimmed[..open].contains('@') {
+                return Err("в значении несколько адресов".into());
+            }
             trimmed[open + 1..close].trim()
         }
         (None, None) => trimmed,
@@ -183,9 +199,6 @@ pub fn normalize_policy_address(value: &str) -> Result<String, String> {
     // S-013: несколько адресов в одном значении не принимаются.
     if inner.contains(',') || inner.contains(';') || inner.contains(char::is_whitespace) {
         return Err("в значении несколько адресов".into());
-    }
-    if inner.len() > MAX_ADDRESS_BYTES {
-        return Err(format!("адрес длиннее {MAX_ADDRESS_BYTES} байт"));
     }
     // S-008: ровно один знак "@" вне кавычек. Кавычки в локальной части
     // допускаются стандартом, но знак "@" внутри них адреса не разделяет.
@@ -214,7 +227,14 @@ pub fn normalize_policy_address(value: &str) -> Result<String, String> {
         return Err("в локальной части адреса есть управляющий символ".into());
     }
     let domain = normalize_policy_domain(domain)?;
-    Ok(format!("{local}@{domain}"))
+    let canonical = format!("{local}@{domain}");
+    // S-011: предел проверяется по канонической форме. Общая форма
+    // международного домена длиннее исходной записи, и адрес, влезавший в
+    // предел до преобразования, может выйти за него после.
+    if canonical.len() > MAX_ADDRESS_BYTES {
+        return Err(format!("адрес длиннее {MAX_ADDRESS_BYTES} байт"));
+    }
+    Ok(canonical)
 }
 
 /// Нормализовать значение записи по её виду (S-013).
@@ -296,6 +316,11 @@ mod tests {
             "user@localhost",
             "\"open@example.test",
             "",
+            // Хвост за угловыми скобками и второй адрес в отображаемом имени:
+            // из такого значения прежде молча бралась одна часть, и запись
+            // создавалась не для того адреса, который видит пользователь.
+            "Имя <boss@example.test> и ещё текст",
+            "other@example.test <boss@example.test>",
         ] {
             assert!(
                 normalize_policy_address(broken).is_err(),

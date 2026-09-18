@@ -59,6 +59,13 @@ pub struct IgnoredConversation {
     pub skipped: i64,
     pub failed: i64,
     pub last_error: Option<String>,
+    /// Письма, перемещение которых дошло до постоянного отказа очереди уже
+    /// после успешного прохода (S-049).
+    #[sqlx(default)]
+    pub queue_failed: i64,
+    /// Причина последнего постоянного отказа очереди (S-049).
+    #[sqlx(default)]
+    pub queue_error: Option<String>,
 }
 
 /// Предварительный просмотр включения игнорирования (S-013, S-014).
@@ -186,6 +193,14 @@ pub fn truncate_snapshot(value: &str) -> String {
 /// завершён или не начинался (S-035).
 pub fn can_enable_again(state: &str) -> bool {
     matches!(state, IGNORE_STATE_ENABLED | IGNORE_STATE_DISABLED)
+}
+
+/// Состояние записи принимает команду прекращения (S-032). Пока идёт
+/// прекращение или возврат, вторая такая команда завела бы второе задание
+/// возврата на те же письма; после неполного возврата повтор разрешён -
+/// письма могли появиться в корзине позже.
+pub fn can_start_disable(state: &str) -> bool {
+    matches!(state, IGNORE_STATE_ENABLED | IGNORE_STATE_RETURN_FAILED)
 }
 
 #[cfg(test)]

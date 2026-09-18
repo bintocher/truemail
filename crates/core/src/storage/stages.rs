@@ -8,7 +8,9 @@
 
 use super::Db;
 use crate::Result;
+use crate::model::*;
 use crate::storage::repo::{TakeawayMessage, TakeawayOutcome};
+use sqlx::AssertSqlSafe;
 
 /// Рабочие папки: папка с ролью `inbox` и папка без роли. Папки с ролями
 /// `sent`, `drafts`, `spam` и `trash` рабочими не считаются ни в одной стадии,
@@ -24,6 +26,21 @@ pub(crate) const WORKING_FOLDERS_WITH_ARCHIVE: &str =
 
 /// Размер пачки стадии: то же число, что уже выбирает один проход правил.
 pub(crate) const STAGE_BATCH: i64 = 500;
+
+/// Условие отбора писем, отложенных этим заданием: они повторяются наравне с
+/// письмами после курсора, поэтому проход к ним возвращается.
+pub(crate) const DEFERRED_MESSAGES: &str =
+    "m.id IN (SELECT message_id FROM stage_job_deferrals WHERE kind=? AND job_id=?)";
+
+/// Исход постановки увода требует повторить письмо следующим проходом: чужая
+/// незавершённая операция и отказ очереди сами по себе не значат, что письмо
+/// убирать не нужно.
+pub(crate) fn needs_retry(outcome: &TakeawayOutcome) -> bool {
+    matches!(
+        outcome,
+        TakeawayOutcome::Conflict | TakeawayOutcome::Busy | TakeawayOutcome::Failed
+    )
+}
 
 /// Данные письма, которых хватает стадии: постановка увода, сверка отправителя
 /// и опознание переписки. Тело письма при этом не загружается.
@@ -133,16 +150,43 @@ impl Db {
         Ok(())
     }
 
-    /// Зафиксировать набор писем-кандидатов и вернуть ключ снимка. Границей
-    /// набора служит наибольший номер письма на момент подсчёта: письма,
-    /// пришедшие позже, получают больший номер и достаются стадии как новые.
+    /// Начальное значение курсора каждой стадии - наибольший номер письма в
+    /// базе. Без него запись, заведённая до первой успешной синхронизации,
+    /// досталась бы стадии вместе со всей историей писем и увела бы в корзину
+    /// письма, на уборку которых пользователь согласия не давал. Шаг
+    /// прикладной, а не частью миграции: уже применённая миграция не меняется.
+    pub(crate) async fn seed_stage_cursors(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        for stage in [
+            SENDER_POLICY_STAGE_NAME,
+            IGNORED_CONVERSATION_STAGE_NAME,
+            SENDER_SWEEP_STAGE_NAME,
+        ] {
+            // Строка заводится один раз: у работающей стадии значение своё, и
+            // назад курсор не двигается.
+            sqlx::query(
+                "INSERT OR IGNORE INTO stage_progress(stage, message_id)
+                 SELECT ?, coalesce(max(id), 0) FROM messages",
+            )
+            .bind(stage)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Зафиксировать набор писем-кандидатов и вернуть ключ снимка. Хранятся
+    /// сами номера писем, а не только их граница: по подтверждению в корзину
+    /// уходят ровно те письма, которые были показаны пользователю.
     pub(crate) async fn save_stage_snapshot(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         kind: &str,
         payload: &str,
         max_message_id: i64,
-        total: i64,
+        candidates: &[i64],
     ) -> Result<String> {
+        Self::purge_stale_snapshots_in_tx(tx, Some(kind)).await?;
         let key = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO stage_snapshots(key, kind, payload, max_message_id, total)
@@ -152,21 +196,34 @@ impl Db {
         .bind(kind)
         .bind(payload)
         .bind(max_message_id)
-        .bind(total)
+        .bind(candidates.len() as i64)
         .execute(&mut **tx)
         .await?;
+        for chunk in candidates.chunks(200) {
+            let values = vec!["(?, ?)"; chunk.len()].join(",");
+            let sql = format!(
+                "INSERT OR IGNORE INTO stage_snapshot_messages(key, message_id) VALUES {values}"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(&key).bind(id);
+            }
+            query.execute(&mut **tx).await?;
+        }
         Ok(key)
     }
 
-    /// Прочитать снимок по ключу. Подтверждение без снимка не принимается:
-    /// иначе в корзину ушло бы больше писем, чем показано пользователю.
-    pub(crate) async fn take_stage_snapshot(
+    /// Израсходовать снимок: строка снимка удаляется тем же запросом, которым
+    /// читается. Одно подтверждение пользователя запускает уборку один раз,
+    /// даже если команда пришла дважды. Строки кандидатов остаются заданию.
+    pub(crate) async fn consume_stage_snapshot(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         key: &str,
         kind: &str,
     ) -> Result<(String, i64, i64)> {
         let row: Option<(String, i64, i64)> = sqlx::query_as(
-            "SELECT payload, max_message_id, total FROM stage_snapshots WHERE key=? AND kind=?",
+            "DELETE FROM stage_snapshots WHERE key=? AND kind=?
+             RETURNING payload, max_message_id, total",
         )
         .bind(key)
         .bind(kind)
@@ -179,17 +236,147 @@ impl Db {
         })
     }
 
-    /// Снимок израсходован подтверждением: второй уборки по тому же ключу не
-    /// бывает, иначе одно подтверждение пользователя запускало бы её дважды.
-    pub(crate) async fn drop_stage_snapshot(
+    /// Убрать снимки, которых никто не подтвердил, и осиротевшие строки
+    /// кандидатов: диалог открывают часто, а подтверждают редко, и без уборки
+    /// строки копились бы навсегда.
+    pub(crate) async fn purge_stale_stage_snapshots(&self) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        Self::purge_stale_snapshots_in_tx(&mut tx, None).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn purge_stale_snapshots_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        key: &str,
+        kind: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("DELETE FROM stage_snapshots WHERE key=?")
-            .bind(key)
+        match kind {
+            Some(kind) => {
+                sqlx::query(
+                    "DELETE FROM stage_snapshots
+                      WHERE kind=? AND datetime(created_at) <= datetime('now', '-1 day')",
+                )
+                .bind(kind)
+                .execute(&mut **tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "DELETE FROM stage_snapshots
+                      WHERE datetime(created_at) <= datetime('now', '-1 day')",
+                )
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        // Строки кандидатов нужны, пока жив снимок или незавершённое задание,
+        // которое по нему убирает письма.
+        sqlx::query(
+            "DELETE FROM stage_snapshot_messages
+              WHERE key NOT IN (SELECT key FROM stage_snapshots)
+                AND key NOT IN (
+                    SELECT snapshot_key FROM sender_policy_jobs
+                     WHERE state IN ('pending','running')
+                    UNION SELECT snapshot_key FROM ignored_conversation_jobs
+                     WHERE state IN ('pending','running')
+                    UNION SELECT snapshot_key FROM sender_sweep_jobs
+                     WHERE state IN ('pending','running','waiting_operation'))",
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Отложить письмо до следующего прохода: его повторяют по номеру, поэтому
+    /// движение общего курсора не выводит его из остатка навсегда (S-019).
+    pub(crate) async fn defer_stage_message(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        kind: &str,
+        job_id: i64,
+        message_id: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO stage_job_deferrals(kind, job_id, message_id)
+             VALUES(?, ?, ?)",
+        )
+        .bind(kind)
+        .bind(job_id)
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Письмо обработано: откладывать его больше не нужно.
+    pub(crate) async fn clear_stage_deferral(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        kind: &str,
+        job_id: i64,
+        message_id: i64,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM stage_job_deferrals WHERE kind=? AND job_id=? AND message_id=?")
+            .bind(kind)
+            .bind(job_id)
+            .bind(message_id)
             .execute(&mut **tx)
             .await?;
         Ok(())
+    }
+
+    /// Задание закрыто: его отложенные письма больше никого не ждут.
+    pub(crate) async fn clear_stage_deferrals(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        kind: &str,
+        job_id: i64,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM stage_job_deferrals WHERE kind=? AND job_id=?")
+            .bind(kind)
+            .bind(job_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Отменить неисполненные перемещения по метке. Признак закрывшей стадии
+    /// снимается тем же запросом: без этого письмо оставалось бы закрытым
+    /// навсегда - правила его больше не разбирают, а в уведомление о новой
+    /// почте оно не попадает, хотя лежит во входящих.
+    pub(crate) async fn cancel_marked_operations(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        marker: &str,
+    ) -> Result<i64> {
+        sqlx::query(
+            "UPDATE messages SET closed_by_stage=NULL
+              WHERE id IN (SELECT message_id FROM outbox_ops
+                            WHERE json_extract(payload, '$.rule_id')=?
+                              AND status IN ('pending','retry'))",
+        )
+        .bind(marker)
+        .execute(&mut **tx)
+        .await?;
+        let cancelled = sqlx::query(
+            "DELETE FROM outbox_ops
+              WHERE json_extract(payload, '$.rule_id')=? AND status IN ('pending','retry')",
+        )
+        .bind(marker)
+        .execute(&mut **tx)
+        .await?;
+        Ok(cancelled.rows_affected() as i64)
+    }
+
+    /// Число перемещений по метке, которые отменить уже нельзя (S-042).
+    pub(crate) async fn count_irreversible_operations(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        marker: &str,
+    ) -> Result<i64> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM outbox_ops
+              WHERE json_extract(payload, '$.rule_id')=? AND status NOT IN ('pending','retry')",
+        )
+        .bind(marker)
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(row.0)
     }
 
     /// Наибольший номер письма: граница снимка кандидатов.

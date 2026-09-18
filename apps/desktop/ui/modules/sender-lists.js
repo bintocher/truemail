@@ -1,4 +1,3 @@
-// truemail UI module: sender-lists.js
 // Чистые функции без DOM и Tauri API: разбор адреса отправителя для диалогов,
 // подписи списков отправителей, игнорируемых переписок и записей автоочистки,
 // проверка числа дней и тексты отчётов. Подключается в index.html обычным
@@ -149,6 +148,45 @@ function policyRowText(policy, lang) {
   return `${kind}: ${policy.value} - ${decision}${swept}`;
 }
 
+// Поздний отказ очереди: письмо осталось на месте уже после того, как проход
+// отчитался об успехе (blocked-senders.md S-048, ignore-conversation.md S-049,
+// sweep-by-sender.md S-044).
+function queueFailureText(record, lang) {
+  if (!record || !record.queue_failed) return '';
+  const head = lang === 'en'
+    ? `queue failures ${record.queue_failed}`
+    : `отказов очереди: ${record.queue_failed}`;
+  return record.queue_error ? `${head} - ${record.queue_error}` : head;
+}
+
+// Подпись игнорируемой переписки: тема, ящик, участники, дата включения,
+// состояние, признак частичного покрытия и счётчики (ignore-conversation.md,
+// S-031).
+function ignoreRowText(record, lang) {
+  const subject = record.subject || (lang === 'en' ? 'no subject' : 'без темы');
+  const parts = [`${subject} (${record.account_email})`];
+  if (record.participants) parts.push(record.participants);
+  parts.push(lang === 'en' ? `since ${record.created_at}` : `включено ${record.created_at}`);
+  parts.push(ignoreStateText(record.state, lang));
+  if (record.partial) parts.push(lang === 'en' ? 'partial coverage' : 'частичное покрытие');
+  parts.push(lang === 'en'
+    ? `messages moved ${record.moved || 0}`
+    : `убрано писем: ${record.moved || 0}`);
+  if (record.returned) {
+    parts.push(lang === 'en' ? `returned ${record.returned}` : `возвращено: ${record.returned}`);
+  }
+  if (record.skipped) {
+    parts.push(lang === 'en' ? `skipped ${record.skipped}` : `пропущено: ${record.skipped}`);
+  }
+  if (record.failed) {
+    parts.push(lang === 'en' ? `not returned ${record.failed}` : `не вернулось: ${record.failed}`);
+  }
+  const queue = queueFailureText(record, lang);
+  if (queue) parts.push(queue);
+  if (record.last_error) parts.push(record.last_error);
+  return parts.join(' - ');
+}
+
 // Область записи автоочистки: один ящик либо все ящики (S-026, S-037).
 function sweepScopeText(rule, accounts, lang) {
   if (!rule.account_id) return lang === 'en' ? 'All mailboxes' : 'Все ящики';
@@ -173,5 +211,7 @@ const senderListsModel = {
   returnReportText,
   policyRowText,
   sweepScopeText,
+  queueFailureText,
+  ignoreRowText,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = senderListsModel;

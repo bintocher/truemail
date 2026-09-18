@@ -7,7 +7,8 @@
 
 use super::Db;
 use super::stages::{
-    STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, WORKING_FOLDERS,
+    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage,
+    WORKING_FOLDERS, needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -23,6 +24,15 @@ const SNAPSHOT_KIND: &str = "sender_policy";
 /// (S-037). Пять минут покрывают самую долгую пачку и не держат задание
 /// после закрытия программы.
 const LEASE_SECONDS: i64 = 300;
+
+/// Вид отложенных писем: у каждого рода заданий свой, номера заданий разных
+/// родов совпадают.
+const DEFERRAL_KIND: &str = "sender_policy";
+
+/// Метка операции очереди, поставленной списком отправителей (S-047).
+fn policy_marker(policy_id: i64) -> String {
+    format!("sender_policy:{policy_id}")
+}
 
 /// Решение списков по одному письму (S-014 - S-018).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +165,9 @@ fn sender_match_filter(kind: &str, value: &str) -> (String, Vec<String>) {
 impl Db {
     /// Списки для раздела настроек вместе со счётчиками уборки (S-045).
     pub async fn list_sender_policies(&self) -> Result<Vec<SenderPolicy>> {
+        // S-048: поздний отказ очереди виден в разделе отправителей. Счётчика
+        // отказов постановки для этого мало: письмо остаётся на месте уже
+        // после того, как проход отчитался об успехе.
         let rows: Vec<SenderPolicy> = sqlx::query_as(
             "SELECT p.id, p.kind, p.value, p.decision, p.created_at, p.updated_at, p.swept,
                     (SELECT j.state FROM sender_policy_jobs j
@@ -162,7 +175,15 @@ impl Db {
                       ORDER BY j.id LIMIT 1) AS job_state,
                     p.last_error,
                     coalesce((SELECT sum(j.failed) FROM sender_policy_jobs j
-                               WHERE j.policy_id=p.id), 0) AS failed
+                               WHERE j.policy_id=p.id), 0) AS failed,
+                    (SELECT count(*) FROM outbox_ops o
+                      WHERE o.status='failed'
+                        AND json_extract(o.payload, '$.rule_id')='sender_policy:' || p.id)
+                      AS queue_failed,
+                    (SELECT o.last_error FROM outbox_ops o
+                      WHERE o.status='failed'
+                        AND json_extract(o.payload, '$.rule_id')='sender_policy:' || p.id
+                      ORDER BY o.id DESC LIMIT 1) AS queue_error
                FROM sender_policies p
               ORDER BY p.decision, p.kind, p.value",
         )
@@ -221,25 +242,27 @@ impl Db {
             }
         }
         let (filter, binds) = sender_match_filter(kind, &canonical);
+        // Кандидаты читаются номерами, а не одним лишь количеством: снимок
+        // хранит сами письма, поэтому в корзину уходят ровно показанные
+        // пользователю письма (S-031).
         let sql = format!(
-            "SELECT m.account_id, count(*) FROM messages m
+            "SELECT m.id, m.account_id FROM messages m
                JOIN folders f ON f.id=m.folder_id
               WHERE {filter} AND {WORKING_FOLDERS}
-              GROUP BY m.account_id"
+              ORDER BY m.id"
         );
         let mut query = sqlx::query_as::<_, (i64, i64)>(AssertSqlSafe(sql));
         for bind in &binds {
             query = query.bind(bind);
         }
-        let counted = query.fetch_all(&mut *tx).await?;
+        let candidates = query.fetch_all(&mut *tx).await?;
         let mut per_account = Vec::new();
         let mut total = 0;
         for (account_id, email) in &own {
-            let count = counted
+            let count = candidates
                 .iter()
-                .find(|(id, _)| id == account_id)
-                .map(|(_, count)| *count)
-                .unwrap_or(0);
+                .filter(|(_, owner)| owner == account_id)
+                .count() as i64;
             total += count;
             per_account.push(SenderPolicyAccountCount {
                 account_id: *account_id,
@@ -247,10 +270,11 @@ impl Db {
                 count,
             });
         }
+        let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
         let max_message_id = Self::max_message_id(&mut tx).await?;
         let payload = format!("{kind}\n{canonical}");
         let snapshot_key =
-            Self::save_stage_snapshot(&mut tx, SNAPSHOT_KIND, &payload, max_message_id, total)
+            Self::save_stage_snapshot(&mut tx, SNAPSHOT_KIND, &payload, max_message_id, &ids)
                 .await?;
         tx.commit().await?;
         Ok(SenderPolicyPreview {
@@ -326,7 +350,8 @@ impl Db {
         .await?;
         let saved: SenderPolicy = sqlx::query_as(
             "SELECT id, kind, value, decision, created_at, updated_at, swept,
-                    NULL AS job_state, last_error, 0 AS failed
+                    NULL AS job_state, last_error, 0 AS failed, 0 AS queue_failed,
+                    NULL AS queue_error
                FROM sender_policies WHERE kind=? AND lower(value)=?",
         )
         .bind(kind)
@@ -348,7 +373,7 @@ impl Db {
     /// отменяются, а уже убранные письма остаются в корзине (S-039 - S-042).
     pub async fn delete_sender_policy(&self, id: i64) -> Result<SenderPolicyReleaseReport> {
         let mut tx = self.begin_write().await?;
-        let marker = format!("sender_policy:{id}");
+        let marker = policy_marker(id);
         let swept: Option<(i64,)> = sqlx::query_as("SELECT swept FROM sender_policies WHERE id=?")
             .bind(id)
             .fetch_optional(&mut *tx)
@@ -357,31 +382,18 @@ impl Db {
         let kept_in_trash = swept.map(|(value,)| value).unwrap_or(0);
         // S-042: операции, которые уже выполняются или выполнены, отменить
         // нельзя - их число называется пользователю.
-        let irreversible: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=?
-                AND status NOT IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .fetch_one(&mut *tx)
-        .await?;
-        // S-041: отменяются только неисполненные операции.
-        let cancelled = sqlx::query(
-            "DELETE FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=?
-                AND status IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .execute(&mut *tx)
-        .await?;
+        let irreversible = Self::count_irreversible_operations(&mut tx, &marker).await?;
+        // S-041: отменяются только неисполненные операции, и письма при этом
+        // возвращаются стадиям.
+        let cancelled = Self::cancel_marked_operations(&mut tx, &marker).await?;
         sqlx::query("DELETE FROM sender_policies WHERE id=?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         Ok(SenderPolicyReleaseReport {
-            cancelled: cancelled.rows_affected() as i64,
-            irreversible: irreversible.0,
+            cancelled,
+            irreversible,
             kept_in_trash,
         })
     }
@@ -411,8 +423,10 @@ impl Db {
                 "запись списка не найдена".into(),
             ));
         };
+        // Снимок расходуется неделимо: повторная команда с тем же ключом
+        // второй уборки не запускает.
         let (payload, max_message_id, _) =
-            Self::take_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
         if payload != format!("{kind}\n{value}") {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой записи, откройте подтверждение заново".into(),
@@ -438,7 +452,6 @@ impl Db {
             .await?;
             created.push(inserted.0);
         }
-        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         let mut reports = Vec::new();
         for job_id in created {
@@ -454,14 +467,14 @@ impl Db {
         job_id: i64,
     ) -> Result<SenderPolicySweepReport> {
         let mut tx = self.begin_write().await?;
-        let job: Option<(i64, i64, i64, i64, String)> = sqlx::query_as(
-            "SELECT policy_id, account_id, max_message_id, cursor_message_id, state
+        let job: Option<(i64, i64, String, i64, String)> = sqlx::query_as(
+            "SELECT policy_id, account_id, snapshot_key, cursor_message_id, state
                FROM sender_policy_jobs WHERE id=?",
         )
         .bind(job_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((policy_id, account_id, max_message_id, cursor, state)) = job else {
+        let Some((policy_id, account_id, snapshot_key, cursor, state)) = job else {
             return Err(crate::Error::AccountConfig(
                 "задание уборки не найдено".into(),
             ));
@@ -474,7 +487,7 @@ impl Db {
                 .bind(policy_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some((kind, value)) = policy else {
+        let Some((_, _)) = policy else {
             // Запись удалена во время уборки: задание закрывается, а уже
             // поставленные перемещения остаются на совести пользователя.
             sqlx::query(
@@ -484,6 +497,7 @@ impl Db {
             .bind(job_id)
             .execute(&mut *tx)
             .await?;
+            Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
             tx.commit().await?;
             return self.sender_policy_job_report(job_id).await;
         };
@@ -498,24 +512,29 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         let trash = crate::storage::repo::resolve_role_folder(&mut tx, account_id, "trash").await?;
-        let (filter, binds) = sender_match_filter(&kind, &value);
-        // S-034: служебные папки и архив уборка не берёт; переключателя уборки
-        // архива у списков отправителей нет.
+        // S-031, S-034: пачка берётся из строк снимка, поэтому отбор не зависит
+        // ни от записи списка, ни от границы номеров. Письма, отложенные чужой
+        // операцией, повторяются наравне с письмами после курсора.
         let sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.account_id=? AND m.id>? AND m.id<=? AND {filter} AND {WORKING_FOLDERS}
+               JOIN stage_snapshot_messages s ON s.message_id=m.id AND s.key=?
+              WHERE m.account_id=? AND {WORKING_FOLDERS}
+                AND (m.id>? OR {DEFERRED_MESSAGES})
               ORDER BY m.id LIMIT ?"
         );
-        let mut query = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql));
-        query = query.bind(account_id).bind(cursor).bind(max_message_id);
-        for bind in &binds {
-            query = query.bind(bind);
-        }
-        let batch = query.bind(STAGE_BATCH).fetch_all(&mut *tx).await?;
+        let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
+            .bind(&snapshot_key)
+            .bind(account_id)
+            .bind(cursor)
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
+            .bind(STAGE_BATCH)
+            .fetch_all(&mut *tx)
+            .await?;
         let mut counters = StageCounters::default();
         let mut last_id = cursor;
-        let marker = format!("sender_policy:{policy_id}");
+        let marker = policy_marker(policy_id);
         if let Some((folder_id, path)) = trash.clone() {
             for message in &batch {
                 let outcome = queue_takeaway_operation(
@@ -537,14 +556,21 @@ impl Db {
                         .execute(&mut *tx)
                         .await?;
                 }
-                last_id = message.id;
+                if needs_retry(&outcome) {
+                    Self::defer_stage_message(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+                } else {
+                    Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+                }
+                last_id = last_id.max(message.id);
             }
         } else {
             // S-003: ящик без корзины оставляет письма на месте, а причина
-            // показывается в разделе отправителей.
+            // показывается в разделе отправителей. Откладывать их незачем:
+            // без назначенной корзины повтор дал бы тот же отказ бесконечно.
             counters.failed += batch.len() as i64;
-            if let Some(message) = batch.last() {
-                last_id = message.id;
+            for message in &batch {
+                Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+                last_id = last_id.max(message.id);
             }
             sqlx::query(
                 "UPDATE sender_policies SET last_error=?, updated_at=datetime('now') WHERE id=?",
@@ -554,25 +580,30 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
-        // S-036: остаток снимка считается тем же условием отбора.
+        // S-036: остаток - письма снимка после курсора вместе с отложенными.
         let remaining_sql = format!(
             "SELECT count(*) FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.account_id=? AND m.id>? AND m.id<=? AND {filter} AND {WORKING_FOLDERS}"
+               JOIN stage_snapshot_messages s ON s.message_id=m.id AND s.key=?
+              WHERE m.account_id=? AND {WORKING_FOLDERS}
+                AND (m.id>? OR {DEFERRED_MESSAGES})"
         );
-        let mut remaining_query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(remaining_sql));
-        remaining_query = remaining_query
+        let remaining = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(remaining_sql))
+            .bind(&snapshot_key)
             .bind(account_id)
             .bind(last_id)
-            .bind(max_message_id);
-        for bind in &binds {
-            remaining_query = remaining_query.bind(bind);
-        }
-        let remaining = remaining_query.fetch_one(&mut *tx).await?.0;
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .0;
         let next_state = if remaining > 0 {
             "pending"
         } else {
             "completed"
         };
+        if next_state == "completed" {
+            Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
+        }
         sqlx::query(
             "UPDATE sender_policy_jobs
                 SET state=?, cursor_message_id=?, queued=queued+?, skipped=skipped+?,
@@ -615,21 +646,9 @@ impl Db {
                 "задание уборки не найдено".into(),
             ));
         };
-        let marker = format!("sender_policy:{policy_id}");
-        let irreversible: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=? AND status NOT IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .fetch_one(&mut *tx)
-        .await?;
-        let cancelled = sqlx::query(
-            "DELETE FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=? AND status IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .execute(&mut *tx)
-        .await?;
+        let marker = policy_marker(policy_id);
+        let irreversible = Self::count_irreversible_operations(&mut tx, &marker).await?;
+        let cancelled = Self::cancel_marked_operations(&mut tx, &marker).await?;
         sqlx::query(
             "UPDATE sender_policy_jobs SET state='cancelled', lease_expires_at=NULL,
                     updated_at=datetime('now') WHERE id=?",
@@ -637,10 +656,11 @@ impl Db {
         .bind(job_id)
         .execute(&mut *tx)
         .await?;
+        Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
         tx.commit().await?;
         Ok(SenderPolicyReleaseReport {
-            cancelled: cancelled.rows_affected() as i64,
-            irreversible: irreversible.0,
+            cancelled,
+            irreversible,
             kept_in_trash: 0,
         })
     }
@@ -764,7 +784,7 @@ impl Db {
                     path,
                 },
                 TakeawayActor::Stage,
-                Some(format!("sender_policy:{policy_id}").as_str()),
+                Some(policy_marker(policy_id).as_str()),
                 0,
             )
             .await?;

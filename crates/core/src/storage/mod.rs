@@ -154,6 +154,15 @@ impl Db {
         // S-074 - S-077: перенос прежних правил в группы и действия идёт
         // прикладным шагом, уже после структурной части.
         self.migrate_mail_rules_to_groups().await?;
+        // Начальный курсор стадий: запись, заведённая до первой синхронизации,
+        // не должна доставать стадии всю историю писем
+        // (blocked-senders.md S-021, ignore-conversation.md S-025,
+        // sweep-by-sender.md S-036). Шаг прикладной: уже применённая миграция
+        // не меняется.
+        self.seed_stage_cursors().await?;
+        // Снимки кандидатов, которых никто не подтвердил, живут не дольше
+        // суток: диалог открывают часто, а подтверждают редко.
+        self.purge_stale_stage_snapshots().await?;
         self.mark_min_app_version().await?;
         // S-072: задание, прерванное закрытием программы, продолжается с
         // сохранённого курсора. Задания уборки списков отправителей,
@@ -164,6 +173,19 @@ impl Db {
         self.restore_sender_policy_jobs().await?;
         self.restore_ignore_jobs().await?;
         self.restore_sender_sweep_jobs().await?;
+        Ok(())
+    }
+
+    /// Продвинуть задания стадий один раз после применения миграций. Полный
+    /// проход включённой записи автоочистки положен при запуске программы, а не
+    /// только по сроку (sweep-by-sender.md S-035); там же продолжаются уборки
+    /// списков и возвраты игнорирования. Шаг отделён от `migrate`: он ставит
+    /// операции в очередь и выполняется на уже открытой базе.
+    pub async fn resume_stage_jobs(&self) -> Result<()> {
+        self.start_sender_sweep_full_passes().await?;
+        self.advance_sender_policy_jobs().await?;
+        self.advance_ignored_conversation_jobs().await?;
+        self.advance_sender_sweep_jobs().await?;
         Ok(())
     }
 

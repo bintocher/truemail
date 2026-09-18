@@ -7,7 +7,9 @@
 //! приметам и честно называет число ненайденных (S-037, S-038).
 
 use super::Db;
-use super::stages::{STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage};
+use super::stages::{
+    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, needs_retry,
+};
 use crate::Result;
 use crate::model::*;
 use crate::storage::repo::{
@@ -30,9 +32,6 @@ const IGNORE_WORKING_FOLDERS: &str =
 pub(crate) struct ConversationSet {
     /// Все идентификаторы набора в порядке появления.
     pub ids: Vec<String>,
-    /// Идентификаторы, подтверждённые локальным письмом: только они годятся
-    /// для слияния наборов (S-045, S-046).
-    pub local_ids: HashSet<String>,
     /// Номера локальных писем набора.
     pub messages: Vec<i64>,
     /// Набор упёрся в предел идентификаторов (S-028).
@@ -75,6 +74,11 @@ struct PendingReturnRow {
     message_date: Option<String>,
     header_id: Option<String>,
     return_requested_at: Option<String>,
+    /// Операция увода письма в корзину: пока она выполняется, письма в корзине
+    /// ещё нет, и пропускать его возврат рано (S-041).
+    operation_id: Option<i64>,
+    /// Операция возврата: её результат и решает судьбу возврата (S-037).
+    return_operation_id: Option<i64>,
 }
 
 /// Метка операции очереди, поставленной игнорированием: по ней отменяются
@@ -82,6 +86,10 @@ struct PendingReturnRow {
 fn ignore_marker(conversation_id: i64) -> String {
     format!("ignored_conversation:{conversation_id}")
 }
+
+/// Вид отложенных писем: у каждого рода заданий свой, номера заданий разных
+/// родов совпадают.
+const DEFERRAL_KIND: &str = "ignored_conversation";
 
 impl Db {
     /// Обход связей до неподвижного результата в пределах одного ящика (S-007,
@@ -110,7 +118,9 @@ impl Db {
             }
             // Заголовки приходят и в угловых скобках, и без них: сравнение
             // идёт с обоими написаниями, чтобы обход пользовался индексом по
-            // Message-ID и всё же не терял ветвь переписки.
+            // Message-ID и всё же не терял ветвь переписки. Поиск подстроки по
+            // References только отбирает кандидатов: полное совпадение
+            // проверяется разобранными значениями ниже.
             let bracketed = format!("<{current}>");
             let rows: Vec<ConversationRow> = sqlx::query_as(
                 "SELECT id, rfc822_message_id, in_reply_to, references_ids FROM messages
@@ -128,18 +138,22 @@ impl Db {
             .fetch_all(&mut **tx)
             .await?;
             for row in rows {
+                let own = message_identifiers(
+                    row.rfc822_message_id.as_deref(),
+                    row.in_reply_to.as_deref(),
+                    row.references_ids.as_deref(),
+                );
+                // Идентификатор совпадает целиком, а не окончанием чужого:
+                // совпадение по подстроке притянуло бы в переписку письмо,
+                // у которого этот идентификатор лишь оканчивает свой.
+                if !own.iter().any(|id| id == &current) {
+                    continue;
+                }
                 if !visited.insert(row.id) {
                     continue;
                 }
                 set.messages.push(row.id);
-                for id in message_identifiers(
-                    row.rfc822_message_id.as_deref(),
-                    row.in_reply_to.as_deref(),
-                    row.references_ids.as_deref(),
-                ) {
-                    // Идентификатор, взятый из локального письма, подтверждает
-                    // цепочку ссылок: по нему разрешено слияние наборов.
-                    set.local_ids.insert(id.clone());
+                for id in own {
                     if set.ids.len() >= MAX_CONVERSATION_IDS {
                         set.partial = true;
                         break;
@@ -187,12 +201,18 @@ impl Db {
         }
         let set = Self::build_conversation_set(&mut tx, account_id, seed).await?;
         let existing = Self::conversation_owner(&mut tx, account_id, &set.ids).await?;
-        let total = Self::count_conversation_messages(&mut tx, account_id, &set.messages).await?;
+        let candidates = Self::conversation_candidates(&mut tx, account_id, &set.messages).await?;
+        let total = candidates.len() as i64;
         let max_message_id = Self::max_message_id(&mut tx).await?;
         let payload = format!("{account_id}\n{message_id}");
-        let snapshot_key =
-            Self::save_stage_snapshot(&mut tx, SNAPSHOT_KIND, &payload, max_message_id, total)
-                .await?;
+        let snapshot_key = Self::save_stage_snapshot(
+            &mut tx,
+            SNAPSHOT_KIND,
+            &payload,
+            max_message_id,
+            &candidates,
+        )
+        .await?;
         tx.commit().await?;
         Ok(IgnoreConversationPreview {
             account_id,
@@ -233,29 +253,30 @@ impl Db {
         Ok(owners)
     }
 
-    /// Число локальных писем набора в рабочих папках.
-    async fn count_conversation_messages(
+    /// Локальные письма набора, которые уйдут в корзину: только рабочие папки
+    /// этого ящика. Именно они попадают в снимок кандидатов (S-014).
+    async fn conversation_candidates(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         account_id: i64,
         messages: &[i64],
-    ) -> Result<i64> {
-        if messages.is_empty() {
-            return Ok(0);
-        }
-        let mut total = 0;
+    ) -> Result<Vec<i64>> {
+        let mut found = Vec::new();
         for chunk in messages.chunks(400) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT count(*) FROM messages m JOIN folders f ON f.id=m.folder_id
-                  WHERE m.account_id=? AND m.id IN ({placeholders}) AND {IGNORE_WORKING_FOLDERS}"
+                "SELECT m.id FROM messages m JOIN folders f ON f.id=m.folder_id
+                  WHERE m.account_id=? AND m.id IN ({placeholders}) AND {IGNORE_WORKING_FOLDERS}
+                  ORDER BY m.id"
             );
             let mut query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(sql)).bind(account_id);
             for id in chunk {
                 query = query.bind(id);
             }
-            total += query.fetch_one(&mut **tx).await?.0;
+            for (id,) in query.fetch_all(&mut **tx).await? {
+                found.push(id);
+            }
         }
-        Ok(total)
+        Ok(found)
     }
 
     /// Включить игнорирование переписки: запись создаётся до постановки
@@ -286,8 +307,10 @@ impl Db {
             return Err(crate::Error::AccountConfig("письмо не найдено".into()));
         };
         let account_id = source.account_id;
+        // Снимок расходуется неделимо: повторное подтверждение с тем же ключом
+        // второй уборки не запускает.
         let (payload, max_message_id, _) =
-            Self::take_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
         if payload != format!("{account_id}\n{message_id}") {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой переписке, откройте подтверждение заново".into(),
@@ -319,28 +342,28 @@ impl Db {
                         "по этой переписке идёт возврат писем: дождитесь его завершения или отмените".into(),
                     ));
                 }
-                // S-046: совпадение идентификатора без подтверждённой цепочки
-                // ссылок наборы не объединяет.
-                let confirmed_chain = set
-                    .ids
-                    .iter()
-                    .any(|id| set.local_ids.contains(id) && Self::id_belongs(&set, id));
-                if !rest.is_empty() && !confirmed_chain {
-                    sqlx::query(
-                        "UPDATE ignored_conversations SET last_error=?, updated_at=datetime('now')
-                          WHERE id=?",
-                    )
-                    .bind("совпал идентификатор письма без подтверждённой цепочки ссылок: наборы не объединены")
-                    .bind(first)
-                    .execute(&mut *tx)
-                    .await?;
-                    return Err(crate::Error::AccountConfig(
-                        "идентификатор письма совпал с другой перепиской без подтверждённой цепочки ссылок".into(),
-                    ));
-                }
-                // S-045: наборы пересеклись по подтверждённой цепочке - они
-                // объединяются одной неделимой операцией.
+                // S-045, S-046: наборы объединяются только тогда, когда между
+                // этими двумя записями есть общее локальное письмо. Без него
+                // подделанный идентификатор слил бы чужую переписку с
+                // игнорируемой и унёс бы чужие письма в корзину.
                 for other in rest {
+                    if !Self::linked_by_local_message(&mut tx, account_id, &set, *first, *other)
+                        .await?
+                    {
+                        sqlx::query(
+                            "UPDATE ignored_conversations
+                                SET last_error=?, updated_at=datetime('now')
+                              WHERE id=?",
+                        )
+                        .bind("совпал идентификатор письма без подтверждённой цепочки ссылок: наборы не объединены")
+                        .bind(first)
+                        .execute(&mut *tx)
+                        .await?;
+                        tx.commit().await?;
+                        return Err(crate::Error::AccountConfig(
+                            "идентификатор письма совпал с другой перепиской без подтверждённой цепочки ссылок".into(),
+                        ));
+                    }
                     Self::merge_conversations(&mut tx, *first, *other).await?;
                 }
                 sqlx::query(
@@ -401,15 +424,79 @@ impl Db {
         .bind(max_message_id)
         .execute(&mut *tx)
         .await?;
-        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         self.advance_ignored_conversation_jobs().await?;
         self.ignored_conversation(conversation_id).await
     }
 
-    /// Идентификатор относится к набору, построенному обходом локальных писем.
-    fn id_belongs(set: &ConversationSet, id: &str) -> bool {
-        set.local_ids.contains(id)
+    /// Цепочка ссылок между двумя записями подтверждена: есть локальное письмо,
+    /// которое уже принадлежит одной записи своим заголовком `Message-ID` и
+    /// ссылается на идентификатор другой (S-045). Совпадения идентификатора в
+    /// новом письме для слияния мало: заголовки приходят с письмом и
+    /// подделываются, а слияние уносит чужую переписку в корзину (S-046).
+    async fn linked_by_local_message(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        account_id: i64,
+        set: &ConversationSet,
+        keep: i64,
+        other: i64,
+    ) -> Result<bool> {
+        let kept_ids = Self::conversation_id_set(tx, keep).await?;
+        let other_ids = Self::conversation_id_set(tx, other).await?;
+        for chunk in set.messages.chunks(200) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, rfc822_message_id, in_reply_to, references_ids FROM messages
+                  WHERE account_id=? AND id IN ({placeholders})"
+            );
+            let mut query =
+                sqlx::query_as::<_, ConversationRow>(AssertSqlSafe(sql)).bind(account_id);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            for row in query.fetch_all(&mut **tx).await? {
+                let Some(own_id) = row
+                    .rfc822_message_id
+                    .as_deref()
+                    .and_then(normalize_message_id)
+                else {
+                    continue;
+                };
+                // Своим письмо считает та запись, которой принадлежит его
+                // собственный Message-ID. Ссылки такого письма и подтверждают
+                // цепочку до второй записи.
+                let theirs = if kept_ids.contains(&own_id) {
+                    &other_ids
+                } else if other_ids.contains(&own_id) {
+                    &kept_ids
+                } else {
+                    continue;
+                };
+                let links = message_identifiers(
+                    None,
+                    row.in_reply_to.as_deref(),
+                    row.references_ids.as_deref(),
+                );
+                if links.iter().any(|id| theirs.contains(id)) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Идентификаторы, принадлежащие записи.
+    async fn conversation_id_set(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conversation_id: i64,
+    ) -> Result<HashSet<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT message_id FROM ignored_conversation_ids WHERE conversation_id=?",
+        )
+        .bind(conversation_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Перенести идентификаторы, перемещения и задания второй записи в первую
@@ -493,9 +580,18 @@ impl Db {
                 .bind(conversation_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if found.is_none() {
+        let Some((current,)) = found else {
             return Err(crate::Error::AccountConfig(
                 "игнорируемая переписка не найдена".into(),
+            ));
+        };
+        // S-032, S-035: команда принимается только в допустимом состоянии.
+        // Повторное прекращение во время идущего возврата завело бы второе
+        // задание, и одно и то же письмо возвращали бы два прохода.
+        if !can_start_disable(&current) {
+            return Err(crate::Error::AccountConfig(
+                "по этой переписке уже идёт прекращение игнорирования: дождитесь его завершения"
+                    .into(),
             ));
         }
         sqlx::query(
@@ -508,22 +604,11 @@ impl Db {
         let marker = ignore_marker(conversation_id);
         // S-036: уже выполняющиеся перемещения отменить нельзя, их число
         // называется пользователю.
-        let irreversible: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM outbox_ops
-              WHERE json_extract(payload, '$.rule_id')=? AND status NOT IN ('pending','retry')",
-        )
-        .bind(&marker)
-        .fetch_one(&mut *tx)
-        .await?;
+        let irreversible = Self::count_irreversible_operations(&mut tx, &marker).await?;
         let cancelled = if return_messages {
-            sqlx::query(
-                "DELETE FROM outbox_ops
-                  WHERE json_extract(payload, '$.rule_id')=? AND status IN ('pending','retry')",
-            )
-            .bind(&marker)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected() as i64
+            // Признак закрывшей стадии снимается вместе с отменой: иначе
+            // оставшееся во входящих письмо навсегда выпало бы из разбора.
+            Self::cancel_marked_operations(&mut tx, &marker).await?
         } else {
             0
         };
@@ -540,7 +625,7 @@ impl Db {
                 conversation_id,
                 kind: "return".into(),
                 state: IGNORE_STATE_DISABLED.into(),
-                irreversible: irreversible.0,
+                irreversible,
                 ..IgnoreJobReport::default()
             });
         }
@@ -554,10 +639,12 @@ impl Db {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        // Прежняя попытка возврата забывается вместе со своей операцией: иначе
+        // её отказ навсегда определял бы исход новой попытки.
         sqlx::query(
             "UPDATE ignored_conversation_moves
                 SET return_state='pending', return_requested_at=datetime('now'),
-                    updated_at=datetime('now')
+                    return_operation_id=NULL, updated_at=datetime('now')
               WHERE conversation_id=? AND header_id IS NOT NULL AND header_id<>''
                 AND return_state NOT IN ('completed','skipped')",
         )
@@ -580,7 +667,7 @@ impl Db {
         .await?;
         tx.commit().await?;
         let mut report = self.continue_ignored_conversation_job(job.0).await?;
-        report.irreversible = irreversible.0;
+        report.irreversible = irreversible;
         // Отменённые перемещения возвращать уже не нужно: письмо осталось на
         // месте, поэтому в счётчик возвращённых они не попадают (S-036).
         tracing::info!(
@@ -612,14 +699,14 @@ impl Db {
     /// (S-016, S-023, S-024).
     async fn run_ignore_sweep_batch(&self, job_id: i64) -> Result<IgnoreJobReport> {
         let mut tx = self.begin_write().await?;
-        let job: Option<(i64, i64, i64, String)> = sqlx::query_as(
-            "SELECT conversation_id, max_message_id, cursor_message_id, state
+        let job: Option<(i64, String, i64, String)> = sqlx::query_as(
+            "SELECT conversation_id, snapshot_key, cursor_message_id, state
                FROM ignored_conversation_jobs WHERE id=?",
         )
         .bind(job_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((conversation_id, max_message_id, cursor, state)) = job else {
+        let Some((conversation_id, snapshot_key, cursor, state)) = job else {
             return Err(crate::Error::AccountConfig("задание не найдено".into()));
         };
         if matches!(state.as_str(), "completed" | "cancelled" | "failed") {
@@ -639,27 +726,30 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         let trash = resolve_role_folder(&mut tx, account_id, "trash").await?;
+        // S-014: уборка идёт по строкам снимка - в корзину уходят ровно те
+        // письма, число которых пользователь видел перед подтверждением.
+        // Отложенные чужой операцией письма читаются наравне с остальными.
         let sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.account_id=? AND m.id>? AND m.id<=? AND {IGNORE_WORKING_FOLDERS}
-                AND {CONVERSATION_MEMBERSHIP}
+               JOIN stage_snapshot_messages s ON s.message_id=m.id AND s.key=?
+              WHERE m.account_id=? AND {IGNORE_WORKING_FOLDERS}
+                AND (m.id>? OR {DEFERRED_MESSAGES})
               ORDER BY m.id LIMIT ?"
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
+            .bind(&snapshot_key)
             .bind(account_id)
             .bind(cursor)
-            .bind(max_message_id)
-            .bind(conversation_id)
-            .bind(conversation_id)
-            .bind(conversation_id)
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
             .bind(STAGE_BATCH)
             .fetch_all(&mut *tx)
             .await?;
         let mut counters = StageCounters::default();
         let mut last_id = cursor;
         for message in &batch {
-            last_id = message.id;
+            last_id = last_id.max(message.id);
             let Some((folder_id, path)) = trash.clone() else {
                 // S-003: ящик без корзины оставляет письмо на месте, а причина
                 // видна в списке игнорируемых переписок.
@@ -677,6 +767,7 @@ impl Db {
                     .bind(message.id)
                     .execute(&mut *tx)
                     .await?;
+                Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
                 continue;
             };
             let outcome = queue_takeaway_operation(
@@ -699,19 +790,24 @@ impl Db {
                     .execute(&mut *tx)
                     .await?;
             }
+            if needs_retry(&outcome) {
+                Self::defer_stage_message(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+            } else {
+                Self::clear_stage_deferral(&mut tx, DEFERRAL_KIND, job_id, message.id).await?;
+            }
         }
         let remaining_sql = format!(
             "SELECT count(*) FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.account_id=? AND m.id>? AND m.id<=? AND {IGNORE_WORKING_FOLDERS}
-                AND {CONVERSATION_MEMBERSHIP}"
+               JOIN stage_snapshot_messages s ON s.message_id=m.id AND s.key=?
+              WHERE m.account_id=? AND {IGNORE_WORKING_FOLDERS}
+                AND (m.id>? OR {DEFERRED_MESSAGES})"
         );
         let remaining: (i64,) = sqlx::query_as(AssertSqlSafe(remaining_sql))
+            .bind(&snapshot_key)
             .bind(account_id)
             .bind(last_id)
-            .bind(max_message_id)
-            .bind(conversation_id)
-            .bind(conversation_id)
-            .bind(conversation_id)
+            .bind(DEFERRAL_KIND)
+            .bind(job_id)
             .fetch_one(&mut *tx)
             .await?;
         let next_state = if remaining.0 > 0 {
@@ -719,6 +815,9 @@ impl Db {
         } else {
             "completed"
         };
+        if next_state == "completed" {
+            Self::clear_stage_deferrals(&mut tx, DEFERRAL_KIND, job_id).await?;
+        }
         sqlx::query(
             "UPDATE ignored_conversation_jobs
                 SET state=?, cursor_message_id=?, queued=queued+?, skipped=skipped+?,
@@ -778,6 +877,41 @@ impl Db {
         Ok(())
     }
 
+    /// Состояние операции очереди. Выполненная операция из очереди удаляется,
+    /// поэтому её отсутствие и означает успех.
+    async fn operation_status(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        operation_id: i64,
+    ) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT status FROM outbox_ops WHERE id=?")
+            .bind(operation_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+        Ok(row.map(|(status,)| status))
+    }
+
+    /// Записать состояние возврата письма и, когда он поставлен в очередь,
+    /// номер его операции.
+    async fn set_return_state(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        move_id: i64,
+        state: &str,
+        return_operation_id: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE ignored_conversation_moves
+                SET return_state=?, return_operation_id=coalesce(?, return_operation_id),
+                    updated_at=datetime('now')
+              WHERE id=?",
+        )
+        .bind(state)
+        .bind(return_operation_id)
+        .bind(move_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Пачка возврата: письмо ищется в корзине того же ящика по приметам и
     /// ставится в очередь на перемещение в свою сохранённую исходную папку
     /// (S-037 - S-041).
@@ -811,7 +945,7 @@ impl Db {
         let inbox = resolve_role_folder(&mut tx, account_id, "inbox").await?;
         let pending: Vec<PendingReturnRow> = sqlx::query_as(
             "SELECT id, source_folder_id, from_addr, message_date, header_id,
-                    return_requested_at
+                    return_requested_at, operation_id, return_operation_id
                FROM ignored_conversation_moves
               WHERE conversation_id=? AND return_state IN ('pending','waiting_sync')
               ORDER BY id LIMIT ?",
@@ -820,13 +954,51 @@ impl Db {
         .bind(STAGE_BATCH)
         .fetch_all(&mut *tx)
         .await?;
-        let mut counters = StageCounters::default();
-        let mut waiting = 0i64;
         for row in pending {
             let (move_id, source_folder_id, header_id) =
                 (row.id, row.source_folder_id, row.header_id.clone());
             let (from_addr, message_date, requested_at) =
                 (row.from_addr, row.message_date, row.return_requested_at);
+            // S-037: возврат уже поставлен в очередь - его судьбу решает
+            // результат операции, а не сама постановка. Пока операция жива,
+            // письмо считается ожидающим и об успехе не отчитывается.
+            if let Some(return_operation) = row.return_operation_id {
+                let status = Self::operation_status(&mut tx, return_operation).await?;
+                match status.as_deref() {
+                    // Выполненная операция удаляется из очереди вместе с
+                    // локальной строкой письма: возврат состоялся.
+                    None => {
+                        Self::set_return_state(
+                            &mut tx,
+                            move_id,
+                            RETURN_STATE_COMPLETED,
+                            Some(return_operation),
+                        )
+                        .await?;
+                    }
+                    Some("failed") => {
+                        Self::set_return_state(
+                            &mut tx,
+                            move_id,
+                            RETURN_STATE_FAILED,
+                            Some(return_operation),
+                        )
+                        .await?;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // S-041: перемещение в корзину ещё выполняется - письмо туда
+            // попадёт позже, поэтому пропускать его возврат рано.
+            let move_running = match row.operation_id {
+                Some(operation_id) => Self::operation_status(&mut tx, operation_id)
+                    .await?
+                    .is_some_and(|status| {
+                        matches!(status.as_str(), "pending" | "processing" | "retry")
+                    }),
+                None => false,
+            };
             let found: Option<(i64, i64, i64, String, Option<String>)> = sqlx::query_as(
                 "SELECT m.id, m.folder_id, m.uid, f.remote_path, m.remote_id
                    FROM messages m JOIN folders f ON f.id=m.folder_id
@@ -868,24 +1040,18 @@ impl Db {
                 .bind(source_folder_id)
                 .fetch_one(&mut *tx)
                 .await?;
-                let next = if still_in_place.0 > 0 {
-                    counters.skipped += 1;
+                let next = if move_running {
+                    // Письмо ещё уводится: его возврат ждёт завершения
+                    // операции и следующей синхронизации.
+                    RETURN_STATE_WAITING_SYNC
+                } else if still_in_place.0 > 0 {
                     RETURN_STATE_SKIPPED
                 } else if expired.0 == 1 {
-                    counters.failed += 1;
                     RETURN_STATE_FAILED
                 } else {
-                    waiting += 1;
                     RETURN_STATE_WAITING_SYNC
                 };
-                sqlx::query(
-                    "UPDATE ignored_conversation_moves SET return_state=?,
-                            updated_at=datetime('now') WHERE id=?",
-                )
-                .bind(next)
-                .bind(move_id)
-                .execute(&mut *tx)
-                .await?;
+                Self::set_return_state(&mut tx, move_id, next, None).await?;
                 continue;
             };
             // S-039, S-040: письмо возвращается в свою исходную папку, а если
@@ -904,14 +1070,7 @@ impl Db {
             };
             let target = target.or_else(|| inbox.clone());
             let Some((target_id, target_path)) = target else {
-                counters.failed += 1;
-                sqlx::query(
-                    "UPDATE ignored_conversation_moves SET return_state='failed',
-                            updated_at=datetime('now') WHERE id=?",
-                )
-                .bind(move_id)
-                .execute(&mut *tx)
-                .await?;
+                Self::set_return_state(&mut tx, move_id, RETURN_STATE_FAILED, None).await?;
                 continue;
             };
             let outcome = queue_takeaway_operation(
@@ -933,53 +1092,62 @@ impl Db {
                 0,
             )
             .await?;
-            let returned = counters.account(&outcome);
-            sqlx::query(
-                "UPDATE ignored_conversation_moves SET return_state=?, updated_at=datetime('now')
-                  WHERE id=?",
-            )
-            .bind(if returned {
-                RETURN_STATE_COMPLETED
-            } else {
-                RETURN_STATE_WAITING_SYNC
-            })
-            .bind(move_id)
-            .execute(&mut *tx)
-            .await?;
-            if returned {
-                // Возвращённое письмо снова доступно стадиям: признак закрывшей
-                // стадии с него снимается.
-                sqlx::query("UPDATE messages SET closed_by_stage=NULL WHERE id=?")
-                    .bind(message_id)
-                    .execute(&mut *tx)
+            // Постановка удалась - результат станет известен по операции, а не
+            // сейчас. Занятое чужой операцией письмо ждёт следующего прохода.
+            match outcome {
+                TakeawayOutcome::Queued(operation_id) => {
+                    Self::set_return_state(
+                        &mut tx,
+                        move_id,
+                        RETURN_STATE_PENDING,
+                        Some(operation_id),
+                    )
                     .await?;
+                    // Возвращаемое письмо снова доступно стадиям: признак
+                    // закрывшей стадии с него снимается.
+                    sqlx::query("UPDATE messages SET closed_by_stage=NULL WHERE id=?")
+                        .bind(message_id)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                _ => {
+                    Self::set_return_state(&mut tx, move_id, RETURN_STATE_WAITING_SYNC, None)
+                        .await?;
+                }
             }
         }
-        let failed: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM ignored_conversation_moves
-              WHERE conversation_id=? AND return_state='failed'",
+        // Счётчики берутся из состояний писем, а не накапливаются проходом:
+        // иначе отчёт запомнил бы обещание, которое очередь позже не исполнила.
+        let totals: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT
+                 count(*) FILTER (WHERE return_state='completed'),
+                 count(*) FILTER (WHERE return_state='skipped'),
+                 count(*) FILTER (WHERE return_state='failed'),
+                 count(*) FILTER (WHERE return_state IN ('pending','waiting_sync'))
+               FROM ignored_conversation_moves WHERE conversation_id=?",
         )
         .bind(conversation_id)
         .fetch_one(&mut *tx)
         .await?;
+        let (returned, skipped, failed, waiting) = totals;
         let next_state = if waiting > 0 { "pending" } else { "completed" };
         sqlx::query(
             "UPDATE ignored_conversation_jobs
-                SET state=?, queued=queued+?, skipped=skipped+?, failed=failed+?, remaining=?,
+                SET state=?, queued=?, skipped=?, failed=?, remaining=?,
                     updated_at=datetime('now')
               WHERE id=?",
         )
         .bind(next_state)
-        .bind(counters.queued)
-        .bind(counters.skipped)
-        .bind(counters.failed)
+        .bind(returned)
+        .bind(skipped)
+        .bind(failed)
         .bind(waiting)
         .bind(job_id)
         .execute(&mut *tx)
         .await?;
         // S-043: неполный возврат оставляет запись в состоянии return_failed и
         // включить игнорирование заново не даёт.
-        let record_state = if failed.0 > 0 {
+        let record_state = if waiting == 0 && failed > 0 {
             IGNORE_STATE_RETURN_FAILED
         } else if waiting > 0 {
             IGNORE_STATE_RETURNING
@@ -1214,19 +1382,6 @@ impl Db {
     }
 }
 
-/// Принадлежность письма набору переписки: собственный идентификатор, ссылка
-/// на родителя или элемент References. `thread_id` служит только ускорению
-/// поиска кандидатов и принадлежности не определяет (S-012).
-const CONVERSATION_MEMBERSHIP: &str = "(EXISTS(SELECT 1 FROM ignored_conversation_ids c
-              WHERE c.conversation_id=?
-                AND c.message_id=trim(coalesce(m.rfc822_message_id,''), '<> '))
-      OR EXISTS(SELECT 1 FROM ignored_conversation_ids c
-                 WHERE c.conversation_id=?
-                   AND c.message_id=trim(coalesce(m.in_reply_to,''), '<> '))
-      OR EXISTS(SELECT 1 FROM ignored_conversation_ids c
-                 WHERE c.conversation_id=? AND m.references_ids IS NOT NULL
-                   AND instr(m.references_ids, c.message_id)>0))";
-
 /// Список игнорируемых переписок со сводкой перемещений и возвратов (S-031).
 const LIST_SQL: &str = "SELECT c.id, c.account_id, a.email AS account_email, c.subject,
             c.participants, c.state, c.partial, c.created_at, c.updated_at,
@@ -1238,6 +1393,14 @@ const LIST_SQL: &str = "SELECT c.id, c.account_id, a.email AS account_email, c.s
               WHERE m.conversation_id=c.id AND m.return_state='skipped') AS skipped,
             (SELECT count(*) FROM ignored_conversation_moves m
               WHERE m.conversation_id=c.id AND m.return_state='failed') AS failed,
-            c.last_error
+            c.last_error,
+            (SELECT count(*) FROM outbox_ops o
+              WHERE o.status='failed'
+                AND json_extract(o.payload, '$.rule_id')='ignored_conversation:' || c.id)
+              AS queue_failed,
+            (SELECT o.last_error FROM outbox_ops o
+              WHERE o.status='failed'
+                AND json_extract(o.payload, '$.rule_id')='ignored_conversation:' || c.id
+              ORDER BY o.id DESC LIMIT 1) AS queue_error
        FROM ignored_conversations c JOIN accounts a ON a.id=c.account_id
       WHERE 1=1";
