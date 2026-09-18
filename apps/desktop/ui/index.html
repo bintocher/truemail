@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260917-4">
+  <link rel="stylesheet" href="styles.css?v=20260918-1">
 </head>
 <body>
 
@@ -67,7 +67,7 @@
 
     <section class="list">
       <div class="listhead">
-        <div class="row1"><div><h2 class="d-inline" data-i18n="navAllInbox">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
+        <div class="row1"><div><span class="head-tag-dot hidden" id="headTagDot"></span><h2 class="d-inline" data-i18n="navAllInbox">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
           <div class="fields-inline"><div class="filter-clear-wrap hidden" id="filterClearWrap"><button class="iconbtn filter-clear" id="filterClearBtn" data-i18n-title="tipFilterClear" title="Сбросить фильтр"><i data-i="filterOff"></i></button><div class="filter-active-tip" id="filterActiveTip"></div></div><button class="iconbtn" id="filterBtn" data-i18n-title="tipFilter" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" data-i18n-title="tipSort" title="Сортировка"><i data-i="sort"></i></button></div></div>
         <div class="list-options hidden" id="filterMenu"><div class="filter-text"><input id="filterText" data-i18n-placeholder="filterPlaceholder" placeholder="Фильтр по тексту…" autocomplete="off"></div><label><input type="checkbox" data-filter="unread"> <span data-i18n="filterUnread">Только непрочитанные</span></label><label><input type="checkbox" data-filter="attachments"> <span data-i18n="filterAttachments">С вложениями</span></label><label><input type="checkbox" data-filter="flagged"> <span data-i18n="filterFlagged">Важные</span></label></div>
         <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc" data-i18n="sortNewest">Сначала новые</button><button data-sort="date-asc" data-i18n="sortOldest">Сначала старые</button><button data-sort="sender" data-i18n="sortSender">По отправителю</button><button data-sort="subject" data-i18n="sortSubject">По теме</button></div>
@@ -724,19 +724,20 @@
 <script src="modules/commands-accessibility.js?v=20260916-1"></script>
 <script src="modules/smart-rules.js?v=20260916-1"></script>
 <script src="modules/i18n-onboarding.js?v=20260917-1"></script>
-<script src="modules/error-presentation.js?v=20260917-4"></script>
+<script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
+<script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260917-1"></script>
+<script src="modules/mail.js?v=20260918-1"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
-<script src="modules/composer.js?v=20260917-4"></script>
+<script src="modules/composer.js?v=20260918-1"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260917-4"></script>
-<script src="modules/window-chrome.js?v=20260917-4"></script>
-<script src="bridge.js?v=20260917-4"></script>
+<script src="modules/settings.js?v=20260918-1"></script>
+<script src="modules/window-chrome.js?v=20260918-1"></script>
+<script src="bridge.js?v=20260918-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

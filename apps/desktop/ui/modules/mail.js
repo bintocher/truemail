@@ -177,6 +177,13 @@ window.relocalizeFolderTree=function(){
   // Строки списка собраны в коде: подпись ящика и подпись "без получателя"
   // остались бы на прежнем языке до следующей прокрутки.
   renderMessageWindow(true);
+  // Подписи кнопок снятия метки в шапке письма тоже собраны в коде, а само
+  // письмо при смене языка не перезагружается (S-017).
+  document.querySelectorAll('#tbody .mail-label').forEach(chip=>{
+    const name=chip.querySelector('.mail-label-name')?.textContent||'';
+    const off=chip.querySelector('.mail-label-off');
+    if(off)off.title=L(`Снять метку «${name}»`,`Remove tag “${name}”`);
+  });
   // Пустое состояние области письма тоже собрано в коде (S-009). Карточку
   // "нет подключённых аккаунтов" не трогаем: её ставит и переводит мастер.
   const empty=document.querySelector('#tbody .mail-empty h2');
@@ -323,6 +330,19 @@ window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
 async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
+// Метки письма в списке (issue #86, specs/message-labels-visible.md). Разбор
+// вынесен в messageLabels: там чистые функции без DOM, их покрывают проверки.
+// Метка "открыта" только когда не открыты папка и умная папка: переход по
+// уведомлению ставит currentFolderId, а currentTagName от прошлого просмотра
+// не сбрасывает.
+function openTagName(){return currentTagName!=null&&currentFolderId===null&&currentSmartIndex==null?currentTagName:null;}
+function labelDots(names){
+  const model=messageLabels.dotsModel(names,coreTags);
+  const host=document.createElement('span');host.className='label-dots';
+  model.dots.forEach(color=>{const dot=document.createElement('span');dot.className='label-dot';dot.style.setProperty('--dot-color',color);host.appendChild(dot);});
+  if(model.more){const more=document.createElement('span');more.className='label-more';more.textContent=`+${model.more}`;host.appendChild(more);}
+  return host;
+}
 function createMessageRow(message,index){
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
   // Строка - элемент списка, а не кнопка: роли кнопки достался бы общий
@@ -345,6 +365,12 @@ function createMessageRow(message,index){
   // Счётчик остальных получателей - отдельный элемент вне обрезки подписи:
   // иначе многоточие длинного имени съедало бы суффикс "+N".
   if(presentation.extra>0){const extra=document.createElement('span');extra.className='from-extra';extra.textContent=`+${presentation.extra}`;row.querySelector('.l1').appendChild(extra);}
+  // Метки: цвет - полосой у края строки, число - точками в первой строке.
+  // Названия целиком уходят в подсказку, ширины на них в строке нет (S-001,
+  // S-005, S-008).
+  const rowLabels=messageLabels.shownLabels(message.labels,openTagName());
+  if(rowLabels.length){row.classList.add('has-labels');row.style.setProperty('--label-stripe',messageLabels.stripeValue(rowLabels,coreTags));row.querySelector('.l1').appendChild(labelDots(rowLabels));}
+  if(message.labels?.length)row.title=`${L('Метки','Tags')}: ${message.labels.join(', ')}`;
   if(message._convCount>1){const expanded=expandedConversations.has(message._convKey);const badge=document.createElement('button');badge.type='button';badge.className='conv-count'+(expanded?' on':'');badge.textContent=message._convCount;badge.title=expanded?L('Свернуть беседу','Collapse conversation'):L(`Показать письма беседы (${message._convCount})`,`Show conversation messages (${message._convCount})`);badge.tabIndex=-1;badge.onclick=event=>{event.stopPropagation();
     // Строку забираем в фокус до перестроения: сама кнопка при нём исчезает, а
     // фокус должен остаться на беседе (S-007).
@@ -357,7 +383,6 @@ function createMessageRow(message,index){
   // отличить их можно только подписью.
   const mailbox=mailAddresses.listMailboxLabel(message.account_id,coreAccounts,currentFolderId===null,L('ящик удалён','mailbox removed'));
   if(mailbox){const box=document.createElement('span');box.className='mbox';box.textContent=mailbox;box.title=mailbox;row.querySelector('.meta').appendChild(box);}
-  if(message.labels?.length){const meta=row.querySelector('.meta');message.labels.forEach(name=>{const tag=coreTags.find(item=>item.name===name);const badge=document.createElement('span');badge.className='msg-tag';badge.textContent=name;const tagColor=tag?.color||'#888';badge.style.setProperty('--tag-color',tagColor);badge.style.setProperty('--tag-text',contrastOn(tagColor));meta.appendChild(badge);});}
   row.ondragstart=event=>{if(!selectedMessageIds.has(message.id)){selectedMessageIds.clear();selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();}row.classList.add('mail-dragging');event.dataTransfer.effectAllowed='move';event.dataTransfer.setData('application/x-truemail-messages',JSON.stringify([...selectedMessageIds]));};row.ondragend=()=>{row.classList.remove('mail-dragging');document.querySelectorAll('.folder-row.drop-hi').forEach(item=>item.classList.remove('drop-hi'));};
   let swipe=null,suppressClick=false;row.onpointerdown=event=>{if(event.pointerType==='mouse'||event.button!==0)return;swipe={id:event.pointerId,x:event.clientX,y:event.clientY,dx:0};};row.onpointermove=event=>{if(!swipe||event.pointerId!==swipe.id)return;const dx=event.clientX-swipe.x,dy=event.clientY-swipe.y;if(Math.abs(dy)>Math.abs(dx)&&Math.abs(dy)>10){swipe=null;row.style.transform='';return;}if(Math.abs(dx)<8)return;event.preventDefault();swipe.dx=dx;row.classList.add('swiping');row.classList.toggle('swipe-archive',dx>0);row.classList.toggle('swipe-trash',dx<0);row.style.transform=`translateX(${Math.max(-120,Math.min(120,dx))}px)`;};const finishSwipe=event=>{if(!swipe||event.pointerId!==swipe.id)return;const action=Math.abs(swipe.dx)>=80?(swipe.dx>0?'archive':'trash'):null;swipe=null;row.classList.remove('swiping','swipe-archive','swipe-trash');row.style.transform='';if(action){suppressClick=true;setTimeout(()=>{suppressClick=false;},250);window.performMessageActionForIds?.(action,[message.id]);}};row.onpointerup=finishSwipe;row.onpointercancel=finishSwipe;
   row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
@@ -424,6 +449,16 @@ function renderMessageWindow(force=false){
 // Клавиатурная навигация и открытие письма из уведомления переносят и фокус:
 // пользователь пришёл к письму и продолжит работать со списком (S-006).
 function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)setMessageScrollTop(top);else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)setMessageScrollTop(Math.max(0,bottom-msgsEl.clientHeight));renderMessageWindow(true);showMessage(currentMessageRows[index]);focusMessageRow(currentMessageRows[index].id);}
+// Цвет открытой метки у заголовка списка: в самих строках эта метка скрыта
+// (S-010), и без точки у заголовка её цвет негде увидеть (S-011).
+function renderHeadTagDot(){
+  const dot=document.getElementById('headTagDot');if(!dot)return;
+  const name=openTagName();
+  if(!name){dot.classList.add('hidden');dot.removeAttribute('title');return;}
+  dot.classList.remove('hidden');
+  dot.style.setProperty('--dot-color',messageLabels.labelColor(name,coreTags));
+  dot.title=name;
+}
 function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
   if(conversationsEnabled)rows=collapseConversations(rows);
@@ -431,6 +466,7 @@ function renderMessageList(rows,title,resetScroll=false){
   // Заголовок списка - то же пользовательское имя, что и подпись в панели:
   // без пометки словарь автоперевода подменял бы его переводом фразы.
   const heading=document.querySelector('.listhead h2');if(heading){heading.dataset.noI18n='1';heading.textContent=title||messagesTitle();}
+  renderHeadTagDot();
   renderListSubtitle(rows.length);
   renderMessageWindow(true);updateSelectionUi();
   // Панель письма очищена - поколение показа растёт вместе с ней: ответ на
@@ -481,6 +517,51 @@ window.relocalizeMailboxLine=function(){
 // поэтому ответы приходят вразнобой: без сверки поколения ответ на первый клик
 // дорисовывал бы своё письмо поверх выбранного вторым (S-001..S-004).
 let messageViewGeneration=0;
+// Названия меток - в шапке письма: в строке списка на них нет ширины, а до
+// этого их не было и здесь, увидеть метку можно было только в контекстном меню
+// по одному письму (S-012).
+function buildLabelLine(meta,message){
+  const names=meta.labels||[];
+  if(!names.length)return null;
+  const host=document.createElement('div');host.className='mail-labels';host.dataset.noI18n='1';
+  names.forEach(name=>{
+    const tag=coreTags.find(item=>item.name===name);
+    const color=messageLabels.labelColor(name,coreTags);
+    const chip=document.createElement('span');chip.className='mail-label';
+    chip.style.setProperty('--label-color',color);chip.style.setProperty('--label-text',contrastOn(color));
+    const text=document.createElement('span');text.className='mail-label-name';text.textContent=name;chip.appendChild(text);
+    // Снять можно только известную метку: у пришедшей без записи в перечне нет
+    // идентификатора, а команда ядра работает по нему (S-009).
+    if(tag){
+      const off=document.createElement('button');off.type='button';off.className='mail-label-off';off.innerHTML='<i data-i="close"></i>';
+      off.title=L(`Снять метку «${name}»`,`Remove tag “${name}”`);
+      off.onclick=async event=>{
+        event.stopPropagation();off.disabled=true;
+        try{
+          await window.tm.toggleMessageLabel(message.id,tag.id,false);
+          // Кэш списка правим сами: до перезагрузки данных строка иначе
+          // продолжала бы показывать снятую метку (S-013).
+          dropLabelFromCache(message.id,name);
+          chip.remove();if(!host.children.length)host.remove();
+          await window.reloadCoreData?.();
+        }catch(error){off.disabled=false;showToast(error);}
+      };
+      chip.appendChild(off);
+    }
+    host.appendChild(chip);
+  });
+  renderIcons(host);
+  return host;
+}
+// Снятие метки не должно ждать перезагрузки данных: полосу и точки строки
+// пересчитываем сразу по кэшу (S-013).
+function dropLabelFromCache(messageId,name){
+  const without=list=>{const item=Array.isArray(list)?list.find(entry=>entry.id===messageId):null;if(item?.labels)item.labels=item.labels.filter(label=>label!==name);};
+  without(messages);without(currentMessageRows);without(lastListRows);
+  if(activeMessage?.id===messageId&&activeMessage.labels)activeMessage.labels=activeMessage.labels.filter(label=>label!==name);
+  if(activeFullMessage?.meta?.id===messageId&&activeFullMessage.meta.labels)activeFullMessage.meta.labels=activeFullMessage.meta.labels.filter(label=>label!==name);
+  renderMessageWindow(true);
+}
 async function showMessage(message){
   const generation=++messageViewGeneration;
   // Отброшенный ответ пишем в журнал интерфейса: без записи разбирать жалобы
@@ -517,6 +598,7 @@ async function showMessage(message){
     // Это не заголовок письма: у копии, забранной другим ящиком по POP3,
     // строка "Кому" остаётся исходной, и без этой строки два ящика неразличимы.
     const mailboxLine=buildMailboxLine(full.meta.account_id);if(mailboxLine)head.appendChild(mailboxLine);
+    const labelLine=buildLabelLine(full.meta,message);if(labelLine)head.appendChild(labelLine);
     const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
     // Отрисовка тела тоже ждёт (проверка доверия отправителю для картинок), и за
     // это время выбор мог смениться - к панели и к отметке прочтения переходим

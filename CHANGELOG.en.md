@@ -7,6 +7,10 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- A tag on a message is visible in the list again. The colored badge used to go into the date column, where there is no spare room, and fell below the row border: the only way to see a tag was the context menu. Now the tag color is carried by a stripe along the left edge of the row, and the number of tags is shown by dots next to the sender; with several tags the stripe splits into segments, so all of them are visible. Tag names appear in a tooltip on the row and as chips in the header of the open message, where a tag can be removed right away.
+
 ## [0.2.19] - 2026-09-17
 
 ### Fixed

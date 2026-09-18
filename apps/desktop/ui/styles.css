@@ -156,7 +156,6 @@
   .navlabel{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);padding:12px 14px 4px;display:flex;align-items:center;}
   .navlabel .add{margin-left:auto;cursor:pointer;opacity:.7;} .navlabel .add:hover{opacity:1;}
   .tag-row .tag-dot{width:11px;height:11px;border-radius:3px;flex:0 0 auto;} .tag-row .tag-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;} .tag-row .count{margin-left:auto;}
-  .msg-tag{display:inline-block;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border-radius:10px;padding:1px 8px;margin-top:3px;font-size:10px;line-height:1.5;color:var(--tag-text,#fff);background:var(--tag-color,#888);}
   .flag-menu .flag-dot{border-radius:3px;} .tmi.has-submenu::after{content:"\203A";margin-left:auto;padding-left:10px;color:var(--text-3);font-size:15px;line-height:1;}
   .tag-settings-row{display:flex;align-items:center;gap:10px;padding:9px 4px;border-top:1px solid var(--border);} .tag-settings-row:first-child{border-top:0;} .tag-settings-row .tag-dot{width:13px;height:13px;border-radius:3px;flex:0 0 auto;} .tag-settings-row .count{color:var(--text-3);font-size:12px;}
   .navitem{display:flex;align-items:center;gap:10px;padding:7px 8px;margin:1px 8px;border-radius:var(--radius);
@@ -314,7 +313,19 @@
   .gallery-close:hover{background:rgba(255,255,255,.22)}
   .gallery-cap{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#fff;font-size:13px;background:rgba(0,0,0,.4);padding:6px 14px;border-radius:20px;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .gallery-save{position:fixed;bottom:22px;right:22px;padding:8px 16px;border:0;border-radius:8px;background:var(--accent);color:var(--on-accent);font-size:13px;cursor:pointer}
-  .mail-loading,.mail-error{padding:24px;color:var(--text-3)}.mail-error{color:var(--danger)}.mail-content{padding:20px 0;width:100%;max-width:100%}.mail-content header{padding-bottom:9px;border-bottom:1px solid var(--border)}.mail-fromline{font-size:13px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mail-fromline .mail-from{color:var(--text);font-weight:700}.mail-fromline .mail-address{color:var(--text-3)}.mail-toline,.mail-ccline,.mail-boxline{font-size:12.5px;color:var(--text-3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mail-toline.expanded,.mail-ccline.expanded{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.5}.mail-address-toggle{display:inline;padding:0 2px;margin-left:2px;border:0;background:none;color:var(--accent);font:inherit;cursor:pointer}.mail-address-toggle:hover{text-decoration:underline}.mail-body{padding-top:20px;line-height:1.65;overflow-wrap:anywhere}.mail-body.plain{white-space:pre-wrap;max-width:850px}.mail-body.html{display:block;width:100%;min-height:80px}.mail-html-frame{display:block;width:100%;min-height:120px;border:0;background:#fff;color-scheme:light}
+  .mail-loading,.mail-error{padding:24px;color:var(--text-3)}.mail-error{color:var(--danger)}.mail-content{padding:20px 0;width:100%;max-width:100%}.mail-content header{padding-bottom:9px;border-bottom:1px solid var(--border)}.mail-fromline{font-size:13px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mail-fromline .mail-from{color:var(--text);font-weight:700}.mail-fromline .mail-address{color:var(--text-3)}.mail-toline,.mail-ccline,.mail-boxline{font-size:12.5px;color:var(--text-3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mail-toline.expanded,.mail-ccline.expanded{white-space:normal;overflow:visible;text-overflow:clip;line-height:1.5}.mail-address-toggle{display:inline;padding:0 2px;margin-left:2px;border:0;background:none;color:var(--accent);font:inherit;cursor:pointer}.mail-address-toggle:hover{text-decoration:underline}
+  /* Названия меток в шапке письма (issue #86, S-012): в строке списка для них
+     места нет, и раньше увидеть название можно было только в контекстном меню
+     по одному письму. */
+  .mail-labels{display:flex;flex-wrap:wrap;gap:6px;margin-top:7px}
+  .mail-label{display:inline-flex;align-items:center;gap:5px;max-width:220px;padding:2px 4px 2px 10px;border-radius:11px;background:var(--label-color,#888);color:var(--label-text,#fff);font-size:11.5px;line-height:17px}
+  .mail-label-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mail-label-off{flex:none;width:15px;height:15px;padding:0;border:0;border-radius:50%;background:rgba(0,0,0,.18);color:inherit;font-size:11px;line-height:15px;cursor:pointer}
+  .mail-label-off svg{display:block;width:11px;height:11px;margin:0 auto;stroke-width:2.4}
+  .mail-label-off:hover{background:rgba(0,0,0,.34)}
+  .mail-label-off:disabled{opacity:.5;cursor:default}
+  .head-tag-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px;background:var(--dot-color,#888)}
+  .mail-body{padding-top:20px;line-height:1.65;overflow-wrap:anywhere}.mail-body.plain{white-space:pre-wrap;max-width:850px}.mail-body.html{display:block;width:100%;min-height:80px}.mail-html-frame{display:block;width:100%;min-height:120px;border:0;background:#fff;color-scheme:light}
   .letter{padding:18px 0 4px;} .lhead{display:flex;align-items:center;gap:11px;padding-bottom:14px;}
   .lhead .ava{width:38px;height:38px;border-radius:10px;font-size:14px;} .lhead .who{min-width:0;}
   .lhead .nm{font-weight:600;} .lhead .em{color:var(--text-3);font-size:12.5px;}
@@ -437,6 +448,17 @@
   .conv-count.on{background:var(--text-3)}
   /* Вложенность беседы - отступом всей строки. Через padding у .avawrap нельзя:
      колонка сетки ровно 32px по ширине аватара, и он наезжал бы на текст. */
+  /* Метки письма в списке (issue #86, specs/message-labels-visible.md). Цвет
+     несёт полоса у левого края: вертикального места в строке нет ни пикселя, а
+     полоса его и не занимает - раньше бейдж метки уходил за нижнюю границу и
+     метки не было видно вообще. Несколько меток делят полосу на сегменты.
+     У открытого письма левый край занят акцентной полоской .msg.active::before,
+     поэтому полоса меток отступает вправо ровно на её ширину. */
+  .msg.has-labels::after{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--label-stripe);}
+  .msg.active.has-labels::after{left:4px;}
+  .msg .label-dots{flex:none;display:flex;align-items:center;gap:3px;}
+  .msg .label-dot{width:6px;height:6px;border-radius:50%;background:var(--dot-color,#888);}
+  .msg .label-more{min-width:15px;height:13px;padding:0 3px;border-radius:7px;background:var(--text-3);color:var(--bg);font-size:9.5px;line-height:13px;text-align:center;font-weight:600;}
   .msg.conv-child{background:var(--hover);padding-left:30px}
   .msg.conv-child .body{opacity:.85}
   .comphead h2{margin:0;font-size:16px;} .comphead .sp{flex:1;}
