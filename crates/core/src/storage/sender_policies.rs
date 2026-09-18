@@ -438,6 +438,7 @@ impl Db {
             .await?;
             created.push(inserted.0);
         }
+        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         let mut reports = Vec::new();
         for job_id in created {
@@ -682,8 +683,14 @@ impl Db {
     /// конвейера стадий, поэтому уборка продолжается сама, без участия
     /// интерфейса.
     pub(crate) async fn advance_sender_policy_jobs(&self) -> Result<()> {
+        // S-037: задание с истёкшей арендой считается брошенным и достаётся
+        // следующему проходу наравне с ожидающими.
         let jobs: Vec<(i64,)> = sqlx::query_as(
-            "SELECT id FROM sender_policy_jobs WHERE state='pending' ORDER BY id LIMIT 4",
+            "SELECT id FROM sender_policy_jobs
+              WHERE state='pending'
+                 OR (state='running' AND (lease_expires_at IS NULL
+                     OR datetime(lease_expires_at) <= datetime('now')))
+              ORDER BY id LIMIT 4",
         )
         .fetch_all(&self.pool)
         .await?;

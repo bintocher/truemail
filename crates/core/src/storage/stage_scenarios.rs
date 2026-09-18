@@ -1278,7 +1278,9 @@ async fn mailbox_without_trash_closes_lists_but_lets_rules_run() {
         }],
         confirm_key: None,
     };
-    db.save_mail_rule(&rule, false, None).await.expect("правило");
+    db.save_mail_rule(&rule, false, None)
+        .await
+        .expect("правило");
     db.save_sender_policy(
         POLICY_KIND_ADDRESS,
         "blocked@example.test",
@@ -1338,7 +1340,10 @@ async fn mailbox_without_trash_closes_lists_but_lets_rules_run() {
         .inbox_message_ids_by_remote_ids(account, &[format!("remote-{inbox}-1")], None, None)
         .await
         .expect("письма для уведомления");
-    assert!(notify.is_empty(), "закрытое письмо в уведомление не попадает");
+    assert!(
+        notify.is_empty(),
+        "закрытое письмо в уведомление не попадает"
+    );
 
     let rule_move = takeaways(&db, swept).await;
     assert_eq!(

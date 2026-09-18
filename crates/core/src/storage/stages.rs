@@ -179,6 +179,19 @@ impl Db {
         })
     }
 
+    /// Снимок израсходован подтверждением: второй уборки по тому же ключу не
+    /// бывает, иначе одно подтверждение пользователя запускало бы её дважды.
+    pub(crate) async fn drop_stage_snapshot(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        key: &str,
+    ) -> Result<()> {
+        sqlx::query("DELETE FROM stage_snapshots WHERE key=?")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// Наибольший номер письма: граница снимка кандидатов.
     pub(crate) async fn max_message_id(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,

@@ -316,6 +316,7 @@ impl Db {
         .bind(max_message_id)
         .fetch_one(&mut *tx)
         .await?;
+        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         self.continue_sender_sweep_job(job.0).await
     }
@@ -806,6 +807,10 @@ impl Db {
         let mut queued = 0usize;
         let mut last_id = cursor;
         let mut touched: Vec<i64> = Vec::new();
+        // Последнее письмо отправителя читается один раз на пачку: запрос на
+        // каждое письмо превратил бы разбор пачки в пятьсот поисков подряд.
+        let mut last_message: std::collections::HashMap<(String, Option<i64>), Option<i64>> =
+            std::collections::HashMap::new();
         for message in &batch {
             last_id = message.id;
             let Some(address) = message.from_addr.as_deref() else {
@@ -840,9 +845,21 @@ impl Db {
                 SWEEP_MODE_ONLY_LAST => {
                     // S-030: новое письмо остаётся последним, а прежнее
                     // последнее убирает проход записи.
-                    let last =
-                        Self::last_message_of_sender(&mut tx, &address, *account_id, sweep_archive)
+                    let key = (address.clone(), *account_id);
+                    let last = match last_message.get(&key) {
+                        Some(found) => *found,
+                        None => {
+                            let found = Self::last_message_of_sender(
+                                &mut tx,
+                                &address,
+                                *account_id,
+                                sweep_archive,
+                            )
                             .await?;
+                            last_message.insert(key, found);
+                            found
+                        }
+                    };
                     last != Some(message.id)
                 }
                 _ => false,

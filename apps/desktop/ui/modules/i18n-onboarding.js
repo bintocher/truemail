@@ -45,6 +45,11 @@ function relocalizeDynamic(){
     if(typeof bindSmartNavigation==='function')bindSmartNavigation();
     if(typeof applyToolbar==='function')applyToolbar();
     if(typeof renderRulesList==='function')renderRulesList();
+    // Списки отправителей, игнорируемые переписки и записи автоочистки собраны
+    // в коде: без пересборки они остались бы на прежнем языке
+    // (blocked-senders.md S-051, ignore-conversation.md S-052,
+    // sweep-by-sender.md S-048).
+    window.relocalizeSenderSections?.();
     // Открытый редактор правила и панель ручного прогона собраны в коде:
     // без пересборки они остались бы на прежнем языке (S-083).
     window.relocalizeRuleSection?.();

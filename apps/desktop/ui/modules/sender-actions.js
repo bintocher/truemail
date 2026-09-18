@@ -281,6 +281,9 @@ async function reloadSenderSections(){
   renderSenderPolicies();renderIgnoredConversations();renderSenderSweepRules();await renderSenderJobs();
 }
 window.reloadSenderSections=reloadSenderSections;
+/* Смена языка перерисовывает уже прочитанные записи, не обращаясь к ядру
+   заново: подписи собраны в коде и сами по себе не меняются. */
+window.relocalizeSenderSections=()=>{renderSenderPolicies();renderIgnoredConversations();renderSenderSweepRules();};
 
 /* Ручное добавление значения в список (S-045). */
 async function addSenderPolicyByHand(decision){

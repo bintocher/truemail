@@ -401,6 +401,7 @@ impl Db {
         .bind(max_message_id)
         .execute(&mut *tx)
         .await?;
+        Self::drop_stage_snapshot(&mut tx, snapshot_key).await?;
         tx.commit().await?;
         self.advance_ignored_conversation_jobs().await?;
         self.ignored_conversation(conversation_id).await
