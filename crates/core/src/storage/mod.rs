@@ -5,7 +5,16 @@
 mod blobs;
 pub mod encoded_words;
 pub mod ignored_conversations;
+pub mod out_of_office;
+#[cfg(test)]
+mod out_of_office_scenarios;
+pub mod outbox_send;
+pub mod recipient_history;
+#[cfg(test)]
+mod recipient_history_scenarios;
 pub mod repo;
+#[cfg(test)]
+mod send_scenarios;
 pub mod sender_policies;
 pub mod sender_sweep;
 #[cfg(test)]
@@ -173,6 +182,19 @@ impl Db {
         self.restore_sender_policy_jobs().await?;
         self.restore_ignore_jobs().await?;
         self.restore_sender_sweep_jobs().await?;
+        // undo-send.md S-027: операция отправки, застигнутая аварийным
+        // завершением в состоянии передачи, получает неопределённый итог. Её
+        // повтор без решения пользователя отправил бы письмо второй раз.
+        self.recover_sending_operations().await?;
+        self.purge_send_request_keys().await?;
+        // out-of-office.md S-050 и recipient-history.md S-010: память об
+        // ответах и об отметках собственных отправок стареет фоновым
+        // обслуживанием, а не растёт без предела.
+        self.purge_out_of_office_replies().await?;
+        self.purge_recipient_own_sends().await?;
+        // recipient-history.md S-002: почтовые контакты прежнего сбора
+        // переносятся в историю получателей прикладным шагом миграции.
+        self.migrate_mail_contacts_to_history().await?;
         Ok(())
     }
 
@@ -2613,27 +2635,32 @@ mod tests {
         assert_eq!(second_exists.0, 1);
 
         let scheduled = db
-            .queue_scheduled_send(account.id, "{\"message\":true}", "2000-01-01 00:00:00")
+            .queue_outgoing_send(
+                account.id,
+                crate::backend::OutgoingMessage {
+                    from: "me@example.test".into(),
+                    to: vec!["you@example.test".into()],
+                    subject: "тема".into(),
+                    body_text: "текст".into(),
+                    ..Default::default()
+                },
+                crate::model::SEND_ORIGIN_SCHEDULED,
+                None,
+                0,
+            )
             .await
-            .expect("queue scheduled send");
-        db.convert_outbox_to_sent_append(scheduled, "{\"raw\":\"bWltZQ==\"}", "append failed")
+            .expect("queue scheduled send")
+            .operation_id;
+        db.convert_send_to_sent_append(scheduled, b"mime", "append failed")
             .await
             .expect("convert delivered SMTP operation");
-        let converted: (String, String, String, i64) =
-            sqlx::query_as("SELECT op_kind, payload, status, attempts FROM outbox_ops WHERE id=?")
+        let converted: (String, String, i64) =
+            sqlx::query_as("SELECT op_kind, status, attempts FROM outbox_ops WHERE id=?")
                 .bind(scheduled)
                 .fetch_one(&db.pool)
                 .await
                 .expect("read append-only retry");
-        assert_eq!(
-            converted,
-            (
-                "append_sent".into(),
-                "{\"raw\":\"bWltZQ==\"}".into(),
-                "retry".into(),
-                0
-            )
-        );
+        assert_eq!(converted, ("append_sent".into(), "retry".into(), 0));
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

@@ -351,8 +351,12 @@ async fn execute_tool(core: &Core, name: &str, arguments: Value) -> Result<Value
         }
         "send" => {
             let input: ApiSendInput = serde_json::from_value(arguments)?;
-            core.accounts
-                .send_outgoing(
+            // specs/undo-send.md, S-059: внешний клиент получает номер
+            // созданной операции, а не обещание состоявшейся отправки: письмо
+            // принято в очередь и уйдёт по её правилам.
+            let queued = core
+                .accounts
+                .queue_outgoing(
                     input.account_id,
                     OutgoingMessage {
                         from: String::new(),
@@ -363,10 +367,13 @@ async fn execute_tool(core: &Core, name: &str, arguments: Value) -> Result<Value
                         body_text: input.body_text,
                         body_html: input.body_html,
                         attachments: input.attachments,
+                        ..Default::default()
                     },
+                    crate::model::SEND_ORIGIN_EXTERNAL,
+                    None,
                 )
                 .await?;
-            Ok(json!({"sent": true}))
+            Ok(json!({"queued": true, "operation_id": queued.operation_id}))
         }
         "label" => {
             let message_id = required_i64(&arguments, "message_id")?;

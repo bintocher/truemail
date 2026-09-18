@@ -412,6 +412,8 @@ fn run() -> anyhow::Result<()> {
                         let _ = app.emit("truemail-global-shortcut", "compose");
                     }
                     "tray_quit" => {
+                        // S-031: письма внутри окна отмены решаются до выхода.
+                        commands::resolve_undo_windows_on_quit(app);
                         let _ = app.save_window_state(WINDOW_STATE_FLAGS);
                         app.state::<AppState>().quitting.store(true, Ordering::SeqCst);
                         app.exit(0);
@@ -598,6 +600,24 @@ fn run() -> anyhow::Result<()> {
             commands::sync_auxiliary_accounts,
             commands::start_realtime,
             commands::send_message,
+            commands::undo_send_seconds,
+            commands::set_undo_send_seconds,
+            commands::list_outbox_sends,
+            commands::cancel_send,
+            commands::open_cancelled_send,
+            commands::delete_send,
+            commands::retry_send,
+            commands::startup_send_state,
+            commands::release_undo_windows,
+            commands::out_of_office,
+            commands::save_out_of_office,
+            commands::disable_out_of_office,
+            commands::list_out_of_office_replies,
+            commands::recipient_candidates,
+            commands::list_recipient_history,
+            commands::update_recipient_history,
+            commands::delete_recipient_history_entry,
+            commands::clear_recipient_history,
             commands::schedule_message,
             commands::mark_seen,
             commands::mark_flagged,
@@ -724,6 +744,31 @@ mod command_contract_tests {
             "retry_message_operation",
             "discard_message_operation",
             "accounts_without_trash",
+            // undo-send.md S-372: без команд очереди отправки раздел
+            // "Исходящие" и сама отмена перестают работать, а письмо остаётся
+            // висеть в очереди без единого действия пользователя.
+            "undo_send_seconds",
+            "set_undo_send_seconds",
+            "list_outbox_sends",
+            "cancel_send",
+            "open_cancelled_send",
+            "delete_send",
+            "retry_send",
+            "startup_send_state",
+            "release_undo_windows",
+            // out-of-office.md S-397: чтение, сохранение и отключение
+            // автоответа вместе с перечнем уже отправленных ответов.
+            "out_of_office",
+            "save_out_of_office",
+            "disable_out_of_office",
+            "list_out_of_office_replies",
+            // recipient-history.md S-334: подсказка получателей и раздел
+            // управления историей.
+            "recipient_candidates",
+            "list_recipient_history",
+            "update_recipient_history",
+            "delete_recipient_history_entry",
+            "clear_recipient_history",
         ] {
             assert!(
                 MAIN.contains(&format!("commands::{command}")),

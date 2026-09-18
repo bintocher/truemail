@@ -325,6 +325,18 @@ type MessageContentCacheRow = (
     Option<String>,
 );
 
+/// Заголовки правил молчания одного письма: их читает стадия автоответа
+/// (specs/out-of-office.md, S-063).
+struct SilenceHeaders {
+    is_newsletter: bool,
+    auto_submitted: Option<String>,
+    precedence: Option<String>,
+    return_path_empty: bool,
+    auto_response_suppress: Option<String>,
+    reply_to_json: String,
+    known: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutboxOperation {
     pub id: i64,
@@ -404,6 +416,10 @@ impl Db {
             let rows: Vec<(String,)> = sqlx::query_as(query).fetch_all(&self.pool).await?;
             referenced.extend(rows.into_iter().map(|row| row.0));
         }
+        // undo-send.md S-007: тело и вложения ожидающего письма лежат в том же
+        // хранилище, а ссылки на них - в данных операции очереди. Без этого
+        // первый же запуск стёр бы тело, и письмо ушло бы пустым.
+        referenced.extend(self.outgoing_blob_references().await?);
         let missing = referenced
             .iter()
             .filter(|reference| !self.blobs.exists(reference))
@@ -1967,7 +1983,7 @@ impl Db {
                 let _ = self.blobs.remove(&reference);
             }
         }
-        self.sync_contacts_from_messages(account_id).await?;
+        self.advance_recipient_history(account_id).await?;
         Ok(counts)
     }
 
@@ -2026,6 +2042,34 @@ impl Db {
                     None
                 }
             };
+            // out-of-office.md S-063: заголовки правил молчания читаются при
+            // сохранении письма. Без них стадия автоответа загружала бы тело
+            // письма из сети на каждое новое письмо.
+            let raw_header = |name: &str| {
+                message
+                    .header_raw(name)
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+            };
+            let is_newsletter = message.header("List-Unsubscribe").is_some();
+            let auto_submitted = raw_header("Auto-Submitted");
+            let precedence = raw_header("Precedence");
+            let return_path = message.header_raw("Return-Path").map(str::trim);
+            let return_path_empty = return_path.is_some_and(|value| {
+                let inner = value.trim_start_matches('<').trim_end_matches('>').trim();
+                inner.is_empty()
+            });
+            let auto_response_suppress = raw_header("X-Auto-Response-Suppress");
+            // S-039: у письма, чьи заголовки серверный модуль не отдаёт,
+            // правила молчания по заголовкам не применяются вовсе. Полное
+            // письмо их даёт всегда, облегчённая проекция - только если модуль
+            // включил их в перечень.
+            let silence_headers_known = source.body_fetched
+                || is_newsletter
+                || auto_submitted.is_some()
+                || precedence.is_some()
+                || return_path.is_some()
+                || auto_response_suppress.is_some();
             let attachment_rows = message
                 .attachments()
                 .enumerate()
@@ -2062,6 +2106,15 @@ impl Db {
                 })
                 .collect::<Vec<_>>();
             let to_json = match serde_json::to_string(&addresses(message.to())) {
+                Ok(value) => value,
+                Err(error) => {
+                    for reference in &created_refs {
+                        let _ = self.blobs.remove(reference);
+                    }
+                    return Err(error.into());
+                }
+            };
+            let reply_to_json = match serde_json::to_string(&addresses(message.reply_to())) {
                 Ok(value) => value,
                 Err(error) => {
                     for reference in &created_refs {
@@ -2117,6 +2170,15 @@ impl Db {
                 auth("spf"),
                 auth("dmarc"),
                 raw_ref,
+                SilenceHeaders {
+                    is_newsletter,
+                    auto_submitted,
+                    precedence,
+                    return_path_empty,
+                    auto_response_suppress,
+                    reply_to_json,
+                    known: silence_headers_known,
+                },
             ));
         }
         let mut active_refs = HashSet::new();
@@ -2152,6 +2214,7 @@ impl Db {
                 spf,
                 dmarc,
                 raw_ref,
+                silence,
                 ) in batch
                 {
                 let folder: Option<(i64,)> = sqlx::query_as(
@@ -2186,8 +2249,8 @@ impl Db {
                     // backfilled намеренно не входит в DO UPDATE SET: письмо,
                     // уже лежавшее в базе, не должно стать "догруженным" из-за
                     // перекрытия страниц - иначе правила его больше не увидят.
-                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled)
-                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled, is_newsletter, auto_submitted, precedence, return_path_empty, auto_response_suppress, reply_to_addrs, silence_headers_known)
+                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(folder_id, uid) DO UPDATE SET
                         remote_id=coalesce(excluded.remote_id,messages.remote_id), rfc822_message_id=excluded.rfc822_message_id, in_reply_to=excluded.in_reply_to,
                         references_ids=excluded.references_ids, from_name=excluded.from_name,
@@ -2198,7 +2261,17 @@ impl Db {
                         has_attachments=CASE WHEN messages.body_fetched=1 AND excluded.body_fetched=0 THEN messages.has_attachments ELSE excluded.has_attachments END,
                         dkim_pass=excluded.dkim_pass, spf_pass=excluded.spf_pass,
                         dmarc_pass=excluded.dmarc_pass, raw_blob_ref=excluded.raw_blob_ref,
-                        body_fetched=CASE WHEN messages.body_fetched=1 THEN 1 ELSE excluded.body_fetched END",
+                        body_fetched=CASE WHEN messages.body_fetched=1 THEN 1 ELSE excluded.body_fetched END,
+                        -- Заголовки правил молчания обновляются только тогда,
+                        -- когда новая проекция их действительно читала: иначе
+                        -- облегчённый повтор стёр бы значения полного письма.
+                        is_newsletter=CASE WHEN excluded.silence_headers_known=1 THEN excluded.is_newsletter ELSE messages.is_newsletter END,
+                        auto_submitted=CASE WHEN excluded.silence_headers_known=1 THEN excluded.auto_submitted ELSE messages.auto_submitted END,
+                        precedence=CASE WHEN excluded.silence_headers_known=1 THEN excluded.precedence ELSE messages.precedence END,
+                        return_path_empty=CASE WHEN excluded.silence_headers_known=1 THEN excluded.return_path_empty ELSE messages.return_path_empty END,
+                        auto_response_suppress=CASE WHEN excluded.silence_headers_known=1 THEN excluded.auto_response_suppress ELSE messages.auto_response_suppress END,
+                        reply_to_addrs=excluded.reply_to_addrs,
+                        silence_headers_known=CASE WHEN messages.silence_headers_known=1 THEN 1 ELSE excluded.silence_headers_known END",
                 )
                 .bind(account_id).bind(folder_id).bind(source.uid as i64).bind(&source.remote_id).bind(&message_id)
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
@@ -2210,7 +2283,12 @@ impl Db {
                 // (ews-lightweight-message-fetch.md, S-007).
                 .bind(source.has_attachments.unwrap_or(!attachments.is_empty()) as i64).bind(dkim).bind(spf)
                 .bind(dmarc).bind(&effective_ref).bind(source.body_fetched as i64)
-                .bind(backfilled as i64).execute(&mut *tx).await?;
+                .bind(backfilled as i64)
+                .bind(silence.is_newsletter as i64).bind(&silence.auto_submitted)
+                .bind(&silence.precedence).bind(silence.return_path_empty as i64)
+                .bind(&silence.auto_response_suppress).bind(&silence.reply_to_json)
+                .bind(silence.known as i64)
+                .execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
                 if preserve_full_body {
                     if raw_ref != effective_ref {
@@ -2297,94 +2375,11 @@ impl Db {
         for (message_id, body_text) in indexed_bodies {
             index.index_body(message_id, &body_text).await?;
         }
-        self.sync_contacts_from_messages(account_id).await?;
+        // recipient-history.md S-001, S-006: адресная книга письмами больше не
+        // пополняется. Адреса, которым пользователь действительно писал,
+        // попадают в историю получателей из папок с ролью sent.
+        self.advance_recipient_history(account_id).await?;
         Ok(())
-    }
-
-    /// Дополнить адресную книгу реальными участниками переписки. Это особенно
-    /// важно для личного Яндекс-аккаунта: его CardDAV содержит только явно
-    /// синхронизируемую книгу и часто пуст, а адреса писем уже доступны локально.
-    pub async fn sync_contacts_from_messages(&self, account_id: i64) -> Result<usize> {
-        use std::collections::{HashMap, HashSet};
-
-        let (own_email,): (String,) = sqlx::query_as("SELECT email FROM accounts WHERE id = ?")
-            .bind(account_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let rows: Vec<(Option<String>, Option<String>, String, String)> = sqlx::query_as(
-            "SELECT from_name, from_addr, coalesce(to_addrs, '[]'), coalesce(cc_addrs, '[]')
-             FROM messages WHERE account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut candidates = HashMap::<String, String>::new();
-        let mut add = |email: &str, name: Option<&str>| {
-            let normalized = email.trim().to_lowercase();
-            if normalized.is_empty()
-                || normalized == own_email.to_lowercase()
-                || !normalized.contains('@')
-            {
-                return;
-            }
-            let display = clean_contact_name(
-                name.map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(&normalized),
-            );
-            candidates
-                .entry(normalized)
-                .and_modify(|current| {
-                    if current.contains('@') && !display.contains('@') {
-                        *current = display.clone();
-                    }
-                })
-                .or_insert(display);
-        };
-        for (from_name, from_addr, to_json, cc_json) in rows {
-            if let Some(email) = from_addr.as_deref() {
-                add(email, from_name.as_deref());
-            }
-            for json in [to_json, cc_json] {
-                for address in serde_json::from_str::<Vec<Addr>>(&json).unwrap_or_default() {
-                    add(&address.email, address.name.as_deref());
-                }
-            }
-        }
-        let existing: HashSet<String> = sqlx::query_as::<_, (String,)>(
-            "SELECT lower(ce.email) FROM contact_emails ce
-             JOIN contacts c ON c.id = ce.contact_id WHERE c.account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(|row| row.0)
-        .collect();
-        let mut tx = self.begin_write().await?;
-        let mut inserted = 0;
-        for (email, display_name) in candidates {
-            if existing.contains(&email) {
-                continue;
-            }
-            let result = sqlx::query(
-                "INSERT INTO contacts(account_id, uid, display_name)
-                 VALUES(?, ?, ?)",
-            )
-            .bind(account_id)
-            .bind(format!("mail:{email}"))
-            .bind(display_name)
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query("INSERT INTO contact_emails(contact_id, email, kind) VALUES(?, ?, 'mail')")
-                .bind(result.last_insert_rowid())
-                .bind(email)
-                .execute(&mut *tx)
-                .await?;
-            inserted += 1;
-        }
-        tx.commit().await?;
-        Ok(inserted)
     }
 
     // ---------- Письма ----------
@@ -3713,10 +3708,16 @@ impl Db {
         limit: i64,
     ) -> Result<Vec<OutboxOperation>> {
         let rows: Vec<OutboxRow> = sqlx::query_as(
+            // undo-send.md S-025: операции отправки в эту пачку не входят - их
+            // работник берёт по одной и переводит в состояние передачи прямо
+            // перед обращением к серверу, иначе последнее письмо пачки
+            // показывалось бы начавшим передачу и его отмена отклонялась бы
+            // сообщением, не соответствующим действительности.
             "UPDATE outbox_ops SET status='processing', next_attempt_at=datetime('now','+2 minutes')
              WHERE id IN (
                SELECT id FROM outbox_ops
-                WHERE account_id=? AND status IN ('pending','retry','processing')
+                WHERE account_id=? AND op_kind<>'send'
+                  AND status IN ('pending','retry','processing')
                   AND coalesce(next_attempt_at, created_at) <= datetime('now')
                 ORDER BY id LIMIT ?
              )
@@ -3746,67 +3747,17 @@ impl Db {
         Ok(result.rows_affected() as usize)
     }
 
-    pub async fn queue_scheduled_send(
-        &self,
-        account_id: i64,
-        payload: &str,
-        send_at: &str,
-    ) -> Result<i64> {
-        let result = sqlx::query(
-            "INSERT INTO outbox_ops(account_id, op_kind, payload, status, next_attempt_at)
-             VALUES(?, 'send', ?, 'pending', ?)",
-        )
-        .bind(account_id)
-        .bind(payload)
-        .bind(send_at)
-        .execute(&self.write_pool)
-        .await?;
-        Ok(result.last_insert_rowid())
-    }
-
-    /// SMTP уже принял письмо, но IMAP APPEND серверной копии не завершился.
-    /// Повторяем только APPEND: повторная SMTP-отправка создала бы дубль у адресата.
-    pub async fn queue_sent_append(
-        &self,
-        account_id: i64,
-        payload: &str,
-        error: &str,
-    ) -> Result<i64> {
-        let result = sqlx::query(
-            "INSERT INTO outbox_ops(account_id, op_kind, payload, status, attempts,
-                                    next_attempt_at, last_error)
-             VALUES(?, 'append_sent', ?, 'retry', 0, datetime('now','+5 seconds'), ?)",
-        )
-        .bind(account_id)
-        .bind(payload)
-        .bind(error.chars().take(1000).collect::<String>())
-        .execute(&self.write_pool)
-        .await?;
-        Ok(result.last_insert_rowid())
-    }
-
-    /// Превратить scheduled `send` в append-only retry после успешного SMTP DATA.
-    pub async fn convert_outbox_to_sent_append(
-        &self,
-        id: i64,
-        payload: &str,
-        error: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE outbox_ops
-                SET op_kind='append_sent', payload=?, status='retry', attempts=0,
-                    next_attempt_at=datetime('now','+5 seconds'), last_error=?
-              WHERE id=?",
-        )
-        .bind(payload)
-        .bind(error.chars().take(1000).collect::<String>())
-        .bind(id)
-        .execute(&self.write_pool)
-        .await?;
-        Ok(())
-    }
-
     pub async fn complete_outbox_operation(&self, operation: &OutboxOperation) -> Result<()> {
+        // undo-send.md S-010: большие объекты письма освобождаются только после
+        // успеха операции. До него они нужны и самой отправке, и возврату
+        // отменённого письма в композер.
+        let released = if matches!(operation.op_kind.as_str(), "send" | "append_sent") {
+            serde_json::from_str::<crate::model::SendPayload>(&operation.payload)
+                .map(|payload| payload.blob_refs())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut tx = self.begin_write().await?;
         if matches!(operation.op_kind.as_str(), "move" | "delete")
             && let Some(message_id) = operation.message_id
@@ -3821,6 +3772,9 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        for reference in released {
+            let _ = self.blobs.remove(&reference);
+        }
         Ok(())
     }
 
@@ -4308,6 +4262,10 @@ impl Db {
         taken += self.process_ignored_conversation_stage().await?;
         taken += self.process_sender_sweep_stage().await?;
         taken += self.process_mail_rules().await?;
+        // out-of-office.md S-030: локальный автоответ - пятая стадия, после
+        // правил обработки. Письмо, закрытое предшествующей стадией, до неё не
+        // доходит вовсе.
+        self.process_out_of_office_stage().await?;
         // Незавершённые уборки продвигаются тем же конвейером: иначе они
         // стояли бы до следующего действия пользователя.
         self.advance_sender_policy_jobs().await?;

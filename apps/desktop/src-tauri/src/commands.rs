@@ -4425,19 +4425,34 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         "outbox временно недоступен"
                     ),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // undo-send.md S-024: работник ждёт ближайший срок отмены, а
+                // не общий интервал прохода. Опрос раз в 10 секунд удлинял бы
+                // выбранное пользователем окно ещё на 0 - 10 секунд.
+                // Контрольный проход остаётся на случай пропущенного срока.
+                let wakeup = outbox_core
+                    .db
+                    .next_send_wakeup_seconds(outbox_account.id)
+                    .await
+                    .unwrap_or(None)
+                    .map(|seconds| seconds.clamp(1, 10))
+                    .unwrap_or(10);
+                tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)).await;
             }
         });
     }
     Ok(())
 }
 
+/// Принять письмо в очередь отправки. Композер очищается только после
+/// подтверждённой записи, поэтому отказ хранилища письмо не теряет
+/// (specs/undo-send.md, S-001 - S-003).
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SendMessageRequest,
-) -> CmdResult<()> {
+    request_key: Option<String>,
+) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
         .db
@@ -4449,9 +4464,319 @@ pub async fn send_message(
             message: "Аккаунт отправителя не найден".into(),
         })?;
     let outgoing = outgoing_message(&account, request);
-    core.accounts.send_outgoing(account.id, outgoing).await?;
+    let queued = core
+        .accounts
+        .queue_outgoing(
+            account.id,
+            outgoing,
+            truemail_core::model::SEND_ORIGIN_ORDINARY,
+            request_key,
+        )
+        .await?;
     let _ = app.emit("truemail-data-changed", account.id);
+    Ok(queued)
+}
+
+/// Письма внутри окна отмены при выходе из программы через меню трея.
+///
+/// Вопрос задаётся только здесь: закрытие окна прячет программу в трей и работу
+/// не заканчивает, поэтому там спрашивать не о чем (specs/undo-send.md, S-031,
+/// S-032). Ответ выполняется до завершения работы: выбранная отправка идёт
+/// немедленно, а отказ оставляет письма ждать следующего запуска.
+pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let core = tauri::async_runtime::block_on(async { state.core.read().await.clone() });
+    let Some(core) = core else { return };
+    let waiting = match tauri::async_runtime::block_on(core.db.startup_send_state()) {
+        Ok(state) => state.pending.len(),
+        Err(error) => {
+            tracing::warn!(%error, "очередь отправки при выходе не прочитана");
+            return;
+        }
+    };
+    if waiting == 0 {
+        return;
+    }
+    let answer = rfd::MessageDialog::new()
+        .set_title("truemail")
+        .set_description(format!(
+            "Писем ждёт окна отмены: {waiting}.\n\nОтправить их сейчас? Если нет, они уйдут при следующем запуске программы."
+        ))
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show();
+    if answer != rfd::MessageDialogResult::Yes {
+        return;
+    }
+    tauri::async_runtime::block_on(async move {
+        if let Err(error) = core.db.release_undo_windows().await {
+            tracing::warn!(%error, "окна отмены не отпущены при выходе");
+            return;
+        }
+        let Ok(accounts) = core.db.list_accounts().await else {
+            return;
+        };
+        for account in accounts.into_iter().filter(|account| account.enabled) {
+            // Выход не должен зависнуть на недоступном сервере: письмо,
+            // которое не успело уйти, остаётся в очереди и уйдёт при следующем
+            // запуске.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                core.accounts.process_mail_outbox(&account),
+            )
+            .await;
+        }
+    });
+}
+
+/// Длительность окна отмены: одно значение на все ящики (S-011, S-014).
+#[tauri::command]
+pub async fn undo_send_seconds(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.undo_send_seconds().await?)
+}
+
+/// Сохранить длительность окна отмены. Границы проверяет ядро (S-012, S-013).
+#[tauri::command]
+pub async fn set_undo_send_seconds(state: State<'_, AppState>, seconds: i64) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_undo_send_seconds(seconds)
+        .await?)
+}
+
+/// Раздел "Исходящие": операции отправки ящика страницами по 100 строк (S-020,
+/// S-022).
+#[tauri::command]
+pub async fn list_outbox_sends(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> CmdResult<Vec<truemail_core::model::OutboxSendEntry>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_outbox_sends(account_id, limit.unwrap_or(100), offset.unwrap_or(0))
+        .await?)
+}
+
+/// Отменить отправку, пока работник не начал передачу (S-037, S-038).
+#[tauri::command]
+pub async fn cancel_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<truemail_core::model::CancelSendOutcome> {
+    let core = core(&state).await?;
+    let outcome = core
+        .db
+        .cancel_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(outcome)
+}
+
+/// Открыть отменённое письмо: композер получает его целиком, вместе с
+/// вложениями (S-040).
+#[tauri::command]
+pub async fn open_cancelled_send(
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<truemail_core::model::CancelledSendMessage> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancelled_send_message(account_id, operation_id)
+        .await?)
+}
+
+/// Удалить письмо из раздела "Исходящие" вместе с его большими объектами.
+/// Подтверждение спрашивает интерфейс: другой копии письма у программы нет
+/// (S-043).
+#[tauri::command]
+pub async fn delete_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db
+        .delete_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
     Ok(())
+}
+
+/// Ручной повтор отправки с неопределённым итогом или с отказом. Закреплённый
+/// идентификатор письма сохраняется (S-051).
+#[tauri::command]
+pub async fn retry_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db
+        .retry_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(())
+}
+
+/// Состояние очереди отправки на запуске: незакончившиеся окна отмены, число
+/// писем с истёкшим окном и число неопределённых итогов (S-034 - S-036).
+#[tauri::command]
+pub async fn startup_send_state(
+    state: State<'_, AppState>,
+) -> CmdResult<truemail_core::model::StartupSendState> {
+    Ok(core(&state).await?.db.startup_send_state().await?)
+}
+
+/// Отпустить письма, ждущие окна отмены: пользователь выбрал отправить их перед
+/// выходом из программы (S-031).
+#[tauri::command]
+pub async fn release_undo_windows(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.release_undo_windows().await?)
+}
+
+/// Настройка автоответа выбранного ящика (specs/out-of-office.md, S-001, S-011).
+#[tauri::command]
+pub async fn out_of_office(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .out_of_office(account_id)
+        .await?)
+}
+
+/// Сохранить автоответ. Режим выбирает программа: Exchange хранит настройку на
+/// сервере, остальные ящики - у себя (S-002, S-012).
+#[tauri::command]
+pub async fn save_out_of_office(
+    state: State<'_, AppState>,
+    input: truemail_core::model::OutOfOfficeInput,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .save_out_of_office(input)
+        .await?)
+}
+
+/// Отключить автоответ (S-017, S-067).
+#[tauri::command]
+pub async fn disable_out_of_office(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    let core = core(&state).await?;
+    let current = core.accounts.out_of_office(account_id).await?;
+    core.accounts
+        .save_out_of_office(truemail_core::model::OutOfOfficeInput {
+            account_id,
+            enabled: false,
+            starts_at: current.starts_at.unwrap_or_default(),
+            ends_at: current.ends_at.unwrap_or_default(),
+            internal_text: current.internal_text,
+            external_text: current.external_text,
+            internal_domains: current.internal_domains,
+        })
+        .await
+        .map_err(Into::into)
+}
+
+/// Последние отправленные автоответы ящика: их показывает раздел автоответа.
+#[tauri::command]
+pub async fn list_out_of_office_replies(
+    state: State<'_, AppState>,
+    account_id: i64,
+    limit: Option<i64>,
+) -> CmdResult<Vec<truemail_core::storage::out_of_office::OutOfOfficeReply>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_out_of_office_replies(account_id, limit.unwrap_or(50))
+        .await?)
+}
+
+/// Кандидаты подсказки получателей: история выбранного ящика, объединённая с
+/// контактами и упорядоченная ядром (specs/recipient-history.md, S-031).
+#[tauri::command]
+pub async fn recipient_candidates(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<truemail_core::model::RecipientCandidate>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .recipient_candidates(account_id)
+        .await?)
+}
+
+/// Раздел управления историей получателей (S-042).
+#[tauri::command]
+pub async fn list_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> CmdResult<Vec<truemail_core::model::RecipientHistoryEntry>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_recipient_history(account_id, limit.unwrap_or(100), offset.unwrap_or(0))
+        .await?)
+}
+
+/// Изменить имя или адрес записи истории (S-043 - S-045).
+#[tauri::command]
+pub async fn update_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+    entry_id: i64,
+    name: Option<String>,
+    address: Option<String>,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .update_recipient_history_entry(account_id, entry_id, name, address)
+        .await?)
+}
+
+/// Убрать адрес из истории: запись остаётся скрытой пользователем (S-046).
+#[tauri::command]
+pub async fn delete_recipient_history_entry(
+    state: State<'_, AppState>,
+    account_id: i64,
+    entry_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .hide_recipient_history_entry(account_id, entry_id)
+        .await?)
+}
+
+/// Очистить историю ящика вместе с сохранением границы очистки (S-047).
+#[tauri::command]
+pub async fn clear_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .clear_recipient_history(account_id)
+        .await?)
 }
 
 fn outgoing_message(
@@ -4475,6 +4800,7 @@ fn outgoing_message(
                 data: item.data,
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -4503,18 +4829,18 @@ pub async fn schedule_message(
         });
     }
     let outgoing = outgoing_message(&account, request);
-    let payload = serde_json::to_string(&outgoing).map_err(truemail_core::Error::from)?;
     Ok(core
         .db
         .queue_scheduled_send(
             account.id,
-            &payload,
+            outgoing,
             &send_at
                 .with_timezone(&chrono::Utc)
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
         )
-        .await?)
+        .await?
+        .operation_id)
 }
 
 #[tauri::command]

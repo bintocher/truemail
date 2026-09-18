@@ -1238,6 +1238,7 @@ mod tests {
             body_text: "Hello".into(),
             body_html: None,
             attachments: Vec::new(),
+            ..Default::default()
         };
 
         backend.send(message, "app-password").await.unwrap();
@@ -1341,6 +1342,7 @@ mod tests {
                         mime_type: "text/plain".into(),
                         data: b"answer".to_vec(),
                     }],
+                    ..Default::default()
                 },
                 "app-password",
             )
