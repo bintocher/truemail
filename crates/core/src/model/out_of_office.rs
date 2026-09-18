@@ -62,10 +62,6 @@ pub struct OutOfOfficeSettings {
     /// (S-064, S-065).
     #[serde(default)]
     pub skipped_old: i64,
-    /// Заголовки правил молчания доступны не во всех серверных модулях, и об
-    /// этом сказано прямо в разделе автоответа ящика (S-039).
-    #[serde(default)]
-    pub silence_headers_available: bool,
     /// Вне сборки Windows ящик Exchange не синхронизируется вовсе, поэтому
     /// автоответ для него недоступен (S-004).
     #[serde(default)]
@@ -281,9 +277,6 @@ pub fn silence_reason(
     {
         return Some(SilenceReason::OutsidePeriod);
     }
-    if (now - received).num_hours() > MAX_MESSAGE_AGE_HOURS {
-        return Some(SilenceReason::TooOld);
-    }
     // S-047: у письма без ровно одного разобранного адреса отправителя сверять
     // нечего.
     let Some(from) = candidate
@@ -354,6 +347,13 @@ pub fn silence_reason(
         .any(|addr| recipient_key(&addr.email) == mailbox_key);
     if !addressed {
         return Some(SilenceReason::NotAddressedToMailbox);
+    }
+    // S-035, S-065: возраст проверяется последним. Письмо рассылки, служебного
+    // адреса или чужого ящика ответа не получило бы в любом случае, и в числе
+    // писем, оставшихся без ответа только из-за перерыва в работе программы,
+    // ему не место.
+    if (now - received).num_hours() > MAX_MESSAGE_AGE_HOURS {
+        return Some(SilenceReason::TooOld);
     }
     None
 }

@@ -38,12 +38,6 @@ function oofModeExplanation(settings, lang) {
     'Ответы уходят только пока программа запущена и этот ящик синхронизируется.',
     'Replies are sent only while the app is running and this mailbox is syncing.',
   ], lang));
-  if (settings.silence_headers_available === false) {
-    lines.push(oofText([
-      'Служебные заголовки писем этого ящика недоступны, поэтому часть правил молчания к нему не применяется.',
-      'Service headers are not available for this mailbox, so some silence rules do not apply to it.',
-    ], lang));
-  }
   return lines.join(' ');
 }
 
@@ -125,17 +119,6 @@ function oofInput(form) {
   };
 }
 
-// Подпись состояния автоответа для списка ящиков.
-function oofStateText(settings, lang) {
-  if (!settings || settings.available === false) {
-    return oofText(['недоступен', 'unavailable'], lang);
-  }
-  if (!settings.enabled) return oofText(['выключен', 'off'], lang);
-  return settings.mode === 'server'
-    ? oofText(['включён на сервере', 'on, stored on the server'], lang)
-    : oofText(['включён в программе', 'on, handled by the app'], lang);
-}
-
 const outOfOfficeModel = {
   OOF_MIN_PERIOD_MINUTES,
   OOF_MAX_PERIOD_DAYS,
@@ -146,7 +129,6 @@ const outOfOfficeModel = {
   oofDomainsFromText,
   oofValidationError,
   oofInput,
-  oofStateText,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = outOfOfficeModel;
 if (typeof window !== 'undefined') window.outOfOfficeModel = outOfOfficeModel;

@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Происхождение отправки (S-092 словаря спецификации).
+/// Происхождение отправки (S-055, S-057 - S-059).
 pub const SEND_ORIGIN_ORDINARY: &str = "ordinary";
 pub const SEND_ORIGIN_SCHEDULED: &str = "scheduled";
 pub const SEND_ORIGIN_AUTOMATIC: &str = "automatic";
@@ -165,7 +165,9 @@ pub struct CancelledSendAttachment {
 }
 
 /// Исход отмены отправки: отмена спорит за одну строку с захватом работника, и
-/// победить может только одно действие (S-037, S-038).
+/// победить может только одно действие (S-037, S-038). Проигравшей отмене
+/// называется настоящее состояние операции: неотправленное письмо не выдаётся
+/// за отправленное (S-064).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelSendOutcome {
@@ -175,6 +177,12 @@ pub enum CancelSendOutcome {
     AlreadySending,
     /// Сервер уже подтвердил принятие письма либо операции больше нет.
     AlreadySent,
+    /// Итог передачи неизвестен, и решение о нём принимает пользователь.
+    Uncertain,
+    /// Отправка окончательно отказала: отменять нечего.
+    AlreadyFailed,
+    /// Операция уже отменена - обычно повторным нажатием.
+    AlreadyCancelled,
 }
 
 /// Число писем с истёкшим окном отмены на запуске программы: показывается одним

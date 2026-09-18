@@ -836,8 +836,13 @@ impl MailBackend for JmapBackend {
         Ok(())
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<super::SendOutcome> {
-        self.send_message(credential, message).await?;
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> super::SendResult {
+        // Отказ сборки письма и отказ соединения случаются до передачи, а
+        // нераспознанный отказ мог застать письмо уже принятым: точку отказа
+        // выбирает общее правило обращений поверх HTTP.
+        self.send_message(credential, message)
+            .await
+            .map_err(super::request_failure)?;
         Ok(super::SendOutcome::SavedOnServer)
     }
 

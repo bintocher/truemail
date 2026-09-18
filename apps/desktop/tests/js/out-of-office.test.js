@@ -7,16 +7,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const oof = require('../../ui/modules/out-of-office.js');
 
-test('S-004, S-007, S-008, S-020, S-039: режим объясняется честно и не обещает лишнего', () => {
+test('S-004, S-007, S-008, S-020: режим объясняется честно и не обещает лишнего', () => {
   const server = oof.oofModeExplanation({mode: 'server', available: true}, 'ru');
   assert.ok(server.includes('на сервере'), server);
   assert.ok(server.includes('определяет сервер'), server);
-  const local = oof.oofModeExplanation({mode: 'local', available: true, silence_headers_available: true}, 'ru');
+  const local = oof.oofModeExplanation({mode: 'local', available: true}, 'ru');
   assert.ok(local.includes('пока программа запущена'), local);
   assert.ok(!local.includes('при закрытой программе'), 'локальный режим не обещает работу при закрытой программе');
-  // Заголовки правил молчания доступны не всякому ящику - об этом говорится.
-  const partial = oof.oofModeExplanation({mode: 'local', available: true, silence_headers_available: false}, 'ru');
-  assert.ok(partial.includes('правил молчания'), partial);
   // Ящик Exchange вне сборки Windows: локальный автоответ ему не предлагается.
   const unavailable = oof.oofModeExplanation(
     {mode: 'server', available: false, unavailable_reason: 'автоответ ящика Exchange доступен только в сборке для Windows'},
@@ -69,11 +66,4 @@ test('S-013, S-027: домены приводятся к общей форме, 
   assert.ok(input.starts_at.endsWith('Z'), 'период уходит во всемирном времени');
   assert.equal(input.internal_text, 'Я в отпуске');
   assert.deepEqual(input.internal_domains, ['example.test']);
-});
-
-test('S-002: состояние автоответа в списке ящиков не путает серверный режим с локальным', () => {
-  assert.equal(oof.oofStateText({available: true, enabled: true, mode: 'server'}, 'ru'), 'включён на сервере');
-  assert.equal(oof.oofStateText({available: true, enabled: true, mode: 'local'}, 'ru'), 'включён в программе');
-  assert.equal(oof.oofStateText({available: true, enabled: false, mode: 'local'}, 'ru'), 'выключен');
-  assert.equal(oof.oofStateText({available: false}, 'en'), 'unavailable');
 });

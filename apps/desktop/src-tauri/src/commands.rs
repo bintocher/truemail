@@ -92,6 +92,10 @@ pub struct AppState {
     // исчерпаны, временный сбой не всплывает: программа сама переподключается,
     // и человеку показывать нечего. Успешный проход обнуляет счёт.
     pub mail_failures: Arc<tokio::sync::Mutex<HashMap<i64, u32>>>,
+    // Принятое письмо будит работников очереди отправки. Без этого письмо,
+    // принятое сразу после прохода, ждало бы конца общего сна: окно отмены в
+    // пять секунд превращалось бы примерно в десять (undo-send.md, S-024).
+    pub send_wakeup: Arc<tokio::sync::Notify>,
 }
 
 /// Сколько сбоев подряд по одному аккаунту считаются исчерпанными повторами:
@@ -4402,6 +4406,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
 
         let outbox_core = core.clone();
         let outbox_account = account.clone();
+        let send_wakeup = state.send_wakeup.clone();
         let outbox_app = app.clone();
         let outbox_generation = state.generation.clone();
         let generation = outbox_generation.load(std::sync::atomic::Ordering::SeqCst);
@@ -4410,6 +4415,11 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 if outbox_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     break;
                 }
+                // Ожидание объявляется до прохода: письмо, принятое во время
+                // прохода, иначе разбудило бы работника, который ещё не начал
+                // ждать, и его пробуждение пропало бы (S-024).
+                let mut wakeup_signal = std::pin::pin!(send_wakeup.notified());
+                wakeup_signal.as_mut().enable();
                 match outbox_core
                     .accounts
                     .process_mail_outbox(&outbox_account)
@@ -4428,7 +4438,9 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 // undo-send.md S-024: работник ждёт ближайший срок отмены, а
                 // не общий интервал прохода. Опрос раз в 10 секунд удлинял бы
                 // выбранное пользователем окно ещё на 0 - 10 секунд.
-                // Контрольный проход остаётся на случай пропущенного срока.
+                // Контрольный проход остаётся на случай пропущенного срока, а
+                // принятое письмо будит работника сразу: его собственный срок
+                // может наступить раньше того, который работник видел.
                 let wakeup = outbox_core
                     .db
                     .next_send_wakeup_seconds(outbox_account.id)
@@ -4436,7 +4448,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     .unwrap_or(None)
                     .map(|seconds| seconds.clamp(1, 10))
                     .unwrap_or(10);
-                tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)) => {}
+                    _ = wakeup_signal => {}
+                }
             }
         });
     }
@@ -4473,6 +4488,9 @@ pub async fn send_message(
             request_key,
         )
         .await?;
+    // S-024: передача начинается не позднее чем через секунду после срока
+    // отмены, а работник в этот момент может спать до десяти секунд.
+    state.send_wakeup.notify_waiters();
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(queued)
 }
@@ -4829,7 +4847,7 @@ pub async fn schedule_message(
         });
     }
     let outgoing = outgoing_message(&account, request);
-    Ok(core
+    let operation_id = core
         .db
         .queue_scheduled_send(
             account.id,
@@ -4840,7 +4858,9 @@ pub async fn schedule_message(
                 .to_string(),
         )
         .await?
-        .operation_id)
+        .operation_id;
+    state.send_wakeup.notify_waiters();
+    Ok(operation_id)
 }
 
 #[tauri::command]

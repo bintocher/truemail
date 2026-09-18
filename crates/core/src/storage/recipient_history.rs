@@ -11,9 +11,14 @@ use crate::Result;
 use crate::model::*;
 use sqlx::AssertSqlSafe;
 
-/// Ранг записи выражением базы: те же веса, что и у чистой функции
-/// `entry_rank`, только считаются на стороне SQLite, чтобы не поднимать в
-/// память до 50 отметок на каждую из 2000 записей (S-028).
+/// Время истории в том же виде, в каком его пишет само обращение: с буквой T и
+/// смещением. Время базы ("2026-09-18 12:00:00") сравнивалось бы с ним как
+/// строка неверно, и убранный адрес возвращался бы в видимые записи тем же
+/// днём (S-046 - S-048).
+const HISTORY_NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%S+00:00','now')";
+
+/// Ранг записи выражением базы: веса считаются на стороне SQLite, чтобы не
+/// поднимать в память до 50 отметок на каждую из 2000 записей (S-028).
 const RANK_SQL: &str = "(SELECT coalesce(sum(CASE
             WHEN julianday('now') - julianday(t.used_at) < 30 THEN 3
             WHEN julianday('now') - julianday(t.used_at) < 90 THEN 2
@@ -81,7 +86,9 @@ impl Db {
         .and_then(|(value,)| value);
         let mut recorded = 0;
         // Один адрес одного письма даёт ровно одно обращение, даже если он
-        // встретился и в поле "Кому", и в поле "Копия" (S-016).
+        // встретился и в поле "Кому", и в поле "Копия" (S-016). Ключ пары -
+        // письмо и адрес: в одной пачке приходят адресаты разных писем, и
+        // общий ключ по адресу потерял бы все письма, кроме первого.
         let mut seen = std::collections::HashSet::new();
         for touch in touches {
             let key = canonical_sender_address(&touch.email).to_lowercase();
@@ -89,7 +96,7 @@ impl Db {
                 continue;
             }
             // S-019: собственный адрес подключённого ящика в историю не идёт.
-            if own.contains(&key) || !seen.insert(key.clone()) {
+            if own.contains(&key) || !seen.insert((touch.message_key.clone(), key.clone())) {
                 continue;
             }
             // S-048: граница очистки защищает и те адреса, которые ещё не
@@ -247,8 +254,11 @@ impl Db {
 
     /// Пополнить историю из папок с ролью `sent`. Курсор пополнения только
     /// ускоряет проход: защиту от повторного счёта даёт ключ письма (S-018).
+    /// Проход идёт пачками до исчерпания писем: на ящике с тысячами отправленных
+    /// писем остановка после первой пачки оставила бы историю неполной, объявив
+    /// первичное заполнение законченным (S-008).
     pub async fn advance_recipient_history(&self, account_id: i64) -> Result<i64> {
-        let cursor: i64 = sqlx::query_as::<_, (i64,)>(
+        let mut cursor: i64 = sqlx::query_as::<_, (i64,)>(
             "SELECT cursor_message_id FROM recipient_history_state WHERE account_id=?",
         )
         .bind(account_id)
@@ -256,6 +266,29 @@ impl Db {
         .await?
         .map(|(value,)| value)
         .unwrap_or(0);
+        let mut recorded = 0;
+        loop {
+            let batch = self.recipient_history_batch(account_id, cursor).await?;
+            if batch.is_empty() {
+                break;
+            }
+            let (last_id, added) = self.record_sent_batch(account_id, batch).await?;
+            recorded += added;
+            cursor = last_id;
+            self.advance_recipient_history_cursor(account_id, cursor, false)
+                .await?;
+        }
+        self.advance_recipient_history_cursor(account_id, cursor, true)
+            .await?;
+        Ok(recorded)
+    }
+
+    /// Очередная пачка уже сохранённых отправленных писем ящика.
+    async fn recipient_history_batch(
+        &self,
+        account_id: i64,
+        cursor: i64,
+    ) -> Result<Vec<SentMessageRow>> {
         let rows: Vec<SentMessageRow> = sqlx::query_as(
             "SELECT m.id, m.rfc822_message_id, m.to_addrs, m.cc_addrs, m.date
                    FROM messages m JOIN folders f ON f.id=m.folder_id
@@ -267,11 +300,17 @@ impl Db {
         .bind(BACKFILL_BATCH)
         .fetch_all(&self.pool)
         .await?;
-        if rows.is_empty() {
-            self.mark_recipient_history_ready(account_id, cursor)
-                .await?;
-            return Ok(0);
-        }
+        Ok(rows)
+    }
+
+    /// Записать обращения целой пачки писем одной неделимой операцией. Прежде
+    /// каждое письмо открывало свою запись и перечитывало адреса ящиков, и
+    /// первичное заполнение давало сотни записей на проход (S-008).
+    async fn record_sent_batch(
+        &self,
+        account_id: i64,
+        rows: Vec<SentMessageRow>,
+    ) -> Result<(i64, i64)> {
         let own_sends: std::collections::HashSet<String> = sqlx::query_as::<_, (String,)>(
             "SELECT fixed_message_id FROM recipient_own_sends WHERE account_id=?",
         )
@@ -281,8 +320,8 @@ impl Db {
         .into_iter()
         .map(|(value,)| value)
         .collect();
-        let mut last_id = cursor;
-        let mut recorded = 0;
+        let mut last_id = 0;
+        let mut touches = Vec::new();
         for (message_id, rfc_id, to_json, cc_json, date) in rows {
             last_id = message_id;
             // S-011: своя копия обращения не удваивает - оно уже записано в
@@ -303,7 +342,6 @@ impl Db {
             // S-026: у письма без разобранной даты берётся время его первой
             // локальной вставки, поэтому обращение не оказывается в 1970 году.
             let used_at = normalize_touch_time(date.as_deref());
-            let mut touches = Vec::new();
             for json in [to_json, cc_json] {
                 let Some(json) = json else { continue };
                 for address in serde_json::from_str::<Vec<Addr>>(&json).unwrap_or_default() {
@@ -315,30 +353,34 @@ impl Db {
                     });
                 }
             }
-            recorded += self
-                .record_recipient_touches(account_id, &touches, TouchOrigin::SentFolder)
-                .await?;
         }
-        self.mark_recipient_history_ready(account_id, last_id)
+        let recorded = self
+            .record_recipient_touches(account_id, &touches, TouchOrigin::SentFolder)
             .await?;
-        Ok(recorded)
+        Ok((last_id, recorded))
     }
 
-    /// Двинуть курсор пополнения вперёд и отметить завершённое первичное
-    /// заполнение (S-008, S-018).
-    async fn mark_recipient_history_ready(&self, account_id: i64, cursor: i64) -> Result<()> {
+    /// Двинуть курсор пополнения вперёд. Признак завершённого первичного
+    /// заполнения ставится только по исчерпании писем (S-008, S-018).
+    async fn advance_recipient_history_cursor(
+        &self,
+        account_id: i64,
+        cursor: i64,
+        done: bool,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO recipient_history_state(account_id, cursor_message_id, initial_done,
                                                  updated_at)
-             VALUES(?, ?, 1, datetime('now'))
+             VALUES(?, ?, ?, datetime('now'))
              ON CONFLICT(account_id) DO UPDATE SET
                 cursor_message_id=max(recipient_history_state.cursor_message_id,
                                       excluded.cursor_message_id),
-                initial_done=1,
+                initial_done=max(recipient_history_state.initial_done, excluded.initial_done),
                 updated_at=datetime('now')",
         )
         .bind(account_id)
         .bind(cursor)
+        .bind(done as i64)
         .execute(&self.write_pool)
         .await?;
         Ok(())
@@ -548,11 +590,11 @@ impl Db {
     /// скрытия: иначе старое отправленное письмо вернуло бы её при следующей
     /// синхронизации (S-046).
     pub async fn hide_recipient_history_entry(&self, account_id: i64, entry_id: i64) -> Result<()> {
-        sqlx::query(
+        sqlx::query(AssertSqlSafe(format!(
             "UPDATE recipient_history
-                SET hidden_by_user=1, hidden_at=datetime('now'), evicted=0, evicted_at=NULL
-              WHERE id=? AND account_id=?",
-        )
+                SET hidden_by_user=1, hidden_at={HISTORY_NOW_SQL}, evicted=0, evicted_at=NULL
+              WHERE id=? AND account_id=?"
+        )))
         .bind(entry_id)
         .bind(account_id)
         .execute(&self.write_pool)
@@ -564,20 +606,20 @@ impl Db {
     /// становятся скрытыми пользователем (S-047).
     pub async fn clear_recipient_history(&self, account_id: i64) -> Result<i64> {
         let mut tx = self.begin_write().await?;
-        let hidden = sqlx::query(
+        let hidden = sqlx::query(AssertSqlSafe(format!(
             "UPDATE recipient_history
-                SET hidden_by_user=1, hidden_at=datetime('now')
-              WHERE account_id=? AND hidden_by_user=0",
-        )
+                SET hidden_by_user=1, hidden_at={HISTORY_NOW_SQL}
+              WHERE account_id=? AND hidden_by_user=0"
+        )))
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO recipient_history_state(account_id, cleared_at, updated_at)
-             VALUES(?, datetime('now'), datetime('now'))
+             VALUES(?, {HISTORY_NOW_SQL}, datetime('now'))
              ON CONFLICT(account_id) DO UPDATE SET
-                cleared_at=datetime('now'), updated_at=datetime('now')",
-        )
+                cleared_at={HISTORY_NOW_SQL}, updated_at=datetime('now')"
+        )))
         .bind(account_id)
         .execute(&mut *tx)
         .await?;
@@ -628,7 +670,9 @@ impl Db {
             sqlx::query(
                 "INSERT INTO recipient_history(account_id, address_key, display_address,
                                                display_name, hidden_by_user, hidden_at)
-                 VALUES(?, ?, ?, ?, ?, CASE WHEN ?=1 THEN datetime('now') ELSE NULL END)
+                 VALUES(?, ?, ?, ?, ?,
+                        CASE WHEN ?=1 THEN strftime('%Y-%m-%dT%H:%M:%S+00:00','now')
+                             ELSE NULL END)
                  ON CONFLICT(account_id, address_key) DO UPDATE SET
                     display_name=CASE WHEN recipient_history.display_name=''
                                       THEN excluded.display_name

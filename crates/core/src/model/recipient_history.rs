@@ -1,9 +1,8 @@
-//! История получателей: ранг записи по распределению обращений во времени,
-//! порядок кандидатов подсказки и границы хранения
-//! (specs/recipient-history.md).
+//! История получателей: порядок кандидатов подсказки, разбор имени адресата и
+//! границы хранения (specs/recipient-history.md).
 //!
-//! Ранжирование - чистые функции: они считаются по отметкам обращений и
-//! проверяются без базы.
+//! Ранг записи считает запрос базы: до 50 отметок на каждую из 2000 записей в
+//! память не поднимаются.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,24 +23,27 @@ pub const HISTORY_PAGE: i64 = 100;
 /// сталкивалась.
 pub const MAX_HISTORY_ADDRESS_BYTES: usize = 254;
 
-/// Вес одной отметки обращения по её возрасту в сутках (S-028). Границы
-/// закрыты явно: щели между группами нет, поэтому отметка возрастом ровно 30,
-/// 90 или 365 суток попадает в следующую группу, а не теряется.
-pub fn touch_weight(age_days: f64) -> i64 {
-    if age_days < 30.0 {
-        3
-    } else if age_days < 90.0 {
-        2
-    } else if age_days < 365.0 {
-        1
-    } else {
-        0
+/// Имя и адрес из строки адресата вида `Имя <user@example.test>`. Собственная
+/// отправка хранит адресатов такими строками целиком: без разбора запись
+/// истории получила бы пустое имя и адрес вместе с именем внутри (S-024,
+/// S-038).
+pub fn split_display_address(value: &str) -> (String, String) {
+    let trimmed = value.trim();
+    let angle = trimmed
+        .rfind('<')
+        .filter(|_| trimmed.ends_with('>'))
+        .map(|start| (start, trimmed.len() - 1));
+    let Some((start, end)) = angle else {
+        return (String::new(), trimmed.to_owned());
+    };
+    let email = trimmed[start + 1..end].trim().to_owned();
+    let name = trimmed[..start].trim().trim_matches('"').trim();
+    // Строка вида "<user@example.test>" имени не несёт, а адрес именем не
+    // считается: подпись кандидата показывает его и так (S-038).
+    if name.is_empty() || name.contains('@') {
+        return (String::new(), email);
     }
-}
-
-/// Ранг записи - сумма весов её отметок обращений (S-028).
-pub fn entry_rank(age_days: &[f64]) -> i64 {
-    age_days.iter().copied().map(touch_weight).sum()
+    (name.to_owned(), email)
 }
 
 /// Источник кандидата подсказки: кандидат только из истории помечается в
@@ -120,19 +122,31 @@ pub struct ContactMigrationReport {
 mod tests {
     use super::*;
 
-    /// S-028: границы весов закрыты явно. Отметка ровно на границе принадлежит
-    /// следующей группе, иначе между группами оставалась бы щель и такое
-    /// обращение не считалось бы вовсе.
+    /// S-024, S-038: имя и адрес берутся из строки адресата собственной
+    /// отправки. Адрес без имени и адрес, записанный именем, имени не дают, но
+    /// сам адрес возвращается всегда без угловых скобок.
     #[test]
-    fn touch_weight_has_no_gaps_on_its_boundaries() {
-        assert_eq!(touch_weight(0.0), 3);
-        assert_eq!(touch_weight(29.999), 3);
-        assert_eq!(touch_weight(30.0), 2);
-        assert_eq!(touch_weight(89.999), 2);
-        assert_eq!(touch_weight(90.0), 1);
-        assert_eq!(touch_weight(364.999), 1);
-        assert_eq!(touch_weight(365.0), 0);
-        assert_eq!(entry_rank(&[1.0, 45.0, 120.0, 400.0]), 6);
+    fn display_name_and_address_come_from_the_address_string() {
+        assert_eq!(
+            split_display_address("Иванов Иван <ivanov@example.test>"),
+            ("Иванов Иван".to_owned(), "ivanov@example.test".to_owned())
+        );
+        assert_eq!(
+            split_display_address("\"Иванов, Иван\" <ivanov@example.test>"),
+            ("Иванов, Иван".to_owned(), "ivanov@example.test".to_owned())
+        );
+        assert_eq!(
+            split_display_address("ivanov@example.test"),
+            (String::new(), "ivanov@example.test".to_owned())
+        );
+        assert_eq!(
+            split_display_address("<ivanov@example.test>"),
+            (String::new(), "ivanov@example.test".to_owned())
+        );
+        assert_eq!(
+            split_display_address("ivanov@example.test <ivanov@example.test>"),
+            (String::new(), "ivanov@example.test".to_owned())
+        );
     }
 
     fn candidate(

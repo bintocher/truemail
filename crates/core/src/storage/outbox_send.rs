@@ -52,6 +52,44 @@ impl Db {
         request_key: Option<String>,
         undo_seconds: i64,
     ) -> Result<SendQueued> {
+        self.queue_send(account_id, message, origin, request_key, undo_seconds, None)
+            .await
+    }
+
+    /// Отложенная отправка по времени: передача начинается в заданное время, а
+    /// окно отмены поверх него не добавляется - пользователь уже выбрал время
+    /// сам (S-055). Отменить такую операцию можно из раздела "Исходящие", пока
+    /// она не перешла в состояние передачи (S-056).
+    pub async fn queue_scheduled_send(
+        &self,
+        account_id: i64,
+        message: OutgoingMessage,
+        send_at: &str,
+    ) -> Result<SendQueued> {
+        self.queue_send(
+            account_id,
+            message,
+            SEND_ORIGIN_SCHEDULED,
+            None,
+            0,
+            Some(send_at),
+        )
+        .await
+    }
+
+    /// Общий приём письма в очередь. Срок передачи известен до записи и
+    /// попадает в ту же строку: письмо, созданное с немедленным сроком и
+    /// перенесённое вторым запросом, работник успевал бы забрать между ними, а
+    /// отказ второго запроса отправил бы его немедленно (S-008, S-055).
+    async fn queue_send(
+        &self,
+        account_id: i64,
+        message: OutgoingMessage,
+        origin: &str,
+        request_key: Option<String>,
+        undo_seconds: i64,
+        send_at: Option<&str>,
+    ) -> Result<SendQueued> {
         // S-005: адресаты проверяются до записи операции, поэтому непригодный
         // адрес не создаёт ожидающего письма вовсе.
         crate::backend::validate_outgoing(&message)?;
@@ -109,6 +147,7 @@ impl Db {
                 origin,
                 request_key.as_deref(),
                 undo_seconds,
+                send_at,
             )
             .await?;
             tx.commit().await?;
@@ -122,43 +161,26 @@ impl Db {
             })
         }
         .await;
-        match queued {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                // S-003: письмо не принято, значит и большие объекты остаться
-                // не должны - иначе каждая неудачная отправка оставляла бы в
-                // хранилище тело письма без ссылки на него.
-                for reference in written {
-                    let _ = self.blobs.remove(&reference);
-                }
-                Err(error)
-            }
+        let error = match queued {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        // S-003: письмо не принято, значит и большие объекты остаться не должны
+        // - иначе каждая неудачная отправка оставляла бы в хранилище тело
+        // письма без ссылки на него.
+        for reference in written {
+            let _ = self.blobs.remove(&reference);
         }
-    }
-
-    /// Отложенная отправка по времени: передача начинается в заданное время, а
-    /// окно отмены поверх него не добавляется - пользователь уже выбрал время
-    /// сам (S-055). Отменить такую операцию можно из раздела "Исходящие", пока
-    /// она не перешла в состояние передачи (S-056).
-    pub async fn queue_scheduled_send(
-        &self,
-        account_id: i64,
-        message: OutgoingMessage,
-        send_at: &str,
-    ) -> Result<SendQueued> {
-        let queued = self
-            .queue_outgoing_send(account_id, message, SEND_ORIGIN_SCHEDULED, None, 0)
-            .await?;
-        sqlx::query("UPDATE outbox_ops SET cancel_until=?, next_attempt_at=? WHERE id=?")
-            .bind(send_at)
-            .bind(send_at)
-            .bind(queued.operation_id)
-            .execute(&self.write_pool)
-            .await?;
-        Ok(SendQueued {
-            cancel_until: send_at.to_owned(),
-            ..queued
-        })
+        // S-053: два одновременных нажатия с одним ключом доходят до записи оба,
+        // и второе спотыкается об уникальный ключ. Ответ ему - уже созданная
+        // операция, а не ошибка.
+        if is_request_key_conflict(&error)
+            && let Some(key) = request_key.as_deref()
+            && let Some(existing) = self.existing_send_request(account_id, key).await?
+        {
+            return Ok(existing);
+        }
+        Err(error)
     }
 
     /// Ранее созданная операция того же запроса (S-053).
@@ -258,6 +280,13 @@ impl Db {
         tx.commit().await?;
         Ok(match status.as_ref().map(|(value,)| value.as_str()) {
             Some(SEND_STATUS_PROCESSING) => CancelSendOutcome::AlreadySending,
+            // S-064: неопределённый итог называется неопределённым, а отказ -
+            // отказом. Прежде любое состояние, кроме передачи, объявлялось
+            // отправленным письмом, включая повторное нажатие на уже
+            // отменённой операции.
+            Some(SEND_STATUS_UNCERTAIN) => CancelSendOutcome::Uncertain,
+            Some(SEND_STATUS_FAILED) => CancelSendOutcome::AlreadyFailed,
+            Some(SEND_STATUS_CANCELLED) => CancelSendOutcome::AlreadyCancelled,
             // Письма в очереди уже нет: сервер подтвердил принятие, и обещать
             // отзыв у получателей программа не вправе (S-044).
             _ => CancelSendOutcome::AlreadySent,
@@ -278,6 +307,10 @@ impl Db {
                FROM outbox_ops o JOIN accounts a ON a.id=o.account_id
               WHERE o.op_kind IN ('send','append_sent')
                 AND (? IS NULL OR o.account_id = ?)
+                -- S-058: служебное письмо программы показывается пользователю
+                -- только тогда, когда с ним что-то не так.
+                AND (coalesce(o.send_origin, 'ordinary') <> 'automatic'
+                     OR o.status IN ('failed','uncertain'))
               ORDER BY o.id DESC LIMIT ? OFFSET ?",
         )
         .bind(account_id)
@@ -342,49 +375,77 @@ impl Db {
     /// Удалить операцию отправки вместе с её большими объектами. Другой копии
     /// письма у программы нет, поэтому команду даёт только пользователь (S-043).
     pub async fn delete_send_operation(&self, account_id: i64, operation_id: i64) -> Result<()> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT payload, status FROM outbox_ops
-              WHERE id=? AND account_id=? AND op_kind IN ('send','append_sent')",
+        // Состояние проверяется тем же изменением, которое удаляет строку:
+        // между отдельным чтением и удалением работник успевает захватить
+        // операцию, и письмо ушло бы уже без своих больших объектов (S-043).
+        let deleted: Option<(String,)> = sqlx::query_as(
+            "DELETE FROM outbox_ops
+              WHERE id=? AND account_id=? AND op_kind IN ('send','append_sent')
+                AND status<>'processing'
+             RETURNING payload",
         )
         .bind(operation_id)
         .bind(account_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.write_pool)
         .await?;
-        let Some((payload, status)) = row else {
-            return Err(crate::Error::Other("операция отправки не найдена".into()));
-        };
-        if matches!(status.as_str(), SEND_STATUS_PROCESSING) {
+        let Some((payload,)) = deleted else {
+            let status: Option<(String,)> =
+                sqlx::query_as("SELECT status FROM outbox_ops WHERE id=? AND account_id=?")
+                    .bind(operation_id)
+                    .bind(account_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
             return Err(crate::Error::Other(
-                "отправка уже началась, удалить письмо нельзя".into(),
+                match status.as_ref().map(|(value,)| value.as_str()) {
+                    Some(SEND_STATUS_PROCESSING) => "отправка уже началась, удалить письмо нельзя",
+                    _ => "операция отправки не найдена",
+                }
+                .into(),
             ));
-        }
-        let references = serde_json::from_str::<SendPayload>(&payload)
+        };
+        for reference in serde_json::from_str::<SendPayload>(&payload)
             .map(|payload| payload.blob_refs())
-            .unwrap_or_default();
-        let deleted = sqlx::query("DELETE FROM outbox_ops WHERE id=? AND account_id=?")
-            .bind(operation_id)
-            .bind(account_id)
-            .execute(&self.write_pool)
-            .await?;
-        if deleted.rows_affected() == 1 {
-            for reference in references {
-                let _ = self.blobs.remove(&reference);
-            }
+            .unwrap_or_default()
+        {
+            let _ = self.blobs.remove(&reference);
+        }
+        Ok(())
+    }
+
+    /// Закрыть успешно завершённую отправку вместе с её большими объектами.
+    /// Данные операции читаются из базы: превращение в дозапись копии успело
+    /// добавить в них точные байты письма, и снимок, взятый до захвата, оставил
+    /// бы их в хранилище навсегда (S-010).
+    pub async fn complete_send_operation(&self, operation_id: i64) -> Result<()> {
+        let deleted: Option<(String,)> =
+            sqlx::query_as("DELETE FROM outbox_ops WHERE id=? RETURNING payload")
+                .bind(operation_id)
+                .fetch_optional(&self.write_pool)
+                .await?;
+        let Some((payload,)) = deleted else {
+            return Ok(());
+        };
+        for reference in serde_json::from_str::<SendPayload>(&payload)
+            .map(|payload| payload.blob_refs())
+            .unwrap_or_default()
+        {
+            let _ = self.blobs.remove(&reference);
         }
         Ok(())
     }
 
     /// Ручной повтор отправки с неопределённым итогом или с окончательным
-    /// отказом. Закреплённый идентификатор письма сохраняется, ключ запроса
-    /// выдаётся новый (S-051).
+    /// отказом. Закреплённый идентификатор письма и ключ запроса сохраняются:
+    /// по ключу отключение автоответа отменяет свои ещё не ушедшие письма, и
+    /// без него повторённый автоответ было бы уже не остановить (S-051,
+    /// out-of-office.md S-067).
     pub async fn retry_send_operation(&self, account_id: i64, operation_id: i64) -> Result<()> {
         let changed = sqlx::query(
             "UPDATE outbox_ops
                 SET status='pending', attempts=0, last_error=NULL,
-                    request_key=NULL,
                     cancel_until=datetime('now'), next_attempt_at=datetime('now')
               WHERE id=? AND account_id=? AND op_kind IN ('send','append_sent')
-                AND status IN ('uncertain','failed','cancelled')",
+                AND status IN ('uncertain','failed')",
         )
         .bind(operation_id)
         .bind(account_id)
@@ -436,13 +497,10 @@ impl Db {
     /// Превратить отправку в дозапись копии в папку с ролью `sent`. Ссылки на
     /// большие объекты переходят к новой операции в той же записи, а точные
     /// байты письма кладутся в хранилище и в данные операции строкой не
-    /// попадают (S-009, S-052).
-    pub async fn convert_send_to_sent_append(
-        &self,
-        operation_id: i64,
-        raw: &[u8],
-        error: &str,
-    ) -> Result<()> {
+    /// попадают (S-009, S-052). Выполняется сразу после подтверждения сервером,
+    /// до попытки добавить копию: иначе аварийное завершение между ними
+    /// оставило бы операцию отправкой и повтор ушёл бы получателю второй раз.
+    pub async fn convert_send_to_sent_append(&self, operation_id: i64, raw: &[u8]) -> Result<()> {
         let (payload,): (String,) = sqlx::query_as("SELECT payload FROM outbox_ops WHERE id=?")
             .bind(operation_id)
             .fetch_one(&self.pool)
@@ -455,16 +513,10 @@ impl Db {
             "UPDATE outbox_ops
                 SET op_kind='append_sent', payload=?, status='retry', attempts=0,
                     next_attempt_at=datetime('now','+5 seconds'), cancel_until=NULL,
-                    last_error=?
+                    last_error=NULL
               WHERE id=?",
         )
         .bind(&serialized)
-        .bind(
-            crate::logging::mask_error_text(error)
-                .chars()
-                .take(1000)
-                .collect::<String>(),
-        )
         .bind(operation_id)
         .execute(&self.write_pool)
         .await?;
@@ -583,9 +635,13 @@ impl Db {
     /// конца окна отмены, пока программа не работала, и сколько операций ждёт
     /// решения пользователя (S-034 - S-036).
     pub async fn startup_send_state(&self) -> Result<StartupSendState> {
+        // S-036: число истёкших окон отмены считается по письмам, у которых
+        // это окно вообще было. Отложенная, служебная и внешняя отправка окна
+        // отмены не получают, и в этом числе им не место.
         let (expired, uncertain): (i64, i64) = sqlx::query_as(
             "SELECT
                sum(CASE WHEN status IN ('pending','retry')
+                         AND send_origin='ordinary'
                          AND coalesce(cancel_until, created_at) <= datetime('now')
                         THEN 1 ELSE 0 END),
                sum(CASE WHEN status='uncertain' THEN 1 ELSE 0 END)
@@ -626,11 +682,17 @@ impl Db {
 
     /// Немедленно отпустить письма, ждущие окна отмены: пользователь выбрал
     /// отправить их перед выходом из программы (S-031).
+    ///
+    /// Отбираются только письма обычного происхождения. У отложенной отправки в
+    /// том же поле стоит выбранное пользователем время, и общее условие
+    /// отправило бы письмо, назначенное на утро понедельника, вечером пятницы
+    /// (S-055).
     pub async fn release_undo_windows(&self) -> Result<i64> {
         let result = sqlx::query(
             "UPDATE outbox_ops
                 SET cancel_until=datetime('now'), next_attempt_at=datetime('now')
-              WHERE op_kind='send' AND status='pending' AND cancel_until > datetime('now')",
+              WHERE op_kind='send' AND status='pending' AND send_origin='ordinary'
+                AND cancel_until > datetime('now')",
         )
         .execute(&self.write_pool)
         .await?;
@@ -680,15 +742,23 @@ pub(crate) async fn insert_send_operation(
     origin: &str,
     request_key: Option<&str>,
     undo_seconds: i64,
+    send_at: Option<&str>,
 ) -> Result<(i64, String)> {
     let serialized = serde_json::to_string(payload)?;
     // S-015: срок отмены считается по длительности, действующей в момент
     // приёма, и хранится абсолютным временем. Изменение настройки после этого
-    // уже назначенный срок не двигает.
-    let (cancel_until,): (String,) = sqlx::query_as("SELECT datetime('now', ?)")
-        .bind(format!("+{undo_seconds} seconds"))
-        .fetch_one(&mut **tx)
-        .await?;
+    // уже назначенный срок не двигает. У отложенной отправки срок задан
+    // пользователем и приходит готовым.
+    let cancel_until = match send_at {
+        Some(value) => value.to_owned(),
+        None => {
+            sqlx::query_as::<_, (String,)>("SELECT datetime('now', ?)")
+                .bind(format!("+{undo_seconds} seconds"))
+                .fetch_one(&mut **tx)
+                .await?
+                .0
+        }
+    };
     let (operation_id,): (i64,) = sqlx::query_as(
         "INSERT INTO outbox_ops(account_id, op_kind, payload, status, attempts,
                                 next_attempt_at, request_key, fixed_message_id,
@@ -719,6 +789,15 @@ pub(crate) async fn insert_send_operation(
         .await?;
     }
     Ok((operation_id, cancel_until))
+}
+
+/// Запись не прошла из-за уникального ключа запроса: тот же запрос уже принят
+/// другим одновременным вызовом (S-053).
+fn is_request_key_conflict(error: &crate::Error) -> bool {
+    let crate::Error::Db(sqlx::Error::Database(database)) = error else {
+        return false;
+    };
+    database.is_unique_violation()
 }
 
 /// Закреплённый идентификатор письма. Домен берётся из адреса отправителя:

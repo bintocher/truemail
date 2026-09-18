@@ -5,7 +5,46 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 const outbox = require('../../ui/modules/outbox.js');
+
+// Раздел настроек живёт в queue-sections.js и работает с DOM. Чтобы проверять
+// рабочий путь, а не отдельную функцию рядом с ним, модуль выполняется целиком
+// в подставном окружении, и дальше вызывается тот же слушатель поля, который
+// вызовет браузер.
+function loadQueueSections(undoField, tm) {
+  const listeners = new Map();
+  const toasts = [];
+  const nodes = {undoSendSeconds: undoField};
+  const context = {
+    console,
+    wizardLocale: 'ru',
+    coreAccounts: [],
+    L: russian => russian,
+    showToast: value => toasts.push(String(value)),
+    confirmAction: async () => true,
+    document: {
+      getElementById: id => {
+        const node = nodes[id];
+        if (!node) return null;
+        node.addEventListener = (type, handler) => listeners.set(`${id}:${type}`, handler);
+        return node;
+      },
+      querySelectorAll: () => [],
+    },
+  };
+  context.window = context;
+  context.window.tm = tm;
+  context.window.outboxModel = outbox;
+  vm.createContext(context);
+  vm.runInContext(
+    fs.readFileSync(path.join(__dirname, '..', '..', 'ui', 'modules', 'queue-sections.js'), 'utf8'),
+    context,
+  );
+  return {listeners, toasts};
+}
 
 test('S-017, S-018: обратный отсчёт считает срок отмены во всемирном времени', () => {
   // Время очереди приходит из базы без обозначения зоны. Прочитанное как
@@ -74,8 +113,41 @@ test('S-040: отменённое письмо возвращается в ко�
   assert.equal(draft.operation_id, 12);
 });
 
-test('S-012: окно отмены принимает только целые секунды от 0 до 60', () => {
-  assert.ok(outbox.validUndoSeconds(0) && outbox.validUndoSeconds(60));
-  assert.ok(!outbox.validUndoSeconds(-1) && !outbox.validUndoSeconds(61));
-  assert.ok(!outbox.validUndoSeconds(5.5) && !outbox.validUndoSeconds(''));
+test('S-064: отмена называет настоящее состояние операции', () => {
+  // Прежде любое состояние, кроме передачи, объявлялось отправленным письмом:
+  // человеку говорили, что письмо ушло, хотя оно отказало или ждёт его решения.
+  assert.ok(outbox.cancelOutcomeText('uncertain', 'ru').includes('неизвестен'));
+  assert.ok(!outbox.cancelOutcomeText('uncertain', 'ru').includes('отправлено'));
+  assert.ok(outbox.cancelOutcomeText('already_failed', 'ru').includes('не удалось'));
+  assert.ok(outbox.cancelOutcomeText('already_cancelled', 'ru').includes('уже отменена'));
+});
+
+test('S-012: пустое поле длительности окна отмены не выключает отмену молча', async () => {
+  // Проверяется сам обработчик поля: прежде он приводил значение к числу до
+  // проверки, пустая строка становилась нулём, проходила как допустимая и
+  // молча выключала окно отмены.
+  const saved = [];
+  const field = {value: ''};
+  const {listeners, toasts} = loadQueueSections(field, {
+    undoSendSeconds: async () => 5,
+    setUndoSendSeconds: async value => {
+      saved.push(value);
+      return value;
+    },
+  });
+  const change = listeners.get('undoSendSeconds:change');
+  assert.ok(change, 'обработчик поля не подключён');
+
+  await change({target: field});
+  assert.deepEqual(saved, [], 'очищенное поле в ядро не уходит');
+  assert.equal(field.value, '5', 'поле возвращается к действующему значению');
+  assert.equal(toasts.length, 1, 'отказ объясняется человеку');
+
+  field.value = '7';
+  await change({target: field});
+  assert.deepEqual(saved, [7], 'допустимое значение сохраняется');
+
+  field.value = '61';
+  await change({target: field});
+  assert.deepEqual(saved, [7], 'значение вне границ в ядро не уходит');
 });

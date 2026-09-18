@@ -5,6 +5,8 @@
 mod blobs;
 pub mod encoded_words;
 pub mod ignored_conversations;
+#[cfg(test)]
+mod migration_scenarios;
 pub mod out_of_office;
 #[cfg(test)]
 mod out_of_office_scenarios;
@@ -2651,7 +2653,7 @@ mod tests {
             .await
             .expect("queue scheduled send")
             .operation_id;
-        db.convert_send_to_sent_append(scheduled, b"mime", "append failed")
+        db.convert_send_to_sent_append(scheduled, b"mime")
             .await
             .expect("convert delivered SMTP operation");
         let converted: (String, String, i64) =

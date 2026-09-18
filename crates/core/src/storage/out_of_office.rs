@@ -58,7 +58,7 @@ impl Db {
             OUT_OF_OFFICE_MODE_LOCAL
         };
         let stored: Option<StoredSettingsRow> = sqlx::query_as(
-            "SELECT mode, enabled, starts_at, ends_at, internal_text, external_text,
+            "SELECT enabled, starts_at, ends_at, internal_text, external_text,
                     internal_domains, version, server_checked_at, last_error, skipped_old
                FROM out_of_office_settings WHERE account_id=?",
         )
@@ -92,12 +92,6 @@ impl Db {
                 .and_then(|row| row.server_checked_at.clone()),
             last_error: stored.as_ref().and_then(|row| row.last_error.clone()),
             skipped_old: stored.as_ref().map(|row| row.skipped_old).unwrap_or(0),
-            // S-039: правило молчания по заголовку не применяется к письму, у
-            // которого этого заголовка нет вовсе. Сами заголовки отдают все
-            // модули: письма IMAP и JMAP разбираются из сырого письма,
-            // проекция Gmail несёт их перечнем, а облегчённый запрос Exchange -
-            // расширенными свойствами.
-            silence_headers_available: true,
             // S-004: вне сборки Windows все запросы Exchange отклоняются, и
             // ящик не синхронизируется вовсе - подменять серверный автоответ
             // локальным программа не вправе.
@@ -206,6 +200,18 @@ impl Db {
             .bind(input.account_id)
             .execute(&mut *tx)
             .await?;
+            // S-048: отменённый ответ отправленным не считается, иначе окно
+            // молчания на семь суток закрыло бы адресата, так и не получившего
+            // ни одного ответа.
+            sqlx::query(
+                "UPDATE out_of_office_replies SET state='failed'
+                  WHERE account_id=? AND state='queued'
+                    AND operation_id IN (SELECT id FROM outbox_ops
+                                          WHERE status='cancelled' AND op_kind='send')",
+            )
+            .bind(input.account_id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         self.out_of_office_settings(input.account_id).await
@@ -305,8 +311,11 @@ impl Db {
         Ok(result.rows_affected() as i64)
     }
 
-    /// Отметить итог передачи автоответа (S-421 одновременной работы: успешная
-    /// передача переводит запись ответа в состояние отправленного).
+    /// Отметить итог передачи автоответа: подтверждённая передача переводит
+    /// запись ответа в состояние отправленного, а окончательный отказ и отмена -
+    /// в состояние отказа. Окно молчания считает только отправленные и ещё
+    /// ожидающие записи, иначе адресат, до которого ответ так и не дошёл,
+    /// остался бы без ответа и в следующий раз (S-048, S-068).
     pub async fn mark_out_of_office_reply_state(
         &self,
         operation_id: i64,
@@ -423,6 +432,7 @@ impl Db {
             let (recent,): (i64,) = sqlx::query_as(
                 "SELECT count(*) FROM out_of_office_replies
                   WHERE account_id=? AND recipient_key=? AND id<>?
+                    AND state<>'failed'
                     AND replied_at > datetime('now', ?)",
             )
             .bind(row.account_id)
@@ -475,6 +485,7 @@ impl Db {
                 SEND_ORIGIN_AUTOMATIC,
                 Some(&format!("oof:{}:{}", row.account_id, row.id)),
                 0,
+                None,
             )
             .await?;
             sqlx::query("UPDATE out_of_office_replies SET operation_id=? WHERE id=?")
@@ -517,11 +528,10 @@ impl ReplyRow {
     }
 }
 
-/// Строка сохранённой настройки.
+/// Строка сохранённой настройки. Режим из неё не читается: его определяет вид
+/// серверного модуля и текущая сборка, а не прежняя запись (S-002).
 #[derive(sqlx::FromRow)]
 struct StoredSettingsRow {
-    #[allow(dead_code)]
-    mode: String,
     enabled: i64,
     starts_at: Option<String>,
     ends_at: Option<String>,

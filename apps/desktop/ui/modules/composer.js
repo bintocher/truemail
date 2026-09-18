@@ -23,7 +23,13 @@ document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclic
 /* Каждый сброс композера - новое письмо: вложение, дочитанное после этого,
    уже не наше и в новое письмо не попадает. */
 let composerGeneration=0;
-function resetComposer(){composerGeneration++;composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+/* Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
+   второй отправки не создаёт (undo-send.md, S-053). Ключ относится к тому
+   содержимому композера, с которым он создан: после правки письма и после
+   открытия нового письма он сбрасывается, иначе ядро вернуло бы прежнюю
+   операцию, а новое содержимое пропало бы вместе с очищенным композером. */
+let composerRequestKey='';
+function resetComposer(){composerGeneration++;composerRequestKey='';composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
@@ -483,13 +489,18 @@ document.getElementById('linkOverlay').addEventListener('click',e=>{if(e.target.
 document.getElementById('linkHref').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();applyLinkDialog();}});
 let draftSaveTimer=null;
 function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:recipientFieldAddresses('compTo').join(', '),cc:recipientFieldAddresses('compCc').join(', '),bcc:recipientFieldAddresses('compBcc').join(', '),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:compEditEl.innerText,attachments:composerAttachments};}
-function scheduleDraftSave(){clearTimeout(draftSaveTimer);draftSaveTimer=setTimeout(()=>window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload())).catch(console.error),500);}
+function scheduleDraftSave(){
+  // S-053: письмо изменилось - прежний ключ запроса к нему уже не относится.
+  composerRequestKey='';
+  clearTimeout(draftSaveTimer);
+  draftSaveTimer=setTimeout(()=>window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload())).catch(console.error),500);
+}
+/* Записать черновик немедленно и дождаться подтверждения: отложенная на 500 мс
+   запись не годится там, где следом удаляется единственная долговечная копия
+   письма (S-003, S-042). */
+async function saveDraftNow(){clearTimeout(draftSaveTimer);await window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload()));}
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
 function composerRequest(){const draft=draftPayload(),to=splitAddresses(draft.to),cc=splitAddresses(draft.cc),bcc=splitAddresses(draft.bcc),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
-/* Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
-   второй отправки не создаёт (undo-send.md, S-053). Ключ живёт до
-   подтверждённой записи письма в очередь. */
-let composerRequestKey='';
 function composerLang(){return wizardLocale==='en'?'en':'ru';}
 /* Карточка окна отмены с обратным отсчётом (S-017, S-018). Срок карточки
    определяет срок отмены, а не общий срок исчезновения карточек. */
@@ -532,8 +543,10 @@ async function restoreCancelledSend(accountId,operationId){
   try{
     const message=await window.tm.openCancelledSend(accountId,operationId);
     applyCancelledSendToComposer(message);
-    // Операция больше не нужна: письмо целиком лежит в композере. Неудачный
-    // возврат её не трогает, поэтому письмо не пропадает.
+    // S-003, S-042: операция очереди - единственная долговечная копия письма.
+    // Она удаляется только после подтверждённой записи черновика, иначе отказ
+    // записи или закрытие программы в этот миг потеряли бы письмо целиком.
+    await saveDraftNow();
     await window.tm.deleteSend(accountId,operationId);
     showView('composeView');
   }catch(error){showToast(error);}
@@ -593,8 +606,8 @@ document.getElementById('compSend').onclick=async()=>{
     // S-003: письмо не принято - композер и черновик остаются нетронутыми.
     showToast(error);return;
   }
-  // S-002: композер очищается только после подтверждённой записи в очередь.
-  composerRequestKey='';
+  // S-002: композер очищается только после подтверждённой записи в очередь;
+  // очистка снимает и ключ запроса - следующее письмо получит свой.
   resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
   showUndoSendCard(queued,request);
 };

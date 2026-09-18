@@ -276,6 +276,21 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
     Error::classified_backend(backend, kind, error.to_string())
 }
 
+/// Отказ SMTP вместе с точкой, в которой он случился. Обрыв соединения и
+/// истечение времени ожидания застают передачу уже начатой: байты письма могли
+/// дойти до сервера, и повтор доставил бы получателю второй экземпляр. Ответ
+/// сервера с кодом, отказ входа и отказ TLS приходят до передачи письма, и
+/// такой отказ повторяется обычным порядком очереди (S-048, S-049).
+fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::SendFailure {
+    let after_handoff = error.is_timeout() || error.is_transport_shutdown();
+    let error = smtp_error(backend, error);
+    if after_handoff {
+        super::SendFailure::after_handoff(error)
+    } else {
+        super::SendFailure::before_handoff(error)
+    }
+}
+
 pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     let extra_headers = message.headers.clone();
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
@@ -401,6 +416,7 @@ pub async fn send_oauth(
     send_oauth_with_raw(message, access_token, host, port, security)
         .await
         .map(|_| ())
+        .map_err(|failure| failure.error)
 }
 
 /// Отправить MIME через SMTP и вернуть ровно те байты, которые были переданы
@@ -412,7 +428,7 @@ pub(crate) async fn send_oauth_with_raw(
     host: &str,
     port: u16,
     security: Security,
-) -> Result<Vec<u8>> {
+) -> std::result::Result<Vec<u8>, super::SendFailure> {
     let from = message.from.clone();
     let email = build_message(message)?;
     let raw = email.formatted();
@@ -423,7 +439,7 @@ pub(crate) async fn send_oauth_with_raw(
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     };
     let transport = builder
-        .map_err(|error| smtp_error("smtp", error))?
+        .map_err(|error| smtp_failure("smtp", error))?
         .port(port)
         .credentials(credentials)
         .authentication(vec![Mechanism::Xoauth2])
@@ -432,7 +448,7 @@ pub(crate) async fn send_oauth_with_raw(
     transport
         .send_raw(email.envelope(), &raw)
         .await
-        .map_err(|error| smtp_error("smtp", error))?;
+        .map_err(|error| smtp_failure("smtp", error))?;
     Ok(raw)
 }
 
@@ -441,9 +457,15 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
+    send_gmail_raw(&build_message(message)?.formatted(), access_token).await
+}
+
+/// Запрос отправки Gmail по уже собранным байтам письма. Сборка письма отделена
+/// от запроса: отказ сборки случается до обращения к серверу, и очередь
+/// отправки различает их (S-048, S-049).
+pub(crate) async fn send_gmail_raw(raw: &[u8], access_token: &str) -> Result<()> {
     use base64::Engine as _;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(build_message(message)?.formatted());
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     let response = reqwest::Client::new()
         .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
         .bearer_auth(access_token)
@@ -474,6 +496,7 @@ pub async fn send_password(
     send_password_with_raw(message, username, password, host, port, security)
         .await
         .map(|_| ())
+        .map_err(|failure| failure.error)
 }
 
 pub(crate) async fn send_password_with_raw(
@@ -483,11 +506,12 @@ pub(crate) async fn send_password_with_raw(
     host: &str,
     port: u16,
     security: Security,
-) -> Result<Vec<u8>> {
+) -> std::result::Result<Vec<u8>, super::SendFailure> {
     if security == Security::None {
         return Err(Error::AccountConfig(
             "незашифрованный SMTP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
-        ));
+        )
+        .into());
     }
     let email = build_message(message)?;
     let raw = email.formatted();
@@ -496,7 +520,7 @@ pub(crate) async fn send_password_with_raw(
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     }
-    .map_err(|error| smtp_error("smtp", error))?;
+    .map_err(|error| smtp_failure("smtp", error))?;
     let transport = builder
         .port(port)
         .credentials(Credentials::new(username.to_owned(), password.to_owned()))
@@ -505,7 +529,7 @@ pub(crate) async fn send_password_with_raw(
     transport
         .send_raw(email.envelope(), &raw)
         .await
-        .map_err(|error| smtp_error("smtp", error))?;
+        .map_err(|error| smtp_failure("smtp", error))?;
     Ok(raw)
 }
 

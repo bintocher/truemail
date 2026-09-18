@@ -50,6 +50,8 @@ struct Incoming<'a> {
     to: Option<&'a str>,
     backfilled: bool,
     headers_known: bool,
+    /// Время получения письма. Пусто - письмо только что пришло.
+    date: Option<&'a str>,
 }
 
 async fn seed_message(
@@ -71,7 +73,8 @@ async fn seed_message(
                               date, rfc822_message_id, to_addrs, reply_to_addrs, backfilled,
                               is_newsletter, auto_submitted, precedence, silence_headers_known,
                               remote_id, size)
-         VALUES(?, ?, ?, 'Отправитель', ?, ?, 'предпросмотр', datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, ?, 2048)
+         VALUES(?, ?, ?, 'Отправитель', ?, ?, 'предпросмотр',
+                coalesce(?, datetime('now')), ?, ?, ?, ?, ?, ?, ?, ?, ?, 2048)
          RETURNING id",
     )
     .bind(account_id)
@@ -79,6 +82,7 @@ async fn seed_message(
     .bind(uid)
     .bind(seed.from)
     .bind(seed.subject)
+    .bind(seed.date)
     .bind(seed.message_id)
     .bind(to)
     .bind(reply_to)
@@ -96,11 +100,18 @@ async fn seed_message(
 
 /// Включить локальный автоответ на период вокруг текущего времени.
 async fn enable_local_absence(db: &Db, account_id: i64) {
+    enable_local_absence_since(db, account_id, 1).await
+}
+
+/// То же, но с началом периода на заданное число суток назад: письмо старше
+/// суток должно попадать внутрь периода, иначе его отсекает не возраст, а
+/// граница периода.
+async fn enable_local_absence_since(db: &Db, account_id: i64, days_back: i64) {
     let now = chrono::Utc::now();
     db.save_local_out_of_office(&OutOfOfficeInput {
         account_id,
         enabled: true,
-        starts_at: (now - chrono::Duration::days(1)).to_rfc3339(),
+        starts_at: (now - chrono::Duration::days(days_back)).to_rfc3339(),
         ends_at: (now + chrono::Duration::days(1)).to_rfc3339(),
         internal_text: "Я в отпуске, коллеги в курсе".into(),
         external_text: "Я в отпуске, отвечу позже".into(),
@@ -485,6 +496,175 @@ async fn internal_and_external_senders_get_their_own_texts() {
     assert_eq!(
         texts[1], "Я в отпуске, отвечу позже",
         "похожий домен своим не становится"
+    );
+    db.close().await;
+}
+
+/// Окончательно отказавший автоответ адресата не закрывает: следующее его письмо
+/// снова получает ответ, потому что ни одного ответа он так и не получил
+/// (S-048, S-068).
+#[tokio::test]
+async fn a_finally_failed_reply_does_not_silence_the_sender() {
+    let db: TestDb = open_test_db("oof-failed").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    enable_local_absence(&db, account).await;
+    seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Incoming {
+            from: "colleague@example.test",
+            subject: "Вопрос",
+            message_id: "<first@partner.test>",
+            headers_known: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    db.process_out_of_office_stage()
+        .await
+        .expect("стадия автоответа");
+    let (operation_id,): (i64,) = sqlx::query_as(
+        "SELECT operation_id FROM out_of_office_replies WHERE account_id=? ORDER BY id LIMIT 1",
+    )
+    .bind(account)
+    .fetch_one(&db.pool)
+    .await
+    .expect("запись ответа");
+
+    // Попытки исчерпаны: ответ окончательно отказал и адресата не получил.
+    sqlx::query("UPDATE outbox_ops SET attempts=8 WHERE id=?")
+        .bind(operation_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("исчерпать попытки");
+    db.fail_outbox_operation(operation_id, "сервер отверг письмо")
+        .await
+        .expect("окончательный отказ");
+    let (state,): (String,) =
+        sqlx::query_as("SELECT state FROM out_of_office_replies WHERE operation_id=?")
+            .bind(operation_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("состояние записи ответа");
+    assert_eq!(state, "failed", "отказ записан в самой записи ответа");
+
+    seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Incoming {
+            from: "colleague@example.test",
+            subject: "Ещё вопрос",
+            message_id: "<second@partner.test>",
+            headers_known: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    db.process_out_of_office_stage()
+        .await
+        .expect("вторая стадия автоответа");
+    assert_eq!(
+        queued_replies(&db, account).await.len(),
+        2,
+        "после окончательного отказа адресат получает ответ на следующее письмо"
+    );
+    db.close().await;
+}
+
+/// Число писем, оставшихся без ответа по возрасту, считает только те письма,
+/// которые ответ получили бы: рассылка, служебный адрес и чужое письмо в него не
+/// попадают (S-035, S-065).
+#[tokio::test]
+async fn the_unanswered_counter_holds_only_messages_that_would_have_been_answered() {
+    let db: TestDb = open_test_db("oof-old").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    enable_local_absence_since(&db, account, 3).await;
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(30))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let older = [
+        Incoming {
+            from: "shop@partner.test",
+            subject: "Скидки",
+            message_id: "<bulk@partner.test>",
+            newsletter: true,
+            headers_known: true,
+            date: Some(&long_ago),
+            ..Default::default()
+        },
+        Incoming {
+            from: "mailer-daemon@partner.test",
+            subject: "Отчёт",
+            message_id: "<daemon@partner.test>",
+            headers_known: true,
+            date: Some(&long_ago),
+            ..Default::default()
+        },
+        Incoming {
+            from: "stranger@partner.test",
+            subject: "Рассылка отдела",
+            message_id: "<hidden@partner.test>",
+            headers_known: true,
+            to: Some(r#"[{"name":null,"email":"team@partner.test"}]"#),
+            date: Some(&long_ago),
+            ..Default::default()
+        },
+    ];
+    let mut uid = 1;
+    for seed in older {
+        seed_message(&db, account, inbox, uid, seed).await;
+        uid += 1;
+    }
+    db.process_out_of_office_stage()
+        .await
+        .expect("стадия автоответа");
+    let (skipped,): (i64,) =
+        sqlx::query_as("SELECT skipped_old FROM out_of_office_settings WHERE account_id=?")
+            .bind(account)
+            .fetch_one(&db.pool)
+            .await
+            .expect("счётчик писем без ответа");
+    assert_eq!(
+        skipped, 0,
+        "письма, которым ответа не было бы в любом случае, в счётчик не идут"
+    );
+
+    // Обычное старое письмо коллеги - тот самый случай, ради которого счётчик и
+    // заведён: ответ был бы, но программа не работала.
+    seed_message(
+        &db,
+        account,
+        inbox,
+        uid,
+        Incoming {
+            from: "colleague@example.test",
+            subject: "Вопрос",
+            message_id: "<old-letter@partner.test>",
+            headers_known: true,
+            date: Some(&long_ago),
+            ..Default::default()
+        },
+    )
+    .await;
+    db.process_out_of_office_stage()
+        .await
+        .expect("вторая стадия автоответа");
+    let (skipped,): (i64,) =
+        sqlx::query_as("SELECT skipped_old FROM out_of_office_settings WHERE account_id=?")
+            .bind(account)
+            .fetch_one(&db.pool)
+            .await
+            .expect("счётчик писем без ответа");
+    assert_eq!(skipped, 1, "старое письмо коллеги названо прямо");
+    assert!(
+        queued_replies(&db, account).await.is_empty(),
+        "запоздалых ответов программа не рассылает"
     );
     db.close().await;
 }

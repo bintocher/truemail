@@ -3405,7 +3405,7 @@ impl MailBackend for EwsBackend {
         Ok(())
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<super::SendOutcome> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> super::SendResult {
         let mime = super::smtp::build_message(message)?.formatted();
         let encoded = base64::engine::general_purpose::STANDARD.encode(mime);
         let item = format!(
@@ -3414,7 +3414,11 @@ impl MailBackend for EwsBackend {
         let body = format!(
             r#"<m:CreateItem MessageDisposition="SendAndSaveCopy"><m:SavedItemFolderId><t:DistinguishedFolderId Id="sentitems"/></m:SavedItemFolderId><m:Items>{item}</m:Items></m:CreateItem>"#
         );
-        self.soap(credential, "CreateItem", &body).await?;
+        // Точку отказа выбирает сам запрос: до ответа сервера письма у него
+        // нет, а нераспознанный отказ мог застать письмо уже принятым.
+        self.soap(credential, "CreateItem", &body)
+            .await
+            .map_err(super::request_failure)?;
         Ok(super::SendOutcome::SavedOnServer)
     }
 
@@ -3471,17 +3475,29 @@ fn get_oof_body(mailbox: &str) -> String {
 
 /// Тело запроса записи настроек отсутствия. Внешняя аудитория - все внешние
 /// отправители, а не только известные (S-015).
+///
+/// Период выключенного автоответа пуст, и блок периода с пустыми значениями
+/// сервер отклоняет целиком: автоответ остался бы включённым на сервере. Без
+/// периода запрос принимается, а состояние `Disabled` периода не требует
+/// (S-017, S-067).
 fn set_oof_body(mailbox: &str, state: &OofState) -> String {
     let status = if state.enabled {
         "Scheduled"
     } else {
         "Disabled"
     };
+    let duration = if state.starts_at.trim().is_empty() || state.ends_at.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<t:Duration><t:StartTime>{}</t:StartTime><t:EndTime>{}</t:EndTime></t:Duration>"#,
+            escape(&state.starts_at),
+            escape(&state.ends_at),
+        )
+    };
     format!(
-        r#"<m:SetUserOofSettingsRequest><t:Mailbox><t:Address>{}</t:Address></t:Mailbox><t:UserOofSettings><t:OofState>{status}</t:OofState><t:ExternalAudience>All</t:ExternalAudience><t:Duration><t:StartTime>{}</t:StartTime><t:EndTime>{}</t:EndTime></t:Duration><t:InternalReply><t:Message>{}</t:Message></t:InternalReply><t:ExternalReply><t:Message>{}</t:Message></t:ExternalReply></t:UserOofSettings></m:SetUserOofSettingsRequest>"#,
+        r#"<m:SetUserOofSettingsRequest><t:Mailbox><t:Address>{}</t:Address></t:Mailbox><t:UserOofSettings><t:OofState>{status}</t:OofState><t:ExternalAudience>All</t:ExternalAudience>{duration}<t:InternalReply><t:Message>{}</t:Message></t:InternalReply><t:ExternalReply><t:Message>{}</t:Message></t:ExternalReply></t:UserOofSettings></m:SetUserOofSettingsRequest>"#,
         escape(mailbox),
-        escape(&state.starts_at),
-        escape(&state.ends_at),
         escape(&state.internal_text),
         escape(&state.external_text),
     )
@@ -3599,8 +3615,11 @@ mod tests {
         assert!(body.contains("<t:StartTime>2026-10-01T00:00:00Z</t:StartTime>"));
         assert!(body.contains("&lt;до 10-го&gt; &amp; недоступен"));
         assert!(!body.contains("<до"));
+        // S-017, S-067: у выключенного автоответа периода нет, и пустой блок
+        // периода сервер отклонил бы вместе со всем запросом.
         let disabled = set_oof_body("user@example.test", &OofState::default());
         assert!(disabled.contains("<t:OofState>Disabled</t:OofState>"));
+        assert!(!disabled.contains("<t:Duration>"), "{disabled}");
     }
 
     /// S-011, S-016: показывается только то, что подтвердил сервер, поэтому

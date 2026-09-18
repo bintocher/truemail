@@ -10,7 +10,7 @@
 const UNDO_MIN_SECONDS = 0;
 const UNDO_MAX_SECONDS = 60;
 
-// Состояния операции отправки (S-087 - S-091 словаря спецификации).
+// Подписи состояний операции отправки (S-020, S-064).
 const SEND_STATUS_TEXT = {
   pending: ['Ожидает отправки', 'Waiting to be sent'],
   processing: ['Передаётся серверу', 'Being sent'],
@@ -20,13 +20,6 @@ const SEND_STATUS_TEXT = {
   // S-064: неопределённый итог называется неопределённым и не выдаётся ни за
   // отказ, ни за успешную отправку.
   uncertain: ['Итог неизвестен', 'Outcome unknown'],
-};
-
-const SEND_ORIGIN_TEXT = {
-  ordinary: ['Письмо', 'Message'],
-  scheduled: ['Отправка по времени', 'Scheduled send'],
-  automatic: ['Служебное письмо', 'Automatic message'],
-  external: ['Письмо внешней программы', 'Message from an external app'],
 };
 
 const outboxText = (pair, lang) => (lang === 'en' ? pair[1] : pair[0]);
@@ -75,11 +68,6 @@ function sendStatusText(status, lang) {
   return outboxText(pair, lang);
 }
 
-function sendOriginText(origin, lang) {
-  const pair = SEND_ORIGIN_TEXT[origin] || SEND_ORIGIN_TEXT.ordinary;
-  return outboxText(pair, lang);
-}
-
 // Строка раздела "Исходящие": тема, адресаты, состояние и пояснение про
 // выключенный ящик (S-020, S-029). Скрытые копии в строке не показываются.
 function outboxRowText(entry, lang) {
@@ -99,14 +87,24 @@ function outboxRowText(entry, lang) {
   return parts.join(' - ');
 }
 
-// Итог отмены: отказ после начала передачи называется прямо, а уже принятое
-// сервером письмо не сопровождается обещанием отзыва (S-038, S-044).
+// Итог отмены: называется настоящее состояние операции. Неотправленное письмо
+// не выдаётся за отправленное, а неопределённый итог называется неопределённым
+// (S-038, S-044, S-064).
 function cancelOutcomeText(outcome, lang) {
   if (outcome === 'cancelled') {
     return outboxText(['Отправка отменена, письмо возвращено', 'Sending cancelled, the message is back'], lang);
   }
   if (outcome === 'already_sending') {
     return outboxText(['Отправка уже началась, отменить нельзя', 'Sending has already started and cannot be cancelled'], lang);
+  }
+  if (outcome === 'uncertain') {
+    return outboxText(['Итог передачи неизвестен, решение за вами', 'The outcome is unknown, the decision is yours'], lang);
+  }
+  if (outcome === 'already_failed') {
+    return outboxText(['Отправить не удалось, отменять нечего', 'Sending failed, there is nothing to cancel'], lang);
+  }
+  if (outcome === 'already_cancelled') {
+    return outboxText(['Отправка уже отменена', 'Sending is already cancelled'], lang);
   }
   return outboxText(['Письмо отправлено, отозвать его нельзя', 'The message is sent and cannot be recalled'], lang);
 }
@@ -158,7 +156,6 @@ const outboxModel = {
   showsUndoAction,
   undoCardText,
   sendStatusText,
-  sendOriginText,
   outboxRowText,
   cancelOutcomeText,
   expiredWindowsText,

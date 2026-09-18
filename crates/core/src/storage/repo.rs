@@ -3788,6 +3788,7 @@ impl Db {
         // S-084: поле последней ошибки названо среди маскируемого, а сервер
         // охотно повторяет в ней адрес письма.
         let reason = crate::logging::mask_error_text(error);
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "UPDATE outbox_ops SET attempts=?, last_error=?, status=?,
                     next_attempt_at=datetime('now', ?)
@@ -3798,8 +3799,18 @@ impl Db {
         .bind(status)
         .bind(format!("+{delay} seconds"))
         .bind(id)
-        .execute(&self.write_pool)
+        .execute(&mut *tx)
         .await?;
+        if status == "failed" {
+            // out-of-office.md S-048: окончательно отказавший автоответ
+            // отправленным не считается. Иначе окно молчания на семь суток
+            // закрывало бы адресата, так и не получившего ни одного ответа.
+            sqlx::query("UPDATE out_of_office_replies SET state='failed' WHERE operation_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7530,6 +7541,38 @@ pub(crate) mod test_storage {
         let mut key = [0_u8; 32];
         rand::rng().fill_bytes(&mut key);
         key
+    }
+
+    /// Открыть тестовое хранилище с миграциями не новее указанной. Нужно
+    /// проверкам обновления: база наполняется в прежней схеме, а новые миграции
+    /// применяются поверх непустых таблиц.
+    pub async fn open_test_db_upto(prefix: &str, version: i64) -> TestDb {
+        let (db, root) = open_unmigrated(prefix).await;
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        migrator
+            .run(&db.write_pool)
+            .await
+            .expect("apply migrations up to version");
+        TestDb { db, root }
+    }
+
+    async fn open_unmigrated(prefix: &str) -> (Db, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("truemail-{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create temp data dir");
+        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
+        let database_key = DatabaseKey::from_key(random_key());
+        let db = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .expect("open database");
+        (db, root)
     }
 
     /// Открыть тестовое хранилище с применёнными миграциями. `prefix` попадает

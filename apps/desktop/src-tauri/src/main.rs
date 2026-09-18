@@ -267,6 +267,7 @@ fn run() -> anyhow::Result<()> {
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         mail_failures: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        send_wakeup: Arc::new(tokio::sync::Notify::new()),
         notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashSet::new(),
         )),

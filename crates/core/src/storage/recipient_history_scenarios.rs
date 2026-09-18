@@ -572,3 +572,208 @@ async fn duplicates_own_address_and_key_conflicts_are_handled_explicitly() {
     );
     db.close().await;
 }
+
+/// Убранный адрес и очищенная история держатся в пределах одних суток: письмо,
+/// пришедшее раньше решения человека, адрес не возвращает, а письмо, пришедшее
+/// позже, возвращает (S-046 - S-049).
+///
+/// Время обращения и время решения человека пишутся разными запросами, и
+/// сравнение их как строк разных видов давало на одной дате обратный ответ.
+#[tokio::test]
+async fn hiding_and_clearing_hold_within_the_same_day() {
+    let db: TestDb = open_test_db("history-same-day").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let sent = seed_folder(&db, account, "Sent", Some("sent")).await;
+    let morning = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    seed_sent_message(
+        &db,
+        account,
+        sent,
+        1,
+        Some("<morning@example.test>"),
+        "client@partner.test",
+        &morning,
+    )
+    .await;
+    db.advance_recipient_history(account)
+        .await
+        .expect("первичное заполнение");
+    let entries = db
+        .list_recipient_history(account, 100, 0)
+        .await
+        .expect("записи истории");
+    let entry = entries.first().expect("запись адреса").id;
+
+    // Человек убрал адрес, а прежнее письмо того же дня осталось в папке.
+    db.hide_recipient_history_entry(account, entry)
+        .await
+        .expect("убрать адрес");
+    // Решение человека состоялось минуту назад: иначе оно и письмо ниже попали
+    // бы в одну и ту же секунду, и проверка зависела бы от скорости машины.
+    sqlx::query(
+        "UPDATE recipient_history
+            SET hidden_at=strftime('%Y-%m-%dT%H:%M:%S+00:00','now','-1 minute')
+          WHERE id=?",
+    )
+    .bind(entry)
+    .execute(&db.write_pool)
+    .await
+    .expect("сдвинуть время решения");
+    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
+        .bind(account)
+        .execute(&db.write_pool)
+        .await
+        .expect("отмотать курсор");
+    db.advance_recipient_history(account)
+        .await
+        .expect("повторное пополнение");
+    assert!(
+        visible_addresses(&db, account).await.is_empty(),
+        "письмо, пришедшее до решения человека, адрес не возвращает"
+    );
+
+    // Новое письмо тому же адресату пришло уже после решения: адрес вернулся.
+    let later = (chrono::Utc::now() + chrono::Duration::seconds(2))
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    seed_sent_message(
+        &db,
+        account,
+        sent,
+        2,
+        Some("<later@example.test>"),
+        "client@partner.test",
+        &later,
+    )
+    .await;
+    db.advance_recipient_history(account)
+        .await
+        .expect("пополнение после нового письма");
+    assert_eq!(
+        visible_addresses(&db, account).await,
+        vec!["client@partner.test"],
+        "новое письмо возвращает адрес"
+    );
+
+    // Очистка держит ту же границу: письмо того же дня историю не наполняет.
+    db.clear_recipient_history(account)
+        .await
+        .expect("очистить историю");
+    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
+        .bind(account)
+        .execute(&db.write_pool)
+        .await
+        .expect("отмотать курсор");
+    db.advance_recipient_history(account)
+        .await
+        .expect("пополнение после очистки");
+    assert!(
+        visible_addresses(&db, account).await.is_empty(),
+        "граница очистки держит письма того же дня"
+    );
+    db.close().await;
+}
+
+/// Первичное заполнение проходит папку до конца, а не одну пачку: на ящике с
+/// сотнями отправленных писем история иначе осталась бы неполной, объявив проход
+/// законченным (S-008, S-018).
+#[tokio::test]
+async fn initial_backfill_walks_past_the_first_batch() {
+    let db: TestDb = open_test_db("history-backfill").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let sent = seed_folder(&db, account, "Sent", Some("sent")).await;
+    let letters = BACKFILL_BATCH + 20;
+    let mut tx = db.begin_write().await.expect("открыть запись");
+    for uid in 1..=letters {
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject, preview, date,
+                                  rfc822_message_id, to_addrs, remote_id, size)
+             VALUES(?, ?, ?, 'me@example.test', 'письмо', '', ?, ?, ?, ?, 100)",
+        )
+        .bind(account)
+        .bind(sent)
+        .bind(uid)
+        .bind(iso(1))
+        .bind(format!("<letter-{uid}@example.test>"))
+        .bind(format!(
+            r#"[{{"name":"Клиент","email":"client{uid}@partner.test"}}]"#
+        ))
+        .bind(format!("remote-{sent}-{uid}"))
+        .execute(&mut *tx)
+        .await
+        .expect("сохранить письмо");
+    }
+    tx.commit().await.expect("записать письма");
+
+    let recorded = db
+        .advance_recipient_history(account)
+        .await
+        .expect("первичное заполнение");
+    assert_eq!(recorded, letters, "проход учёл все письма папки");
+    let (visible,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM recipient_history WHERE account_id=? AND hidden_by_user=0",
+    )
+    .bind(account)
+    .fetch_one(&db.pool)
+    .await
+    .expect("прочитать историю");
+    assert_eq!(visible, letters, "в истории все адресаты папки");
+    let (done, cursor): (i64, i64) = sqlx::query_as(
+        "SELECT initial_done, cursor_message_id FROM recipient_history_state WHERE account_id=?",
+    )
+    .bind(account)
+    .fetch_one(&db.pool)
+    .await
+    .expect("прочитать состояние заполнения");
+    assert_eq!(done, 1, "проход объявлен законченным только по исчерпании");
+    assert!(cursor > 0, "курсор сдвинут на последнее письмо");
+    db.close().await;
+}
+
+/// Ранг записи считает запрос базы, и его границы закрыты явно: обращение
+/// возрастом ровно 30, 90 или 365 суток принадлежит следующей группе, а не
+/// теряется между ними (S-028).
+#[tokio::test]
+async fn rank_boundaries_belong_to_the_next_group() {
+    let db: TestDb = open_test_db("history-rank-borders").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let cases = [
+        ("fresh@partner.test", 29_i64, 3_i64),
+        ("month@partner.test", 30, 2),
+        ("quarter@partner.test", 89, 2),
+        ("season@partner.test", 90, 1),
+        ("year@partner.test", 364, 1),
+        ("ancient@partner.test", 365, 0),
+    ];
+    for (email, days, _) in cases {
+        db.record_recipient_touches(
+            account,
+            &[RecipientTouch {
+                email: email.into(),
+                name: String::new(),
+                message_key: format!("<{email}@example.test>"),
+                used_at: iso(days),
+            }],
+            TouchOrigin::OwnSend,
+        )
+        .await
+        .expect("записать обращение");
+    }
+    let candidates = db
+        .recipient_candidates(account)
+        .await
+        .expect("кандидаты подсказки");
+    for (email, days, rank) in cases {
+        let candidate = candidates
+            .iter()
+            .find(|item| item.email == email)
+            .expect("кандидат истории");
+        assert_eq!(
+            candidate.rank, rank,
+            "обращение возрастом {days} суток весит не столько"
+        );
+    }
+    db.close().await;
+}
