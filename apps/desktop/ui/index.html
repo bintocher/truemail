@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260918-3">
+  <link rel="stylesheet" href="styles.css?v=20260918-4">
 </head>
 <body>
 
@@ -46,6 +46,7 @@
 
       <button type="button" class="navitem topnav" data-nav="calendar"><i data-i="cal"></i><span data-i18n="navCalendar">Календарь</span><span class="count">3</span></button>
       <button type="button" class="navitem topnav" data-nav="contacts"><i data-i="people"></i><span data-i18n="navContacts">Контакты</span></button>
+      <button type="button" class="navitem topnav" id="tasksNav" data-nav="tasks"><i data-i="check"></i><span data-i18n="navTasks">Дела</span><span class="count" id="tasksOverdueCount"></span></button>
 
       <div class="navlabel"><span data-i18n="navSmartFolders">Умные папки</span> <button type="button" class="add" id="addSmart" data-i18n-title="createSmartFolder" title="Создать умную папку"><i data-i="plus"></i></button></div>
       <button type="button" class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label" data-i18n="navAllInbox">Все входящие</span><span class="count"></span></button>
@@ -85,6 +86,8 @@
           <button class="btn" data-act="replyall"><i data-i="replyall"></i><span data-i18n="actionReplyAll">Ответить всем</span></button>
           <button class="btn" data-act="forward"><i data-i="forward"></i><span data-i18n="actionForward">Переслать</span></button>
           <span class="sp"></span>
+          <button class="iconbtn" data-i18n-title="flagMessage" title="Флажок" data-act="flag-message"><i data-i="flag"></i></button>
+          <button class="iconbtn" data-i18n-title="taskDates" title="Сроки дела" data-act="task-message"><i data-i="cal"></i></button>
           <button class="iconbtn" data-i18n-title="actionArchive" title="В архив" data-act="archive"><i data-i="archive"></i></button>
           <button class="iconbtn" data-i18n-title="actionDelete" title="Удалить" data-act="trash"><i data-i="trash"></i></button>
           <button class="iconbtn thread-more-button" id="threadMoreButton" data-toolbar-persistent data-i18n-title="tipMore" title="Ещё действия" aria-haspopup="menu" aria-expanded="false"><i data-i="dots"></i></button>
@@ -189,6 +192,7 @@
         <h1 data-i18n="toolbarTitle">Панель над письмом</h1><p class="lead" data-i18n="toolbarLead">Выберите, какие кнопки показывать над открытым письмом и в каком порядке. Тумблер справа - показывать кнопку; стрелки - менять порядок.</p>
         <div class="card"><div class="cb"><div class="frow"><div class="fl"><div class="t" data-i18n="alignment">Расположение</div><div class="d" data-i18n="alignmentDesc">Слева — рядом с началом письма; справа — у правого края.</div></div><div class="fc"><div class="seg" id="toolbarAlign"><button data-align="left" class="on" data-i18n="alignLeft">Слева</button><button data-align="right" data-i18n="alignRight">Справа</button></div></div></div></div></div>
         <div class="card"><div class="cb" id="tbList"></div></div>
+        <div class="card"><div class="cb"><div class="set-section-title"><b data-i18n="quickSteps">Быстрые действия</b><button class="btn sm ml-auto" type="button" id="quickStepAdd"><i data-i="plus"></i><span data-i18n="quickStepAdd">Добавить</span></button></div><div id="quickStepList"></div></div></div>
       </div>
 
       <div class="setpage" id="set-accounts">
@@ -421,6 +425,16 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="snooze">Отложить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="snooze" value="H"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="keyNextPrev">Следующее / предыдущее письмо</div></div><div class="fc fc-inline"><input class="inp keybind-input keybind-short" data-key-action="next_message" value="J"><input class="inp keybind-input keybind-short" data-key-action="prev_message" value="K"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionDelete">Удалить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="delete" value="Del"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot1">Быстрое действие 1</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_1" placeholder="Ctrl+Shift+1"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot2">Быстрое действие 2</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_2" placeholder="Ctrl+Shift+2"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot3">Быстрое действие 3</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_3" placeholder="Ctrl+Shift+3"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot4">Быстрое действие 4</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_4" placeholder="Ctrl+Shift+4"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot5">Быстрое действие 5</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_5" placeholder="Ctrl+Shift+5"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot6">Быстрое действие 6</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_6" placeholder="Ctrl+Shift+6"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot7">Быстрое действие 7</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_7" placeholder="Ctrl+Shift+7"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot8">Быстрое действие 8</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_8" placeholder="Ctrl+Shift+8"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot9">Быстрое действие 9</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_9" placeholder="Ctrl+Shift+9"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot10">Быстрое действие 10</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_10" placeholder="Ctrl+Shift+0"></div></div>
         </div></div>
       </div>
 
@@ -776,14 +790,17 @@
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
-<script src="modules/shell.js?v=20260916-1"></script>
-<script src="modules/calendar-contacts.js?v=20260918-2"></script>
+<script src="modules/shell.js?v=20260918-6"></script>
+<script src="modules/calendar-contacts.js?v=20260918-7"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
-<script src="modules/commands-accessibility.js?v=20260916-1"></script>
+<script src="modules/commands-accessibility.js?v=20260918-1"></script>
 <script src="modules/mail-rules.js?v=20260918-2"></script>
+<script src="modules/flag-due-dates.js?v=20260918-1"></script>
+<script src="modules/pin-message.js?v=20260918-1"></script>
+<script src="modules/quick-steps.js?v=20260918-1"></script>
 <script src="modules/sender-lists.js?v=20260918-2"></script>
-<script src="modules/smart-rules.js?v=20260918-3"></script>
-<script src="modules/i18n-onboarding.js?v=20260918-4"></script>
+<script src="modules/smart-rules.js?v=20260918-11"></script>
+<script src="modules/i18n-onboarding.js?v=20260918-5"></script>
 <script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
@@ -791,18 +808,18 @@
 <script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260918-2"></script>
+<script src="modules/mail.js?v=20260918-14"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
 <script src="modules/outbox.js?v=20260918-3"></script>
 <script src="modules/out-of-office.js?v=20260918-2"></script>
 <script src="modules/recipient-history.js?v=20260918-1"></script>
-<script src="modules/composer.js?v=20260918-5"></script>
+<script src="modules/composer.js?v=20260918-8"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
 <script src="modules/settings.js?v=20260918-1"></script>
 <script src="modules/sender-actions.js?v=20260918-2"></script>
 <script src="modules/queue-sections.js?v=20260918-3"></script>
 <script src="modules/window-chrome.js?v=20260918-1"></script>
-<script src="bridge.js?v=20260918-5"></script>
+<script src="bridge.js?v=20260918-11"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

@@ -198,6 +198,9 @@ async function refreshTagsNav(){try{coreTags=await window.tm.listLabels();}catch
   renderTagsNav();renderTagSettings();}
 document.getElementById('tagNew2')?.addEventListener('click',()=>openLabelCreator(null));
 function filterTag(tag){window.setListLoading?.(false);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));currentTagName=tag.name;currentFolderId=null;currentSmartIndex=null;window.resetTagPaging?.(tag.name);applyListOptions(true,tag.name);renderTagsNav();window.loadNextTagPage?.();}
+async function openTasksSection(){window.setListLoading?.(true);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));document.getElementById('tasksNav')?.classList.add('active');currentTagName=null;currentFolderId=null;currentSmartIndex=null;try{let cursor=null,items=[];do{const page=await window.tm.listMessageTasks(100,cursor);items=items.concat(page.items);cursor=page.next_cursor;}while(cursor);items=flagDueDatesModel.sortTasks(flagDueDatesModel.visibleTasks(items));const rows=[],plain=[];let group=null;items.forEach(item=>{const nextGroup=flagDueDatesModel.taskGroup(item);if(nextGroup!==group){group=nextGroup;rows.push({kind:'task_separator',label:flagDueDatesModel.groupLabel(group,wizardLocale)});}const message={id:item.task.message_id,account_id:item.account_id,folder_id:item.folder_id,thread_id:null,uid:0,message_id:null,from:{name:item.sender_name,email:item.sender_address||''},to:[],cc:[],subject:item.subject||L('Без темы','No subject'),preview:flagDueDatesModel.taskRowText(item,wizardLocale),date:item.message_date,size:null,flags:{seen:true,flagged:item.task.state==='active'},has_attachments:false,auth:{},labels:[],pinned_at:null,task_due_at:item.task.due_at,task_state:item.task.state,snoozed_until:item.snoozed_until,_taskSource:true};rows.push(message);plain.push(message);});const known=new Set(messages.map(item=>item.id));messages=messages.concat(plain.filter(item=>!known.has(item.id)));renderMessageList(rows,L('Дела','Tasks'),true);}catch(error){showToast(error);}finally{window.setListLoading?.(false);}}
+document.getElementById('tasksNav')?.addEventListener('click',openTasksSection);
+window.openTasksSection=openTasksSection;
 window.refreshTagsNav=refreshTagsNav;
 function contactPhoneLabel(phone){return phone?`${phone.number||''}${phone.extension?` ${L('доб.','ext.')} ${phone.extension}`:''}`:'';}
 // Одна строка адреса для поиска и подписи карточки: пустые компоненты просто
@@ -290,20 +293,6 @@ const expandedConversations=new Set();
 // отправителей с темой вида "Счёт", а thread_id есть далеко не у всех писем
 // (его получают только ответы и те, кому ответили).
 function conversationKey(message){return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|m:${message.id}`;}
-function collapseConversations(rows){
-  const groups=new Map();
-  rows.forEach(message=>{const key=conversationKey(message);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(message);});
-  // Сортируем беседы по дате самого свежего письма, а письма развёрнутой беседы
-  // держим сразу под её строкой: общая сортировка по дате раскидывала их по списку.
-  const ordered=[...groups.entries()].map(([key,items])=>{items.sort(byDateDesc);return{key,items};});
-  ordered.sort((a,b)=>byDateDesc(a.items[0],b.items[0]));
-  const result=[];
-  ordered.forEach(({key,items})=>{
-    result.push({...items[0],_convKey:key,_convCount:items.length});
-    if(items.length>1&&expandedConversations.has(key))for(let i=1;i<items.length;i++)result.push({...items[i],_convKey:key,_convChild:true});
-  });
-  return result;
-}
 // В режиме диалогов групповая операция над свёрнутой беседой применяется ко всем
 // её письмам. Развёрнутую беседу не расширяем - действие идёт по конкретному письму.
 function expandConversationIds(ids){
@@ -343,7 +332,60 @@ function labelDots(names){
   if(model.more){const more=document.createElement('span');more.className='label-more';more.textContent=`+${model.more}`;host.appendChild(more);}
   return host;
 }
+function taskEditorLocalValue(value){if(!value)return '';const date=new Date(value);return Number.isNaN(date.getTime())?'':new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);}
+async function openMessageTaskEditor(message){
+  let task={message_id:message.id,start_at:null,due_at:message.task_due_at||null,reminder_at:null,state:message.task_state||'active'};
+  try{task=await window.tm.getMessageTask(message.id)||task;}catch(error){showToast(error);return;}
+  const presetButtons=flagDueDatesModel.duePresets(new Date(),wizardLocale).filter(preset=>preset.id!=='custom').map(preset=>`<button class="btn" data-due="${preset.id}">${preset.title}</button>`).join('');
+  const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal compact-modal task-modal"><div class="mh"><i data-i="flag"></i><h3>${L('Сроки дела','Task dates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="snooze-presets task-presets">${presetButtons}</div><label class="template-field">${L('Начать','Start')}<input class="inp task-start" type="datetime-local"></label><label class="template-field">${L('Исполнить','Due')}<input class="inp task-due-input" type="datetime-local"></label><label class="template-field">${L('Напомнить','Remind')}<input class="inp task-reminder" type="datetime-local"></label></div><div class="mf"><button class="btn task-complete">${task.state==='done'?L('Вернуть в работу','Reopen'):task.state==='detached'?L('Удалить дело','Delete task'):L('Выполнено','Done')}</button><span class="sp"></span><button class="btn task-cancel">${L('Отмена','Cancel')}</button><button class="btn primary task-save">${L('Сохранить','Save')}</button></div></div>`;
+  document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove(),start=overlay.querySelector('.task-start'),due=overlay.querySelector('.task-due-input'),reminder=overlay.querySelector('.task-reminder');start.value=taskEditorLocalValue(task.start_at);due.value=taskEditorLocalValue(task.due_at);reminder.value=taskEditorLocalValue(task.reminder_at);
+  overlay.querySelectorAll('[data-due]').forEach(button=>button.onclick=()=>{const preset=flagDueDatesModel.duePresets(new Date(),wizardLocale).find(item=>item.id===button.dataset.due);due.value=taskEditorLocalValue(preset?.value);});
+  overlay.querySelector('.task-save').onclick=async()=>{const input={start_at:start.value?new Date(start.value).toISOString():null,due_at:due.value?new Date(due.value).toISOString():null,reminder_at:reminder.value?new Date(reminder.value).toISOString():null},check=flagDueDatesModel.validateTask(input);if(!check.ok){showToast(flagDueDatesModel.taskErrorText(check.reason,wizardLocale));return;}try{await flagDueDatesModel.saveTask(window.tm,message.id,input);close();await window.reloadCoreData();}catch(error){showToast(error);}};
+  overlay.querySelector('.task-complete').onclick=async()=>{try{await flagDueDatesModel.completeTask(window.tm,message.id,task.state);close();await window.reloadCoreData();}catch(error){showToast(error);}};
+  overlay.querySelectorAll('.x,.task-cancel').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};due.focus();
+}
+window.openMessageTaskEditor=openMessageTaskEditor;
+async function setMessagesPinnedFromUi(ids,pinned){
+  const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];
+  const original=new Map(unique.map(id=>[id,messages.find(message=>message.id===id)?.pinned_at||null]));
+  if(pinned){unique.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.pinned_at=new Date().toISOString();});}
+  else{
+    const state=pinMessageModel.unpinInPlace({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},unique,{sort:sortMenu?.dataset.sort||'date-desc',locale:wizardLocale});
+    messages=state.pinned.concat(state.normal);
+  }
+  applyListOptions(false);
+  try{
+    const result=await pinMessageModel.togglePin(window.tm,unique,pinned);
+    const limitText=pinMessageModel.pinLimitText(result,wizardLocale);if(limitText)showToast(limitText);
+    if(pinned)await window.reloadCoreData();
+    return result;
+  }catch(error){
+    unique.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.pinned_at=original.get(id);});
+    applyListOptions(false);showToast(error);return null;
+  }
+}
+window.setMessagesPinnedFromUi=setMessagesPinnedFromUi;
+async function setMessagesFlaggedFromUi(ids,flagged,task=null){
+  const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];
+  const original=new Map(unique.map(id=>[id,Boolean(messages.find(message=>message.id===id)?.flags?.flagged)]));
+  const taskState=task?{due_at:task.due_at??task.task_due_at??null}:null;
+  try{
+    const result=await flagDueDatesModel.toggleFlag(window.tm,unique,flagged,{reason:'user',task:taskState,lang:wizardLocale,confirm:async text=>confirm(text),onOptimistic:changed=>{changed.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.flags.flagged=flagged;});applyListOptions(false);}});
+    if(!flagged&&taskState?.due_at&&result===0)return 0;
+    await window.reloadCoreData();return result;
+  }catch(error){
+    unique.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.flags.flagged=original.get(id);});
+    applyListOptions(false);showToast(error);return null;
+  }
+}
+window.setMessagesFlaggedFromUi=setMessagesFlaggedFromUi;
 function createMessageRow(message,index){
+  if(message?.kind==='task_separator'){
+    const separator=document.createElement('div');separator.className='msg pinned-separator task-separator';separator.setAttribute('role','separator');separator.textContent=message.label;return separator;
+  }
+  if(message?.kind==='pinned_separator'){
+    const separator=document.createElement('div');separator.className='msg pinned-separator';separator.setAttribute('role','separator');separator.textContent=pinMessageModel.separatorText(message.hidden,wizardLocale);return separator;
+  }
   const row=document.createElement('div');row.className='msg'+(message.flags?.seen?'':' unread')+(message._convChild?' conv-child':'')+(selectedMessageIds.has(message.id)?' selected':'')+(activeMessage?.id===message.id?' active':'');row.dataset.messageId=message.id;row.draggable=true;
   // Строка - элемент списка, а не кнопка: роли кнопки достался бы общий
   // обработчик Enter и пробела, и письмо открывалось бы дважды. В обход по Tab
@@ -371,6 +413,9 @@ function createMessageRow(message,index){
   const rowLabels=messageLabels.shownLabels(message.labels,openTagName());
   if(rowLabels.length){row.classList.add('has-labels');row.style.setProperty('--label-stripe',messageLabels.stripeValue(rowLabels,coreTags));row.querySelector('.l1').appendChild(labelDots(rowLabels));}
   if(message.labels?.length)row.title=`${L('Метки','Tags')}: ${message.labels.join(', ')}`;
+  const pin=document.createElement('button');pin.type='button';pin.className='row-pin'+(message.pinned_at?' on':'');pin.title=message.pinned_at?L('Открепить','Unpin'):L('Закрепить','Pin');pin.innerHTML='<i data-i="pin"></i>';pin.onclick=event=>{event.stopPropagation();setMessagesPinnedFromUi(selectedMessageIds.size?[...selectedMessageIds]:[message.id],!message.pinned_at);};row.querySelector('.l1').appendChild(pin);
+  const flag=document.createElement('button');flag.type='button';flag.className='row-flag'+(message.flags?.flagged?' on':'');flag.title=message.flags?.flagged?L('Снять флажок','Clear flag'):L('Поставить флажок','Set flag');flag.innerHTML='<i data-i="flag"></i>';flag.onclick=event=>{event.stopPropagation();setMessagesFlaggedFromUi(selectedMessageIds.size?[...selectedMessageIds]:[message.id],!message.flags?.flagged,message);};row.querySelector('.l1').appendChild(flag);
+  if(message.task_due_at){const due=document.createElement('button');due.type='button';due.className='task-due'+(new Date(message.task_due_at)<new Date()?' overdue':'');due.textContent=flagDueDatesModel.formatDue(message.task_due_at,wizardLocale);due.title=L('Изменить сроки дела','Edit task dates');due.onclick=event=>{event.stopPropagation();window.openMessageTaskEditor?.(message);};row.querySelector('.l1').appendChild(due);}
   if(message._convCount>1){const expanded=expandedConversations.has(message._convKey);const badge=document.createElement('button');badge.type='button';badge.className='conv-count'+(expanded?' on':'');badge.textContent=message._convCount;badge.title=expanded?L('Свернуть беседу','Collapse conversation'):L(`Показать письма беседы (${message._convCount})`,`Show conversation messages (${message._convCount})`);badge.tabIndex=-1;badge.onclick=event=>{event.stopPropagation();
     // Строку забираем в фокус до перестроения: сама кнопка при нём исчезает, а
     // фокус должен остаться на беседе (S-007).
@@ -388,7 +433,7 @@ function createMessageRow(message,index){
   row.onpointerenter=e=>{if(selectionDragMode===null||!(e.buttons&1))return;selectionDragMode?selectedMessageIds.add(message.id):selectedMessageIds.delete(message.id);updateSelectionUi();};
   // Фокус ставим сами: после клика по обычному div он ушёл бы на документ, и
   // дальнейшие нажатия адресовались бы пустому месту (S-005).
-  row.onclick=e=>{if(suppressClick)return;row.focus({preventScroll:true});if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();selectionAnchorId=message.id;showMessage(message);};renderIcons(row);return row;
+  row.onclick=e=>{if(suppressClick)return;row.focus({preventScroll:true});if(e.shiftKey){selectMessageRange(index,e.ctrlKey||e.metaKey);return;}if(e.ctrlKey||e.metaKey){selectedMessageIds.has(message.id)?selectedMessageIds.delete(message.id):selectedMessageIds.add(message.id);selectionAnchorId=message.id;updateSelectionUi();return;}if(selectedMessageIds.size)clearMessageSelection();selectionAnchorId=message.id;if(message._taskSource)window.openMessageById?.(message.id);else showMessage(message);};renderIcons(row);return row;
 }
 // Пока кнопка указателя прижата к списку, окно не перестраиваем: строки
 // пересоздаются целиком, и замена узла между прижатием и отпусканием съедает
@@ -448,7 +493,7 @@ function renderMessageWindow(force=false){
 }
 // Клавиатурная навигация и открытие письма из уведомления переносят и фокус:
 // пользователь пришёл к письму и продолжит работать со списком (S-006).
-function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)setMessageScrollTop(top);else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)setMessageScrollTop(Math.max(0,bottom-msgsEl.clientHeight));renderMessageWindow(true);showMessage(currentMessageRows[index]);focusMessageRow(currentMessageRows[index].id);}
+function focusMessageAt(index){if(index<0||index>=currentMessageRows.length)return;if(currentMessageRows[index]?.kind){const active=currentMessageRows.findIndex(message=>message.id===activeMessage?.id),direction=index>=active?1:-1;while(currentMessageRows[index]?.kind&&index>=0&&index<currentMessageRows.length)index+=direction;if(index<0||index>=currentMessageRows.length)return;}const top=index*messageRowHeight,bottom=top+messageRowHeight;if(top<msgsEl.scrollTop)setMessageScrollTop(top);else if(bottom>msgsEl.scrollTop+msgsEl.clientHeight)setMessageScrollTop(Math.max(0,bottom-msgsEl.clientHeight));renderMessageWindow(true);showMessage(currentMessageRows[index]);focusMessageRow(currentMessageRows[index].id);}
 // Цвет открытой метки у заголовка списка: в самих строках эта метка скрыта
 // (S-010), и без точки у заголовка её цвет негде увидеть (S-011).
 function renderHeadTagDot(){
@@ -461,13 +506,12 @@ function renderHeadTagDot(){
 }
 function renderMessageList(rows,title,resetScroll=false){
   lastListRows=rows;lastListTitle=title;
-  if(conversationsEnabled)rows=collapseConversations(rows);
-  currentMessageRows=[...rows];const visibleIds=new Set(rows.map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(resetScroll)setMessageScrollTop(0);messageWindowStart=-1;messageWindowEnd=-1;
+  if(rows.some(message=>message?.kind==='task_separator'))currentMessageRows=[...rows];else{const pinned=rows.filter(message=>message.pinned_at),ordinary=rows.filter(message=>!message.pinned_at);const built=pinMessageModel.buildRows(pinned,ordinary,{sort:sortMenu?.dataset.sort||'date-desc',locale:wizardLocale,collapseThreads:conversationsEnabled,expandedThreads:expandedConversations});currentMessageRows=built.rows;}const visibleIds=new Set(pinMessageModel.messageRows(currentMessageRows).map(message=>message.id));for(const id of selectedMessageIds)if(!visibleIds.has(id))selectedMessageIds.delete(id);if(resetScroll)setMessageScrollTop(0);messageWindowStart=-1;messageWindowEnd=-1;
   // Заголовок списка - то же пользовательское имя, что и подпись в панели:
   // без пометки словарь автоперевода подменял бы его переводом фразы.
   const heading=document.querySelector('.listhead h2');if(heading){heading.dataset.noI18n='1';heading.textContent=title||messagesTitle();}
   renderHeadTagDot();
-  renderListSubtitle(rows.length);
+  renderListSubtitle(visibleIds.size);
   renderMessageWindow(true);updateSelectionUi();
   // Панель письма очищена - поколение показа растёт вместе с ней: ответ на
   // запрос, начатый до очистки, рисовать уже некуда (S-001).
@@ -862,6 +906,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const listAnchor=messageView.listAnchorAt(currentMessageRows,messageScroll,messageRowHeight);
   rememberListFocus();
   window.clearDemoData(true);
+  window.seedOrdinaryPageCursors?.(loadedMessages);
   coreAccounts=accounts;setCoreFolders(foldersByAccount.flat());coreContacts=contacts;coreCalendarData=calendarData;
   // coreContacts обновился - кэши ключей транслитерации по всем поверхностям
   // устарели (person-search-translit.md, S-012): раздел контактов (эта же
@@ -879,13 +924,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Старую копию храним только если она за границей свежей страницы папки: письмо
   // внутри страницы, которого в выборке нет, из папки ушло (перемещено, удалено,
   // ждёт отправки в очереди) - иначе оно продолжало бы висеть в прежней папке.
-  {const page=window.corePageSize||100,freshById=new Map(loadedMessages.map(message=>[message.id,message])),counts=new Map(),edges=new Map();
-   loadedMessages.forEach(message=>{const folder=message.folder_id;counts.set(folder,(counts.get(folder)||0)+1);
-     const date=message.date||'',edge=edges.get(folder);if(!edge||date<edge.date||(date===edge.date&&message.id<edge.id))edges.set(folder,{date,id:message.id});});
-   const survived=messages.filter(message=>{if(freshById.has(message.id))return true;
-     const edge=edges.get(message.folder_id);if(!edge||(counts.get(message.folder_id)||0)<page)return false;
-     const date=message.date||'';return date<edge.date||(date===edge.date&&message.id<edge.id);});
-   const merged=new Map(survived.map(message=>[message.id,message]));loadedMessages.forEach(message=>merged.set(message.id,applyPendingSeen(message)));messages=trimMessages([...merged.values()],loadedMessages.map(message=>message.id));}
+  {const fresh=loadedMessages.map(applyPendingSeen),merged=pinMessageModel.mergeReloadedPages({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},{fresh,pageSize:window.corePageSize||100});messages=trimMessages(merged.pinned.concat(merged.normal),fresh.map(message=>message.id));}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Счётчики умных папок пересчитываем после каждой перезагрузки данных: письма
   // могли прийти, уйти или стать прочитанными. Прежние числа возвращаем на
@@ -911,7 +950,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Счётчик писем по папкам считаем за один проход: messages.filter внутри
   // цикла по папкам давал квадратичный обход (десятки папок на десятки тысяч
   // писем) и заметно грузил процессор на каждой перезагрузке данных.
-  {const localCounts=new Map();messages.forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
+  {const localCounts=new Map();messages.filter(message=>!message.pinned_at).forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
    coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount===MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});}
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];

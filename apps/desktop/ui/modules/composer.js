@@ -165,7 +165,7 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
   }
   // S-013, S-048: безвозвратное удаление подтверждается отдельно и отмены не
   // имеет.
-  if(action==='delete'&&!await confirmAction(L(`Удалить навсегда писем: ${ids.length}? Отмены не будет.`,`Delete ${ids.length} message(s) permanently? There is no undo.`)))return;
+  if(action==='delete'){const hasActiveTask=ids.some(id=>(currentMessageRows.find(item=>item.id===id)||messages.find(item=>item.id===id))?.task_state==='active');const warning=hasActiveTask?L(`Удалить навсегда писем: ${ids.length}? Среди них есть невыполненное дело. Отмены не будет.`,`Delete ${ids.length} message(s) permanently? An unfinished task will be deleted. There is no undo.`):L(`Удалить навсегда писем: ${ids.length}? Отмены не будет.`,`Delete ${ids.length} message(s) permanently? There is no undo.`);if(!await confirmAction(warning))return;}
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   let nextId=null;
   if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
@@ -181,6 +181,7 @@ window.performMessageActionForIds=performMessageActionForIds;
    письмо без единственной папки нужного типа - разные беды (S-005, S-006,
    S-046). */
 function showSkippedMessages(queued){
+  if(queued?.traits_at_risk)showToast(L(`У ${queued.traits_at_risk} писем нет единственного Message-ID. Сохранение дела и закрепления после переноса не гарантируется.`,`For ${queued.traits_at_risk} message(s), Message-ID is not unique. Task and pin preservation after moving is not guaranteed.`));
   if(!queued?.skipped)return;
   const parts=[];
   if(queued.skipped_busy)parts.push(L(`уже переносятся: ${queued.skipped_busy}`,`already being moved: ${queued.skipped_busy}`));
@@ -197,7 +198,7 @@ async function deleteMessagesForever(ids){
 }
 window.deleteMessagesForever=deleteMessagesForever;
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];return performMessageActionForIds(action,ids);}
-function selectAllCurrentMessages(){currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();}
+function selectAllCurrentMessages(){currentMessageRows.forEach(message=>{if(!message?.kind)selectedMessageIds.add(message.id);});updateSelectionUi();}
 document.getElementById('bulkSelectAll').onclick=selectAllCurrentMessages;
 document.getElementById('bulkClear').onclick=clearMessageSelection;
 document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');

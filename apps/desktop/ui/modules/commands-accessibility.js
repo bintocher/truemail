@@ -117,7 +117,7 @@ const activeKeybindings=new Map([
   ['palette','Ctrl+K'],['compose','C'],['reply','R'],['reply_all','A'],['forward','F'],
   ['archive','E'],['snooze','H'],['next_message','J'],['prev_message','K'],['delete','Del'],
 ]);
-function eventCombo(event){const parts=[];if(event.ctrlKey)parts.push('Ctrl');if(event.altKey)parts.push('Alt');if(event.shiftKey)parts.push('Shift');if(event.metaKey)parts.push('Meta');let key=event.key;if(['Control','Alt','Shift','Meta'].includes(key))return '';if(key==='Delete')key='Del';else if(key===' ')key='Space';else if(key.length===1)key=key.toUpperCase();parts.push(key);return parts.join('+');}
+function eventCombo(event){return quickStepsModel.eventCombo(event);}
 function bindingMatches(action,event){return activeKeybindings.get(action)?.toLocaleLowerCase()===eventCombo(event).toLocaleLowerCase();}
 async function refreshKeybindings(){if(!window.tm?.listKeybindings)return;const bindings=await window.tm.listKeybindings();bindings.forEach(binding=>activeKeybindings.set(binding.action,binding.combo));document.querySelectorAll('[data-key-action]').forEach(input=>{input.value=activeKeybindings.get(input.dataset.keyAction)||'';});}
 window.refreshKeybindings=refreshKeybindings;
@@ -129,6 +129,7 @@ document.addEventListener('keydown',e=>{
   if(!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){
     const actions={compose:()=>document.getElementById('composeBtn').click(),reply:()=>openComposerForMessage('reply'),reply_all:()=>openComposerForMessage('replyall'),forward:()=>openComposerForMessage('forward'),archive:()=>performMessageAction('archive'),delete:()=>performMessageAction('trash'),snooze:()=>document.querySelector('[data-act="snooze"]')?.click()};
     const matched=Object.keys(actions).find(action=>bindingMatches(action,e));if(matched){e.preventDefault();actions[matched]();}
+    const quickSlot=Array.from({length:10},(_,index)=>`quick_step_${index+1}`).find(action=>bindingMatches(action,e));if(quickSlot){e.preventDefault();window.executeQuickStepSlot?.(Number(quickSlot.slice(11)));}
     const forward=bindingMatches('next_message',e)||e.code==='ArrowDown',backward=bindingMatches('prev_message',e)||e.code==='ArrowUp';if(forward||backward){e.preventDefault();const active=currentMessageRows.findIndex(message=>message.id===activeMessage?.id),next=forward?Math.min(currentMessageRows.length-1,active+1):Math.max(0,active<0?0:active-1);focusMessageAt(next);}
     if(e.code==='KeyU'&&!e.ctrlKey&&!e.metaKey&&!e.altKey){e.preventDefault();if(activeMessage)window.markMessagesSeen?.(activeMessage,false).then(()=>window.reloadCoreData()).catch(console.error);}
     if(e.code==='Enter'&&activeMessage){e.preventDefault();const row=document.querySelector(`.msg[data-message-id="${activeMessage.id}"]`);row?.click();}
@@ -174,4 +175,3 @@ function revealActiveScrollbar(target){
   scrollbarIdleTimers.set(target,setTimeout(()=>{target.classList.remove('is-scrolling');scrollbarIdleTimers.delete(target);},900));
 }
 document.addEventListener('scroll',event=>revealActiveScrollbar(event.target),{capture:true,passive:true});
-

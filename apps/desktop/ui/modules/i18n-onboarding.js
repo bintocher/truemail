@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260918-4`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260918-5`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -57,6 +57,9 @@ function relocalizeDynamic(){
     // Открытый редактор правила и панель ручного прогона собраны в коде:
     // без пересборки они остались бы на прежнем языке (S-083).
     window.relocalizeRuleSection?.();
+    window.reloadQuickSteps?.().catch(console.error);
+    if(document.getElementById('tasksNav')?.classList.contains('active'))window.openTasksSection?.();
+    else if(typeof applyListOptions==='function')applyListOptions(false);
     if(typeof renderContacts==='function')renderContacts();
     if(typeof updateSelectionUi==='function')updateSelectionUi();
     // Подсказка активного фильтра собрана из подписей чекбоксов - после смены
