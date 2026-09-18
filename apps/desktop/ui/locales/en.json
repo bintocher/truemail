@@ -506,5 +506,14 @@
   "ruleRunTitle": "Manual rule run",
   "ruleRunHint": "Choose folders: the rules will walk their messages, including the ones pulled up by scrolling. One run handles at most 5000 messages.",
   "ruleRunStart": "Run",
-  "ruleRunContinue": "Continue"
+  "ruleRunContinue": "Continue",
+  "setSenders": "Senders",
+  "sendersLead": "Blocked and trusted senders and ignored conversations. The lists are shared by all connected mailboxes, and messages go to trash only and can be restored until it is emptied.",
+  "senderListsTitle": "Sender lists",
+  "senderAddBlocked": "Block a value",
+  "senderAddTrusted": "Add a trusted value",
+  "ignoredConversationsTitle": "Ignored conversations",
+  "blockSenderMenu": "Block sender",
+  "ignoreConversationMenu": "Ignore conversation",
+  "sweepSenderMenu": "Clean up by sender"
 }

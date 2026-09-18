@@ -23,9 +23,12 @@ use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
 };
 use truemail_core::model::{
-    Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, Keybinding, MailRule,
-    MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
-    ServerConfig, Signature, SmartFolder, SmartFolderCount, resolve_my_attendance,
+    Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, IgnoreConversationPreview,
+    IgnoreJobReport, IgnoredConversation, Keybinding, MailRule, MailRuleInput, MessageFull,
+    MessageMeta, MessageTemplate, Provider, RsvpResponse, Security, SenderPolicy,
+    SenderPolicyPreview, SenderPolicyReleaseReport, SenderPolicySweepReport, SenderSweepInput,
+    SenderSweepJobReport, SenderSweepPreview, SenderSweepRule, ServerConfig, Signature,
+    SmartFolder, SmartFolderCount, resolve_my_attendance,
 };
 use truemail_core::storage::repo::{
     CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
@@ -2948,6 +2951,279 @@ pub async fn set_mail_rule_enabled(
 #[tauri::command]
 pub async fn delete_mail_rule(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     Ok(core(&state).await?.db.delete_mail_rule(&id).await?)
+}
+
+/// Списки заблокированных и доверенных отправителей (blocked-senders.md,
+/// S-045, S-050).
+#[tauri::command]
+pub async fn list_sender_policies(state: State<'_, AppState>) -> CmdResult<Vec<SenderPolicy>> {
+    Ok(core(&state).await?.db.list_sender_policies().await?)
+}
+
+/// Предпросмотр блокировки: канонический вид значения, защита собственного
+/// адреса и домена, число уже полученных писем по каждому ящику и ключ снимка
+/// кандидатов уборки (S-019, S-020, S-029, S-031).
+#[tauri::command]
+pub async fn preview_sender_policy(
+    state: State<'_, AppState>,
+    kind: String,
+    value: String,
+) -> CmdResult<SenderPolicyPreview> {
+    Ok(core(&state)
+        .await?
+        .db
+        .preview_sender_policy(&kind, &value)
+        .await?)
+}
+
+/// Добавить запись списка или сменить её решение (S-039, S-043, S-044).
+#[tauri::command]
+pub async fn save_sender_policy(
+    state: State<'_, AppState>,
+    kind: String,
+    value: String,
+    decision: String,
+    confirm_own_domain: bool,
+) -> CmdResult<SenderPolicy> {
+    Ok(core(&state)
+        .await?
+        .db
+        .save_sender_policy(&kind, &value, &decision, confirm_own_domain)
+        .await?)
+}
+
+/// Снять блокировку: неисполненные перемещения отменяются, уже убранные письма
+/// остаются в корзине (S-039 - S-042).
+#[tauri::command]
+pub async fn delete_sender_policy(
+    state: State<'_, AppState>,
+    id: i64,
+) -> CmdResult<SenderPolicyReleaseReport> {
+    Ok(core(&state).await?.db.delete_sender_policy(id).await?)
+}
+
+/// Уборка уже полученных писем по отдельному согласию и по ключу снимка
+/// (S-030 - S-033).
+#[tauri::command]
+pub async fn start_sender_policy_sweep(
+    state: State<'_, AppState>,
+    policy_id: i64,
+    snapshot_key: String,
+    consent: bool,
+) -> CmdResult<Vec<SenderPolicySweepReport>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_sender_policy_sweep(policy_id, &snapshot_key, consent)
+        .await?)
+}
+
+/// Продолжить уборку следующей пачкой (S-036).
+#[tauri::command]
+pub async fn continue_sender_policy_sweep(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderPolicySweepReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_sender_policy_sweep(job_id)
+        .await?)
+}
+
+/// Отменить незавершённую уборку с отчётом о неотменимых перемещениях (S-042).
+#[tauri::command]
+pub async fn cancel_sender_policy_sweep(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderPolicyReleaseReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancel_sender_policy_sweep(job_id)
+        .await?)
+}
+
+/// Незавершённые уборки списков отправителей (S-045).
+#[tauri::command]
+pub async fn pending_sender_policy_jobs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderPolicySweepReport>> {
+    Ok(core(&state).await?.db.pending_sender_policy_jobs().await?)
+}
+
+/// Список игнорируемых переписок (ignore-conversation.md, S-031, S-051).
+#[tauri::command]
+pub async fn list_ignored_conversations(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<IgnoredConversation>> {
+    Ok(core(&state).await?.db.list_ignored_conversations().await?)
+}
+
+/// Предпросмотр игнорирования: тема, ящик, число писем и ключ снимка
+/// кандидатов (S-013, S-014).
+#[tauri::command]
+pub async fn preview_ignore_conversation(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<IgnoreConversationPreview> {
+    Ok(core(&state)
+        .await?
+        .db
+        .preview_ignore_conversation(message_id)
+        .await?)
+}
+
+/// Включить игнорирование переписки по подтверждению (S-015, S-016).
+#[tauri::command]
+pub async fn enable_ignore_conversation(
+    state: State<'_, AppState>,
+    message_id: i64,
+    snapshot_key: String,
+    confirmed: bool,
+) -> CmdResult<IgnoredConversation> {
+    Ok(core(&state)
+        .await?
+        .db
+        .enable_ignore_conversation(message_id, &snapshot_key, confirmed)
+        .await?)
+}
+
+/// Прекратить игнорирование с возвратом писем или без него (S-033, S-034).
+#[tauri::command]
+pub async fn disable_ignore_conversation(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    return_messages: bool,
+) -> CmdResult<IgnoreJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .disable_ignore_conversation(conversation_id, return_messages)
+        .await?)
+}
+
+/// Продолжить задание уборки или возврата следующей пачкой (S-024, S-041).
+#[tauri::command]
+pub async fn continue_ignore_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<IgnoreJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_ignored_conversation_job(job_id)
+        .await?)
+}
+
+/// Незавершённые задания игнорирования (S-031).
+#[tauri::command]
+pub async fn pending_ignore_jobs(state: State<'_, AppState>) -> CmdResult<Vec<IgnoreJobReport>> {
+    Ok(core(&state).await?.db.pending_ignore_jobs().await?)
+}
+
+/// Записи автоочистки по отправителю в общем списке правил (sweep-by-sender.md,
+/// S-037, S-047).
+#[tauri::command]
+pub async fn list_sender_sweep_rules(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderSweepRule>> {
+    Ok(core(&state).await?.db.list_sender_sweep_rules().await?)
+}
+
+/// Предварительный подсчёт уборки: число писем, папки и ключ снимка (S-010,
+/// S-011).
+#[tauri::command]
+pub async fn preview_sender_sweep(
+    state: State<'_, AppState>,
+    input: SenderSweepInput,
+) -> CmdResult<SenderSweepPreview> {
+    Ok(core(&state).await?.db.preview_sender_sweep(input).await?)
+}
+
+/// Подтверждённая уборка: разовая, постоянная запись или правило режима
+/// новых писем (S-022 - S-025).
+#[tauri::command]
+pub async fn start_sender_sweep(
+    state: State<'_, AppState>,
+    input: SenderSweepInput,
+    snapshot_key: String,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_sender_sweep(input, &snapshot_key)
+        .await?)
+}
+
+/// Выключить или включить запись автоочистки (S-038).
+#[tauri::command]
+pub async fn set_sender_sweep_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_sender_sweep_enabled(id, enabled)
+        .await?)
+}
+
+/// Сменить режим записи одной неделимой операцией (S-028).
+#[tauri::command]
+pub async fn update_sender_sweep_mode(
+    state: State<'_, AppState>,
+    id: i64,
+    mode: String,
+    days: Option<i64>,
+    sweep_archive: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .update_sender_sweep_mode(id, &mode, days, sweep_archive)
+        .await?)
+}
+
+/// Удалить запись автоочистки: убранные письма остаются в корзине (S-039).
+#[tauri::command]
+pub async fn delete_sender_sweep_rule(state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    Ok(core(&state).await?.db.delete_sender_sweep_rule(id).await?)
+}
+
+/// Продолжить проход уборки следующей пачкой (S-018).
+#[tauri::command]
+pub async fn continue_sender_sweep_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_sender_sweep_job(job_id)
+        .await?)
+}
+
+/// Отменить незавершённую уборку с отчётом о неотменимых перемещениях (S-041).
+#[tauri::command]
+pub async fn cancel_sender_sweep_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancel_sender_sweep_job(job_id)
+        .await?)
+}
+
+/// Незавершённые проходы автоочистки (S-018, S-040).
+#[tauri::command]
+pub async fn pending_sender_sweep_jobs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderSweepJobReport>> {
+    Ok(core(&state).await?.db.pending_sender_sweep_jobs().await?)
 }
 
 #[tauri::command]

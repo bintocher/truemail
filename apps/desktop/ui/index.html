@@ -94,6 +94,10 @@
             <button type="button" data-thread-action="raw"><i data-i="edit"></i><span data-i18n="viewSource">Исходный текст</span></button>
             <button type="button" data-thread-action="export-eml"><i data-i="download"></i><span data-i18n="saveAsEml">Сохранить как .eml</span></button>
             <button type="button" data-thread-action="create-rule"><i data-i="filter"></i><span data-i18n="createRuleFromMessage">Создать правило из письма</span></button>
+            <button type="button" data-thread-action="block-sender"><i data-i="shield"></i><span data-i18n="blockSenderMenu">Заблокировать отправителя</span></button>
+            <button type="button" data-thread-action="ignore-conversation"><i data-i="snooze"></i><span data-i18n="ignoreConversationMenu">Игнорировать переписку</span></button>
+            <button type="button" data-thread-action="sweep-sender"><i data-i="trash"></i><span data-i18n="sweepSenderMenu">Автоочистка по отправителю</span></button>
+            <button type="button" data-thread-action="senders"><i data-i="settings"></i><span data-i18n="setSenders">Отправители</span></button>
             <button type="button" data-thread-action="rules"><i data-i="settings"></i><span data-i18n="processingRules">Правила обработки</span></button>
             <div class="thread-menu-separator"></div>
             <button type="button" data-thread-action="settings"><i data-i="settings"></i><span data-i18n="configureMailToolbar">Настроить панель письма</span></button>
@@ -149,6 +153,7 @@
       <button type="button" class="sec" data-set="smart"><i data-i="star"></i><span data-i18n="navSmartFolders">Умные папки</span></button>
       <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Метки</span></button>
       <button type="button" class="sec" data-set="rules"><i data-i="filter"></i><span data-i18n="processingRules">Правила обработки</span></button>
+      <button type="button" class="sec" data-set="senders"><i data-i="shield"></i><span data-i18n="setSenders">Отправители</span></button>
       <button type="button" class="sec" data-set="unified"><i data-i="inbox"></i><span data-i18n="setUnified">Сквозные папки</span></button>
       <button type="button" class="sec" data-set="folders"><i data-i="folder"></i><span data-i18n="setFolders">Сопоставление папок</span></button>
       <button type="button" class="sec" data-set="calendars"><i data-i="cal"></i><span data-i18n="setCalendars">Календари</span></button>
@@ -267,9 +272,18 @@
         </div></div>
         <div id="ruleTrashWarnings" class="mt-20"></div>
         <div id="rulePendingRuns" class="mt-20"></div>
+        <div id="senderSweepList" class="mt-20"></div>
         <div id="ruleFailedOps" class="mt-20"></div>
         <div class="card mt-20"><div class="cb" id="rulesList"><p class="note-muted" data-i18n="noRules">Правил пока нет.</p></div></div>
       </div>
+      <div class="setpage" id="set-senders">
+        <h1 data-i18n="setSenders">Отправители</h1><p class="lead" data-i18n="sendersLead">Заблокированные и доверенные отправители и игнорируемые переписки. Списки общие для всех подключённых ящиков, а письма уходят только в корзину и восстанавливаются оттуда до её очистки.</p>
+        <div class="btn-row"><button class="btn primary" id="senderPolicyAddBlocked"><i data-i="plus"></i><span data-i18n="senderAddBlocked">Заблокировать значение</span></button><button class="btn" id="senderPolicyAddTrusted"><i data-i="plus"></i><span data-i18n="senderAddTrusted">Добавить доверенное</span></button></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="senderListsTitle">Списки отправителей</span></div><div class="cb" id="senderPoliciesList" data-no-i18n></div></div>
+        <div id="senderPendingJobs" class="mt-20"></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="ignoredConversationsTitle">Игнорируемые переписки</span></div><div class="cb" id="ignoredConversationsList" data-no-i18n></div></div>
+      </div>
+
       <div class="setpage" id="set-unified">
         <h1 data-i18n="setUnified">Сквозные папки</h1><p class="lead" data-i18n="unifiedLead">Выберите физические папки почтовых ящиков, из которых умные папки могут собирать письма. По умолчанию участвуют все папки. Например, «Все входящие» дополнительно оставляет только источники с ролью «Входящие».</p>
         <div class="note-muted unified-explanation" data-i18n="unifiedNote">Отключённая здесь папка не попадёт ни в одну умную папку. Сами условия — «входящие», «за 24 часа», «с вложениями» — редактируются в разделе «Умные папки».</div>
@@ -726,12 +740,13 @@
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
 <script src="modules/shell.js?v=20260916-1"></script>
-<script src="modules/calendar-contacts.js?v=20260918-1"></script>
+<script src="modules/calendar-contacts.js?v=20260918-2"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
 <script src="modules/commands-accessibility.js?v=20260916-1"></script>
 <script src="modules/mail-rules.js?v=20260918-2"></script>
+<script src="modules/sender-lists.js?v=20260918-1"></script>
 <script src="modules/smart-rules.js?v=20260918-3"></script>
-<script src="modules/i18n-onboarding.js?v=20260918-2"></script>
+<script src="modules/i18n-onboarding.js?v=20260918-3"></script>
 <script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
@@ -744,8 +759,9 @@
 <script src="modules/composer.js?v=20260918-3"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
 <script src="modules/settings.js?v=20260918-1"></script>
+<script src="modules/sender-actions.js?v=20260918-1"></script>
 <script src="modules/window-chrome.js?v=20260918-1"></script>
-<script src="bridge.js?v=20260918-3"></script>
+<script src="bridge.js?v=20260918-4"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

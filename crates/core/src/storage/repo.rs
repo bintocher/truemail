@@ -4300,22 +4300,31 @@ impl Db {
 
     /// Единая точка стадий обработки новых писем (S-001). Сквозной порядок
     /// стадий - списки отправителей, игнорируемые переписки, автоочистка по
-    /// отправителю и только потом правила. Первые три стадии принадлежат
-    /// задачам списков отправителей, игнорирования переписки и автоочистки
-    /// (specs/blocked-senders.md, specs/ignore-conversation.md,
-    /// specs/sweep-by-sender.md) и встанут в этот же вызов перед правилами,
-    /// поэтому синхронизация обращается сюда, а не прямо к правилам.
+    /// отправителю и только потом правила. Письмо, уведённое любой стадией,
+    /// в следующие стадии не идёт: признак закрывшей стадии стоит в его строке
+    /// и отбор каждой следующей стадии его не берёт (S-002, S-009).
     pub async fn process_sync_batch_stages(&self) -> Result<usize> {
-        self.process_mail_rules().await
+        let mut taken = self.process_sender_policy_stage().await?;
+        taken += self.process_ignored_conversation_stage().await?;
+        taken += self.process_sender_sweep_stage().await?;
+        taken += self.process_mail_rules().await?;
+        // Незавершённые уборки продвигаются тем же конвейером: иначе они
+        // стояли бы до следующего действия пользователя.
+        self.advance_sender_policy_jobs().await?;
+        self.advance_ignored_conversation_jobs().await?;
+        self.advance_sender_sweep_jobs().await?;
+        Ok(taken)
     }
 
     /// Стадии пути догрузки прокруткой (S-063): игнорируемые переписки и
     /// автоочистка по отправителю. Списки отправителей и правила по таким
     /// письмам не выполняются намеренно - правила не должны срабатывать на
-    /// старую переписку. Обе стадии принадлежат другим задачам, поэтому пока
-    /// точка пустая и названа явно, чтобы путь догрузки не потерялся.
+    /// старую переписку, поднятую прокруткой, а списки отправителей заданы
+    /// адресом, а не конкретной перепиской.
     pub async fn process_backfill_stages(&self) -> Result<usize> {
-        Ok(0)
+        let mut taken = self.process_ignored_conversation_stage().await?;
+        taken += self.process_sender_sweep_stage().await?;
+        Ok(taken)
     }
 
     /// Автоматический прогон правил по новым письмам. Поставленные операции,
@@ -6861,7 +6870,7 @@ async fn infer_missing_folder_role(
 
 /// Папка роли в ящике: ровно одна, иначе правило переводится в состояние
 /// внимания, а разбор пачки продолжается (S-046).
-async fn resolve_role_folder(
+pub(crate) async fn resolve_role_folder(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
     role: &str,
@@ -7526,7 +7535,7 @@ mod smart_condition_legacy_tests {
 }
 
 #[cfg(test)]
-mod test_storage {
+pub(crate) mod test_storage {
     use crate::crypto::{DatabaseKey, StorageCrypto};
     use crate::storage::Db;
     use std::sync::Arc;

@@ -82,6 +82,32 @@ window.corePageSize = 100;
     continueMailRuleRun: (runId) => invoke("continue_mail_rule_run", { runId }),
     lastMailRuleRun: () => invoke("last_mail_rule_run"),
     pendingMailRuleRuns: () => invoke("pending_mail_rule_runs"),
+    // Списки заблокированных и доверенных отправителей (blocked-senders.md, S-050).
+    listSenderPolicies: () => invoke("list_sender_policies"),
+    previewSenderPolicy: (kind, value) => invoke("preview_sender_policy", { kind, value }),
+    saveSenderPolicy: (kind, value, decision, confirmOwnDomain = false) => invoke("save_sender_policy", { kind, value, decision, confirmOwnDomain }),
+    deleteSenderPolicy: (id) => invoke("delete_sender_policy", { id }),
+    startSenderPolicySweep: (policyId, snapshotKey, consent) => invoke("start_sender_policy_sweep", { policyId, snapshotKey, consent }),
+    continueSenderPolicySweep: (jobId) => invoke("continue_sender_policy_sweep", { jobId }),
+    cancelSenderPolicySweep: (jobId) => invoke("cancel_sender_policy_sweep", { jobId }),
+    pendingSenderPolicyJobs: () => invoke("pending_sender_policy_jobs"),
+    // Игнорирование переписки (ignore-conversation.md, S-051).
+    listIgnoredConversations: () => invoke("list_ignored_conversations"),
+    previewIgnoreConversation: (messageId) => invoke("preview_ignore_conversation", { messageId }),
+    enableIgnoreConversation: (messageId, snapshotKey, confirmed) => invoke("enable_ignore_conversation", { messageId, snapshotKey, confirmed }),
+    disableIgnoreConversation: (conversationId, returnMessages) => invoke("disable_ignore_conversation", { conversationId, returnMessages }),
+    continueIgnoreJob: (jobId) => invoke("continue_ignore_job", { jobId }),
+    pendingIgnoreJobs: () => invoke("pending_ignore_jobs"),
+    // Автоочистка писем по отправителю (sweep-by-sender.md, S-047).
+    listSenderSweepRules: () => invoke("list_sender_sweep_rules"),
+    previewSenderSweep: (input) => invoke("preview_sender_sweep", { input }),
+    startSenderSweep: (input, snapshotKey) => invoke("start_sender_sweep", { input, snapshotKey }),
+    setSenderSweepEnabled: (id, enabled) => invoke("set_sender_sweep_enabled", { id, enabled }),
+    updateSenderSweepMode: (id, mode, days, sweepArchive) => invoke("update_sender_sweep_mode", { id, mode, days, sweepArchive }),
+    deleteSenderSweepRule: (id) => invoke("delete_sender_sweep_rule", { id }),
+    continueSenderSweepJob: (jobId) => invoke("continue_sender_sweep_job", { jobId }),
+    cancelSenderSweepJob: (jobId) => invoke("cancel_sender_sweep_job", { jobId }),
+    pendingSenderSweepJobs: () => invoke("pending_sender_sweep_jobs"),
     failedMessageOperations: () => invoke("failed_message_operations"),
     retryMessageOperation: (operationId) => invoke("retry_message_operation", { operationId }),
     discardMessageOperation: (operationId) => invoke("discard_message_operation", { operationId }),
@@ -339,6 +365,7 @@ window.corePageSize = 100;
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
       window.markSettingsLoaded?.();
       await window.reloadMailRules?.();
+      await window.reloadSenderSections?.();
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
       // Стартовая загрузка тоже наполняет список: пока она идёт, освобождение

@@ -5,16 +5,22 @@ mod account;
 mod contact;
 mod event;
 mod folder;
+mod ignored_conversation;
 mod message;
 mod rule;
+mod sender_policy;
+mod sender_sweep;
 mod settings;
 
 pub use account::*;
 pub use contact::*;
 pub use event::*;
 pub use folder::*;
+pub use ignored_conversation::*;
 pub use message::*;
 pub use rule::*;
+pub use sender_policy::*;
+pub use sender_sweep::*;
 pub use settings::*;
 
 use serde::{Deserialize, Serialize};
