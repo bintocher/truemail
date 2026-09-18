@@ -1033,6 +1033,21 @@ async fn notify_new_mail(
         );
         return;
     };
+    // S-010: между сбором списка и показом письмо могло быть уведено стадией
+    // или действием пользователя - проверяем по зафиксированной базе.
+    if !core
+        .db
+        .message_is_notifiable(message_id)
+        .await
+        .unwrap_or(true)
+    {
+        tracing::debug!(
+            source,
+            account = %truemail_core::logging::mask_email(&account.email),
+            "уведомление подавлено: письмо уведено стадией обработки"
+        );
+        return;
+    }
     let count = fresh.len();
     let meta = core
         .db
@@ -2788,13 +2803,113 @@ pub async fn save_mail_rule(
     state: State<'_, AppState>,
     rule: MailRuleInput,
     apply_existing: bool,
+    known_rule_ids: Option<Vec<String>>,
 ) -> CmdResult<MailRule> {
     let core = core(&state).await?;
-    let saved = core.db.save_mail_rule(&rule, apply_existing).await?;
-    if saved.enabled {
+    let saved = core
+        .db
+        .save_mail_rule(&rule, apply_existing, known_rule_ids.as_deref())
+        .await?;
+    if saved.enabled && saved.state == "ok" {
         core.db.process_mail_rules().await?;
     }
     Ok(saved)
+}
+
+/// Одноразовый ключ подтверждения удаления навсегда: интерфейс показывает
+/// название правила и его область, а ключ привязан к составу правила (S-048).
+#[tauri::command]
+pub async fn mail_rule_delete_confirmation(
+    state: State<'_, AppState>,
+    rule: MailRuleInput,
+) -> CmdResult<String> {
+    Ok(core(&state)
+        .await?
+        .db
+        .issue_delete_confirmation(&rule)
+        .await?)
+}
+
+/// Новый порядок правил приходит полным перечнем идентификаторов (S-059).
+#[tauri::command]
+pub async fn reorder_mail_rules(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<()> {
+    Ok(core(&state).await?.db.reorder_mail_rules(&ids).await?)
+}
+
+/// Ручной прогон по выбранным папкам (S-065 - S-073).
+#[tauri::command]
+pub async fn run_mail_rules(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    folder_ids: Vec<i64>,
+    rule_ids: Option<Vec<String>>,
+) -> CmdResult<truemail_core::model::MailRuleRunReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_mail_rule_run(account_id, &folder_ids, rule_ids.as_deref())
+        .await?)
+}
+
+/// Продолжить прогон, остановленный пределом писем (S-070).
+#[tauri::command]
+pub async fn continue_mail_rule_run(
+    state: State<'_, AppState>,
+    run_id: i64,
+) -> CmdResult<truemail_core::model::MailRuleRunReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_mail_rule_run(run_id)
+        .await?)
+}
+
+/// Отчёт последнего ручного прогона для списка правил (S-073).
+#[tauri::command]
+pub async fn last_mail_rule_run(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<truemail_core::model::MailRuleRunReport>> {
+    Ok(core(&state).await?.db.last_mail_rule_run().await?)
+}
+
+/// Операции увода в состоянии отказа: письмо считается не уведённым, пока
+/// пользователь не повторит операцию или не откажется от неё (S-052, S-053).
+#[tauri::command]
+pub async fn failed_message_operations(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::storage::repo::FailedOperation>> {
+    Ok(core(&state).await?.db.failed_takeaway_operations().await?)
+}
+
+#[tauri::command]
+pub async fn retry_message_operation(
+    state: State<'_, AppState>,
+    operation_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .retry_failed_operation(operation_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn discard_message_operation(
+    state: State<'_, AppState>,
+    operation_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .discard_failed_operation(operation_id)
+        .await?)
+}
+
+/// Ящики без папки с ролью корзины: без неё стадии обработки молча оставляют
+/// почту на месте, поэтому интерфейс показывает предупреждение (S-014).
+#[tauri::command]
+pub async fn accounts_without_trash(state: State<'_, AppState>) -> CmdResult<Vec<i64>> {
+    Ok(core(&state).await?.db.accounts_without_trash().await?)
 }
 
 #[tauri::command]
@@ -4253,6 +4368,9 @@ pub async fn message_action(
         "archive" => "archive",
         "trash" => "trash",
         "spam" => "spam",
+        // S-013: безвозвратное удаление приходит отдельным действием и из
+        // переноса в корзину никогда не получается.
+        "delete" => "delete",
         _ => {
             return Err(ApiError {
                 message: "Неизвестное действие с письмом".into(),

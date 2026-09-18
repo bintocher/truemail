@@ -5,10 +5,22 @@ use super::encoded_words;
 use crate::Result;
 use crate::model::*;
 use futures::TryStreamExt;
+use sqlx::AssertSqlSafe;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
+    /// Письма, пропущенные из-за уже стоящей по ним операции увода (S-005).
+    pub skipped: usize,
+}
+
+/// Операция увода, дошедшая до состояния отказа (S-052).
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct FailedOperation {
+    pub id: i64,
+    pub message_id: Option<i64>,
+    pub op_kind: String,
+    pub last_error: Option<String>,
 }
 
 /// Результат сохранения календарей/контактов провайдера: счётчики плюс
@@ -3026,6 +3038,25 @@ impl Db {
     /// писем с испорченной датой далеко в будущем - без неё такое письмо всегда
     /// считалось бы свежим. Письма без даты остаются: заголовок Date не
     /// обязателен, и терять из-за него уведомление нельзя.
+    /// Письмо всё ещё доступно уведомлению: стадии его не закрыли и
+    /// незавершённой операции увода по нему нет. Проверяется непосредственно
+    /// перед показом, уже по зафиксированной базе (S-010).
+    pub async fn message_is_notifiable(&self, message_id: i64) -> Result<bool> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT m.id FROM messages m
+              WHERE m.id = ? AND m.closed_by_stage IS NULL
+                AND NOT EXISTS (
+                     SELECT 1 FROM outbox_ops o WHERE o.message_id = m.id
+                       AND o.op_kind IN ('move','delete')
+                       AND o.status IN ('pending','processing','retry')
+                )",
+        )
+        .bind(message_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
     pub async fn inbox_message_ids_by_remote_ids(
         &self,
         account_id: i64,
@@ -3043,9 +3074,18 @@ impl Db {
             (false, true) => " AND (m.date IS NULL OR m.date <= ?)",
             (false, false) => "",
         };
+        // S-010: письмо, закрытое стадией обработки или уже стоящее в очереди
+        // на увод, в уведомление не попадает - иначе программа зовёт читать
+        // почту, которой в Входящих через мгновение не будет.
         let sql = format!(
             "SELECT m.id FROM messages m JOIN folders f ON f.id = m.folder_id \
                  WHERE m.account_id = ? AND f.role = 'inbox' AND m.remote_id IN ({placeholders}){date_filter} \
+                   AND m.closed_by_stage IS NULL \
+                   AND NOT EXISTS ( \
+                        SELECT 1 FROM outbox_ops o WHERE o.message_id = m.id \
+                          AND o.op_kind IN ('move','delete') \
+                          AND o.status IN ('pending','processing','retry') \
+                   ) \
                  ORDER BY m.date ASC"
         );
         // Плейсхолдеры формируются только из числа id (не из пользовательских
@@ -3458,8 +3498,10 @@ impl Db {
         Ok(())
     }
 
-    /// Поставить реальное перемещение/удаление на сервере в очередь. Локальный
-    /// список скрывает такие письма сразу, но undo может отменить pending op.
+    /// Поставить перемещение или безвозвратное удаление на сервере в очередь.
+    /// Единственная точка постановки для действий пользователя: роль `delete`
+    /// означает явное удаление навсегда и из переноса в корзину не получается
+    /// (S-012, S-013).
     pub async fn queue_message_action(
         &self,
         message_ids: &[i64],
@@ -3467,6 +3509,7 @@ impl Db {
     ) -> Result<QueuedAction> {
         let mut tx = self.begin_write().await?;
         let mut operation_ids = Vec::new();
+        let mut skipped = 0_usize;
         for message_id in message_ids {
             let locator: (i64, i64, i64, String, Option<String>, Option<String>) = sqlx::query_as(
                 "SELECT m.account_id, m.folder_id, m.uid, f.remote_path, f.role, m.remote_id
@@ -3475,24 +3518,32 @@ impl Db {
             .bind(message_id)
             .fetch_one(&mut *tx)
             .await?;
-            let permanently_delete =
-                target_role == "trash" && locator.4.as_deref() == Some("trash");
-            let (kind, target): (&str, Option<(i64, String)>) = if permanently_delete {
-                ("delete", None)
+            let message = TakeawayMessage {
+                id: *message_id,
+                account_id: locator.0,
+                folder_id: locator.1,
+                uid: locator.2,
+                remote_path: locator.3,
+                remote_id: locator.5,
+            };
+            let target = if target_role == "delete" {
+                TakeawayTarget::Delete
             } else {
-                let mut target = sqlx::query_as::<_, (i64, String)>(
+                let mut folder = sqlx::query_as::<_, (i64, String)>(
                     "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
                 )
-                .bind(locator.0)
+                .bind(message.account_id)
                 .bind(target_role)
                 .fetch_optional(&mut *tx)
                 .await?;
-                if target.is_none() {
+                if folder.is_none() {
+                    // Роль могла быть не проставлена при первом обходе папок:
+                    // выводим её из имени и пути, как это делалось и раньше.
                     let expected = FolderRole::parse(target_role);
                     let folders = sqlx::query_as::<_, (i64, String, String)>(
                         "SELECT id, remote_path, display_name FROM folders WHERE account_id=?",
                     )
-                    .bind(locator.0)
+                    .bind(message.account_id)
                     .fetch_all(&mut *tx)
                     .await?;
                     if let Some((id, path, _)) = folders.into_iter().find(|(_, path, name)| {
@@ -3503,43 +3554,46 @@ impl Db {
                             .bind(id)
                             .execute(&mut *tx)
                             .await?;
-                        target = Some((id, path));
+                        folder = Some((id, path));
                     }
                 }
-                let target = target.ok_or_else(|| {
+                let folder = folder.ok_or_else(|| {
                     crate::Error::AccountConfig(format!(
                         "для аккаунта не назначена папка {target_role}"
                     ))
                 })?;
-                ("move", Some(target))
+                TakeawayTarget::Folder {
+                    id: folder.0,
+                    path: folder.1,
+                }
             };
-            let payload = serde_json::json!({
-                "message_id": message_id,
-                "folder_id": locator.1,
-                "folder_path": locator.3,
-                "uid": locator.2,
-                "remote_id": locator.5,
-                "target_folder_id": target.as_ref().map(|value| value.0),
-                "target_folder_path": target.as_ref().map(|value| value.1.as_str()),
-            });
-            let result = sqlx::query(
-                "INSERT INTO outbox_ops(account_id, message_id, op_kind, payload, status, next_attempt_at)
-                 VALUES(?, ?, ?, ?, 'pending', datetime('now','+10 seconds'))",
+            // Ручное перемещение доступно очереди через 10 секунд: это окно
+            // отмены в интерфейсе.
+            match queue_takeaway_operation(
+                &mut tx,
+                &message,
+                &target,
+                TakeawayActor::User,
+                None,
+                10,
             )
-            .bind(locator.0)
-            .bind(message_id)
-            .bind(kind)
-            .bind(payload.to_string())
-            .execute(&mut *tx)
-            .await?;
-            operation_ids.push(result.last_insert_rowid());
+            .await?
+            {
+                TakeawayOutcome::Queued(id) => operation_ids.push(id),
+                // S-005: занятое письмо пропускается, остальные письма группы
+                // переносятся.
+                TakeawayOutcome::Conflict | TakeawayOutcome::NeedsAttention => skipped += 1,
+                TakeawayOutcome::Unchanged => {}
+            }
         }
         tx.commit().await?;
-        Ok(QueuedAction { operation_ids })
+        Ok(QueuedAction {
+            operation_ids,
+            skipped,
+        })
     }
 
-    /// Queue moving messages to an explicitly selected folder. Rules use this
-    /// for user folders which do not have a system role.
+    /// Поставить перемещение в явно выбранную папку.
     pub async fn queue_message_move(
         &self,
         message_ids: &[i64],
@@ -3552,6 +3606,7 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await?;
         let mut operation_ids = Vec::new();
+        let mut skipped = 0_usize;
         for message_id in message_ids {
             let locator: (i64, i64, i64, String, Option<String>) = sqlx::query_as(
                 "SELECT m.account_id, m.folder_id, m.uid, f.remote_path, m.remote_id
@@ -3565,31 +3620,85 @@ impl Db {
                     "нельзя переместить письмо в папку другого аккаунта".into(),
                 ));
             }
-            if locator.1 == target_folder_id {
-                continue;
-            }
-            let payload = serde_json::json!({
-                "message_id": message_id,
-                "folder_id": locator.1,
-                "folder_path": locator.3,
-                "uid": locator.2,
-                "remote_id": locator.4,
-                "target_folder_id": target_folder_id,
-                "target_folder_path": target.1.as_str(),
-            });
-            let result = sqlx::query(
-                "INSERT INTO outbox_ops(account_id, message_id, op_kind, payload, status, next_attempt_at)
-                 VALUES(?, ?, 'move', ?, 'pending', datetime('now','+10 seconds'))",
+            let message = TakeawayMessage {
+                id: *message_id,
+                account_id: locator.0,
+                folder_id: locator.1,
+                uid: locator.2,
+                remote_path: locator.3,
+                remote_id: locator.4,
+            };
+            let folder = TakeawayTarget::Folder {
+                id: target_folder_id,
+                path: target.1.clone(),
+            };
+            match queue_takeaway_operation(
+                &mut tx,
+                &message,
+                &folder,
+                TakeawayActor::User,
+                None,
+                10,
             )
-            .bind(locator.0)
-            .bind(message_id)
-            .bind(payload.to_string())
-            .execute(&mut *tx)
-            .await?;
-            operation_ids.push(result.last_insert_rowid());
+            .await?
+            {
+                TakeawayOutcome::Queued(id) => operation_ids.push(id),
+                TakeawayOutcome::Conflict | TakeawayOutcome::NeedsAttention => skipped += 1,
+                TakeawayOutcome::Unchanged => {}
+            }
         }
         tx.commit().await?;
-        Ok(QueuedAction { operation_ids })
+        Ok(QueuedAction {
+            operation_ids,
+            skipped,
+        })
+    }
+
+    /// Повторить операцию, дошедшую до состояния отказа (S-053).
+    pub async fn retry_failed_operation(&self, operation_id: i64) -> Result<()> {
+        let changed = sqlx::query(
+            "UPDATE outbox_ops SET status='retry', attempts=0, last_error=NULL,
+                    next_attempt_at=datetime('now')
+              WHERE id=? AND status='failed'",
+        )
+        .bind(operation_id)
+        .execute(&self.write_pool)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(crate::Error::Other(
+                "операция не найдена или не в состоянии отказа".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Отказаться от операции в состоянии отказа: только после этого по письму
+    /// можно поставить новую операцию увода (S-053).
+    pub async fn discard_failed_operation(&self, operation_id: i64) -> Result<()> {
+        let changed = sqlx::query("DELETE FROM outbox_ops WHERE id=? AND status='failed'")
+            .bind(operation_id)
+            .execute(&self.write_pool)
+            .await?;
+        if changed.rows_affected() != 1 {
+            return Err(crate::Error::Other(
+                "операция не найдена или не в состоянии отказа".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Операции писем, дошедшие до состояния отказа: их показывает отчёт
+    /// правила и список правил (S-052).
+    pub async fn failed_takeaway_operations(&self) -> Result<Vec<FailedOperation>> {
+        let rows: Vec<FailedOperation> = sqlx::query_as(
+            "SELECT o.id, o.message_id, o.op_kind, o.last_error
+               FROM outbox_ops o
+              WHERE o.status='failed' AND o.op_kind IN ('move','delete')
+              ORDER BY o.id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn cancel_outbox_operations(&self, operation_ids: &[i64]) -> Result<usize> {
@@ -3818,52 +3927,135 @@ impl Db {
         Ok(())
     }
 
+    /// Перенести правила прежней схемы в группы и действия (S-074 - S-077).
+    /// Прикладной шаг, а не часть структурной миграции: он идёт после неё и
+    /// повторный запуск ничего не меняет, потому что переносятся только
+    /// правила, у которых ещё нет ни одного условия.
+    pub async fn migrate_mail_rules_to_groups(&self) -> Result<usize> {
+        let legacy: Vec<LegacyMailRuleRow> = sqlx::query_as(
+            "SELECT id, field, operator, value, action, folder_id, label_id
+                 FROM mail_rules r
+                 WHERE NOT EXISTS (SELECT 1 FROM mail_rule_conditions c WHERE c.rule_id=r.id)
+                   AND NOT EXISTS (SELECT 1 FROM mail_rule_actions a WHERE a.rule_id=r.id)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if legacy.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.begin_write().await?;
+        let moved = legacy.len();
+        for rule in legacy {
+            let id = rule.id;
+            sqlx::query(
+                "INSERT INTO mail_rule_conditions(
+                    rule_id, is_exception, group_index, group_logic, position, field, op, value
+                 ) VALUES(?, 0, 0, 'all', 0, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&rule.field)
+            .bind(&rule.operator)
+            .bind(&rule.value)
+            .execute(&mut *tx)
+            .await?;
+            let kind = if rule.action == "label" {
+                "label_add"
+            } else {
+                rule.action.as_str()
+            };
+            sqlx::query(
+                "INSERT INTO mail_rule_actions(rule_id, position, kind, folder_id, label_id)
+                 VALUES(?, 0, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(kind)
+            .bind(rule.folder_id)
+            .bind(rule.label_id)
+            .execute(&mut *tx)
+            .await?;
+            // S-076: прежняя схема применяла к письму только первое подходящее
+            // правило, поэтому перенесённое правило заканчивается остановкой -
+            // иначе почта после обновления разложилась бы иначе.
+            sqlx::query(
+                "INSERT INTO mail_rule_actions(rule_id, position, kind) VALUES(?, 1, 'stop')",
+            )
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+
+    /// Правила с группами, исключениями, действиями и состоянием.
     pub async fn list_mail_rules(&self) -> Result<Vec<MailRule>> {
         let rows: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
-                    enabled, progress_message_id, sort_order
+            "SELECT id, name, account_id, enabled, progress_message_id, sort_order, rule_version
              FROM mail_rules ORDER BY sort_order, created_at, id",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        let conditions: Vec<MailRuleConditionRow> = sqlx::query_as(
+            "SELECT rule_id, is_exception, group_index, group_logic, field, op, value, unit, value2
+             FROM mail_rule_conditions ORDER BY rule_id, is_exception, group_index, position, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let actions: Vec<MailRuleActionRow> = sqlx::query_as(
+            "SELECT rule_id, kind, folder_id, folder_role, label_id
+             FROM mail_rule_actions ORDER BY rule_id, position, id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        // Роли папок читаем один раз: состояние правила с ролью зависит от
+        // того, ровно ли одна такая папка в ящике (S-046).
+        let folder_roles: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT account_id, role FROM folders")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(assemble_mail_rules(
+            rows,
+            conditions,
+            actions,
+            &folder_roles,
+        ))
     }
 
+    /// Сохранить правило целиком. Проверки состава выполняются до открытия
+    /// транзакции, поэтому отказ не создаёт и не изменяет ни одной записи.
     pub async fn save_mail_rule(
         &self,
         rule: &MailRuleInput,
         apply_existing: bool,
+        known_rule_ids: Option<&[String]>,
     ) -> Result<MailRule> {
-        if rule.id.trim().is_empty() || rule.name.trim().is_empty() || rule.value.trim().is_empty()
-        {
-            return Err(crate::Error::AccountConfig(
-                "правилу нужны id, название и значение".into(),
-            ));
-        }
-        if !matches!(rule.field.as_str(), "sender" | "subject")
-            || !matches!(rule.operator.as_str(), "contains" | "equals")
-            || !matches!(
-                rule.action.as_str(),
-                "move" | "archive" | "spam" | "trash" | "label"
-            )
-        {
-            return Err(crate::Error::AccountConfig(
-                "правило содержит неподдерживаемое условие или действие".into(),
-            ));
-        }
-        if rule.action == "label" {
-            let label_id = rule
-                .label_id
-                .ok_or_else(|| crate::Error::AccountConfig("для правила не выбран тег".into()))?;
-            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM labels WHERE id=?")
-                .bind(label_id)
-                .fetch_optional(&self.pool)
-                .await?;
-            if exists.is_none() {
-                return Err(crate::Error::AccountConfig("тег правила не найден".into()));
+        validate_rule_input(rule).map_err(crate::Error::AccountConfig)?;
+        if rule.actions.iter().any(|action| action.kind == "delete") {
+            // S-048: удаление навсегда не имеет отмены, поэтому подтверждение
+            // привязано к составу правила и принимается ровно один раз.
+            let expected = delete_forever_fingerprint(rule);
+            let provided = rule.confirm_key.clone().unwrap_or_default();
+            if provided != expected || !self.take_delete_confirmation(&expected).await {
+                return Err(crate::Error::AccountConfig(
+                    "удаление навсегда нужно подтвердить заново".into(),
+                ));
             }
         }
         let mut tx = self.begin_write().await?;
+        if let Some(known) = known_rule_ids {
+            let current: Vec<(String,)> =
+                sqlx::query_as("SELECT id FROM mail_rules ORDER BY sort_order, created_at, id")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let current: Vec<String> = current.into_iter().map(|(id,)| id).collect();
+            let expected: Vec<&String> = known.iter().filter(|id| **id != rule.id).collect();
+            let actual: Vec<&String> = current.iter().filter(|id| **id != rule.id).collect();
+            if expected != actual {
+                return Err(crate::Error::AccountConfig(
+                    "список правил изменился, откройте его заново".into(),
+                ));
+            }
+        }
         if let Some(account_id) = rule.account_id {
             let exists: Option<(i64,)> =
                 sqlx::query_as("SELECT id FROM accounts WHERE id=? AND enabled=1")
@@ -3876,33 +4068,19 @@ impl Db {
                 ));
             }
         }
-        if rule.action == "move" {
-            let account_id = rule.account_id.ok_or_else(|| {
-                crate::Error::AccountConfig("для перемещения выберите конкретный аккаунт".into())
-            })?;
-            let folder_id = rule
-                .folder_id
-                .ok_or_else(|| crate::Error::AccountConfig("папка назначения не выбрана".into()))?;
-            let target: Option<(i64,)> =
-                sqlx::query_as("SELECT id FROM folders WHERE id=? AND account_id=?")
-                    .bind(folder_id)
-                    .bind(account_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            if target.is_none() {
-                return Err(crate::Error::AccountConfig(
-                    "папка назначения не принадлежит аккаунту правила".into(),
-                ));
-            }
-        }
-        let existing: Option<(i64, i64)> =
-            sqlx::query_as("SELECT progress_message_id, sort_order FROM mail_rules WHERE id=?")
-                .bind(&rule.id)
-                .fetch_optional(&mut *tx)
+        for action in &rule.actions {
+            self.check_rule_action_targets(&mut tx, rule, action)
                 .await?;
+        }
+        let existing: Option<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT progress_message_id, sort_order, rule_version FROM mail_rules WHERE id=?",
+        )
+        .bind(&rule.id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let progress = if apply_existing {
             0
-        } else if let Some((progress, _)) = existing {
+        } else if let Some((progress, _, _)) = existing {
             progress
         } else {
             sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(id), 0) FROM messages")
@@ -3910,7 +4088,7 @@ impl Db {
                 .await?
                 .0
         };
-        let sort_order = if let Some((_, sort_order)) = existing {
+        let sort_order = if let Some((_, sort_order, _)) = existing {
             sort_order
         } else {
             sqlx::query_as::<_, (i64,)>("SELECT coalesce(max(sort_order), -1)+1 FROM mail_rules")
@@ -3918,32 +4096,83 @@ impl Db {
                 .await?
                 .0
         };
+        // Версия растёт при каждом сохранении: по ней задание ручного прогона
+        // узнаёт, что правило изменилось уже после его начала (S-071).
+        let version = existing.map(|(_, _, version)| version + 1).unwrap_or(1);
+        let legacy = legacy_rule_columns(rule);
         sqlx::query(
             "INSERT INTO mail_rules(
                 id, name, field, operator, value, account_id, action, folder_id, label_id,
-                enabled, progress_message_id, sort_order
-             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enabled, progress_message_id, sort_order, rule_version
+             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name, field=excluded.field, operator=excluded.operator,
                 value=excluded.value, account_id=excluded.account_id,
                 action=excluded.action, folder_id=excluded.folder_id, label_id=excluded.label_id,
                 enabled=excluded.enabled, progress_message_id=excluded.progress_message_id,
-                updated_at=datetime('now')",
+                rule_version=excluded.rule_version, updated_at=datetime('now')",
         )
         .bind(&rule.id)
         .bind(rule.name.trim())
-        .bind(&rule.field)
-        .bind(&rule.operator)
-        .bind(rule.value.trim())
+        .bind(legacy.field)
+        .bind(legacy.operator)
+        .bind(legacy.value)
         .bind(rule.account_id)
-        .bind(&rule.action)
-        .bind((rule.action == "move").then_some(rule.folder_id).flatten())
-        .bind((rule.action == "label").then_some(rule.label_id).flatten())
+        .bind(legacy.action)
+        .bind(legacy.folder_id)
+        .bind(legacy.label_id)
         .bind(rule.enabled)
         .bind(progress)
         .bind(sort_order)
+        .bind(version)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("DELETE FROM mail_rule_conditions WHERE rule_id=?")
+            .bind(&rule.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM mail_rule_actions WHERE rule_id=?")
+            .bind(&rule.id)
+            .execute(&mut *tx)
+            .await?;
+        for (is_exception, groups) in [(0_i64, &rule.groups), (1_i64, &rule.exceptions)] {
+            for (group_index, group) in groups.iter().enumerate() {
+                for (position, condition) in group.conditions.iter().enumerate() {
+                    sqlx::query(
+                        "INSERT INTO mail_rule_conditions(
+                            rule_id, is_exception, group_index, group_logic, position,
+                            field, op, value, unit, value2
+                         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    )
+                    .bind(&rule.id)
+                    .bind(is_exception)
+                    .bind(group_index as i64)
+                    .bind(&group.logic)
+                    .bind(position as i64)
+                    .bind(&condition.field)
+                    .bind(&condition.op)
+                    .bind(condition.value.trim())
+                    .bind(condition.unit.as_deref())
+                    .bind(condition.value2.as_deref())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+        }
+        for (position, action) in rule.actions.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO mail_rule_actions(rule_id, position, kind, folder_id, folder_role, label_id)
+                 VALUES(?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&rule.id)
+            .bind(position as i64)
+            .bind(&action.kind)
+            .bind(action.folder_id)
+            .bind(action.folder_role.as_deref())
+            .bind(action.label_id)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         self.list_mail_rules()
             .await?
@@ -3952,7 +4181,70 @@ impl Db {
             .ok_or_else(|| crate::Error::Other("сохранённое правило не найдено".into()))
     }
 
+    /// Папка и метка действия должны существовать и принадлежать области
+    /// правила: иначе правило сразу оказалось бы в состоянии внимания.
+    async fn check_rule_action_targets(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        rule: &MailRuleInput,
+        action: &MailRuleAction,
+    ) -> Result<()> {
+        if let Some(label_id) = action.label_id {
+            let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM labels WHERE id=?")
+                .bind(label_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            if exists.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "метка правила не найдена".into(),
+                ));
+            }
+        }
+        if action.kind != "move" {
+            return Ok(());
+        }
+        if let Some(folder_id) = action.folder_id {
+            // S-045: номер папки допустим только у правила одного ящика, иначе
+            // правило переносило бы письма между ящиками.
+            let account_id = rule.account_id.ok_or_else(|| {
+                crate::Error::AccountConfig(
+                    "для перемещения в конкретную папку выберите ящик или укажите тип папки".into(),
+                )
+            })?;
+            let target: Option<(i64,)> =
+                sqlx::query_as("SELECT id FROM folders WHERE id=? AND account_id=?")
+                    .bind(folder_id)
+                    .bind(account_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+            if target.is_none() {
+                return Err(crate::Error::AccountConfig(
+                    "папка назначения не принадлежит аккаунту правила".into(),
+                ));
+            }
+        } else if let Some(role) = action.folder_role.as_deref()
+            && !matches!(role, "inbox" | "archive" | "spam" | "trash")
+        {
+            return Err(crate::Error::AccountConfig(
+                "тип папки назначения не поддерживается".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Выдать одноразовый ключ подтверждения удаления навсегда (S-048).
+    pub async fn issue_delete_confirmation(&self, rule: &MailRuleInput) -> Result<String> {
+        let key = delete_forever_fingerprint(rule);
+        self.delete_confirmations.lock().await.insert(key.clone());
+        Ok(key)
+    }
+
+    async fn take_delete_confirmation(&self, key: &str) -> bool {
+        self.delete_confirmations.lock().await.remove(key)
+    }
+
     pub async fn set_mail_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        // S-060: переключатель списка меняет только признак включения.
         let changed =
             sqlx::query("UPDATE mail_rules SET enabled=?, updated_at=datetime('now') WHERE id=?")
                 .bind(enabled)
@@ -3965,6 +4257,35 @@ impl Db {
         Ok(())
     }
 
+    /// Переставить правила: перечень приходит целиком в новом порядке, а
+    /// `sort_order` становится последовательными числами от нуля (S-059).
+    pub async fn reorder_mail_rules(&self, ids: &[String]) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let current: Vec<(String,)> = sqlx::query_as("SELECT id FROM mail_rules")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut current: Vec<String> = current.into_iter().map(|(id,)| id).collect();
+        let mut wanted = ids.to_vec();
+        current.sort();
+        wanted.sort();
+        if current != wanted {
+            return Err(crate::Error::AccountConfig(
+                "список правил изменился, откройте его заново".into(),
+            ));
+        }
+        for (position, id) in ids.iter().enumerate() {
+            sqlx::query(
+                "UPDATE mail_rules SET sort_order=?, updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(position as i64)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn delete_mail_rule(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM mail_rules WHERE id=?")
             .bind(id)
@@ -3973,176 +4294,448 @@ impl Db {
         Ok(())
     }
 
-    /// Match new messages and atomically queue server actions together with
-    /// rule progress. A crash can therefore cause neither a skipped message nor
-    /// a duplicate operation.
-    pub async fn process_mail_rules(&self) -> Result<usize> {
-        let mut tx = self.begin_write().await?;
-        let mut rules: Vec<MailRuleRow> = sqlx::query_as(
-            "SELECT id, name, field, operator, value, account_id, action, folder_id, label_id,
-                    enabled, progress_message_id, sort_order
-             FROM mail_rules WHERE enabled=1 ORDER BY sort_order, created_at, id",
+    /// Ящики, у которых не назначена папка с ролью корзины (S-014).
+    pub async fn accounts_without_trash(&self) -> Result<Vec<i64>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT a.id FROM accounts a
+              WHERE a.enabled=1
+                AND NOT EXISTS (SELECT 1 FROM folders f WHERE f.account_id=a.id AND f.role='trash')
+              ORDER BY a.id",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.pool)
         .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Автоматический прогон правил по новым письмам. Поставленные операции,
+    /// изменения локальной базы и новый прогресс правил записываются одной
+    /// неделимой операцией (S-057).
+    pub async fn process_mail_rules(&self) -> Result<usize> {
+        let rules: Vec<MailRule> = self
+            .list_mail_rules()
+            .await?
+            .into_iter()
+            .filter(|rule| rule.enabled && rule.state == "ok")
+            .collect();
         if rules.is_empty() {
-            tx.commit().await?;
             return Ok(0);
         }
-        // Правила с удалённой меткой ждут новой и прогресс не двигают, поэтому в
-        // границу пакета они не входят: иначе их застывший прогресс держал бы
-        // выборку на старых письмах, остальные правила пропускали бы весь пакет
-        // как уже пройденный, и через 500 писем разбор почты встал бы совсем.
-        let Some(min_progress) = rules
-            .iter()
-            .filter(|rule| !(rule.action == "label" && rule.label_id.is_none()))
-            .map(|rule| rule.progress_message_id)
-            .min()
-        else {
-            // Все правила ждут выбора метки - читать пакет писем незачем.
-            tx.commit().await?;
+        let Some(min_progress) = rules.iter().map(|rule| rule.progress_message_id).min() else {
             return Ok(0);
         };
-        let messages: Vec<RuleMessageRow> = sqlx::query_as(
-            "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path,
-                    m.remote_id, m.from_name, m.from_addr, m.subject
-             FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE m.id>? AND m.backfilled=0
-               AND (f.role IS NULL OR f.role NOT IN
-                    ('sent','drafts','archive','spam','trash'))
-               AND NOT EXISTS (
-                    SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
-                      AND o.op_kind IN ('move','delete')
-                      AND o.status IN ('pending','processing','retry')
-               )
-             ORDER BY m.id LIMIT 500",
+        let mut tx = self.begin_write().await?;
+        // S-061 - S-064: пачка не больше 500 писем, только рабочие папки, без
+        // догруженных прокруткой писем и без писем, закрытых прежней стадией.
+        let snapshots = load_rule_snapshots(
+            &mut tx,
+            "m.id>? AND m.backfilled=0 AND m.closed_by_stage IS NULL
+               AND (f.role IS NULL OR f.role NOT IN ('sent','drafts','archive','spam','trash'))",
+            vec![min_progress],
+            500,
         )
-        .bind(min_progress)
-        .fetch_all(&mut *tx)
         .await?;
-        let mut queued = 0;
-        for message in messages {
-            let matching = rules.iter().position(|rule| {
-                if message.id <= rule.progress_message_id
-                    || rule.account_id.is_some_and(|id| id != message.account_id)
-                    // Метку правила удалили - правило ждёт новой, а не валит
-                    // обработку остальных.
-                    || (rule.action == "label" && rule.label_id.is_none())
-                {
-                    return false;
-                }
-                let source = if rule.field == "subject" {
-                    message.subject.clone()
-                } else {
-                    format!(
-                        "{} {}",
-                        message.from_name.as_deref().unwrap_or(""),
-                        message.from_addr.as_deref().unwrap_or("")
-                    )
-                };
-                let source = source.to_lowercase();
-                let value = rule.value.to_lowercase();
-                if rule.operator == "equals" {
-                    source == value
-                } else {
-                    source.contains(&value)
-                }
-            });
-            if let Some(index) = matching {
-                let rule = &rules[index];
-                if rule.action == "label" {
-                    // Метки локальные - вешаем сразу, без outbox/сервера.
-                    let label_id = rule.label_id.ok_or_else(|| {
-                        crate::Error::AccountConfig(format!("у правила {} не задан тег", rule.name))
-                    })?;
-                    let result = sqlx::query(
-                        "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
-                    )
-                    .bind(message.id)
-                    .bind(label_id)
-                    .execute(&mut *tx)
-                    .await?;
-                    if result.rows_affected() > 0 {
-                        queued += 1;
-                    }
-                } else {
-                    let target = if rule.action == "move" {
-                        let folder_id = rule.folder_id.ok_or_else(|| {
-                            crate::Error::AccountConfig(format!(
-                                "у правила {} нет папки назначения",
-                                rule.name
-                            ))
-                        })?;
-                        sqlx::query_as::<_, (i64, String)>(
-                            "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
-                        )
-                        .bind(folder_id)
-                        .bind(message.account_id)
-                        .fetch_optional(&mut *tx)
-                        .await?
-                    } else {
-                        sqlx::query_as::<_, (i64, String)>(
-                        "SELECT id, remote_path FROM folders WHERE account_id=? AND role=? LIMIT 1",
-                    )
-                    .bind(message.account_id)
-                    .bind(&rule.action)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    }
-                    .ok_or_else(|| {
-                        crate::Error::AccountConfig(format!(
-                            "для правила {} не найдена папка назначения",
-                            rule.name
-                        ))
-                    })?;
-                    if target.0 != message.folder_id {
-                        let payload = serde_json::json!({
-                            "message_id": message.id,
-                            "folder_id": message.folder_id,
-                            "folder_path": message.remote_path,
-                            "uid": message.uid,
-                            "remote_id": message.remote_id,
-                            "target_folder_id": target.0,
-                            "target_folder_path": target.1,
-                            "rule_id": rule.id,
-                        });
-                        sqlx::query(
-                            "INSERT INTO outbox_ops(
-                            account_id, message_id, op_kind, payload, status, next_attempt_at
-                         ) VALUES(?, ?, 'move', ?, 'pending', datetime('now'))",
-                        )
-                        .bind(message.account_id)
-                        .bind(message.id)
-                        .bind(payload.to_string())
-                        .execute(&mut *tx)
-                        .await?;
-                        queued += 1;
-                    }
-                }
-            }
-            for rule in &mut rules {
-                // Правило с удалённой меткой пропущено, а не выполнено: прогресс
-                // ему не двигаем, иначе после выбора новой метки письма этого
-                // периода остались бы неразмеченными навсегда.
-                if rule.action == "label" && rule.label_id.is_none() {
-                    continue;
-                }
-                if message.id > rule.progress_message_id {
-                    rule.progress_message_id = message.id;
+        let mut progress: Vec<i64> = rules.iter().map(|rule| rule.progress_message_id).collect();
+        let mut counters = RuleRunCounters::default();
+        for snapshot in &snapshots {
+            self.apply_rules_to_message(&mut tx, &rules, snapshot, &mut counters)
+                .await?;
+            for (index, rule) in rules.iter().enumerate() {
+                let _ = rule;
+                if snapshot.id > progress[index] {
+                    progress[index] = snapshot.id;
                 }
             }
         }
-        for rule in &rules {
+        for (index, rule) in rules.iter().enumerate() {
             sqlx::query(
                 "UPDATE mail_rules SET progress_message_id=?, updated_at=datetime('now') WHERE id=?",
             )
-            .bind(rule.progress_message_id)
+            .bind(progress[index])
             .bind(&rule.id)
             .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
-        Ok(queued)
+        Ok(counters.applied as usize)
+    }
+
+    /// Применить все подходящие правила к одному письму по его снимку
+    /// (S-031 - S-034).
+    async fn apply_rules_to_message(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        rules: &[MailRule],
+        snapshot: &RuleMessageSnapshot,
+        counters: &mut RuleRunCounters,
+    ) -> Result<()> {
+        // S-002: письмо с уже поставленной операцией увода получает только
+        // местные действия последующих правил.
+        let mut taken = snapshot.has_takeaway;
+        for rule in rules {
+            if rule.account_id.is_some_and(|id| id != snapshot.account_id) {
+                continue;
+            }
+            if !rule_matches(rule, snapshot) {
+                continue;
+            }
+            counters.applied += 1;
+            let mut stop = false;
+            for action in &rule.actions {
+                if action.kind == "stop" {
+                    stop = true;
+                    break;
+                }
+                if is_takeaway_action(&action.kind) {
+                    if taken {
+                        continue;
+                    }
+                    match self.apply_takeaway(tx, rule, action, snapshot).await? {
+                        TakeawayOutcome::Queued(_) => {
+                            taken = true;
+                            counters.queued += 1;
+                        }
+                        TakeawayOutcome::Conflict => {
+                            // S-005: занятое письмо пропускается со счётчиком,
+                            // прогон при этом не останавливается.
+                            taken = true;
+                            counters.skipped += 1;
+                        }
+                        TakeawayOutcome::Unchanged => taken = true,
+                        TakeawayOutcome::NeedsAttention => {}
+                    }
+                } else {
+                    self.apply_local_action(tx, action, snapshot).await?;
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Местные действия меняют локальную базу сразу и повторяются без вреда
+    /// (S-041 - S-043).
+    async fn apply_local_action(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        action: &MailRuleAction,
+        snapshot: &RuleMessageSnapshot,
+    ) -> Result<()> {
+        match action.kind.as_str() {
+            "label_add" => {
+                let Some(label_id) = action.label_id else {
+                    return Ok(());
+                };
+                sqlx::query(
+                    "INSERT OR IGNORE INTO message_labels(message_id, label_id) VALUES(?, ?)",
+                )
+                .bind(snapshot.id)
+                .bind(label_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+            "label_remove" => {
+                let Some(label_id) = action.label_id else {
+                    return Ok(());
+                };
+                sqlx::query("DELETE FROM message_labels WHERE message_id=? AND label_id=?")
+                    .bind(snapshot.id)
+                    .bind(label_id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            "mark_read" | "mark_flagged" => {
+                let read = action.kind == "mark_read";
+                let seen = if read { true } else { snapshot.seen };
+                let flagged = if read { snapshot.flagged } else { true };
+                sqlx::query("UPDATE messages SET seen=?, flagged=? WHERE id=?")
+                    .bind(seen as i64)
+                    .bind(flagged as i64)
+                    .bind(snapshot.id)
+                    .execute(&mut **tx)
+                    .await?;
+                // S-043: признак нужно перенести и на сервер, поэтому ставим
+                // ту же операцию очереди, что и ручная отметка.
+                Self::queue_flag_sync(
+                    tx,
+                    snapshot.id,
+                    snapshot.account_id,
+                    &snapshot.remote_path,
+                    snapshot.uid,
+                    snapshot.remote_id.as_deref(),
+                    seen,
+                    flagged,
+                )
+                .await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Уводящее действие всегда идёт через общую точку постановки операции.
+    async fn apply_takeaway(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        rule: &MailRule,
+        action: &MailRuleAction,
+        snapshot: &RuleMessageSnapshot,
+    ) -> Result<TakeawayOutcome> {
+        let target = if action.kind == "delete" {
+            TakeawayTarget::Delete
+        } else if action.kind == "move" {
+            match action.folder_id {
+                Some(folder_id) => {
+                    let folder = sqlx::query_as::<_, (i64, String)>(
+                        "SELECT id, remote_path FROM folders WHERE id=? AND account_id=?",
+                    )
+                    .bind(folder_id)
+                    .bind(snapshot.account_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    match folder {
+                        Some((id, path)) => TakeawayTarget::Folder { id, path },
+                        None => return Ok(TakeawayOutcome::NeedsAttention),
+                    }
+                }
+                None => {
+                    let Some(role) = action.folder_role.as_deref() else {
+                        return Ok(TakeawayOutcome::NeedsAttention);
+                    };
+                    match resolve_role_folder(tx, snapshot.account_id, role).await? {
+                        Some((id, path)) => TakeawayTarget::Folder { id, path },
+                        None => return Ok(TakeawayOutcome::NeedsAttention),
+                    }
+                }
+            }
+        } else {
+            let Some(role) = takeaway_target_role(&action.kind) else {
+                return Ok(TakeawayOutcome::NeedsAttention);
+            };
+            match resolve_role_folder(tx, snapshot.account_id, role).await? {
+                Some((id, path)) => TakeawayTarget::Folder { id, path },
+                // S-046: роль без единственной папки останавливает только это
+                // правило, а не разбор всей пачки.
+                None => return Ok(TakeawayOutcome::NeedsAttention),
+            }
+        };
+        let outcome = queue_takeaway_operation(
+            tx,
+            &snapshot.takeaway_message(),
+            &target,
+            TakeawayActor::Stage,
+            Some(rule.id.as_str()),
+            0,
+        )
+        .await?;
+        if matches!(outcome, TakeawayOutcome::Queued(_)) {
+            // S-009: письмо закрыто стадией правил и дальше не передаётся.
+            sqlx::query("UPDATE messages SET closed_by_stage=? WHERE id=?")
+                .bind(RULES_STAGE_NAME)
+                .bind(snapshot.id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    /// Начать ручной прогон по выбранным папкам (S-065, S-066).
+    pub async fn start_mail_rule_run(
+        &self,
+        account_id: Option<i64>,
+        folder_ids: &[i64],
+        rule_ids: Option<&[String]>,
+    ) -> Result<MailRuleRunReport> {
+        if folder_ids.is_empty() {
+            return Err(crate::Error::AccountConfig(
+                "для ручного запуска выберите хотя бы одну папку".into(),
+            ));
+        }
+        for folder_id in folder_ids {
+            let folder: Option<(i64,)> =
+                sqlx::query_as("SELECT account_id FROM folders WHERE id=?")
+                    .bind(folder_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            let Some((folder_account,)) = folder else {
+                return Err(crate::Error::AccountConfig("папка не найдена".into()));
+            };
+            if account_id.is_some_and(|id| id != folder_account) {
+                return Err(crate::Error::AccountConfig(
+                    "папка принадлежит другому аккаунту".into(),
+                ));
+            }
+        }
+        let rules: Vec<MailRule> = self
+            .list_mail_rules()
+            .await?
+            .into_iter()
+            .filter(|rule| rule.enabled && rule.state == "ok")
+            .filter(|rule| rule_ids.is_none_or(|ids| ids.contains(&rule.id)))
+            .collect();
+        if rules.is_empty() {
+            return Err(crate::Error::AccountConfig(
+                "нет включённых правил, готовых к прогону".into(),
+            ));
+        }
+        let versions: Vec<serde_json::Value> = rules
+            .iter()
+            .map(|rule| serde_json::json!({"id": rule.id, "version": rule.version}))
+            .collect();
+        let border: (i64,) = sqlx::query_as("SELECT coalesce(max(id), 0) FROM messages")
+            .fetch_one(&self.pool)
+            .await?;
+        let run_id: (i64,) = sqlx::query_as(
+            "INSERT INTO mail_rule_runs(folder_ids, rule_versions, max_message_id, state)
+             VALUES(?, ?, ?, 'running') RETURNING id",
+        )
+        .bind(serde_json::to_string(folder_ids).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(&versions).unwrap_or_else(|_| "[]".into()))
+        .bind(border.0)
+        .fetch_one(&self.write_pool)
+        .await?;
+        self.run_mail_rule_job(run_id.0).await
+    }
+
+    /// Продолжить задание с сохранённого курсора (S-070).
+    pub async fn continue_mail_rule_run(&self, run_id: i64) -> Result<MailRuleRunReport> {
+        sqlx::query("UPDATE mail_rule_runs SET state='running', updated_at=datetime('now') WHERE id=? AND state IN ('pending','running')")
+            .bind(run_id)
+            .execute(&self.write_pool)
+            .await?;
+        self.run_mail_rule_job(run_id).await
+    }
+
+    /// Последнее задание ручного прогона: сводка для списка правил.
+    pub async fn last_mail_rule_run(&self) -> Result<Option<MailRuleRunReport>> {
+        let row: Option<MailRuleRunRow> = sqlx::query_as(
+            "SELECT id, state, scanned, applied, queued, skipped, remaining
+             FROM mail_rule_runs ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Вернуть задания из состояния выполнения в ожидание после запуска
+    /// программы: прогон, прерванный закрытием окна, продолжается с курсора
+    /// (S-072).
+    pub async fn restore_mail_rule_runs(&self) -> Result<usize> {
+        let restored = sqlx::query(
+            "UPDATE mail_rule_runs SET state='pending', updated_at=datetime('now')
+             WHERE state='running'",
+        )
+        .execute(&self.write_pool)
+        .await?;
+        Ok(restored.rows_affected() as usize)
+    }
+
+    /// Разбор пачками по 500 писем с пределом 5000 писем за запуск
+    /// (S-068, S-069). Каждая пачка - отдельная неделимая операция вместе с
+    /// обновлением задания: писатель в базе один, и длинный прогон задержал бы
+    /// всю запись программы.
+    async fn run_mail_rule_job(&self, run_id: i64) -> Result<MailRuleRunReport> {
+        let job: MailRuleJobRow = sqlx::query_as(
+            "SELECT id, folder_ids, rule_versions, max_message_id, cursor_message_id,
+                    scanned, applied, queued, skipped
+             FROM mail_rule_runs WHERE id=?",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let folder_ids: Vec<i64> = serde_json::from_str(&job.folder_ids).unwrap_or_default();
+        let versions: Vec<RuleVersion> =
+            serde_json::from_str(&job.rule_versions).unwrap_or_default();
+        // S-071: задание работает с тем перечнем правил и с теми версиями,
+        // которые записаны в нём. Правило, изменённое во время прогона, из
+        // начатого задания выбывает.
+        let rules: Vec<MailRule> = self
+            .list_mail_rules()
+            .await?
+            .into_iter()
+            .filter(|rule| {
+                versions
+                    .iter()
+                    .any(|saved| saved.id == rule.id && saved.version == rule.version)
+            })
+            .filter(|rule| rule.state == "ok")
+            .collect();
+        let folder_list = id_list(&folder_ids);
+        let mut counters = RuleRunCounters {
+            scanned: job.scanned,
+            applied: job.applied,
+            queued: job.queued,
+            skipped: job.skipped,
+        };
+        let mut cursor = job.cursor_message_id;
+        let mut processed_now = 0_i64;
+        while processed_now < MANUAL_RUN_LIMIT {
+            let batch = MANUAL_RUN_BATCH.min(MANUAL_RUN_LIMIT - processed_now);
+            let mut tx = self.begin_write().await?;
+            // S-065: ручной прогон берёт письма и с признаком backfilled, но
+            // только из выбранных папок и только до границы задания.
+            let snapshots = load_rule_snapshots(
+                &mut tx,
+                &format!("m.id>? AND m.id<=? AND m.folder_id IN ({folder_list})"),
+                vec![cursor, job.max_message_id],
+                batch,
+            )
+            .await?;
+            if snapshots.is_empty() {
+                tx.commit().await?;
+                break;
+            }
+            for snapshot in &snapshots {
+                self.apply_rules_to_message(&mut tx, &rules, snapshot, &mut counters)
+                    .await?;
+                counters.scanned += 1;
+                processed_now += 1;
+                cursor = snapshot.id;
+            }
+            // S-067: прогресс автоматического прогона ручной запуск не двигает,
+            // курсор живёт в задании.
+            sqlx::query(
+                "UPDATE mail_rule_runs SET cursor_message_id=?, scanned=?, applied=?, queued=?,
+                        skipped=?, updated_at=datetime('now')
+                 WHERE id=?",
+            )
+            .bind(cursor)
+            .bind(counters.scanned)
+            .bind(counters.applied)
+            .bind(counters.queued)
+            .bind(counters.skipped)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+        }
+        let remaining: (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT count(*) FROM messages m
+              WHERE m.id>? AND m.id<=? AND m.folder_id IN ({folder_list})"
+        )))
+        .bind(cursor)
+        .bind(job.max_message_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let state = if remaining.0 > 0 { "pending" } else { "done" };
+        sqlx::query(
+            "UPDATE mail_rule_runs SET state=?, remaining=?, updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(state)
+        .bind(remaining.0)
+        .bind(run_id)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(MailRuleRunReport {
+            run_id,
+            state: state.to_owned(),
+            scanned: counters.scanned,
+            applied: counters.applied,
+            queued: counters.queued,
+            skipped: counters.skipped,
+            remaining: remaining.0,
+        })
     }
 
     // ---------- Умные папки ----------
@@ -5546,48 +6139,165 @@ impl From<MessageRow> for MessageMeta {
 struct MailRuleRow {
     id: String,
     name: String,
-    field: String,
-    operator: String,
-    value: String,
     account_id: Option<i64>,
-    action: String,
-    folder_id: Option<i64>,
-    label_id: Option<i64>,
     enabled: i64,
     progress_message_id: i64,
     sort_order: i64,
+    rule_version: i64,
 }
 
-impl From<MailRuleRow> for MailRule {
-    fn from(rule: MailRuleRow) -> Self {
+/// Правило прежней схемы: одно поле, один оператор, одно значение и одно
+/// действие (S-074, S-075).
+#[derive(sqlx::FromRow)]
+struct LegacyMailRuleRow {
+    id: String,
+    field: String,
+    operator: String,
+    value: String,
+    action: String,
+    folder_id: Option<i64>,
+    label_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MailRuleConditionRow {
+    rule_id: String,
+    is_exception: i64,
+    group_index: i64,
+    group_logic: String,
+    field: String,
+    op: String,
+    value: String,
+    unit: Option<String>,
+    value2: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MailRuleActionRow {
+    rule_id: String,
+    kind: String,
+    folder_id: Option<i64>,
+    folder_role: Option<String>,
+    label_id: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct MailRuleRunRow {
+    id: i64,
+    state: String,
+    scanned: i64,
+    applied: i64,
+    queued: i64,
+    skipped: i64,
+    remaining: i64,
+}
+
+impl From<MailRuleRunRow> for MailRuleRunReport {
+    fn from(row: MailRuleRunRow) -> Self {
         Self {
-            id: rule.id,
-            name: rule.name,
-            field: rule.field,
-            operator: rule.operator,
-            value: rule.value,
-            account_id: rule.account_id,
-            action: rule.action,
-            folder_id: rule.folder_id,
-            label_id: rule.label_id,
-            enabled: rule.enabled != 0,
-            progress_message_id: rule.progress_message_id,
-            sort_order: rule.sort_order,
+            run_id: row.id,
+            state: row.state,
+            scanned: row.scanned,
+            applied: row.applied,
+            queued: row.queued,
+            skipped: row.skipped,
+            remaining: row.remaining,
         }
     }
 }
 
 #[derive(sqlx::FromRow)]
-struct RuleMessageRow {
+struct MailRuleJobRow {
+    #[allow(dead_code)]
+    id: i64,
+    folder_ids: String,
+    rule_versions: String,
+    max_message_id: i64,
+    cursor_message_id: i64,
+    scanned: i64,
+    applied: i64,
+    queued: i64,
+    skipped: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuleSnapshotRow {
     id: i64,
     account_id: i64,
     folder_id: i64,
     uid: i64,
     remote_path: String,
+    display_name: Option<String>,
+    role: Option<String>,
+    email: String,
     remote_id: Option<String>,
     from_name: Option<String>,
     from_addr: Option<String>,
+    to_addrs: Option<String>,
+    cc_addrs: Option<String>,
     subject: String,
+    preview: String,
+    date: Option<String>,
+    size: Option<i64>,
+    seen: i64,
+    flagged: i64,
+    answered: i64,
+    draft: i64,
+    has_attachments: i64,
+    has_takeaway: i64,
+}
+
+impl From<RuleSnapshotRow> for RuleMessageSnapshot {
+    fn from(row: RuleSnapshotRow) -> Self {
+        // Получатели читаются из тех же столбцов JSON, что и список писем: имя
+        // и адрес склеиваются, чтобы условие ловило и то, и другое.
+        let addresses = |raw: Option<&str>| -> String {
+            raw.and_then(|value| serde_json::from_str::<Vec<Addr>>(value).ok())
+                .map(|list| {
+                    list.into_iter()
+                        .map(|address| {
+                            format!("{} {}", address.name.unwrap_or_default(), address.email)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+        };
+        let recipients = format!(
+            "{} {}",
+            addresses(row.to_addrs.as_deref()),
+            addresses(row.cc_addrs.as_deref())
+        );
+        Self {
+            id: row.id,
+            account_id: row.account_id,
+            folder_id: row.folder_id,
+            uid: row.uid,
+            remote_path: row.remote_path.clone(),
+            remote_id: row.remote_id,
+            account_email: row.email,
+            folder_name: format!(
+                "{} {}",
+                row.display_name.unwrap_or_default(),
+                row.remote_path
+            ),
+            folder_role: row.role,
+            from_name: row.from_name,
+            from_addr: row.from_addr,
+            recipients,
+            subject: row.subject,
+            preview: row.preview,
+            date: row.date,
+            size: row.size,
+            seen: row.seen != 0,
+            flagged: row.flagged != 0,
+            answered: row.answered != 0,
+            draft: row.draft != 0,
+            has_attachments: row.has_attachments != 0,
+            labels: Vec::new(),
+            has_takeaway: row.has_takeaway != 0,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -5768,6 +6478,629 @@ impl From<ContactRow> for Contact {
             is_local_only: r.remote_url.is_none(),
         }
     }
+}
+
+// ---------- Прогон правил: снимок письма, сопоставление и постановка ----------
+
+/// Размер одной пачки ручного прогона и предел писем за один запуск
+/// (S-068, S-069).
+const MANUAL_RUN_BATCH: i64 = 500;
+const MANUAL_RUN_LIMIT: i64 = 5000;
+
+/// Счётчики отчёта о прогоне (S-073).
+#[derive(Debug, Clone, Copy, Default)]
+struct RuleRunCounters {
+    scanned: i64,
+    applied: i64,
+    queued: i64,
+    skipped: i64,
+}
+
+/// Кто ставит операцию увода. Пользователь заменяет собственную незавершённую
+/// операцию (S-006), стадия чужую не трогает и пропускает письмо (S-007).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TakeawayActor {
+    User,
+    Stage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TakeawayOutcome {
+    Queued(i64),
+    Conflict,
+    Unchanged,
+    NeedsAttention,
+}
+
+/// Куда уводится письмо. Безвозвратное удаление - отдельная цель, а не
+/// следствие переноса в корзину (S-012, S-013).
+#[derive(Debug, Clone)]
+pub(crate) enum TakeawayTarget {
+    Folder { id: i64, path: String },
+    Delete,
+}
+
+/// Данные письма, которых хватает для постановки операции увода.
+#[derive(Debug, Clone)]
+pub(crate) struct TakeawayMessage {
+    pub id: i64,
+    pub account_id: i64,
+    pub folder_id: i64,
+    pub uid: i64,
+    pub remote_path: String,
+    pub remote_id: Option<String>,
+}
+
+/// Снимок письма на начало прогона: все правила сверяются с ним, а не с
+/// письмом, уже изменённым предыдущим правилом (S-031).
+#[derive(Debug, Clone)]
+pub(crate) struct RuleMessageSnapshot {
+    pub id: i64,
+    pub account_id: i64,
+    pub folder_id: i64,
+    pub uid: i64,
+    pub remote_path: String,
+    pub remote_id: Option<String>,
+    pub account_email: String,
+    pub folder_name: String,
+    pub folder_role: Option<String>,
+    pub from_name: Option<String>,
+    pub from_addr: Option<String>,
+    pub recipients: String,
+    pub subject: String,
+    pub preview: String,
+    pub date: Option<String>,
+    pub size: Option<i64>,
+    pub seen: bool,
+    pub flagged: bool,
+    pub answered: bool,
+    pub draft: bool,
+    pub has_attachments: bool,
+    pub labels: Vec<String>,
+    /// По письму уже стоит незавершённая операция увода или операция в
+    /// состоянии отказа (S-002, S-052).
+    pub has_takeaway: bool,
+}
+
+impl RuleMessageSnapshot {
+    fn takeaway_message(&self) -> TakeawayMessage {
+        TakeawayMessage {
+            id: self.id,
+            account_id: self.account_id,
+            folder_id: self.folder_id,
+            uid: self.uid,
+            remote_path: self.remote_path.clone(),
+            remote_id: self.remote_id.clone(),
+        }
+    }
+}
+
+/// Перечень номеров для условия IN. Значения целые, поэтому подставляются в
+/// текст запроса: связанных параметров переменного числа sqlx не даёт.
+fn id_list(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        return "NULL".into();
+    }
+    ids.iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Снимки писем одной пачки. `filter` дописывается в условие запроса, а его
+/// связанные параметры приходят в `binds` - значения условий в текст запроса
+/// не попадают.
+async fn load_rule_snapshots(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    filter: &str,
+    binds: Vec<i64>,
+    limit: i64,
+) -> Result<Vec<RuleMessageSnapshot>> {
+    let sql = format!(
+        "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path, f.display_name,
+                f.role, a.email, m.remote_id, m.from_name, m.from_addr, m.to_addrs,
+                m.cc_addrs, m.subject, m.preview, m.date, m.size, m.seen, m.flagged,
+                m.answered, m.draft, m.has_attachments,
+                EXISTS(SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
+                        AND o.op_kind IN ('move','delete')
+                        AND o.status IN ('pending','processing','retry','failed')) AS has_takeaway
+           FROM messages m
+           JOIN folders f ON f.id=m.folder_id
+           JOIN accounts a ON a.id=m.account_id
+          WHERE {filter}
+          ORDER BY m.id LIMIT ?"
+    );
+    let mut query = sqlx::query_as::<_, RuleSnapshotRow>(AssertSqlSafe(sql));
+    for value in binds {
+        query = query.bind(value);
+    }
+    let rows = query.bind(limit).fetch_all(&mut **tx).await?;
+    let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+    let mut labels: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    if !ids.is_empty() {
+        let pairs: Vec<(i64, String)> = sqlx::query_as(AssertSqlSafe(format!(
+            "SELECT ml.message_id, l.name FROM message_labels ml
+               JOIN labels l ON l.id=ml.label_id
+              WHERE ml.message_id IN ({})",
+            id_list(&ids)
+        )))
+        .fetch_all(&mut **tx)
+        .await?;
+        for (message_id, name) in pairs {
+            labels.entry(message_id).or_default().push(name);
+        }
+    }
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let id = row.id;
+            let mut snapshot = RuleMessageSnapshot::from(row);
+            snapshot.labels = labels.remove(&id).unwrap_or_default();
+            snapshot
+        })
+        .collect())
+}
+
+/// Папка роли в ящике: ровно одна, иначе правило переводится в состояние
+/// внимания, а разбор пачки продолжается (S-046).
+async fn resolve_role_folder(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    role: &str,
+) -> Result<Option<(i64, String)>> {
+    let folders: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=? AND role=?")
+            .bind(account_id)
+            .bind(role)
+            .fetch_all(&mut **tx)
+            .await?;
+    if folders.len() == 1 {
+        Ok(folders.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+/// Общая точка постановки операции увода: через неё идут стадии, правила и
+/// действия пользователя (S-003, S-006, S-007, S-012).
+pub(crate) async fn queue_takeaway_operation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message: &TakeawayMessage,
+    target: &TakeawayTarget,
+    actor: TakeawayActor,
+    rule_id: Option<&str>,
+    delay_seconds: i64,
+) -> Result<TakeawayOutcome> {
+    if let TakeawayTarget::Folder { id, .. } = target
+        && *id == message.folder_id
+    {
+        // S-012: письмо уже лежит в этой папке. Прежде такой перенос в корзину
+        // превращался в безвозвратное удаление - теперь не превращается ни по
+        // требованию стадии, ни по требованию пользователя.
+        return Ok(TakeawayOutcome::Unchanged);
+    }
+    let existing: Option<(i64, String)> = sqlx::query_as(
+        "SELECT id, status FROM outbox_ops
+          WHERE message_id=? AND op_kind IN ('move','delete')
+            AND status IN ('pending','processing','retry','failed')
+          ORDER BY id LIMIT 1",
+    )
+    .bind(message.id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((existing_id, status)) = existing {
+        match (actor, status.as_str()) {
+            (TakeawayActor::User, "pending" | "retry") => {
+                // S-006: передумать после ошибочного переноса можно, пока
+                // операция не ушла на сервер.
+                sqlx::query("DELETE FROM outbox_ops WHERE id=?")
+                    .bind(existing_id)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            (TakeawayActor::User, "processing") => {
+                return Err(crate::Error::AccountConfig(
+                    "письмо уже переносится, дождитесь завершения".into(),
+                ));
+            }
+            (TakeawayActor::User, _) => {
+                // S-052, S-053: операция в состоянии отказа ждёт решения
+                // пользователя - повтора или отказа от неё.
+                return Err(crate::Error::AccountConfig(
+                    "прошлая операция письма завершилась отказом: повторите её или откажитесь"
+                        .into(),
+                ));
+            }
+            (TakeawayActor::Stage, _) => return Ok(TakeawayOutcome::Conflict),
+        }
+    }
+    let (kind, target_id, target_path) = match target {
+        TakeawayTarget::Delete => ("delete", None, None),
+        TakeawayTarget::Folder { id, path } => ("move", Some(*id), Some(path.as_str())),
+    };
+    let payload = serde_json::json!({
+        "message_id": message.id,
+        "folder_id": message.folder_id,
+        "folder_path": message.remote_path,
+        "uid": message.uid,
+        "remote_id": message.remote_id,
+        "target_folder_id": target_id,
+        "target_folder_path": target_path,
+        "rule_id": rule_id,
+    });
+    let inserted = sqlx::query(
+        "INSERT INTO outbox_ops(account_id, message_id, op_kind, payload, status, next_attempt_at)
+         VALUES(?, ?, ?, ?, 'pending', datetime('now', ?))",
+    )
+    .bind(message.account_id)
+    .bind(message.id)
+    .bind(kind)
+    .bind(payload.to_string())
+    .bind(format!("+{delay_seconds} seconds"))
+    .execute(&mut **tx)
+    .await;
+    match inserted {
+        Ok(result) => Ok(TakeawayOutcome::Queued(result.last_insert_rowid())),
+        // S-005: ограничение по одному уводу на письмо отвергло вставку -
+        // письмо пропускается, а групповое действие и прогон продолжаются.
+        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+            Ok(TakeawayOutcome::Conflict)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Правило применимо к письму: совпала хотя бы одна обычная группа и не
+/// совпала ни одна группа исключений (S-015, S-017).
+fn rule_matches(rule: &MailRule, message: &RuleMessageSnapshot) -> bool {
+    if rule
+        .exceptions
+        .iter()
+        .any(|group| rule_group_matches(group, message))
+    {
+        return false;
+    }
+    rule.groups
+        .iter()
+        .any(|group| rule_group_matches(group, message))
+}
+
+/// Логика группы применяется ко всем её условиям, пустая группа совпадением не
+/// считается (S-016, S-018).
+fn rule_group_matches(group: &MailRuleGroup, message: &RuleMessageSnapshot) -> bool {
+    if group.conditions.is_empty() {
+        return false;
+    }
+    let matches = |condition: &MailRuleCondition| rule_condition_matches(condition, message);
+    if group.logic == "any" {
+        group.conditions.iter().any(matches)
+    } else {
+        group.conditions.iter().all(matches)
+    }
+}
+
+fn rule_condition_matches(condition: &MailRuleCondition, message: &RuleMessageSnapshot) -> bool {
+    match rule_field_kind(&condition.field) {
+        Some(RuleFieldKind::Date) => return rule_date_matches(condition, message),
+        Some(RuleFieldKind::Size) => return rule_size_matches(condition, message),
+        None => return false,
+        _ => {}
+    }
+    // S-023, S-024: точный адрес сравнивается целиком в канонической форме, без
+    // отображаемого имени.
+    let (left, right) = if condition.field == "sender_address" {
+        (
+            canonical_sender_address(message.from_addr.as_deref().unwrap_or("")).to_lowercase(),
+            canonical_sender_address(&condition.value).to_lowercase(),
+        )
+    } else {
+        (
+            rule_field_value(&condition.field, message).to_lowercase(),
+            condition.value.trim().to_lowercase(),
+        )
+    };
+    // S-026: поле без значения - пустая строка, совпадающая только с
+    // операторами отрицания.
+    match condition.op.as_str() {
+        "not_contains" => !left.contains(&right),
+        "equals" => left == right,
+        "not_equals" => left != right,
+        "starts_with" => left.starts_with(&right),
+        "ends_with" => left.ends_with(&right),
+        _ => left.contains(&right),
+    }
+}
+
+fn rule_field_value(field: &str, message: &RuleMessageSnapshot) -> String {
+    match field {
+        "sender" => format!(
+            "{} {}",
+            message.from_name.as_deref().unwrap_or(""),
+            message.from_addr.as_deref().unwrap_or("")
+        ),
+        "recipient" => message.recipients.clone(),
+        "subject" => message.subject.clone(),
+        // Тело из сети ради условия не загружается: сравнивается то, что уже
+        // лежит локально.
+        "body" => message.preview.clone(),
+        "account" => message.account_email.clone(),
+        "folder" => message.folder_name.clone(),
+        "folder_role" => message
+            .folder_role
+            .clone()
+            .unwrap_or_else(|| "other".into()),
+        "read_state" => if message.seen { "read" } else { "unread" }.into(),
+        "importance" => if message.flagged { "flagged" } else { "normal" }.into(),
+        "reply_state" => if message.answered {
+            "answered"
+        } else {
+            "unanswered"
+        }
+        .into(),
+        "draft_state" => if message.draft { "draft" } else { "not_draft" }.into(),
+        "attachment" => if message.has_attachments {
+            "has"
+        } else {
+            "none"
+        }
+        .into(),
+        "label" => message.labels.join(" "),
+        _ => String::new(),
+    }
+}
+
+fn rule_date_matches(condition: &MailRuleCondition, message: &RuleMessageSnapshot) -> bool {
+    let Some(raw) = message.date.as_deref() else {
+        return false;
+    };
+    let timestamp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                .map(|value| value.and_utc())
+        });
+    let Ok(timestamp) = timestamp else {
+        return false;
+    };
+    if matches!(condition.op.as_str(), "within_last" | "older_than") {
+        let Ok(amount) = condition.value.trim().parse::<i64>() else {
+            return false;
+        };
+        let seconds = match condition.unit.as_deref().unwrap_or("hours") {
+            "minutes" => 60,
+            "days" => 86_400,
+            "weeks" => 604_800,
+            _ => 3_600,
+        };
+        // Период приходит из условия, которое пользователь пишет руками:
+        // непредставимую длительность считаем бесконечной, а не роняем прогон.
+        let Some(offset) = amount
+            .checked_mul(seconds)
+            .and_then(chrono::Duration::try_seconds)
+        else {
+            return condition.op == "within_last";
+        };
+        let age = chrono::Utc::now().signed_duration_since(timestamp);
+        return if condition.op == "within_last" {
+            age <= offset
+        } else {
+            age > offset
+        };
+    }
+    let Ok(target) = chrono::NaiveDate::parse_from_str(condition.value.trim(), "%Y-%m-%d") else {
+        return false;
+    };
+    let actual = timestamp.date_naive();
+    match condition.op.as_str() {
+        "before" => actual < target,
+        "after" => actual > target,
+        _ => actual == target,
+    }
+}
+
+fn rule_size_matches(condition: &MailRuleCondition, message: &RuleMessageSnapshot) -> bool {
+    let Some(bytes) = message.size else {
+        return false;
+    };
+    let factor = match condition.unit.as_deref().unwrap_or("mb") {
+        "kb" => 1_024_f64,
+        "gb" => 1_073_741_824_f64,
+        _ => 1_048_576_f64,
+    };
+    let Ok(value) = condition.value.trim().parse::<f64>() else {
+        return false;
+    };
+    let minimum = value * factor;
+    let bytes = bytes as f64;
+    match condition.op.as_str() {
+        "greater_than" => bytes > minimum,
+        "greater_or_equal" => bytes >= minimum,
+        "less_than" => bytes < minimum,
+        "less_or_equal" => bytes <= minimum,
+        "between" => condition
+            .value2
+            .as_deref()
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .is_some_and(|maximum| bytes >= minimum && bytes <= maximum * factor),
+        _ => (bytes - minimum).abs() < f64::EPSILON,
+    }
+}
+
+/// Значения прежних столбцов правила. Ссылки на папку и метку в них больше не
+/// пишутся: старый `folder_id` объявлен с каскадом, и удаление папки стёрло бы
+/// правило целиком вместо перевода в состояние внимания (S-054, S-078).
+struct LegacyRuleColumns {
+    field: String,
+    operator: String,
+    value: String,
+    action: String,
+    folder_id: Option<i64>,
+    label_id: Option<i64>,
+}
+
+fn legacy_rule_columns(rule: &MailRuleInput) -> LegacyRuleColumns {
+    let first = rule
+        .groups
+        .first()
+        .and_then(|group| group.conditions.first());
+    let (field, operator) = match first {
+        // S-078: в прежние столбцы попадают только значения, допустимые их
+        // ограничениями check.
+        Some(condition)
+            if matches!(condition.field.as_str(), "sender" | "subject")
+                && matches!(condition.op.as_str(), "contains" | "equals") =>
+        {
+            (condition.field.clone(), condition.op.clone())
+        }
+        _ => ("subject".to_owned(), "contains".to_owned()),
+    };
+    let value = first
+        .map(|condition| condition.value.trim().to_owned())
+        .unwrap_or_default();
+    let action = rule
+        .actions
+        .iter()
+        .find_map(|action| match action.kind.as_str() {
+            "move" | "archive" | "spam" | "trash" => Some(action.kind.clone()),
+            "label_add" => Some("label".to_owned()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "archive".to_owned());
+    LegacyRuleColumns {
+        field,
+        operator,
+        value,
+        action,
+        folder_id: None,
+        label_id: None,
+    }
+}
+
+/// Собрать правила из строк таблиц и определить их состояние (S-054).
+fn assemble_mail_rules(
+    rows: Vec<MailRuleRow>,
+    conditions: Vec<MailRuleConditionRow>,
+    actions: Vec<MailRuleActionRow>,
+    folder_roles: &[(i64, Option<String>)],
+) -> Vec<MailRule> {
+    let mut grouped: std::collections::HashMap<String, (Vec<MailRuleGroup>, Vec<MailRuleGroup>)> =
+        std::collections::HashMap::new();
+    for row in conditions {
+        let entry = grouped.entry(row.rule_id.clone()).or_default();
+        let target = if row.is_exception != 0 {
+            &mut entry.1
+        } else {
+            &mut entry.0
+        };
+        let index = row.group_index.max(0) as usize;
+        while target.len() <= index {
+            target.push(MailRuleGroup {
+                logic: "all".into(),
+                conditions: Vec::new(),
+            });
+        }
+        target[index].logic = row.group_logic.clone();
+        target[index].conditions.push(MailRuleCondition {
+            field: row.field,
+            op: row.op,
+            value: row.value,
+            unit: row.unit,
+            value2: row.value2,
+        });
+    }
+    let mut by_rule: std::collections::HashMap<String, Vec<MailRuleAction>> =
+        std::collections::HashMap::new();
+    for row in actions {
+        by_rule
+            .entry(row.rule_id.clone())
+            .or_default()
+            .push(MailRuleAction {
+                kind: row.kind,
+                folder_id: row.folder_id,
+                folder_role: row.folder_role,
+                label_id: row.label_id,
+            });
+    }
+    rows.into_iter()
+        .map(|row| {
+            let (groups, exceptions) = grouped.remove(&row.id).unwrap_or_default();
+            // Пустая группа, найденная в базе, действующей не считается (S-018).
+            let groups: Vec<MailRuleGroup> = groups
+                .into_iter()
+                .filter(|group| !group.conditions.is_empty())
+                .collect();
+            let exceptions: Vec<MailRuleGroup> = exceptions
+                .into_iter()
+                .filter(|group| !group.conditions.is_empty())
+                .collect();
+            let actions = by_rule.remove(&row.id).unwrap_or_default();
+            let reason = rule_attention_reason(row.account_id, &groups, &actions, folder_roles);
+            MailRule {
+                id: row.id,
+                name: row.name,
+                account_id: row.account_id,
+                enabled: row.enabled != 0,
+                progress_message_id: row.progress_message_id,
+                sort_order: row.sort_order,
+                version: row.rule_version,
+                groups,
+                exceptions,
+                actions,
+                state: if reason.is_some() {
+                    "needs_attention".into()
+                } else {
+                    "ok".into()
+                },
+                attention_reason: reason,
+            }
+        })
+        .collect()
+}
+
+/// Причина состояния `needs_attention`: удалённая папка, удалённая метка,
+/// неоднозначная роль папки или потерянные условия (S-054).
+fn rule_attention_reason(
+    account_id: Option<i64>,
+    groups: &[MailRuleGroup],
+    actions: &[MailRuleAction],
+    folder_roles: &[(i64, Option<String>)],
+) -> Option<String> {
+    if groups.is_empty() || actions.is_empty() {
+        return Some("rule_incomplete".into());
+    }
+    for action in actions {
+        if matches!(action.kind.as_str(), "label_add" | "label_remove") && action.label_id.is_none()
+        {
+            return Some("label_missing".into());
+        }
+        if action.kind == "move" && action.folder_id.is_none() && action.folder_role.is_none() {
+            return Some("folder_missing".into());
+        }
+        let role = if action.kind == "move" {
+            action.folder_role.as_deref()
+        } else {
+            takeaway_target_role(&action.kind)
+        };
+        // Роль проверяем только у правила одного ящика: у правила для всех
+        // ящиков папка выбирается в ящике письма уже во время прогона.
+        if let (Some(role), Some(account_id)) = (role, account_id) {
+            let count = folder_roles
+                .iter()
+                .filter(|(id, value)| *id == account_id && value.as_deref() == Some(role))
+                .count();
+            if count != 1 {
+                return Some("folder_role_ambiguous".into());
+            }
+        }
+    }
+    None
+}
+
+/// Перечень правил задания ручного прогона со снимком их версий (S-066).
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuleVersion {
+    id: String,
+    version: i64,
 }
 
 #[cfg(test)]
@@ -8132,5 +9465,1267 @@ mod mail_sync_state_tests {
             MailSyncOutcome::from_result(&ok),
             MailSyncOutcome::Success
         ));
+    }
+}
+
+#[cfg(test)]
+mod mail_rules_tests {
+    use super::test_storage::{TestDb, open_test_db};
+    use super::*;
+
+    async fn test_db() -> TestDb {
+        open_test_db("repo-rules").await
+    }
+
+    async fn seed_account(db: &Db, email: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
+             VALUES(?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(email)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert account")
+        .0
+    }
+
+    async fn seed_folder(db: &Db, account_id: i64, path: &str, role: Option<&str>) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO folders(account_id, remote_path, display_name, role)
+             VALUES(?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(path)
+        .bind(path)
+        .bind(role)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert folder")
+        .0
+    }
+
+    struct MessageSeed<'a> {
+        uid: i64,
+        from_addr: &'a str,
+        subject: &'a str,
+        backfilled: bool,
+    }
+
+    impl<'a> MessageSeed<'a> {
+        fn new(uid: i64, from_addr: &'a str, subject: &'a str) -> Self {
+            Self {
+                uid,
+                from_addr,
+                subject,
+                backfilled: false,
+            }
+        }
+    }
+
+    async fn seed_message(db: &Db, account_id: i64, folder_id: i64, seed: MessageSeed<'_>) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO messages(account_id, folder_id, uid, from_name, from_addr, subject,
+                                  preview, size, backfilled, remote_id)
+             VALUES(?, ?, ?, 'Отправитель', ?, ?, 'предпросмотр', 2048, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(folder_id)
+        .bind(seed.uid)
+        .bind(seed.from_addr)
+        .bind(seed.subject)
+        .bind(seed.backfilled as i64)
+        .bind(format!("remote-{}-{}", folder_id, seed.uid))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert message")
+        .0
+    }
+
+    fn condition(field: &str, op: &str, value: &str) -> MailRuleCondition {
+        MailRuleCondition {
+            field: field.into(),
+            op: op.into(),
+            value: value.into(),
+            unit: None,
+            value2: None,
+        }
+    }
+
+    fn group(logic: &str, conditions: Vec<MailRuleCondition>) -> MailRuleGroup {
+        MailRuleGroup {
+            logic: logic.into(),
+            conditions,
+        }
+    }
+
+    fn action(kind: &str) -> MailRuleAction {
+        MailRuleAction {
+            kind: kind.into(),
+            folder_id: None,
+            folder_role: None,
+            label_id: None,
+        }
+    }
+
+    fn rule_input(
+        id: &str,
+        account_id: Option<i64>,
+        groups: Vec<MailRuleGroup>,
+        actions: Vec<MailRuleAction>,
+    ) -> MailRuleInput {
+        MailRuleInput {
+            id: id.into(),
+            name: format!("Правило {id}"),
+            account_id,
+            enabled: true,
+            groups,
+            exceptions: Vec::new(),
+            actions,
+            confirm_key: None,
+        }
+    }
+
+    async fn pending_operations(db: &Db) -> Vec<(i64, Option<i64>, String, String)> {
+        sqlx::query_as("SELECT id, message_id, op_kind, status FROM outbox_ops ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read outbox")
+    }
+
+    /// S-015 - S-017: совпала обычная группа - правило применяется, совпала
+    /// группа исключений - не применяется.
+    #[tokio::test]
+    async fn groups_and_exceptions_decide_applicability() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-groups@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        let wanted = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "boss@example.test", "Отчёт за месяц"),
+        )
+        .await;
+        let excluded = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(2, "boss@example.test", "Отчёт срочно"),
+        )
+        .await;
+        let mut rule = rule_input(
+            "r1",
+            Some(account),
+            vec![group(
+                "all",
+                vec![condition("subject", "contains", "отчёт")],
+            )],
+            vec![action("archive")],
+        );
+        rule.exceptions = vec![group(
+            "any",
+            vec![condition("subject", "contains", "срочно")],
+        )];
+        db.save_mail_rule(&rule, true, None)
+            .await
+            .expect("save rule");
+        db.process_mail_rules().await.expect("process");
+        let operations = pending_operations(&db).await;
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].1, Some(wanted));
+        assert!(operations.iter().all(|row| row.1 != Some(excluded)));
+        db.close().await;
+    }
+
+    /// S-016: логика `any` внутри группы засчитывает одно совпавшее условие.
+    #[tokio::test]
+    async fn any_logic_needs_one_condition() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-any@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "news@example.test", "Письмо"),
+        )
+        .await;
+        let rule = rule_input(
+            "any-rule",
+            Some(account),
+            vec![group(
+                "any",
+                vec![
+                    condition("subject", "contains", "не подходит"),
+                    condition("sender", "contains", "news@"),
+                ],
+            )],
+            vec![action("archive")],
+        );
+        db.save_mail_rule(&rule, true, None)
+            .await
+            .expect("save rule");
+        db.process_mail_rules().await.expect("process");
+        assert_eq!(pending_operations(&db).await.len(), 1);
+        db.close().await;
+    }
+
+    /// S-024: поле точного адреса сравнивает канонический адрес целиком, а
+    /// отображаемое имя в сравнение не входит.
+    #[tokio::test]
+    async fn sender_address_compares_canonical_address() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-addr@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "Bills@Example.TEST", "Счёт"),
+        )
+        .await;
+        let rule = rule_input(
+            "addr-rule",
+            Some(account),
+            vec![group(
+                "all",
+                vec![condition("sender_address", "equals", "bills@example.test")],
+            )],
+            vec![action("archive")],
+        );
+        db.save_mail_rule(&rule, true, None)
+            .await
+            .expect("save rule");
+        db.process_mail_rules().await.expect("process");
+        assert_eq!(pending_operations(&db).await.len(), 1);
+        db.close().await;
+    }
+
+    /// S-032 - S-034, S-036: правила перебираются по порядку, применяются все
+    /// подходящие, а действие остановки закрывает письмо для правил ниже.
+    #[tokio::test]
+    async fn rule_order_actions_and_stop() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-order@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        let label: i64 = sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO labels(name, color) VALUES('Важное', '#ff0000') RETURNING id",
+        )
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("insert label")
+        .0;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "boss@example.test", "Письмо"),
+        )
+        .await;
+        let mut first = rule_input(
+            "rule-a",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "boss@")])],
+            vec![
+                MailRuleAction {
+                    kind: "label_add".into(),
+                    folder_id: None,
+                    folder_role: None,
+                    label_id: Some(label),
+                },
+                action("mark_read"),
+            ],
+        );
+        first.name = "Первое".into();
+        db.save_mail_rule(&first, true, None)
+            .await
+            .expect("save first");
+        let second = rule_input(
+            "rule-b",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "boss@")])],
+            vec![action("archive"), action("stop")],
+        );
+        db.save_mail_rule(&second, true, None)
+            .await
+            .expect("save second");
+        let third = rule_input(
+            "rule-c",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "boss@")])],
+            vec![action("mark_flagged")],
+        );
+        db.save_mail_rule(&third, true, None)
+            .await
+            .expect("save third");
+        db.process_mail_rules().await.expect("process");
+        let (seen, flagged): (i64, i64) =
+            sqlx::query_as("SELECT seen, flagged FROM messages WHERE id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read flags");
+        assert_eq!(seen, 1, "второе действие первого правила выполнено");
+        assert_eq!(flagged, 0, "правило после остановки не выполняется");
+        let labels: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM message_labels WHERE message_id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read labels");
+        assert_eq!(labels.0, 1);
+        db.close().await;
+    }
+
+    /// S-002, S-003, S-007: второе уводящее действие по письму не ставится, а
+    /// стадия не трогает уже стоящую операцию.
+    #[tokio::test]
+    async fn one_takeaway_per_message() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-single@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_folder(&db, account, "Spam", Some("spam")).await;
+        seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "boss@example.test", "Письмо"),
+        )
+        .await;
+        for (id, kind) in [("rule-1", "archive"), ("rule-2", "spam")] {
+            let rule = rule_input(
+                id,
+                Some(account),
+                vec![group("all", vec![condition("sender", "contains", "boss@")])],
+                vec![action(kind)],
+            );
+            db.save_mail_rule(&rule, true, None).await.expect("save");
+        }
+        db.process_mail_rules().await.expect("process");
+        let operations = pending_operations(&db).await;
+        assert_eq!(operations.len(), 1, "письмо уводится один раз");
+        db.close().await;
+    }
+
+    /// S-005: ограничение очереди отвергает второй увод письма даже при
+    /// прямой вставке, а групповое действие продолжает работать.
+    #[tokio::test]
+    async fn queue_constraint_skips_busy_message() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-conflict@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_folder(&db, account, "Trash", Some("trash")).await;
+        let first = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Первое"),
+        )
+        .await;
+        let second = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(2, "b@example.test", "Второе"),
+        )
+        .await;
+        db.queue_message_action(&[first], "archive")
+            .await
+            .expect("queue first");
+        // Пометка операции как отправляемой: заменить её пользователь уже не
+        // может, а групповое действие обязано продолжиться (S-005, S-006).
+        sqlx::query("UPDATE outbox_ops SET status='processing' WHERE message_id=?")
+            .bind(first)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark processing");
+        let error = db
+            .queue_message_action(&[first], "trash")
+            .await
+            .expect_err("вторая операция письма отклоняется");
+        assert!(error.to_string().contains("переносится"));
+        let queued = db
+            .queue_message_action(&[second], "archive")
+            .await
+            .expect("queue second");
+        assert_eq!(queued.operation_ids.len(), 1);
+        db.close().await;
+    }
+
+    /// S-006: пока операция не ушла на сервер, пользователь может передумать -
+    /// его новая операция заменяет собственную незавершённую.
+    #[tokio::test]
+    async fn user_replaces_own_pending_operation() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-replace@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        db.queue_message_action(&[message], "archive")
+            .await
+            .expect("queue archive");
+        db.queue_message_action(&[message], "trash")
+            .await
+            .expect("queue trash");
+        let operations = pending_operations(&db).await;
+        assert_eq!(operations.len(), 1);
+        let payload: (String,) = sqlx::query_as("SELECT payload FROM outbox_ops")
+            .fetch_one(&db.pool)
+            .await
+            .expect("read payload");
+        assert!(payload.0.contains(&format!("\"target_folder_id\":{trash}")));
+        db.close().await;
+    }
+
+    /// S-012, S-013: перенос в корзину письма, уже лежащего в корзине, не
+    /// превращается в безвозвратное удаление, а явное удаление ставится.
+    #[tokio::test]
+    async fn trash_move_never_becomes_permanent_delete() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-trash@example.test").await;
+        let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+        let message = seed_message(
+            &db,
+            account,
+            trash,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let queued = db
+            .queue_message_action(&[message], "trash")
+            .await
+            .expect("queue trash");
+        assert!(queued.operation_ids.is_empty());
+        assert!(pending_operations(&db).await.is_empty());
+        let deleted = db
+            .queue_message_action(&[message], "delete")
+            .await
+            .expect("queue delete");
+        assert_eq!(deleted.operation_ids.len(), 1);
+        assert_eq!(pending_operations(&db).await[0].2, "delete");
+        db.close().await;
+    }
+
+    /// S-008 - S-010: уведённое правилом письмо помечается стадией и в список
+    /// для уведомления не попадает.
+    #[tokio::test]
+    async fn queued_message_is_closed_and_not_notified() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-notify@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let rule = rule_input(
+            "notify-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("archive")],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        db.process_mail_rules().await.expect("process");
+        let stage: (Option<String>,) =
+            sqlx::query_as("SELECT closed_by_stage FROM messages WHERE id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("read stage");
+        assert_eq!(stage.0.as_deref(), Some(RULES_STAGE_NAME));
+        let ids = db
+            .inbox_message_ids_by_remote_ids(account, &[format!("remote-{inbox}-1")], None, None)
+            .await
+            .expect("notification ids");
+        assert!(ids.is_empty(), "уведённое письмо в уведомление не попадает");
+        assert!(!db.message_is_notifiable(message).await.expect("check"));
+        db.close().await;
+    }
+
+    /// S-041 - S-043: местные действия меняют локальную базу и ставят
+    /// изменение признака в очередь, а повтор ничего не ломает.
+    #[tokio::test]
+    async fn local_actions_are_idempotent_and_queue_flags() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-local@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let label: i64 =
+            sqlx::query_as::<_, (i64,)>("INSERT INTO labels(name) VALUES('Метка') RETURNING id")
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert label")
+                .0;
+        let rule = rule_input(
+            "local-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![
+                MailRuleAction {
+                    kind: "label_add".into(),
+                    folder_id: None,
+                    folder_role: None,
+                    label_id: Some(label),
+                },
+                action("mark_read"),
+            ],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        db.process_mail_rules().await.expect("process");
+        db.save_mail_rule(&rule, true, None)
+            .await
+            .expect("save again");
+        db.process_mail_rules().await.expect("process again");
+        let labels: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM message_labels WHERE message_id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count labels");
+        assert_eq!(labels.0, 1, "повторная метка не удваивается");
+        let flags: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM outbox_ops WHERE op_kind='flag' AND message_id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count flag ops");
+        assert_eq!(
+            flags.0, 1,
+            "отметка о прочтении ставится в очередь один раз"
+        );
+        db.close().await;
+    }
+
+    /// S-045, S-046: правило для всех ящиков выбирает папку по роли в ящике
+    /// письма, а неоднозначная роль переводит правило в состояние внимания.
+    #[tokio::test]
+    async fn folder_role_target_and_ambiguity() {
+        let db = test_db().await;
+        let first = seed_account(&db, "rules-role1@example.test").await;
+        let second = seed_account(&db, "rules-role2@example.test").await;
+        let first_inbox = seed_folder(&db, first, "INBOX", Some("inbox")).await;
+        let first_archive = seed_folder(&db, first, "Archive", Some("archive")).await;
+        let second_inbox = seed_folder(&db, second, "INBOX", Some("inbox")).await;
+        let second_archive = seed_folder(&db, second, "Archive", Some("archive")).await;
+        seed_message(
+            &db,
+            first,
+            first_inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        seed_message(
+            &db,
+            second,
+            second_inbox,
+            MessageSeed::new(2, "a@example.test", "Письмо"),
+        )
+        .await;
+        let rule = rule_input(
+            "role-rule",
+            None,
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("archive")],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        db.process_mail_rules().await.expect("process");
+        let targets: Vec<(String,)> = sqlx::query_as("SELECT payload FROM outbox_ops ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read payloads");
+        assert_eq!(targets.len(), 2);
+        assert!(
+            targets[0]
+                .0
+                .contains(&format!("\"target_folder_id\":{first_archive}"))
+        );
+        assert!(
+            targets[1]
+                .0
+                .contains(&format!("\"target_folder_id\":{second_archive}"))
+        );
+        // Вторая папка той же роли делает выбор неоднозначным (S-046).
+        seed_folder(&db, first, "Archive2", Some("archive")).await;
+        let scoped = rule_input(
+            "role-scoped",
+            Some(first),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("archive")],
+        );
+        db.save_mail_rule(&scoped, true, None)
+            .await
+            .expect("save scoped");
+        let saved = db
+            .list_mail_rules()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|rule| rule.id == "role-scoped")
+            .expect("rule saved");
+        assert_eq!(saved.state, "needs_attention");
+        db.close().await;
+    }
+
+    /// S-054, S-055: удалённая метка переводит правило в состояние внимания и
+    /// не даёт ему разбирать письма, а новая метка возвращает его в работу.
+    #[tokio::test]
+    async fn missing_label_needs_attention() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-attention@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let label: i64 =
+            sqlx::query_as::<_, (i64,)>("INSERT INTO labels(name) VALUES('Старая') RETURNING id")
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert label")
+                .0;
+        let rule = rule_input(
+            "label-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![MailRuleAction {
+                kind: "label_add".into(),
+                folder_id: None,
+                folder_role: None,
+                label_id: Some(label),
+            }],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        sqlx::query("DELETE FROM labels WHERE id=?")
+            .bind(label)
+            .execute(&db.write_pool)
+            .await
+            .expect("delete label");
+        let saved = db.list_mail_rules().await.expect("list");
+        assert_eq!(saved[0].state, "needs_attention");
+        let progress_before = saved[0].progress_message_id;
+        db.process_mail_rules().await.expect("process");
+        let after = db.list_mail_rules().await.expect("list again");
+        assert_eq!(
+            after[0].progress_message_id, progress_before,
+            "правило в состоянии внимания прогресс не двигает"
+        );
+        let fresh: i64 =
+            sqlx::query_as::<_, (i64,)>("INSERT INTO labels(name) VALUES('Новая') RETURNING id")
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert label")
+                .0;
+        let mut fixed = rule.clone();
+        fixed.actions[0].label_id = Some(fresh);
+        db.save_mail_rule(&fixed, false, None).await.expect("fix");
+        let repaired = db.list_mail_rules().await.expect("list repaired");
+        assert_eq!(repaired[0].state, "ok");
+        db.process_mail_rules().await.expect("process repaired");
+        let labels: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM message_labels WHERE message_id=?")
+                .bind(message)
+                .fetch_one(&db.pool)
+                .await
+                .expect("count labels");
+        assert_eq!(labels.0, 1);
+        db.close().await;
+    }
+
+    /// S-047, S-048, S-049: удаление навсегда ставится без переноса в корзину
+    /// и требует подтверждения, связанного с составом правила.
+    #[tokio::test]
+    async fn delete_forever_requires_confirmation() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-delete@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "spam@example.test", "Письмо"),
+        )
+        .await;
+        let mut rule = rule_input(
+            "delete-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "spam@")])],
+            vec![action("delete")],
+        );
+        assert!(
+            db.save_mail_rule(&rule, true, None).await.is_err(),
+            "без подтверждения правило не сохраняется"
+        );
+        let key = db
+            .issue_delete_confirmation(&rule)
+            .await
+            .expect("issue key");
+        // S-049: изменение правила делает выданный ключ недействительным.
+        let mut changed = rule.clone();
+        changed.groups[0].conditions[0].value = "другое".into();
+        changed.confirm_key = Some(key.clone());
+        assert!(db.save_mail_rule(&changed, true, None).await.is_err());
+        rule.confirm_key = Some(key);
+        db.save_mail_rule(&rule, true, None)
+            .await
+            .expect("save with confirmation");
+        db.process_mail_rules().await.expect("process");
+        let operations = pending_operations(&db).await;
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].2, "delete");
+        db.close().await;
+    }
+
+    /// S-059, S-060: порядок правил задаётся полным перечнем, а переключатель
+    /// меняет только признак включения.
+    #[tokio::test]
+    async fn reorder_and_enable_are_independent() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-order2@example.test").await;
+        seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        for id in ["r1", "r2", "r3"] {
+            let rule = rule_input(
+                id,
+                Some(account),
+                vec![group("all", vec![condition("subject", "contains", "счет")])],
+                vec![action("mark_read")],
+            );
+            db.save_mail_rule(&rule, false, None).await.expect("save");
+        }
+        db.reorder_mail_rules(&["r3".into(), "r1".into(), "r2".into()])
+            .await
+            .expect("reorder");
+        let rules = db.list_mail_rules().await.expect("list");
+        let order: Vec<(String, i64)> = rules
+            .iter()
+            .map(|rule| (rule.id.clone(), rule.sort_order))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("r3".to_owned(), 0),
+                ("r1".to_owned(), 1),
+                ("r2".to_owned(), 2)
+            ]
+        );
+        assert!(
+            db.reorder_mail_rules(&["r3".into(), "r1".into()])
+                .await
+                .is_err(),
+            "неполный перечень отклоняется"
+        );
+        db.set_mail_rule_enabled("r1", false)
+            .await
+            .expect("disable");
+        let after = db.list_mail_rules().await.expect("list again");
+        let disabled = after.iter().find(|rule| rule.id == "r1").expect("rule");
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.sort_order, 1, "порядок не изменился");
+        db.close().await;
+    }
+
+    /// S-061 - S-064: автоматическая пачка ограничена 500 письмами, письма
+    /// догрузки и служебные папки в неё не попадают.
+    #[tokio::test]
+    async fn automatic_batch_limits_and_folders() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-batch@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let spam = seed_folder(&db, account, "Spam", Some("spam")).await;
+        for uid in 1..=600 {
+            seed_message(
+                &db,
+                account,
+                inbox,
+                MessageSeed::new(uid, "a@example.test", "Письмо"),
+            )
+            .await;
+        }
+        seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed {
+                uid: 900,
+                from_addr: "a@example.test",
+                subject: "Догруженное",
+                backfilled: true,
+            },
+        )
+        .await;
+        seed_message(
+            &db,
+            account,
+            spam,
+            MessageSeed::new(901, "a@example.test", "Спам"),
+        )
+        .await;
+        let rule = rule_input(
+            "batch-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        let first = db.process_mail_rules().await.expect("first batch");
+        assert_eq!(first, 500);
+        let second = db.process_mail_rules().await.expect("second batch");
+        assert_eq!(second, 100, "остаток письма из служебной папки не включает");
+        let untouched: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM messages WHERE seen=0 AND (backfilled=1 OR folder_id=?)",
+        )
+        .bind(spam)
+        .fetch_one(&db.pool)
+        .await
+        .expect("count untouched");
+        assert_eq!(untouched.0, 2);
+        db.close().await;
+    }
+
+    /// S-065 - S-070, S-073: ручной прогон идёт пачками по выбранным папкам,
+    /// останавливается на пределе и продолжается с курсора задания.
+    #[tokio::test]
+    async fn manual_run_limit_and_continuation() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-manual@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let other = seed_account(&db, "rules-manual2@example.test").await;
+        let other_inbox = seed_folder(&db, other, "INBOX", Some("inbox")).await;
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject, preview,
+                                  backfilled)
+             SELECT ?, ?, value, 'a@example.test', 'Письмо', '', 1
+               FROM (WITH RECURSIVE numbers(value) AS (
+                        SELECT 1 UNION ALL SELECT value+1 FROM numbers WHERE value < 5200
+                     ) SELECT value FROM numbers)",
+        )
+        .bind(account)
+        .bind(inbox)
+        .execute(&db.write_pool)
+        .await
+        .expect("seed many messages");
+        let rule = rule_input(
+            "manual-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&rule, false, None).await.expect("save");
+        let progress_before = db.list_mail_rules().await.expect("list")[0].progress_message_id;
+        assert!(
+            db.start_mail_rule_run(Some(account), &[other_inbox], None)
+                .await
+                .is_err(),
+            "папка другого ящика отклоняется"
+        );
+        let report = db
+            .start_mail_rule_run(Some(account), &[inbox], None)
+            .await
+            .expect("start run");
+        assert_eq!(report.scanned, 5000, "предел одного запуска");
+        assert_eq!(report.remaining, 200);
+        assert_eq!(report.state, "pending");
+        let progress = db.list_mail_rules().await.expect("list")[0].progress_message_id;
+        assert_eq!(
+            progress, progress_before,
+            "ручной прогон прогресс правил не двигает"
+        );
+        let finished = db
+            .continue_mail_rule_run(report.run_id)
+            .await
+            .expect("continue run");
+        assert_eq!(finished.scanned, 5200);
+        assert_eq!(finished.remaining, 0);
+        assert_eq!(finished.state, "done");
+        let last = db
+            .last_mail_rule_run()
+            .await
+            .expect("last run")
+            .expect("report exists");
+        assert_eq!(last.run_id, report.run_id);
+        db.close().await;
+    }
+
+    /// S-058, S-071, S-072: повторный ручной прогон снова выполняет местные
+    /// действия, изменённое правило из начатого задания выбывает, а задание в
+    /// состоянии выполнения возвращается в ожидание.
+    #[tokio::test]
+    async fn manual_run_repeats_local_actions_and_restores_jobs() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-repeat@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed {
+                uid: 1,
+                from_addr: "a@example.test",
+                subject: "Письмо",
+                backfilled: true,
+            },
+        )
+        .await;
+        let rule = rule_input(
+            "repeat-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&rule, false, None).await.expect("save");
+        db.start_mail_rule_run(Some(account), &[inbox], None)
+            .await
+            .expect("first run");
+        sqlx::query("UPDATE messages SET seen=0 WHERE id=?")
+            .bind(message)
+            .execute(&db.write_pool)
+            .await
+            .expect("reset flag");
+        let second = db
+            .start_mail_rule_run(Some(account), &[inbox], None)
+            .await
+            .expect("second run");
+        assert_eq!(
+            second.applied, 1,
+            "повторный прогон снова применяет правило"
+        );
+        let seen: (i64,) = sqlx::query_as("SELECT seen FROM messages WHERE id=?")
+            .bind(message)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read flag");
+        assert_eq!(seen.0, 1);
+        sqlx::query("UPDATE mail_rule_runs SET state='running'")
+            .execute(&db.write_pool)
+            .await
+            .expect("mark running");
+        assert!(db.restore_mail_rule_runs().await.expect("restore") >= 1);
+        let states: Vec<(String,)> = sqlx::query_as("SELECT state FROM mail_rule_runs")
+            .fetch_all(&db.pool)
+            .await
+            .expect("read states");
+        assert!(states.iter().all(|(state,)| state != "running"));
+        db.close().await;
+    }
+
+    /// S-052, S-053: операция в состоянии отказа держит письмо на месте, а
+    /// новую операцию по нему можно поставить только после отказа от прежней.
+    #[tokio::test]
+    async fn failed_operation_blocks_until_user_decides() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-failed@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_folder(&db, account, "Trash", Some("trash")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let queued = db
+            .queue_message_action(&[message], "archive")
+            .await
+            .expect("queue");
+        let operation = queued.operation_ids[0];
+        sqlx::query("UPDATE outbox_ops SET status='failed', last_error='отказ' WHERE id=?")
+            .bind(operation)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark failed");
+        assert!(db.queue_message_action(&[message], "trash").await.is_err());
+        let failed = db
+            .failed_takeaway_operations()
+            .await
+            .expect("list failed operations");
+        assert_eq!(failed.len(), 1);
+        db.retry_failed_operation(operation)
+            .await
+            .expect("retry operation");
+        db.discard_failed_operation(operation)
+            .await
+            .expect_err("повторённая операция уже не в отказе");
+        sqlx::query("UPDATE outbox_ops SET status='failed' WHERE id=?")
+            .bind(operation)
+            .execute(&db.write_pool)
+            .await
+            .expect("mark failed again");
+        db.discard_failed_operation(operation)
+            .await
+            .expect("discard");
+        db.queue_message_action(&[message], "trash")
+            .await
+            .expect("queue after discard");
+        db.close().await;
+    }
+
+    /// S-056: удаление ящика уносит его правила, а правила для всех ящиков
+    /// остаются.
+    #[tokio::test]
+    async fn deleting_account_removes_only_its_rules() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-account@example.test").await;
+        seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let scoped = rule_input(
+            "scoped",
+            Some(account),
+            vec![group("all", vec![condition("subject", "contains", "счет")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&scoped, false, None)
+            .await
+            .expect("save scoped");
+        let shared = rule_input(
+            "shared",
+            None,
+            vec![group("all", vec![condition("subject", "contains", "счет")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&shared, false, None)
+            .await
+            .expect("save shared");
+        sqlx::query("DELETE FROM accounts WHERE id=?")
+            .bind(account)
+            .execute(&db.write_pool)
+            .await
+            .expect("delete account");
+        let rules = db.list_mail_rules().await.expect("list");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, "shared");
+        let orphans: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM mail_rule_conditions WHERE rule_id NOT IN (SELECT id FROM mail_rules)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("count orphans");
+        assert_eq!(orphans.0, 0);
+        db.close().await;
+    }
+
+    /// S-074 - S-078: правило прежней схемы превращается в одну группу с одним
+    /// условием, первое действие сохраняется, а за ним дописывается остановка.
+    #[tokio::test]
+    async fn legacy_rule_is_migrated_with_stop() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-legacy@example.test").await;
+        seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        sqlx::query(
+            "INSERT INTO mail_rules(id, name, field, operator, value, account_id, action,
+                                    enabled, progress_message_id, sort_order)
+             VALUES('legacy', 'Старое правило', 'sender', 'contains', 'boss@', ?, 'archive', 1, 7, 3)",
+        )
+        .bind(account)
+        .execute(&db.write_pool)
+        .await
+        .expect("insert legacy rule");
+        let moved = db
+            .migrate_mail_rules_to_groups()
+            .await
+            .expect("migrate rules");
+        assert_eq!(moved, 1);
+        assert_eq!(
+            db.migrate_mail_rules_to_groups()
+                .await
+                .expect("migrate again"),
+            0,
+            "повторный перенос ничего не делает"
+        );
+        let rules = db.list_mail_rules().await.expect("list");
+        let rule = rules.iter().find(|rule| rule.id == "legacy").expect("rule");
+        assert_eq!(rule.groups.len(), 1);
+        assert_eq!(rule.groups[0].logic, "all");
+        assert_eq!(rule.groups[0].conditions.len(), 1);
+        assert_eq!(rule.groups[0].conditions[0].field, "sender");
+        assert_eq!(rule.actions.len(), 2);
+        assert_eq!(rule.actions[0].kind, "archive");
+        assert_eq!(rule.actions[1].kind, "stop");
+        assert_eq!(rule.progress_message_id, 7);
+        assert_eq!(rule.sort_order, 3);
+        assert!(rule.enabled);
+        db.close().await;
+    }
+
+    /// S-078: прежние столбцы получают только значения, допустимые их
+    /// ограничениями check.
+    #[tokio::test]
+    async fn legacy_columns_keep_allowed_values() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-columns@example.test").await;
+        seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let rule = rule_input(
+            "modern",
+            Some(account),
+            vec![group(
+                "all",
+                vec![condition("sender_address", "ends_with", "@example.test")],
+            )],
+            vec![action("mark_flagged")],
+        );
+        db.save_mail_rule(&rule, false, None).await.expect("save");
+        let row: (String, String, String) =
+            sqlx::query_as("SELECT field, operator, action FROM mail_rules WHERE id='modern'")
+                .fetch_one(&db.pool)
+                .await
+                .expect("read legacy columns");
+        assert!(matches!(row.0.as_str(), "sender" | "subject"));
+        assert!(matches!(row.1.as_str(), "contains" | "equals"));
+        assert!(matches!(
+            row.2.as_str(),
+            "move" | "archive" | "spam" | "trash" | "label"
+        ));
+        db.close().await;
+    }
+
+    /// S-031: все правила сверяются с одним снимком письма, поэтому метка,
+    /// поставленная первым правилом, не включает условие второго в том же
+    /// прогоне.
+    #[tokio::test]
+    async fn rules_share_one_message_snapshot() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-snapshot@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        let label: i64 =
+            sqlx::query_as::<_, (i64,)>("INSERT INTO labels(name) VALUES('Важное') RETURNING id")
+                .fetch_one(&db.write_pool)
+                .await
+                .expect("insert label")
+                .0;
+        let first = rule_input(
+            "snapshot-a",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![MailRuleAction {
+                kind: "label_add".into(),
+                folder_id: None,
+                folder_role: None,
+                label_id: Some(label),
+            }],
+        );
+        db.save_mail_rule(&first, true, None)
+            .await
+            .expect("save first");
+        let second = rule_input(
+            "snapshot-b",
+            Some(account),
+            vec![group("all", vec![condition("label", "contains", "Важное")])],
+            vec![action("mark_read")],
+        );
+        db.save_mail_rule(&second, true, None)
+            .await
+            .expect("save second");
+        db.process_mail_rules().await.expect("process");
+        let seen: (i64,) = sqlx::query_as("SELECT seen FROM messages WHERE id=?")
+            .bind(message)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read flag");
+        assert_eq!(seen.0, 0, "второе правило видит письмо без новой метки");
+        db.close().await;
+    }
+
+    /// S-002, S-050: у письма с уже поставленной операцией увода выполняются
+    /// только местные действия, а их результат сохраняется.
+    #[tokio::test]
+    async fn local_actions_survive_when_takeaway_is_impossible() {
+        let db = test_db().await;
+        let account = seed_account(&db, "rules-partial@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        seed_folder(&db, account, "Archive", Some("archive")).await;
+        seed_folder(&db, account, "Spam", Some("spam")).await;
+        let message = seed_message(
+            &db,
+            account,
+            inbox,
+            MessageSeed::new(1, "a@example.test", "Письмо"),
+        )
+        .await;
+        db.queue_message_action(&[message], "archive")
+            .await
+            .expect("user queues move");
+        let rule = rule_input(
+            "partial-rule",
+            Some(account),
+            vec![group("all", vec![condition("sender", "contains", "a@")])],
+            vec![action("mark_read"), action("spam")],
+        );
+        db.save_mail_rule(&rule, true, None).await.expect("save");
+        db.process_mail_rules().await.expect("process");
+        let seen: (i64,) = sqlx::query_as("SELECT seen FROM messages WHERE id=?")
+            .bind(message)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read flag");
+        assert_eq!(seen.0, 1, "местное действие выполнено");
+        let operations = pending_operations(&db).await;
+        let takeaways = operations
+            .iter()
+            .filter(|row| matches!(row.2.as_str(), "move" | "delete"))
+            .count();
+        assert_eq!(takeaways, 1, "второй увод письма не ставится");
+        db.close().await;
+    }
+
+    /// S-080: база с отметкой более новой версии программы не открывается, и
+    /// пользователь получает объяснение вместо технической ошибки.
+    #[tokio::test]
+    async fn database_from_newer_version_is_refused() {
+        let db = test_db().await;
+        sqlx::query("UPDATE storage_meta SET value='99.0.0' WHERE key='min_app_version'")
+            .execute(&db.write_pool)
+            .await
+            .expect("mark newer version");
+        let error = db.migrate().await.expect_err("база не открывается");
+        assert!(
+            error.to_string().contains("более новой версией программы"),
+            "{error}"
+        );
+        db.close().await;
+    }
+
+    /// S-079: миграция оставляет в storage_meta отметку минимальной
+    /// совместимой версии программы.
+    #[tokio::test]
+    async fn migration_marks_minimal_app_version() {
+        let db = test_db().await;
+        let marked: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key='min_app_version'")
+                .fetch_optional(&db.pool)
+                .await
+                .expect("read marker");
+        assert!(marked.is_some(), "отметка версии записана");
+        db.close().await;
     }
 }
