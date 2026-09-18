@@ -4,7 +4,13 @@
 
 mod blobs;
 pub mod encoded_words;
+pub mod ignored_conversations;
 pub mod repo;
+pub mod sender_policies;
+pub mod sender_sweep;
+#[cfg(test)]
+mod stage_scenarios;
+mod stages;
 
 pub use blobs::BlobStore;
 
@@ -150,8 +156,14 @@ impl Db {
         self.migrate_mail_rules_to_groups().await?;
         self.mark_min_app_version().await?;
         // S-072: задание, прерванное закрытием программы, продолжается с
-        // сохранённого курсора.
+        // сохранённого курсора. Задания уборки списков отправителей,
+        // игнорирования переписки и автоочистки возвращаются в очередь по той
+        // же причине (blocked-senders.md S-038, ignore-conversation.md S-048,
+        // sweep-by-sender.md S-043).
         self.restore_mail_rule_runs().await?;
+        self.restore_sender_policy_jobs().await?;
+        self.restore_ignore_jobs().await?;
+        self.restore_sender_sweep_jobs().await?;
         Ok(())
     }
 
