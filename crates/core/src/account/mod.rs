@@ -1183,9 +1183,20 @@ impl AccountManager {
         self.db
             .save_discovered_messages(account.id, &discovery.messages, false)
             .await?;
-        // Письма к этому моменту уже в БД и получили локальные id - можно
-        // достать их для уведомления. Только Входящие (роль 'inbox'): другие
-        // папки уведомлению не нужны.
+        self.db
+            .save_folder_sync_tokens(account.id, &discovery.folders)
+            .await?;
+        let rules_applied = match self.db.process_mail_rules().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
+                0
+            }
+        };
+        // S-010, S-011: список для уведомления собирается после стадий
+        // обработки и по письмам этой же синхронизационной пачки, поэтому
+        // уведённое правилом письмо в уведомление уже не попадает. Только
+        // Входящие (роль 'inbox'): другие папки уведомлению не нужны.
         let new_message_ids = if unknown_remote_ids.is_empty() {
             Vec::new()
         } else {
@@ -1198,16 +1209,6 @@ impl AccountManager {
                     Some(&not_after),
                 )
                 .await?
-        };
-        self.db
-            .save_folder_sync_tokens(account.id, &discovery.folders)
-            .await?;
-        let rules_applied = match self.db.process_mail_rules().await {
-            Ok(count) => count,
-            Err(error) => {
-                tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
-                0
-            }
         };
         let changed = downloaded > 0
             || folders_changed

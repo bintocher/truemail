@@ -120,11 +120,25 @@ window.handleSyncState=function(state){if(!state)return;
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;
+  // S-012, S-013: перенос в корзину письма, уже лежащего в корзине, больше не
+  // превращается в безвозвратное удаление сам собой - его выбирает пользователь
+  // отдельным подтверждением.
+  if(action==='trash'){
+    const messageFolder=id=>{const message=currentMessageRows.find(item=>item.id===id)||messages.find(item=>item.id===id);return coreFolders.find(folder=>folder.id===message?.folder_id);};
+    if(ids.every(id=>messageFolder(id)?.role==='trash')){
+      if(!await confirmAction(L(`Письма уже в корзине. Удалить навсегда, без возможности отмены?`,`These messages are already in Trash. Delete them permanently, with no undo?`)))return;
+      action='delete';
+    }
+  }
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   let nextId=null;
   if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
   try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(ids);await window.reloadCoreData();
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
+    if(action==='delete'){showToast(L('Письмо удаляется навсегда','The message is being deleted permanently'));return;}
+    // Письмо, по которому уже стоит незавершённая операция увода, пропущено
+    // ограничением очереди (S-005) - об этом честно говорим.
+    if(queued.skipped)showToast(L(`Пропущено писем с незавершённой операцией: ${queued.skipped}`,`Messages skipped because an operation is already queued: ${queued.skipped}`));
     showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 window.performMessageActionForIds=performMessageActionForIds;
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];return performMessageActionForIds(action,ids);}

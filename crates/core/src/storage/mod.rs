@@ -27,9 +27,21 @@ pub struct Db {
     pub write_pool: SqlitePool,
     pub blobs: BlobStore,
     crypto: Arc<StorageCrypto>,
+    /// Выданные ключи подтверждения удаления навсегда: подтверждение
+    /// одноразовое и живёт только до сохранения правила (S-048).
+    delete_confirmations: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 const ENCRYPTED_SETTING_PREFIX: &[u8] = b"TMSET1\0";
+
+/// Ключ отметки минимальной совместимой версии программы в `storage_meta`
+/// (S-079).
+const MIN_APP_VERSION_KEY: &str = "min_app_version";
+
+/// Версия программы, начиная с которой понимается схема правил с группами и
+/// цепочками действий. Отметка описывает схему, а не текущую сборку, поэтому
+/// растёт только вместе с несовместимым изменением схемы.
+const MIN_COMPATIBLE_APP_VERSION: &str = "0.2.19";
 
 impl Db {
     /// Открыть/создать базу в data_dir/truemail.db и blob-store в data_dir/blobs.
@@ -88,6 +100,9 @@ impl Db {
             write_pool,
             blobs,
             crypto,
+            delete_confirmations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 
@@ -119,13 +134,72 @@ impl Db {
 
     /// Прогнать все миграции из crates/core/migrations.
     pub async fn migrate(&self) -> Result<()> {
+        // S-080: отметка читается до мигратора. Мигратор запускается первым
+        // шагом и на слишком новой базе упал бы техническим текстом раньше
+        // любой прикладной проверки.
+        self.check_min_app_version().await?;
         sqlx::migrate!("./migrations")
             .run(&self.write_pool)
             .await
-            .map_err(|e| crate::Error::Other(format!("миграции: {e}")))?;
+            .map_err(migrator_error)?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
         self.import_legacy_mail_rules().await?;
+        // S-074 - S-077: перенос прежних правил в группы и действия идёт
+        // прикладным шагом, уже после структурной части.
+        self.migrate_mail_rules_to_groups().await?;
+        self.mark_min_app_version().await?;
+        // S-072: задание, прерванное закрытием программы, продолжается с
+        // сохранённого курсора.
+        self.restore_mail_rule_runs().await?;
+        Ok(())
+    }
+
+    /// Отказаться открывать базу, изменённую более новой версией программы
+    /// (S-080).
+    async fn check_min_app_version(&self) -> Result<()> {
+        let stored: std::result::Result<Option<(String,)>, sqlx::Error> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = ?")
+                .bind(MIN_APP_VERSION_KEY)
+                .fetch_optional(&self.pool)
+                .await;
+        // Таблицы отметок в базе прежних версий ещё нет - это не более новая
+        // база, а более старая.
+        let Ok(Some((required,))) = stored else {
+            return Ok(());
+        };
+        let running = env!("CARGO_PKG_VERSION");
+        if version_is_newer(&required, running) {
+            return Err(crate::Error::Other(format!(
+                "база данных изменена более новой версией программы ({required}), обновите truemail: текущая версия {running}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Записать отметку минимальной совместимой версии программы (S-079).
+    async fn mark_min_app_version(&self) -> Result<()> {
+        let stored: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = ?")
+                .bind(MIN_APP_VERSION_KEY)
+                .fetch_optional(&self.pool)
+                .await?;
+        // Отметку опускать нельзя: её мог поднять более новый выпуск программы,
+        // а сравнивать версии строками нельзя - "0.10.0" строкой меньше "0.9.9".
+        if stored
+            .as_ref()
+            .is_some_and(|(value,)| !version_is_newer(MIN_COMPATIBLE_APP_VERSION, value))
+        {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO storage_meta(key, value) VALUES(?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(MIN_APP_VERSION_KEY)
+        .bind(MIN_COMPATIBLE_APP_VERSION)
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 
@@ -231,6 +305,42 @@ impl Db {
         .await?;
         Ok(())
     }
+}
+
+/// Понятное сообщение вместо технического текста мигратора: применённая
+/// миграция, которой нет во встроенном наборе, означает базу более новой
+/// версии программы (S-081).
+fn migrator_error(error: sqlx::migrate::MigrateError) -> crate::Error {
+    let text = error.to_string();
+    if text.contains("previously applied but is missing")
+        || text.contains("was previously applied but has been modified")
+    {
+        return crate::Error::Other(
+            "база данных создана более новой версией программы, обновите truemail".into(),
+        );
+    }
+    crate::Error::Other(format!("миграции: {text}"))
+}
+
+/// Сравнение версий по числам: "0.10.0" новее "0.9.9", хотя по строкам это не
+/// так. Нечисловые части считаются нулями.
+fn version_is_newer(candidate: &str, baseline: &str) -> bool {
+    let parts = |value: &str| -> Vec<u64> {
+        value
+            .split(|symbol: char| !symbol.is_ascii_digit())
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let left = parts(candidate);
+    let right = parts(baseline);
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
 }
 
 fn encrypted_options(
@@ -461,6 +571,30 @@ fn secure_remove_file(path: &Path) -> Result<()> {
 
 fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::{migrator_error, version_is_newer};
+
+    /// S-080: отметка больше версии программы означает базу более новой
+    /// версии, а равная и меньшая - совместимую.
+    #[test]
+    fn version_comparison_uses_numbers() {
+        assert!(version_is_newer("0.10.0", "0.9.9"));
+        assert!(version_is_newer("1.0.0", "0.2.19"));
+        assert!(!version_is_newer("0.2.19", "0.2.19"));
+        assert!(!version_is_newer("0.2.18", "0.2.19"));
+    }
+
+    /// S-081: техническая жалоба мигратора на неизвестную применённую миграцию
+    /// превращается в понятное предложение обновиться.
+    #[test]
+    fn unknown_applied_migration_is_explained() {
+        let error = sqlx::migrate::MigrateError::VersionMissing(44);
+        let text = migrator_error(error).to_string();
+        assert!(text.contains("более новой версией программы"), "{text}");
+    }
 }
 
 #[cfg(test)]
@@ -2163,7 +2297,8 @@ mod tests {
     #[tokio::test]
     async fn mail_rules_queue_each_matching_message_once() {
         use crate::model::{
-            AuthKind, BackendKind, MailRuleInput, NewAccount, Provider, Security, ServerConfig,
+            AuthKind, BackendKind, MailRuleAction, MailRuleCondition, MailRuleGroup, MailRuleInput,
+            NewAccount, Provider, Security, ServerConfig,
         };
 
         let root = std::env::temp_dir().join(format!("truemail-rules-{}", uuid::Uuid::new_v4()));
@@ -2235,16 +2370,29 @@ mod tests {
             &MailRuleInput {
                 id: "archive-alerts".into(),
                 name: "Archive alerts".into(),
-                field: "sender".into(),
-                operator: "contains".into(),
-                value: "alerts@".into(),
                 account_id: Some(account.id),
-                action: "archive".into(),
-                folder_id: None,
-                label_id: None,
                 enabled: true,
+                groups: vec![MailRuleGroup {
+                    logic: "all".into(),
+                    conditions: vec![MailRuleCondition {
+                        field: "sender".into(),
+                        op: "contains".into(),
+                        value: "alerts@".into(),
+                        unit: None,
+                        value2: None,
+                    }],
+                }],
+                exceptions: Vec::new(),
+                actions: vec![MailRuleAction {
+                    kind: "archive".into(),
+                    folder_id: None,
+                    folder_role: None,
+                    label_id: None,
+                }],
+                confirm_key: None,
             },
             true,
+            None,
         )
         .await
         .expect("save rule");
