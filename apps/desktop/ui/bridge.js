@@ -160,7 +160,25 @@ window.corePageSize = 100;
     sendMessage: (request, requestKey) => invoke("send_message", { request, requestKey }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
-    markFlagged: (messageId, flagged) => invoke("mark_flagged", { messageId, flagged }),
+    markFlagged: (messageIds, flagged, reason = "user") => invoke("mark_flagged", { messageIds: Array.isArray(messageIds) ? messageIds : [messageIds], flagged, reason }),
+    setMessagesPinned: (messageIds, pinned) => invoke("set_messages_pinned", { messageIds, pinned }),
+    listPinnedMessages: (viewKind, viewValue = null) => invoke("list_pinned_messages", { viewKind, viewValue }),
+    saveMessageTask: (input) => invoke("save_message_task", { input }),
+    getMessageTask: (messageId) => invoke("get_message_task", { messageId }),
+    listMessageTasks: (limit = 100, cursor = null) => invoke("list_message_tasks", { limit, cursor }),
+    completeMessageTask: (messageId) => invoke("complete_message_task", { messageId }),
+    reopenMessageTask: (messageId) => invoke("reopen_message_task", { messageId }),
+    deleteMessageTask: (messageId) => invoke("delete_message_task", { messageId }),
+    overdueMessageTaskCount: () => invoke("overdue_message_task_count"),
+    dueTaskReminders: (limit = 50) => invoke("due_task_reminders", { limit }),
+    markTaskRemindersShown: (messageIds) => invoke("mark_task_reminders_shown", { messageIds }),
+    snoozeTaskReminder: (messageId) => invoke("snooze_task_reminder", { messageId }),
+    listQuickSteps: () => invoke("list_quick_steps"),
+    saveQuickStep: (input) => invoke("save_quick_step", { input }),
+    deleteQuickStep: (id) => invoke("delete_quick_step", { id }),
+    reorderQuickSteps: (ids) => invoke("reorder_quick_steps", { ids }),
+    bindQuickStepSlot: (id, slot) => invoke("bind_quick_step_slot", { id, slot }),
+    applyQuickStep: (id, messageIds) => invoke("apply_quick_step", { id, messageIds }),
     snoozeMessages: (messageIds, until) => invoke("snooze_messages", { messageIds, until }),
     unsnoozeMessages: (messageIds) => invoke("unsnooze_messages", { messageIds }),
     releaseDueSnoozes: () => invoke("release_due_snoozes"),
@@ -266,6 +284,7 @@ window.corePageSize = 100;
     try { await window.reloadCoreData?.(); } catch (_) {}
     await window.openMessageById?.(id);
   }).catch(console.error);
+  tauri.event?.listen("truemail-open-tasks", () => window.openTasksSection?.()).catch(console.error);
 
   // Переход в календарь по клику "Открыть" в карточке изменения встречи.
   tauri.event?.listen("truemail-open-event", event => {
@@ -337,10 +356,13 @@ window.corePageSize = 100;
     const unifiedSources = await window.tm.listUnifiedSources();
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
-    const [contacts, calendarData, smartFolders, storage] = await Promise.all([
-      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),
+    const [contacts, calendarData, smartFolders, storage, pinned, overdueTasks] = await Promise.all([
+      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount(),
     ]);
-    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat(), contacts, calendarData, smartFolders, storage);
+    const taskCount = document.getElementById("tasksOverdueCount");
+    if (taskCount) taskCount.textContent = overdueTasks > 0 ? String(overdueTasks) : "";
+    window.corePinnedMessages = pinned.messages || [];
+    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat().concat(pinned.ordinary || [], window.corePinnedMessages), contacts, calendarData, smartFolders, storage);
   }
   // Перезагрузки выстраиваем в очередь: reloadCoreData зовут и обработчик
   // событий, и модули после действий пользователя. Параллельные проходы
@@ -380,6 +402,7 @@ window.corePageSize = 100;
       // preview_lines, contacts_view, notify_position).
       const settings = await window.tm.allSettings();
       await window.refreshKeybindings?.();
+      await window.reloadQuickSteps?.();
       const onboardingCompleted = settings.onboarding_completed;
       // Выставляем до загрузки данных: renderCoreAccounts по этому флагу решает,
       // можно ли открывать композер для файлов из меню "Отправить".

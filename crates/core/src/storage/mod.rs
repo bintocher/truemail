@@ -4,6 +4,8 @@
 
 mod blobs;
 pub mod encoded_words;
+#[cfg(test)]
+mod flag_due_dates_scenarios;
 pub mod ignored_conversations;
 #[cfg(test)]
 mod migration_scenarios;
@@ -11,6 +13,10 @@ pub mod out_of_office;
 #[cfg(test)]
 mod out_of_office_scenarios;
 pub mod outbox_send;
+#[cfg(test)]
+mod pinned_messages_scenarios;
+#[cfg(test)]
+mod quick_steps_scenarios;
 pub mod recipient_history;
 #[cfg(test)]
 mod recipient_history_scenarios;

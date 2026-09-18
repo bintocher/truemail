@@ -33,6 +33,29 @@ pub struct MessageMeta {
     pub has_attachments: bool,
     pub auth: AuthResults,
     pub labels: Vec<String>,
+    /// Всемирное время закрепления. Пустое значение означает, что письмо не
+    /// закреплено.
+    #[serde(default)]
+    pub pinned_at: Option<String>,
+    /// Срок исполнения нужен строке списка без отдельного чтения дела.
+    #[serde(default)]
+    pub task_due_at: Option<String>,
+    /// Состояние существует и без строки дела: у письма с флажком это active.
+    #[serde(default)]
+    pub task_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PinMessagesResult {
+    pub changed: usize,
+    pub rejected_limit: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedMessageList {
+    pub messages: Vec<MessageMeta>,
+    pub total: usize,
+    pub ordinary: Vec<MessageMeta>,
 }
 
 /// Вложение (метаданные; содержимое подгружается по запросу).

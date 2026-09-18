@@ -41,23 +41,32 @@
   function addCard(data) {
     const isEvent = data.kind === "event";
     const isChange = data.kind === "event-change";
+    const isTask = data.kind === "task";
+    const isTaskBundle = data.kind === "task-bundle";
+    const taskCard = isTask ? flagDueDatesModel.reminderCard({
+      message_id: data.message_id,
+      subject: data.subject,
+      from_name: data.preview,
+      due_at: data.details,
+    }, document.documentElement.lang === "en" ? "en" : "ru") : null;
+    const shown = taskCard ? {...data, ...taskCard} : data;
     const card = document.createElement("div");
     // Отмену встречи выделяем тревожным акцентом - в отличие от переноса
     // или смены места, её лучше явно отличить визуально от прочих карточек.
     card.className = "card" + (isChange && data.change === "cancelled" ? " cancel" : "");
-    const brandName = isEvent ? "Напоминание" : isChange ? (data.brand || "Календарь") : "truemail";
-    const icon = isEvent ? "◷" : isChange ? (data.change === "cancelled" ? "✕" : "▤") : "✉";
+    const brandName = isTask||isTaskBundle ? "Дела" : isEvent ? "Напоминание" : isChange ? (data.brand || "Календарь") : "truemail";
+    const icon = isTask||isTaskBundle ? "!" : isEvent ? "◷" : isChange ? (data.change === "cancelled" ? "✕" : "▤") : "✉";
     card.innerHTML =
       `<div class="head"><div class="brand"><span class="dot">${icon}</span><span>${escapeHtml(brandName)}</span></div>` +
       `<button class="close-x" title="Закрыть">×</button></div>` +
       `<div class="title"></div><div class="subject"></div>` +
-      (data.preview ? `<div class="preview"></div>` : "") +
-      (data.details ? `<div class="details"></div>` : "") +
+      (shown.preview ? `<div class="preview"></div>` : "") +
+      (shown.details ? `<div class="details"></div>` : "") +
       `<div class="actions"></div>`;
-    card.querySelector(".title").textContent = data.title || "";
-    card.querySelector(".subject").textContent = data.subject || "";
-    if (data.preview) card.querySelector(".preview").textContent = data.preview;
-    if (data.details) card.querySelector(".details").textContent = data.details;
+    card.querySelector(".title").textContent = shown.title || "";
+    card.querySelector(".subject").textContent = shown.subject || "";
+    if (shown.preview) card.querySelector(".preview").textContent = shown.preview;
+    if (shown.details) card.querySelector(".details").textContent = shown.details;
 
     const actions = card.querySelector(".actions");
     if (isEvent) {
@@ -100,6 +109,16 @@
       // календарь на дату встречи и закрытие карточки.
       const open = mkBtn("Открыть", !data.needs_response, () => { invoke("notify_open", { messageId: null, eventId: data.event_id ?? null }).catch(() => {}); dismiss(card); });
       actions.appendChild(open);
+    } else if (isTask) {
+      const changed = () => window.__TAURI__?.event?.emit("truemail-data-changed", null).catch(() => {});
+      const handlers = {
+        open: () => { invoke("notify_open", {messageId:data.message_id,eventId:null}).catch(() => {});dismiss(card); },
+        snooze: () => { invoke("snooze_task_reminder", {messageId:data.message_id}).then(changed).catch(() => {});dismiss(card); },
+        done: () => { invoke("complete_message_task", {messageId:data.message_id}).then(changed).catch(() => {});dismiss(card); },
+      };
+      taskCard.actions.forEach((action, index) => actions.appendChild(mkBtn(action.title, index === 0, handlers[action.id])));
+    } else if (isTaskBundle) {
+      actions.appendChild(mkBtn("Открыть дела", true, () => { window.__TAURI__?.event?.emit("truemail-open-tasks", null).catch(() => {});dismiss(card); }));
     } else {
       const open = mkBtn("Открыть", true, () => { invoke("notify_open", { messageId: data.message_id ?? null, eventId: null }).catch(() => {}); dismiss(card); });
       const read = mkBtn("Прочитано", false, () => {

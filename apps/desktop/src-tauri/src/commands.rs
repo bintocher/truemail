@@ -23,12 +23,14 @@ use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
 };
 use truemail_core::model::{
-    Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, IgnoreConversationPreview,
-    IgnoreJobReport, IgnoredConversation, Keybinding, MailRule, MailRuleInput, MessageFull,
-    MessageMeta, MessageTemplate, Provider, RsvpResponse, Security, SenderPolicy,
-    SenderPolicyPreview, SenderPolicyReleaseReport, SenderPolicySweepReport, SenderSweepInput,
-    SenderSweepJobReport, SenderSweepPreview, SenderSweepRule, ServerConfig, Signature,
-    SmartFolder, SmartFolderCount, resolve_my_attendance,
+    Account, AuthKind, BackendKind, Contact, Event, EventStatus, FlagChangeReason, Folder,
+    IgnoreConversationPreview, IgnoreJobReport, IgnoredConversation, Keybinding, MailRule,
+    MailRuleInput, MessageFull, MessageMeta, MessageTask, MessageTaskInput, MessageTemplate,
+    PinMessagesResult, PinnedMessageList, Provider, QuickStep, QuickStepInput, QuickStepReport,
+    RsvpResponse, Security, SenderPolicy, SenderPolicyPreview, SenderPolicyReleaseReport,
+    SenderPolicySweepReport, SenderSweepInput, SenderSweepJobReport, SenderSweepPreview,
+    SenderSweepRule, ServerConfig, Signature, SmartFolder, SmartFolderCount, TaskListPage,
+    TaskReminder, is_quick_step_key_action, normalize_key_combo, resolve_my_attendance,
 };
 use truemail_core::storage::repo::{
     CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
@@ -1640,6 +1642,7 @@ fn parse_event_start(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// Фоновый цикл: уведомляет о встречах, начинающихся в ближайшие 10 минут.
 async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
     let mut notified: HashSet<String> = HashSet::new();
+    let mut last_task_cleanup = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let events = match core.db.list_calendars_and_events().await {
@@ -1705,6 +1708,85 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
         if notified.len() > 1000 {
             notified.clear();
         }
+        loop {
+            let reminders = match core.db.due_task_reminders(50).await {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if reminders.is_empty() {
+                break;
+            }
+            let ids = reminders
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>();
+            if core.db.mark_task_reminders_shown(&ids).await.is_err() {
+                break;
+            }
+            for reminder in reminders {
+                let sender = reminder
+                    .sender_name
+                    .clone()
+                    .or(reminder.sender_address.clone())
+                    .unwrap_or_else(|| "Отправитель неизвестен".into());
+                push_notification(
+                    &app,
+                    serde_json::json!({
+                        "kind": "task",
+                        "title": "Напоминание о деле",
+                        "subject": if reminder.subject.is_empty() { "Без темы" } else { &reminder.subject },
+                        "preview": sender,
+                        "details": reminder.due_at,
+                        "message_id": reminder.message_id,
+                    }),
+                    "task-reminder",
+                );
+            }
+        }
+        let today = chrono::Utc::now().date_naive();
+        if last_task_cleanup != Some(today) {
+            let _ = core.db.purge_completed_message_tasks().await;
+            last_task_cleanup = Some(today);
+        }
+    }
+}
+
+async fn show_missed_task_reminders(core: &Core, app: &AppHandle) {
+    let mut recent = 0usize;
+    loop {
+        let Ok(reminders) = core.db.due_task_reminders(50).await else {
+            return;
+        };
+        if reminders.is_empty() {
+            break;
+        }
+        let now = chrono::Utc::now();
+        for reminder in &reminders {
+            if parse_event_start(&reminder.reminder_at)
+                .is_some_and(|time| now.signed_duration_since(time) <= chrono::Duration::days(7))
+            {
+                recent += 1;
+            }
+        }
+        let ids = reminders
+            .iter()
+            .map(|item| item.message_id)
+            .collect::<Vec<_>>();
+        if core.db.mark_task_reminders_shown(&ids).await.is_err() {
+            return;
+        }
+    }
+    if recent != 0 {
+        push_notification(
+            app,
+            serde_json::json!({
+                "kind": "task-bundle",
+                "title": "Пропущенные напоминания",
+                "subject": format!("Пропущено напоминаний: {recent}"),
+                "count": recent,
+            }),
+            "task-reminder-bundle",
+        );
     }
 }
 
@@ -4168,6 +4250,8 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         .reminders_started
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
+        let _ = core.db.purge_completed_message_tasks().await;
+        show_missed_task_reminders(&core, &app).await;
         let reminder_core = core.clone();
         let reminder_app = app.clone();
         tokio::spawn(async move { reminders_loop(reminder_core, reminder_app).await });
@@ -4873,13 +4957,188 @@ pub async fn mark_seen(state: State<'_, AppState>, message_id: i64, seen: bool) 
 #[tauri::command]
 pub async fn mark_flagged(
     state: State<'_, AppState>,
-    message_id: i64,
+    message_ids: Vec<i64>,
     flagged: bool,
+    reason: String,
+) -> CmdResult<usize> {
+    let reason = FlagChangeReason::parse(&reason).ok_or_else(|| ApiError {
+        message: "неизвестная причина изменения признака важности".into(),
+    })?;
+    Ok(core(&state)
+        .await?
+        .db
+        .mark_flagged_many(&message_ids, flagged, reason)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn set_messages_pinned(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    pinned: bool,
+) -> CmdResult<PinMessagesResult> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_pinned(&message_ids, pinned)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_pinned_messages(
+    state: State<'_, AppState>,
+    view_kind: String,
+    view_value: Option<String>,
+) -> CmdResult<PinnedMessageList> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_pinned_messages(&view_kind, view_value.as_deref())
+        .await?)
+}
+
+#[tauri::command]
+pub async fn save_message_task(
+    state: State<'_, AppState>,
+    input: MessageTaskInput,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state).await?.db.save_message_task(&input).await?)
+}
+
+#[tauri::command]
+pub async fn get_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<Option<MessageTask>> {
+    Ok(core(&state).await?.db.get_message_task(message_id).await?)
+}
+
+#[tauri::command]
+pub async fn list_message_tasks(
+    state: State<'_, AppState>,
+    limit: i64,
+    cursor: Option<String>,
+) -> CmdResult<TaskListPage> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_message_tasks(limit, cursor.as_deref())
+        .await?)
+}
+
+#[tauri::command]
+pub async fn complete_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .complete_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn reopen_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .reopen_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn delete_message_task(state: State<'_, AppState>, message_id: i64) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .delete_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn overdue_message_task_count(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.overdue_message_task_count().await?)
+}
+
+#[tauri::command]
+pub async fn due_task_reminders(
+    state: State<'_, AppState>,
+    limit: i64,
+) -> CmdResult<Vec<TaskReminder>> {
+    Ok(core(&state).await?.db.due_task_reminders(limit).await?)
+}
+
+#[tauri::command]
+pub async fn mark_task_reminders_shown(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .db
+        .mark_task_reminders_shown(&message_ids)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn snooze_task_reminder(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .snooze_task_reminder(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_quick_steps(state: State<'_, AppState>) -> CmdResult<Vec<QuickStep>> {
+    Ok(core(&state).await?.db.list_quick_steps().await?)
+}
+
+#[tauri::command]
+pub async fn save_quick_step(state: State<'_, AppState>, input: QuickStepInput) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.save_quick_step(&input).await?)
+}
+
+#[tauri::command]
+pub async fn delete_quick_step(state: State<'_, AppState>, id: i64) -> CmdResult<bool> {
+    Ok(core(&state).await?.db.delete_quick_step(id).await?)
+}
+
+#[tauri::command]
+pub async fn reorder_quick_steps(state: State<'_, AppState>, ids: Vec<i64>) -> CmdResult<()> {
+    Ok(core(&state).await?.db.reorder_quick_steps(&ids).await?)
+}
+
+#[tauri::command]
+pub async fn bind_quick_step_slot(
+    state: State<'_, AppState>,
+    id: i64,
+    slot: Option<i64>,
 ) -> CmdResult<()> {
     Ok(core(&state)
         .await?
         .db
-        .mark_flagged(message_id, flagged)
+        .bind_quick_step_slot(id, slot)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn apply_quick_step(
+    state: State<'_, AppState>,
+    id: i64,
+    message_ids: Vec<i64>,
+) -> CmdResult<QuickStepReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .apply_quick_step(id, &message_ids)
         .await?)
 }
 
@@ -5083,15 +5342,22 @@ pub async fn set_keybinding(
     action: String,
     combo: String,
 ) -> CmdResult<()> {
-    let combo = combo.trim();
-    if combo.is_empty() {
+    let Some(combo) = normalize_key_combo(combo.trim()) else {
         return Err(ApiError {
             message: "сочетание клавиш не может быть пустым".into(),
         });
-    }
+    };
     let core = core(&state).await?;
     let previous = core.db.list_keybindings().await?;
     let mut updated = previous.clone();
+    if is_quick_step_key_action(&action) && !updated.iter().any(|binding| binding.action == action)
+    {
+        updated.push(Keybinding {
+            action: action.clone(),
+            scope: "local".into(),
+            combo: combo.clone(),
+        });
+    }
     let binding = updated
         .iter_mut()
         .find(|binding| binding.action == action)
@@ -5099,16 +5365,19 @@ pub async fn set_keybinding(
             message: "неизвестное действие клавиатуры".into(),
         })?;
     if binding.scope == "global" {
-        Shortcut::from_str(combo).map_err(|error| ApiError {
+        Shortcut::from_str(&combo).map_err(|error| ApiError {
             message: format!("неверное сочетание клавиш: {error}"),
         })?;
     }
-    binding.combo = combo.to_owned();
+    binding.combo = combo.clone();
     let mut seen = HashSet::new();
-    if updated
-        .iter()
-        .any(|binding| !seen.insert(binding.combo.to_ascii_lowercase()))
-    {
+    if updated.iter().any(|binding| {
+        !seen.insert(
+            normalize_key_combo(&binding.combo)
+                .unwrap_or_else(|| binding.combo.clone())
+                .to_ascii_lowercase(),
+        )
+    }) {
         return Err(ApiError {
             message: "это сочетание уже назначено другому действию".into(),
         });
@@ -5119,7 +5388,7 @@ pub async fn set_keybinding(
             message: format!("не удалось зарегистрировать сочетание: {error}"),
         });
     }
-    if let Err(error) = core.db.set_keybinding(&action, combo).await {
+    if let Err(error) = core.db.set_keybinding(&action, &combo).await {
         let _ = register_global_shortcuts(&app, &previous);
         return Err(error.into());
     }

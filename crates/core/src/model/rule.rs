@@ -411,6 +411,54 @@ fn validate_actions(actions: &[MailRuleAction]) -> Result<(), String> {
     Ok(())
 }
 
+/// Проверка цепочки быстрого действия делит с правилами словарь и требования
+/// к целям, но намеренно не вызывает validate_actions: правила допускают stop
+/// и хвост из stop после увода, а кнопка быстрого действия - нет.
+pub fn validate_quick_step_input(step: &super::QuickStepInput) -> Result<(), String> {
+    let name = step.name.trim();
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err("имя быстрого действия должно содержать от 1 до 40 символов".into());
+    }
+    if step.actions.is_empty() {
+        return Err("в быстром действии нет ни одного действия".into());
+    }
+    if step.actions.len() > MAX_RULE_ACTIONS {
+        return Err(format!(
+            "в быстром действии не больше {MAX_RULE_ACTIONS} действий"
+        ));
+    }
+    if step
+        .hotkey_slot
+        .is_some_and(|slot| !(1..=10).contains(&slot))
+    {
+        return Err("номер слота горячей клавиши должен быть от 1 до 10".into());
+    }
+    let mut takeaway = None;
+    for (index, action) in step.actions.iter().enumerate() {
+        if !RULE_ACTIONS.contains(&action.kind.as_str()) || action.kind == "stop" {
+            return Err(format!("действие {} не поддерживается", action.kind));
+        }
+        if action.kind == "move" && action.folder_id.is_none() && action.folder_role.is_none() {
+            return Err("у перемещения не выбрана папка назначения".into());
+        }
+        if matches!(action.kind.as_str(), "label_add" | "label_remove") && action.label_id.is_none()
+        {
+            return Err("у действия с меткой не выбрана метка".into());
+        }
+        if is_takeaway_action(&action.kind) && takeaway.replace(index).is_some() {
+            return Err(
+                "письмо можно увести только один раз: оставьте одно уводящее действие".into(),
+            );
+        }
+    }
+    if let Some(index) = takeaway
+        && index + 1 != step.actions.len()
+    {
+        return Err("после уводящего действия остальные действия не выполнятся".into());
+    }
+    Ok(())
+}
+
 /// Отпечаток правила для подтверждения удаления навсегда: в него входят
 /// область, условия и состав действий, поэтому любое изменение правила делает
 /// прежнее подтверждение недействительным (S-048, S-049).
