@@ -92,9 +92,9 @@ const RULE_ACTIONS = [
   {id: 'stop', ru: 'Остановить обработку', en: 'Stop processing'},
 ];
 
-const ruleLang = lang => (lang === 'en' ? 'en' : 'ru');
-const ruleText = (item, lang) => item[ruleLang(lang)];
-const ruleOptionText = (item, lang) => item[ruleLang(lang) === 'en' ? 2 : 1];
+const ruleLocale = lang => (lang === 'en' ? 'en' : 'ru');
+const ruleText = (item, lang) => item[ruleLocale(lang)];
+const ruleOptionText = (item, lang) => item[ruleLocale(lang) === 'en' ? 2 : 1];
 
 function ruleField(id) {
   return RULE_FIELDS.find(field => field.id === id) || RULE_FIELDS[0];
@@ -176,10 +176,22 @@ function validRuleCondition(source) {
   }
   if (field.type === 'date') return /^\d{4}-\d{2}-\d{2}$/.test(condition.value);
   if (field.type === 'size') {
-    return Number(condition.value) >= 0 && RULE_SIZE_UNITS.some(item => item[0] === condition.unit)
-      && (condition.op !== 'between' || Number(condition.value2) > Number(condition.value));
+    const amount = ruleSizeAmount(condition.value);
+    if (amount === null || !RULE_SIZE_UNITS.some(item => item[0] === condition.unit)) return false;
+    if (condition.op !== 'between') return true;
+    const maximum = ruleSizeAmount(condition.value2);
+    return maximum !== null && maximum > amount;
   }
   return Boolean(condition.value.trim());
+}
+
+// Размер условия: конечное неотрицательное число. Пустое поле прежде
+// приводилось к нулю, и условие "размер больше" совпадало с каждым письмом.
+function ruleSizeAmount(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const amount = Number(text);
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
 }
 
 // Проверка состава правила повторяет проверки ядра (S-018 - S-019, S-028 -
@@ -228,7 +240,7 @@ function ruleErrorText(reason, lang) {
     stop_last: ['Остановка обработки ставится последним действием', 'Stop processing must be the last action'],
   };
   const text = texts[reason] || texts.condition_value;
-  return ruleLang(lang) === 'en' ? text[1] : text[0];
+  return ruleLocale(lang) === 'en' ? text[1] : text[0];
 }
 
 // Новый порядок списка после перетаскивания: элемент from встаёт на место to
@@ -241,12 +253,42 @@ function moveRule(ids, from, to) {
   return list;
 }
 
+// Условие в описании правила: подписи поля, оператора и значения. Значения
+// перечислений и единицы измерения показываются так же, как в редакторе, а не
+// сырыми идентификаторами.
+function ruleConditionText(source, lang) {
+  const condition = normalizeRuleCondition(source);
+  const field = ruleField(condition.field);
+  const locale = ruleLocale(lang);
+  const fieldName = ruleText(field, locale);
+  const opName = (RULE_OPS[condition.op] || [condition.op, condition.op])[locale === 'en' ? 1 : 0];
+  const unitName = units => {
+    const found = units.find(item => item[0] === condition.unit);
+    return found ? ruleOptionText(found, locale) : condition.unit || '';
+  };
+  if (field.type === 'enum') {
+    const value = field.values.find(item => item[0] === condition.value);
+    return `${fieldName} ${opName} ${value ? ruleOptionText(value, locale) : condition.value}`;
+  }
+  if (field.type === 'size') {
+    const unit = unitName(RULE_SIZE_UNITS);
+    const value = condition.op === 'between'
+      ? `${condition.value} - ${condition.value2 || ''}`
+      : condition.value;
+    return `${fieldName} ${opName} ${value} ${unit}`.trim();
+  }
+  if (field.type === 'date' && ['within_last', 'older_than'].includes(condition.op)) {
+    return `${fieldName} ${opName} ${condition.value} ${unitName(RULE_DATE_UNITS)}`.trim();
+  }
+  return `${fieldName} ${opName} "${condition.value}"`;
+}
+
 // Короткое описание правила для списка: условия и цепочка действий.
 function ruleSummary(source, context = {}) {
   const rule = normalizeRule(source);
-  const lang = ruleLang(context.lang);
+  const lang = ruleLocale(context.lang);
   const groupText = group => group.conditions
-    .map(condition => `${ruleText(ruleField(condition.field), lang)} ${(RULE_OPS[condition.op] || [condition.op, condition.op])[lang === 'en' ? 1 : 0]} "${condition.value}"`)
+    .map(condition => ruleConditionText(condition, lang))
     .join(group.logic === 'any' ? (lang === 'en' ? ' or ' : ' или ') : (lang === 'en' ? ' and ' : ' и '));
   const conditions = rule.groups.map(groupText).join(lang === 'en' ? '; or ' : '; или ');
   const exceptions = rule.exceptions.length
@@ -282,14 +324,14 @@ function ruleStateText(rule, lang) {
     rule_incomplete: ['правило не заполнено', 'rule is incomplete'],
   };
   const reason = reasons[rule.attention_reason] || reasons.rule_incomplete;
-  const text = ruleLang(lang) === 'en' ? reason[1] : reason[0];
-  return ruleLang(lang) === 'en' ? `Needs attention: ${text}` : `Требует внимания: ${text}`;
+  const text = ruleLocale(lang) === 'en' ? reason[1] : reason[0];
+  return ruleLocale(lang) === 'en' ? `Needs attention: ${text}` : `Требует внимания: ${text}`;
 }
 
 // Отчёт ручного прогона (S-073).
 function runReportText(report, lang) {
   if (!report) return '';
-  const en = ruleLang(lang) === 'en';
+  const en = ruleLocale(lang) === 'en';
   const parts = en
     ? [`scanned ${report.scanned}`, `rules applied ${report.applied}`, `operations queued ${report.queued}`, `skipped ${report.skipped}`, `left ${report.remaining}`]
     : [`просмотрено ${report.scanned}`, `применено правил ${report.applied}`, `поставлено операций ${report.queued}`, `пропущено ${report.skipped}`, `осталось ${report.remaining}`];
@@ -320,6 +362,7 @@ const mailRulesModel = {
   ruleErrorText,
   moveRule,
   ruleSummary,
+  ruleConditionText,
   ruleStateText,
   runReportText,
 };

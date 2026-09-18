@@ -81,6 +81,7 @@ window.corePageSize = 100;
     runMailRules: (accountId, folderIds, ruleIds = null) => invoke("run_mail_rules", { accountId, folderIds, ruleIds }),
     continueMailRuleRun: (runId) => invoke("continue_mail_rule_run", { runId }),
     lastMailRuleRun: () => invoke("last_mail_rule_run"),
+    pendingMailRuleRuns: () => invoke("pending_mail_rule_runs"),
     failedMessageOperations: () => invoke("failed_message_operations"),
     retryMessageOperation: (operationId) => invoke("retry_message_operation", { operationId }),
     discardMessageOperation: (operationId) => invoke("discard_message_operation", { operationId }),

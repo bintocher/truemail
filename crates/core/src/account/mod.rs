@@ -1186,7 +1186,7 @@ impl AccountManager {
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
-        let rules_applied = match self.db.process_mail_rules().await {
+        let rules_applied = match self.db.process_sync_batch_stages().await {
             Ok(count) => count,
             Err(error) => {
                 tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
@@ -1387,10 +1387,12 @@ impl AccountManager {
             });
         }
         let count = messages.len();
-        // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
+        // Правила не должны срабатывать на старую переписку, поднятую прокруткой:
+        // по догруженным письмам выполняются только стадии пути догрузки (S-063).
         self.db
             .save_discovered_messages(account.id, &messages, true)
             .await?;
+        self.db.process_backfill_stages().await?;
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(BackfillPage {
             fetched: count,
@@ -2047,14 +2049,16 @@ impl AccountManager {
                     completed += 1;
                 }
                 Err(error) => {
-                    self.db
-                        .fail_outbox_operation(operation.id, &error.to_string())
-                        .await?;
+                    // S-084: текст ошибки сервера маскируется и в журнале, и в
+                    // поле последней ошибки очереди - он повторяет адреса и
+                    // тему письма.
+                    let reason = crate::logging::mask_error_text(&error.to_string());
+                    self.db.fail_outbox_operation(operation.id, &reason).await?;
                     tracing::warn!(
                         account = %crate::logging::mask_email(&account.email),
                         operation = operation.id,
                         attempts = operation.attempts + 1,
-                        %error,
+                        last_error = %reason,
                         "операция outbox будет повторена"
                     );
                 }
@@ -2870,8 +2874,10 @@ impl AccountManager {
                                                     .await
                                                 {
                                                     Ok(()) => {
-                                                        if let Err(error) =
-                                                            self.db.process_mail_rules().await
+                                                        if let Err(error) = self
+                                                            .db
+                                                            .process_sync_batch_stages()
+                                                            .await
                                                         {
                                                             tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
                                                         }

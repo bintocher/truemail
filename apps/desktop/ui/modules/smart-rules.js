@@ -244,8 +244,10 @@ function ruleConditionGroup(source={conditions:[{}]}){
   group.querySelector('.cond-group-remove').onclick=()=>{group.remove();renumberRuleGroups();};
   renderIcons(group);return group;
 }
+/* Группы читаются как есть, включая пустые: отброшенная группа исключений
+   молча сохраняла бы правило, которое уводит защищённые письма (S-018). */
 function readRuleGroups(host){
-  return [...host.querySelectorAll('.cond-group')].map(group=>({logic:group.dataset.logic==='any'?'any':'all',conditions:[...group.querySelectorAll('.cond')].map(readRuleConditionRow)})).filter(group=>group.conditions.length);
+  return [...host.querySelectorAll('.cond-group')].map(group=>({logic:group.dataset.logic==='any'?'any':'all',conditions:[...group.querySelectorAll('.cond')].map(readRuleConditionRow)}));
 }
 /* Дополнительное поле действия: папка назначения или метка. Правило для всех
    ящиков выбирает папку по её типу, а не по номеру (S-045). */
@@ -269,23 +271,26 @@ function ruleActionRow(source={}){
   const action=mailRulesModel.normalizeRuleAction(source),row=document.createElement('div');row.className='rule-action-row';
   row.innerHTML=`<span class="grip"><i data-i="grip"></i></span><select class="sel rule-action-kind">${mailRulesModel.RULE_ACTIONS.map(item=>`<option value="${item.id}">${escapeHtml(mailRulesModel.ruleText(item,ruleLang()))}</option>`).join('')}</select><div class="rule-action-target"></div><span class="ord"><button type="button" class="iconbtn" data-dir="up"><i data-i="up"></i></button><button type="button" class="iconbtn" data-dir="down"><i data-i="down"></i></button></span><button type="button" class="del iconbtn" title="${escapeHtml(L('Удалить действие','Delete action'))}"><i data-i="trash"></i></button>`;
   const kind=row.querySelector('.rule-action-kind');kind.value=action.kind;
-  kind.onchange=()=>renderRuleActionTarget(row,{kind:kind.value});
+  // Смена вида действия и смена ящика сохраняют уже выбранную папку или
+  // метку: молчаливый возврат к первому варианту терял выбор пользователя.
+  kind.onchange=()=>renderRuleActionTarget(row,{...readRuleActionRow(row),kind:kind.value});
   renderRuleActionTarget(row,action);
   row.querySelector('[data-dir="up"]').onclick=()=>{const previous=row.previousElementSibling;if(previous)ruleActionsHost.insertBefore(row,previous);};
   row.querySelector('[data-dir="down"]').onclick=()=>{const next=row.nextElementSibling;if(next)ruleActionsHost.insertBefore(next,row);};
   row.querySelector('.del').onclick=()=>row.remove();
   renderIcons(row);return row;
 }
-function readRuleActions(){
-  return [...ruleActionsHost.querySelectorAll('.rule-action-row')].map(row=>{
-    const kind=row.querySelector('.rule-action-kind').value,target=row.querySelector('.rule-action-folder')?.value||'',label=row.querySelector('.rule-action-label')?.value||'';
-    return mailRulesModel.normalizeRuleAction({
-      kind,
-      folder_id:target.startsWith('folder:')?Number(target.slice(7)):null,
-      folder_role:target.startsWith('role:')?target.slice(5):null,
-      label_id:label?Number(label):null,
-    });
+function readRuleActionRow(row){
+  const kind=row.querySelector('.rule-action-kind').value,target=row.querySelector('.rule-action-folder')?.value||'',label=row.querySelector('.rule-action-label')?.value||'';
+  return mailRulesModel.normalizeRuleAction({
+    kind,
+    folder_id:target.startsWith('folder:')?Number(target.slice(7)):null,
+    folder_role:target.startsWith('role:')?target.slice(5):null,
+    label_id:label?Number(label):null,
   });
+}
+function readRuleActions(){
+  return [...ruleActionsHost.querySelectorAll('.rule-action-row')].map(readRuleActionRow);
 }
 function editorRule(){
   const accountValue=ruleAccount.value;
@@ -301,7 +306,7 @@ function editorRule(){
 }
 function openRuleEditor(source=null,rule=null){
   showView('settingsView');setSection('rules');editingRuleId=rule?.id??null;ruleEditor.classList.remove('hidden');
-  document.getElementById('ruleEditorTitle').textContent=rule?L('Изменить правило','Edit rule'):L('Новое правило','New rule');
+  document.getElementById('ruleEditorTitle').textContent=rule?.id?L('Изменить правило','Edit rule'):L('Новое правило','New rule');
   ruleAccount.innerHTML=`<option value="all">${escapeHtml(L('Все аккаунты','All accounts'))}</option>`+coreAccounts.map(account=>`<option value="${account.id}">${escapeHtml(account.email)}</option>`).join('');
   const sourceEmail=source?.from?.email||'';
   document.getElementById('ruleName').value=rule?.name||(sourceEmail?L(`Письма от ${sourceEmail}`,`Mail from ${sourceEmail}`):'');
@@ -340,14 +345,37 @@ function renderRulesList(){
 /* Перетаскивание правила меняет его порядковый номер: ядро получает полный
    перечень идентификаторов в новом порядке (S-059). */
 let draggedRuleRow=null;
+/* Новый порядок строк вычисляет mailRulesModel.moveRule: перестановка в
+   списке и проверка порядка идут по одному и тому же коду (S-059). */
+function placeRuleRow(list,target,before){
+  if(!draggedRuleRow||target===draggedRuleRow)return;
+  const rows=[...list.querySelectorAll('.rule-row')],ids=rows.map(row=>row.dataset.ruleId);
+  const from=ids.indexOf(draggedRuleRow.dataset.ruleId);let to=ids.indexOf(target.dataset.ruleId);
+  if(from<0||to<0)return;
+  if(!before&&to<from)to+=1;
+  if(before&&to>from)to-=1;
+  const order=mailRulesModel.moveRule(ids,from,to);
+  order.forEach(id=>{const row=rows.find(item=>item.dataset.ruleId===id);if(row)list.appendChild(row);});
+}
+function finishRuleDragging(event){
+  if(!draggedRuleRow)return;
+  event?.target?.closest?.('.grip')?.releasePointerCapture?.(event.pointerId);
+  draggedRuleRow.classList.remove('pointer-dragging');
+  draggedRuleRow=null;
+  persistRuleOrder();
+}
 function bindRuleDragging(){
   const list=document.getElementById('rulesList');
   list.addEventListener('dragstart',event=>{draggedRuleRow=event.target.closest('.rule-row');});
-  list.addEventListener('dragover',event=>{event.preventDefault();const row=event.target.closest('.rule-row');if(row&&draggedRuleRow&&row!==draggedRuleRow){const rect=row.getBoundingClientRect();list.insertBefore(draggedRuleRow,event.clientY<rect.top+rect.height/2?row:row.nextSibling);}});
-  list.addEventListener('drop',()=>persistRuleOrder());
+  list.addEventListener('dragover',event=>{event.preventDefault();const row=event.target.closest('.rule-row');if(!row||!draggedRuleRow)return;const rect=row.getBoundingClientRect();placeRuleRow(list,row,event.clientY<rect.top+rect.height/2);});
+  list.addEventListener('drop',event=>{event.preventDefault();finishRuleDragging(event);});
+  // Перетаскивание, брошенное вне списка, тоже обязано завершиться: иначе
+  // следующее движение указателя продолжило бы переставлять строки.
+  list.addEventListener('dragend',event=>finishRuleDragging(event));
   list.addEventListener('pointerdown',event=>{const grip=event.target.closest('.grip'),row=grip?.closest('.rule-row');if(!row||event.button!==0)return;event.preventDefault();draggedRuleRow=row;row.classList.add('pointer-dragging');grip.setPointerCapture(event.pointerId);});
-  list.addEventListener('pointermove',event=>{if(!draggedRuleRow)return;const target=document.elementFromPoint(event.clientX,event.clientY)?.closest('.rule-row');if(!target||target===draggedRuleRow||target.parentElement!==list)return;const rect=target.getBoundingClientRect();list.insertBefore(draggedRuleRow,event.clientY<rect.top+rect.height/2?target:target.nextSibling);});
-  list.addEventListener('pointerup',event=>{if(!draggedRuleRow)return;event.target.closest('.grip')?.releasePointerCapture?.(event.pointerId);draggedRuleRow.classList.remove('pointer-dragging');draggedRuleRow=null;persistRuleOrder();});
+  list.addEventListener('pointermove',event=>{if(!draggedRuleRow)return;const target=document.elementFromPoint(event.clientX,event.clientY)?.closest('.rule-row');if(!target||target.parentElement!==list)return;const rect=target.getBoundingClientRect();placeRuleRow(list,target,event.clientY<rect.top+rect.height/2);});
+  list.addEventListener('pointerup',event=>finishRuleDragging(event));
+  list.addEventListener('pointercancel',event=>finishRuleDragging(event));
 }
 async function persistRuleOrder(){
   const ids=[...document.querySelectorAll('#rulesList .rule-row')].map(row=>row.dataset.ruleId);
@@ -360,14 +388,15 @@ async function reloadMailRules(){
   try{lastRuleRun=await window.tm.lastMailRuleRun();}catch(_){lastRuleRun=null;}
   renderRulesList();
   renderFailedOperations();
+  renderPendingRuleRuns();
   warnAboutMissingTrash();
 }
 /* S-052, S-053: операция, дошедшая до состояния отказа, держит письмо на
    месте. Выйти из этого состояния можно только решением пользователя:
    повторить операцию или отказаться от неё. */
 async function renderFailedOperations(){
-  const list=document.getElementById('rulesList');if(!list)return;
-  document.querySelectorAll('.rule-failed-ops').forEach(node=>node.remove());
+  const host=document.getElementById('ruleFailedOps');if(!host)return;
+  host.innerHTML='';
   let failed=[];
   try{failed=await window.tm.failedMessageOperations();}catch(_){return;}
   if(!failed.length)return;
@@ -386,7 +415,31 @@ async function renderFailedOperations(){
     discard.onclick=async()=>{try{await window.tm.discardMessageOperation(operation.id);await reloadMailRules();}catch(error){showToast(error);}};
     row.append(text,retry,discard);block.appendChild(row);
   });
-  list.prepend(block);
+  host.appendChild(block);
+}
+/* S-070, S-072: незавершённое задание ручного прогона продолжается кнопкой в
+   разделе правил, а не только из отчёта текущей сессии - иначе прерванный
+   закрытием программы прогон некому было бы довести до конца. */
+async function renderPendingRuleRuns(){
+  const host=document.getElementById('rulePendingRuns');if(!host)return;
+  host.innerHTML='';
+  let runs=[];
+  try{runs=await window.tm.pendingMailRuleRuns();}catch(_){return;}
+  if(!runs.length)return;
+  const block=document.createElement('div');block.className='rule-failed-ops';
+  const title=document.createElement('div');title.className='rule-failed-title';
+  title.textContent=L('Незавершённые прогоны правил','Unfinished rule runs');
+  block.appendChild(title);
+  runs.forEach(run=>{
+    const row=document.createElement('div');row.className='rule-failed-row';
+    const text=document.createElement('span');
+    text.textContent=mailRulesModel.runReportText(run,ruleLang());
+    const resume=document.createElement('button');resume.type='button';resume.className='btn sm';
+    resume.textContent=L('Продолжить','Continue');
+    resume.onclick=async()=>{try{showRuleRunReport(await window.tm.continueMailRuleRun(run.run_id));await reloadMailRules();}catch(error){showToast(error);}};
+    row.append(text,resume);block.appendChild(row);
+  });
+  host.appendChild(block);
 }
 window.reloadMailRules=reloadMailRules;
 document.getElementById('ruleNew').onclick=()=>openRuleEditor();
@@ -395,7 +448,7 @@ document.getElementById('ruleAddGroup').onclick=()=>{ruleGroupsHost.appendChild(
 document.getElementById('ruleAddException').onclick=()=>{ruleExceptionsHost.appendChild(ruleConditionGroup());renumberRuleGroups();};
 document.getElementById('ruleAddAction').onclick=()=>{ruleActionsHost.appendChild(ruleActionRow());};
 // Смена ящика меняет перечень папок назначения у действий перемещения.
-ruleAccount.onchange=()=>{[...ruleActionsHost.querySelectorAll('.rule-action-row')].forEach(row=>renderRuleActionTarget(row,{kind:row.querySelector('.rule-action-kind').value}));};
+ruleAccount.onchange=()=>{[...ruleActionsHost.querySelectorAll('.rule-action-row')].forEach(row=>renderRuleActionTarget(row,readRuleActionRow(row)));};
 document.getElementById('ruleSave').onclick=async()=>{
   const rule=editorRule(),check=mailRulesModel.validateRule(rule);
   if(!check.ok){showToast(mailRulesModel.ruleErrorText(check.reason,ruleLang()));return;}
@@ -405,7 +458,7 @@ document.getElementById('ruleSave').onclick=async()=>{
     // его областью, и ключ подтверждения выдаёт ядро.
     if(rule.actions.some(action=>action.kind==='delete')){
       const scope=rule.account_id?(coreAccounts.find(account=>account.id===rule.account_id)?.email||''):L('все аккаунты','all accounts');
-      const question=L(`Правило «${rule.name}» (${scope}) будет удалять письма навсегда, без корзины и без отмены. Продолжить?`,`The rule "${rule.name}" (${scope}) will delete messages permanently, with no trash and no undo. Continue?`);
+      const question=L(`Правило "${rule.name}" (${scope}) будет удалять письма навсегда, без корзины и без отмены. Продолжить?`,`The rule "${rule.name}" (${scope}) will delete messages permanently, with no trash and no undo. Continue?`);
       if(!await confirmAction(question))return;
       rule.confirm_key=await window.tm.mailRuleDeleteConfirmation(rule);
     }
@@ -414,14 +467,17 @@ document.getElementById('ruleSave').onclick=async()=>{
     setTimeout(()=>window.reloadCoreData?.().catch(console.error),350);
   }catch(error){showToast(error);}
 };
-document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило «${rule.name}»?`,`Delete the rule "${rule.name}"?`)))return;try{await window.tm.deleteMailRule(rule.id);await reloadMailRules();closeRuleEditor();}catch(error){showToast(error);}};
+document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило "${rule.name}"?`,`Delete the rule "${rule.name}"?`)))return;try{await window.tm.deleteMailRule(rule.id);await reloadMailRules();closeRuleEditor();}catch(error){showToast(error);}};
 /* Ручной прогон: выбранные папки, отчёт и продолжение по курсору задания
    (S-065, S-070, S-073). */
 const ruleRunPanel=document.getElementById('ruleRunPanel'),ruleRunFolders=document.getElementById('ruleRunFolders'),ruleRunReport=document.getElementById('ruleRunReport'),ruleRunContinue=document.getElementById('ruleRunContinue');
+const RULE_RUN_SKIPPED_ROLES=['sent','drafts','spam','trash'];
 function renderRuleRunFolders(){
   ruleRunFolders.innerHTML='';
   coreAccounts.forEach(account=>{
-    const folders=ruleAccountFolders(account.id);if(!folders.length)return;
+    // Отправленные, черновики, спам и корзина не рабочие папки ни в одной
+    // стадии: прогон по ним увёл бы почту, которую никто не получал.
+    const folders=ruleAccountFolders(account.id).filter(folder=>!RULE_RUN_SKIPPED_ROLES.includes(folder.role));if(!folders.length)return;
     const block=document.createElement('div');block.className='rule-run-account';
     block.innerHTML=`<div class="rule-run-account-title">${escapeHtml(account.email)}</div>`;
     folders.forEach(folder=>{
@@ -457,18 +513,39 @@ ruleRunContinue.onclick=async()=>{
   try{showRuleRunReport(await window.tm.continueMailRuleRun(runId));await reloadMailRules();}catch(error){showToast(error);}
 };
 bindRuleDragging();
+/* S-083: смена языка перерисовывает не только список правил, но и открытый
+   редактор с панелью прогона - иначе часть экрана осталась бы на прежнем
+   языке до повторного открытия. */
+function relocalizeRuleSection(){
+  if(!ruleEditor.classList.contains('hidden')){
+    const draft=editorRule(),existing=mailRules.find(rule=>rule.id===editingRuleId)||null;
+    // Несохранённое правило остаётся новым: пустой идентификатор оставляет
+    // заголовок "Новое правило" и не привязывает черновик к списку.
+    openRuleEditor(null,existing?{...existing,...draft}:{...draft,id:null});
+  }
+  if(!ruleRunPanel.classList.contains('hidden')){
+    renderRuleRunFolders();
+    if(lastRuleRun)showRuleRunReport(lastRuleRun);
+  }
+  renderPendingRuleRuns();
+  renderFailedOperations();
+  warnAboutMissingTrash();
+}
+window.relocalizeRuleSection=relocalizeRuleSection;
 /* S-014: у ящика без папки корзины стадии обработки и действия с письмами
    оставляют почту на месте, поэтому раздел правил говорит об этом прямо. */
 async function warnAboutMissingTrash(){
   try{
     const ids=await window.tm.accountsWithoutTrash();
-    const host=document.getElementById('rulesList');if(!host)return;
-    document.querySelectorAll('.rule-trash-warning').forEach(node=>node.remove());
+    const host=document.getElementById('ruleTrashWarnings');if(!host)return;
+    host.innerHTML='';
     if(!ids.length)return;
-    const warning=document.createElement('p');warning.className='note-muted rule-trash-warning';
-    const names=ids.map(id=>coreAccounts.find(account=>account.id===id)?.email||id).join(', ');
-    warning.textContent=L(`Не назначена папка корзины: ${names}. Правила и действия с письмами оставят их почту на месте.`,`No trash folder assigned: ${names}. Rules and message actions will leave their mail where it is.`);
-    host.prepend(warning);
+    ids.forEach(id=>{
+      const name=coreAccounts.find(account=>account.id===id)?.email||id;
+      const warning=document.createElement('p');warning.className='note-muted rule-trash-warning';
+      warning.textContent=L(`Ящик ${name}: не назначена папка корзины. Правила и действия с письмами оставят его почту на месте.`,`Mailbox ${name}: no trash folder assigned. Rules and message actions will leave its mail where it is.`);
+      host.appendChild(warning);
+    });
   }catch(_){/* Предупреждение не обязано мешать работе со списком правил. */}
 }
 window.warnAboutMissingTrash=warnAboutMissingTrash;

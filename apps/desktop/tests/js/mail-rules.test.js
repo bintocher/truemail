@@ -140,3 +140,54 @@ test('S-016: логика группы принимает только "все" 
   assert.equal(rules.normalizeRuleGroup({logic: 'any', conditions: [CONDITION]}).logic, 'any');
   assert.equal(rules.normalizeRuleGroup({logic: 'что-то', conditions: [CONDITION]}).logic, 'all');
 });
+
+// Часть проверок смотрит на живые файлы интерфейса: чистых функций там нет, а
+// дефект сидел именно в разметке и в связке модулей.
+const readUiFile = name => require('node:fs')
+  .readFileSync(require('node:path').join(__dirname, '../../ui', name), 'utf8');
+
+test('S-025: пустое и нечисловое значение размера условием не считается', () => {
+  const size = (value, extra = {}) => Object.assign({field: 'size', op: 'greater_than', value, unit: 'mb'}, extra);
+  assert.equal(rules.validRuleCondition(size('')), false, 'очищенное поле совпадало бы с каждым письмом');
+  assert.equal(rules.validRuleCondition(size('  ')), false);
+  assert.equal(rules.validRuleCondition(size('десять')), false);
+  assert.equal(rules.validRuleCondition(size('-1')), false);
+  assert.equal(rules.validRuleCondition(size('10')), true);
+  assert.equal(rules.validRuleCondition(size('10', {op: 'between', value2: ''})), false);
+  assert.equal(rules.validRuleCondition(size('10', {op: 'between', value2: '50'})), true);
+});
+
+test('S-020, S-022: описание правила показывает подписи значений и единицы', () => {
+  const summary = rules.ruleSummary({
+    id: 'r9',
+    name: 'Правило',
+    groups: [{logic: 'all', conditions: [
+      {field: 'folder_role', op: 'equals', value: 'inbox'},
+      {field: 'size', op: 'greater_than', value: '10', unit: 'mb'},
+      {field: 'date', op: 'within_last', value: '24', unit: 'hours'},
+    ]}],
+    actions: [{kind: 'archive'}],
+  }, {lang: 'ru'});
+  assert.ok(summary.includes('Тип папки равно Входящие'), summary);
+  assert.ok(summary.includes('Размер письма больше 10 МБ'), summary);
+  assert.ok(summary.includes('Дата письма за последние 24 часов'), summary);
+  const english = rules.ruleConditionText({field: 'size', op: 'between', value: '1', value2: '5', unit: 'gb'}, 'en');
+  assert.equal(english, 'Message size between 1 - 5 GB');
+});
+
+test('S-018: пустая группа исключений называется ошибкой, а не выбрасывается молча', () => {
+  const check = rules.validateRule(rule({exceptions: [{logic: 'all', conditions: []}]}));
+  assert.equal(check.ok, false);
+  assert.equal(check.reason, 'empty_group');
+  assert.ok(rules.ruleErrorText('empty_group', 'ru').includes('без условий'));
+});
+
+test('S-083: смена языка перерисовывает открытый редактор правила и панель прогона', () => {
+  const editor = readUiFile('modules/smart-rules.js');
+  assert.ok(editor.includes('window.relocalizeRuleSection=relocalizeRuleSection'), 'редактор отдаёт перерисовку наружу');
+  assert.ok(/relocalizeRuleSection\(\)\{[\s\S]*renderRuleRunFolders\(\)/.test(editor), 'панель прогона пересобирается');
+  const language = readUiFile('modules/i18n-onboarding.js');
+  assert.ok(language.includes('window.relocalizeRuleSection?.()'), 'смена языка вызывает перерисовку раздела правил');
+  const html = readUiFile('index.html');
+  assert.ok(/<span id="ruleEditorTitle"><\/span>/.test(html), 'заголовок редактора собирается в коде, а не словарём подписей');
+});

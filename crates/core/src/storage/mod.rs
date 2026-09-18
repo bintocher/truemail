@@ -163,9 +163,16 @@ impl Db {
                 .bind(MIN_APP_VERSION_KEY)
                 .fetch_optional(&self.pool)
                 .await;
-        // Таблицы отметок в базе прежних версий ещё нет - это не более новая
-        // база, а более старая.
-        let Ok(Some((required,))) = stored else {
+        let stored = match stored {
+            Ok(value) => value,
+            // Таблицы отметок в базе прежних версий ещё нет - это не более
+            // новая база, а более старая. Любая другая ошибка чтения означает
+            // недоступную или повреждённую базу, и проглатывать её нельзя:
+            // иначе повреждение выглядело бы как старая база.
+            Err(error) if missing_storage_meta(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let Some((required,)) = stored else {
             return Ok(());
         };
         let running = env!("CARGO_PKG_VERSION");
@@ -311,15 +318,22 @@ impl Db {
 /// миграция, которой нет во встроенном наборе, означает базу более новой
 /// версии программы (S-081).
 fn migrator_error(error: sqlx::migrate::MigrateError) -> crate::Error {
-    let text = error.to_string();
-    if text.contains("previously applied but is missing")
-        || text.contains("was previously applied but has been modified")
-    {
+    // S-081 говорит о применённой миграции, которой нет во встроенном наборе.
+    // Изменённая контрольная сумма - другая беда: она означает подменённую
+    // миграцию, а не более новую программу, и объяснять её обновлением нельзя.
+    if matches!(error, sqlx::migrate::MigrateError::VersionMissing(_)) {
         return crate::Error::Other(
             "база данных создана более новой версией программы, обновите truemail".into(),
         );
     }
-    crate::Error::Other(format!("миграции: {text}"))
+    crate::Error::Other(format!("миграции: {error}"))
+}
+
+/// Ошибка чтения отметки, означающая только отсутствие таблицы `storage_meta`
+/// в базе прежних версий.
+fn missing_storage_meta(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database)
+        if database.message().contains("no such table: storage_meta"))
 }
 
 /// Сравнение версий по числам: "0.10.0" новее "0.9.9", хотя по строкам это не

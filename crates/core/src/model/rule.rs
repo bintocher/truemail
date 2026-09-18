@@ -335,25 +335,38 @@ fn validate_condition(condition: &MailRuleCondition) -> Result<(), String> {
         }
         RuleFieldKind::Size => {
             let unit = condition.unit.as_deref().unwrap_or("");
-            let amount = condition.value.trim().parse::<f64>().unwrap_or(-1.0);
-            if amount < 0.0 || !RULE_SIZE_UNITS.contains(&unit) {
+            // S-025: пустое поле размера прежде приводилось к нулю, и условие
+            // "размер больше" совпадало с каждым письмом. Значение, которое не
+            // является конечным неотрицательным числом, условием не считается.
+            let amount = parse_size_amount(&condition.value);
+            if amount.is_none() || !RULE_SIZE_UNITS.contains(&unit) {
                 return Err("у условия по размеру нужны число и единица размера".into());
             }
             if condition.op == "between" {
-                let maximum = condition
-                    .value2
-                    .as_deref()
-                    .unwrap_or("")
-                    .trim()
-                    .parse::<f64>()
-                    .unwrap_or(-1.0);
-                if maximum <= amount {
-                    return Err("верхняя граница размера должна быть больше нижней".into());
+                let maximum = condition.value2.as_deref().map(parse_size_amount);
+                match (maximum, amount) {
+                    (Some(Some(maximum)), Some(amount)) if maximum > amount => {}
+                    _ => {
+                        return Err("верхняя граница размера должна быть больше нижней".into());
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Размер условия: конечное неотрицательное число. Пустая строка, текст и
+/// нечисловые значения вида "nan" условием не считаются.
+fn parse_size_amount(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .parse::<f64>()
+        .ok()
+        .filter(|amount| amount.is_finite() && *amount >= 0.0)
 }
 
 fn validate_actions(actions: &[MailRuleAction]) -> Result<(), String> {

@@ -550,6 +550,7 @@ fn run() -> anyhow::Result<()> {
             commands::run_mail_rules,
             commands::continue_mail_rule_run,
             commands::last_mail_rule_run,
+            commands::pending_mail_rule_runs,
             commands::failed_message_operations,
             commands::retry_message_operation,
             commands::discard_message_operation,
@@ -661,6 +662,15 @@ mod command_contract_tests {
             "run_mail_rules",
             "continue_mail_rule_run",
             "last_mail_rule_run",
+            "pending_mail_rule_runs",
+            "mail_rule_delete_confirmation",
+            // S-052, S-053, S-014: выход из состояния отказа и предупреждение о
+            // ящике без корзины - такие же обязательные пути, как сам список
+            // правил, и без них правила молча оставляют почту на месте.
+            "failed_message_operations",
+            "retry_message_operation",
+            "discard_message_operation",
+            "accounts_without_trash",
         ] {
             assert!(
                 MAIN.contains(&format!("commands::{command}")),

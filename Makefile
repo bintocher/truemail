@@ -1,7 +1,7 @@
 # truemail - команды разработки
 # Старые build-артефакты чистятся cargo-sweep, актуальный кэш сохраняется.
 
-.PHONY: dev dev-check build migrate-new lint fmt test check-ui-tags clean sweep sweep-preview setup
+.PHONY: dev dev-check build migrate-new lint fmt test check-ui-tags check-ui-scope clean sweep sweep-preview setup
 
 ifeq ($(OS),Windows_NT)
 DEV_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
@@ -66,6 +66,12 @@ test:
 # Аргумент - база сравнения (по умолчанию предыдущее состояние ветки).
 check-ui-tags:
 	@node scripts/check-ui-cache-tags.js $(BASE)
+
+# Общая область имён файлов интерфейса: они подключаются обычными тегами script
+# без сборщика, поэтому второе объявление того же имени через const, let или
+# class роняет разбор целого файла, и он не выполняется совсем.
+check-ui-scope:
+	@node scripts/check-ui-global-scope.js
 
 clean:
 	cargo clean

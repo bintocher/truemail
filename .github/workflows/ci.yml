@@ -57,6 +57,12 @@ jobs:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
         run: node scripts/check-ui-cache-tags.js
 
+      # Файлы интерфейса делят одну область имён: повторное объявление имени
+      # роняет разбор целого файла, и он не выполняется совсем
+      # (specs/ui-global-scope-check.md).
+      - name: Общая область имён файлов интерфейса
+        run: node scripts/check-ui-global-scope.js
+
   windows:
     # Нативная Windows: Tauri/NSIS и WebView2 нельзя проверить в Linux.
     # Strawberry Perl и NASM (нужны vendored OpenSSL для SQLCipher)

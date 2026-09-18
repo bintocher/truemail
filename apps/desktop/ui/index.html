@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260918-2">
+  <link rel="stylesheet" href="styles.css?v=20260918-3">
 </head>
 <body>
 
@@ -244,7 +244,7 @@
       <div class="setpage" id="set-rules">
         <h1 data-i18n="processingRules">Правила обработки</h1><p class="lead" data-i18n="rulesLead">Автоматически обрабатывайте новые письма: собирайте правило из групп условий и выстраивайте цепочку действий - метку, отметку, перемещение или удаление.</p>
         <div class="btn-row"><button class="btn primary" id="ruleNew"><i data-i="plus"></i><span data-i18n="createRule">Создать правило</span></button><button class="btn" id="ruleRunOpen"><i data-i="filter"></i><span data-i18n="ruleRunOpen">Запустить по папкам</span></button></div>
-        <div class="card mt-20 hidden" id="ruleEditor"><div class="ch"><span id="ruleEditorTitle" data-i18n="newRule">Новое правило</span></div><div class="cb">
+        <div class="card mt-20 hidden" id="ruleEditor"><div class="ch"><span id="ruleEditorTitle"></span></div><div class="cb">
           <div class="rule-condition-grid">
             <div class="fld"><label data-i18n="ruleNameLabel">Название</label><input class="inp" id="ruleName" data-i18n-placeholder="ruleNamePlaceholder" placeholder="Например: Чеки в Финансы"></div>
             <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
@@ -265,6 +265,9 @@
           <div class="btn-row mt-20"><button class="btn primary" id="ruleRunStart"><i data-i="check"></i><span data-i18n="ruleRunStart">Запустить</span></button><button class="btn hidden" id="ruleRunContinue" data-i18n="ruleRunContinue">Продолжить</button><button class="btn" id="ruleRunClose" data-i18n="close">Закрыть</button></div>
           <p class="note-muted" id="ruleRunReport"></p>
         </div></div>
+        <div id="ruleTrashWarnings" class="mt-20"></div>
+        <div id="rulePendingRuns" class="mt-20"></div>
+        <div id="ruleFailedOps" class="mt-20"></div>
         <div class="card mt-20"><div class="cb" id="rulesList"><p class="note-muted" data-i18n="noRules">Правил пока нет.</p></div></div>
       </div>
       <div class="setpage" id="set-unified">
@@ -723,12 +726,12 @@
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
 <script src="modules/shell.js?v=20260916-1"></script>
-<script src="modules/calendar-contacts.js?v=20260916-2"></script>
+<script src="modules/calendar-contacts.js?v=20260918-1"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
 <script src="modules/commands-accessibility.js?v=20260916-1"></script>
-<script src="modules/mail-rules.js?v=20260918-1"></script>
-<script src="modules/smart-rules.js?v=20260918-2"></script>
-<script src="modules/i18n-onboarding.js?v=20260918-1"></script>
+<script src="modules/mail-rules.js?v=20260918-2"></script>
+<script src="modules/smart-rules.js?v=20260918-3"></script>
+<script src="modules/i18n-onboarding.js?v=20260918-2"></script>
 <script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
@@ -736,13 +739,13 @@
 <script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260918-1"></script>
+<script src="modules/mail.js?v=20260918-2"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
-<script src="modules/composer.js?v=20260918-2"></script>
+<script src="modules/composer.js?v=20260918-3"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
 <script src="modules/settings.js?v=20260918-1"></script>
 <script src="modules/window-chrome.js?v=20260918-1"></script>
-<script src="bridge.js?v=20260918-2"></script>
+<script src="bridge.js?v=20260918-3"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

@@ -342,7 +342,7 @@ function buildContextMenu(){
   ctxmenu.innerHTML='';
   tbActions.forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
   const sep=document.createElement('div');sep.className='tmsep';ctxmenu.appendChild(sep);
-  (smartIsEnglish()?[['flag','flag','Add tag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule']]:[['flag','flag','Добавить метку'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top},true);}});ctxmenu.appendChild(item);});
+  (smartIsEnglish()?[['flag','flag','Add tag'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule'],['delete-forever','trash','Delete permanently']]:[['flag','flag','Добавить метку'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило'],['delete-forever','trash','Удалить навсегда']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top},true);}});ctxmenu.appendChild(item);});
   renderIcons(ctxmenu);
 }
 // Пункт меню письма закрывает и само меню, и открытое подменю меток (S-008).
@@ -350,6 +350,9 @@ ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('
   if(action==='raw'){openRawViewer(activeMessage?.id);return;}
   if(action==='eml'){saveMessageAsEml(activeMessage?.id);return;}
   if(action==='create-rule'){openRuleEditor(activeMessage);return;}
+  // S-013: безвозвратное удаление доступно только этим явно названным пунктом
+  // и только с подтверждением - из переноса в корзину оно не получается.
+  if(action==='delete-forever'){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];window.deleteMessagesForever?.(ids);return;}
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
   executeToolbarAction(action);
 });

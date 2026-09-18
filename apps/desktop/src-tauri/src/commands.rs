@@ -1024,7 +1024,7 @@ async fn notify_new_mail(
         let mut guard = notified.lock().await;
         dedupe_notified(&mut guard, new_message_ids)
     };
-    let Some(&message_id) = fresh.last() else {
+    if fresh.is_empty() {
         tracing::debug!(
             source,
             account = %truemail_core::logging::mask_email(&account.email),
@@ -1032,23 +1032,32 @@ async fn notify_new_mail(
             "уведомление подавлено: письма уже показаны другим путём"
         );
         return;
-    };
+    }
     // S-010: между сбором списка и показом письмо могло быть уведено стадией
-    // или действием пользователя - проверяем по зафиксированной базе.
-    if !core
-        .db
-        .message_is_notifiable(message_id)
-        .await
-        .unwrap_or(true)
-    {
+    // или действием пользователя. Проверяется каждое письмо списка: проверка
+    // одного лишь последнего прятала бы уведомление о настоящей новой почте,
+    // когда уведено именно оно.
+    let mut notifiable = Vec::with_capacity(fresh.len());
+    for candidate in &fresh {
+        if core
+            .db
+            .message_is_notifiable(*candidate)
+            .await
+            .unwrap_or(true)
+        {
+            notifiable.push(*candidate);
+        }
+    }
+    let Some(&message_id) = notifiable.last() else {
         tracing::debug!(
             source,
             account = %truemail_core::logging::mask_email(&account.email),
-            "уведомление подавлено: письмо уведено стадией обработки"
+            candidates = new_message_ids.len(),
+            "уведомление подавлено: все письма уведены стадиями обработки"
         );
         return;
-    }
-    let count = fresh.len();
+    };
+    let count = notifiable.len();
     let meta = core
         .db
         .message_notification_preview(message_id)
@@ -2870,6 +2879,16 @@ pub async fn last_mail_rule_run(
     state: State<'_, AppState>,
 ) -> CmdResult<Option<truemail_core::model::MailRuleRunReport>> {
     Ok(core(&state).await?.db.last_mail_rule_run().await?)
+}
+
+/// Незавершённые задания ручного прогона: продолжение не должно зависеть от
+/// отчёта текущей сессии, поэтому раздел правил показывает их отдельно
+/// (S-070, S-072).
+#[tauri::command]
+pub async fn pending_mail_rule_runs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::model::MailRuleRunReport>> {
+    Ok(core(&state).await?.db.pending_mail_rule_runs().await?)
 }
 
 /// Операции увода в состоянии отказа: письмо считается не уведённым, пока

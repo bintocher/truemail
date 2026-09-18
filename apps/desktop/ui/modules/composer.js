@@ -120,16 +120,19 @@ window.handleSyncState=function(state){if(!state)return;
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;
-  // S-012, S-013: перенос в корзину письма, уже лежащего в корзине, больше не
-  // превращается в безвозвратное удаление сам собой - его выбирает пользователь
-  // отдельным подтверждением.
+  // S-012, S-013: перенос в корзину письма, уже лежащего в корзине, ничего не
+  // делает и в безвозвратное удаление не превращается. Удаление навсегда
+  // выбирается отдельным действием меню письма.
   if(action==='trash'){
     const messageFolder=id=>{const message=currentMessageRows.find(item=>item.id===id)||messages.find(item=>item.id===id);return coreFolders.find(folder=>folder.id===message?.folder_id);};
     if(ids.every(id=>messageFolder(id)?.role==='trash')){
-      if(!await confirmAction(L(`Письма уже в корзине. Удалить навсегда, без возможности отмены?`,`These messages are already in Trash. Delete them permanently, with no undo?`)))return;
-      action='delete';
+      showToast(L('Письма уже в корзине. Чтобы стереть их без возврата, выберите "Удалить навсегда".','These messages are already in Trash. To erase them for good choose "Delete permanently".'));
+      return;
     }
   }
+  // S-013, S-048: безвозвратное удаление подтверждается отдельно и отмены не
+  // имеет.
+  if(action==='delete'&&!await confirmAction(L(`Удалить навсегда писем: ${ids.length}? Отмены не будет.`,`Delete ${ids.length} message(s) permanently? There is no undo.`)))return;
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   let nextId=null;
   if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
@@ -137,10 +140,29 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
     if(action==='delete'){showToast(L('Письмо удаляется навсегда','The message is being deleted permanently'));return;}
     // Письмо, по которому уже стоит незавершённая операция увода, пропущено
-    // ограничением очереди (S-005) - об этом честно говорим.
-    if(queued.skipped)showToast(L(`Пропущено писем с незавершённой операцией: ${queued.skipped}`,`Messages skipped because an operation is already queued: ${queued.skipped}`));
+    // ограничением очереди (S-005) - об этом честно говорим вместе с причиной.
+    showSkippedMessages(queued);
     showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 window.performMessageActionForIds=performMessageActionForIds;
+/* Пропуски называются причиной: занятое письмо, письмо с отказавшей операцией и
+   письмо без единственной папки нужного типа - разные беды (S-005, S-006,
+   S-046). */
+function showSkippedMessages(queued){
+  if(!queued?.skipped)return;
+  const parts=[];
+  if(queued.skipped_busy)parts.push(L(`уже переносятся: ${queued.skipped_busy}`,`already being moved: ${queued.skipped_busy}`));
+  if(queued.skipped_failed)parts.push(L(`ждут решения после отказа: ${queued.skipped_failed}`,`waiting for your decision after a failure: ${queued.skipped_failed}`));
+  if(queued.skipped_no_folder)parts.push(L(`нет единственной папки нужного типа: ${queued.skipped_no_folder}`,`no single folder of the required type: ${queued.skipped_no_folder}`));
+  const reason=parts.length?` (${parts.join(', ')})`:'';
+  showToast(L(`Пропущено писем: ${queued.skipped}${reason}`,`Messages skipped: ${queued.skipped}${reason}`));
+}
+window.showSkippedMessages=showSkippedMessages;
+/* S-013: безвозвратное удаление - отдельное явно названное действие, а не
+   следствие переноса в корзину. */
+async function deleteMessagesForever(ids){
+  return performMessageActionForIds('delete',ids);
+}
+window.deleteMessagesForever=deleteMessagesForever;
 async function performMessageAction(action){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];return performMessageActionForIds(action,ids);}
 function selectAllCurrentMessages(){currentMessageRows.forEach(message=>selectedMessageIds.add(message.id));updateSelectionUi();}
 document.getElementById('bulkSelectAll').onclick=selectAllCurrentMessages;
