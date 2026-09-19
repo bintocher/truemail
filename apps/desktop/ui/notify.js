@@ -43,22 +43,27 @@
     const isChange = data.kind === "event-change";
     const isTask = data.kind === "task";
     const isTaskBundle = data.kind === "task-bundle";
+    // Язык приходит вместе с событием: разметка окна уведомлений объявлена
+    // русской, и карточка дела иначе всегда была бы русской.
+    const lang = (data.lang || document.documentElement.lang) === "en" ? "en" : "ru";
     const taskCard = isTask ? flagDueDatesModel.reminderCard({
       message_id: data.message_id,
       subject: data.subject,
-      from_name: data.preview,
-      due_at: data.details,
-    }, document.documentElement.lang === "en" ? "en" : "ru") : null;
-    const shown = taskCard ? {...data, ...taskCard} : data;
+      from_name: data.sender_name ?? data.preview,
+      from_addr: data.sender_address ?? null,
+      due_at: data.due_at ?? data.details,
+    }, lang) : null;
+    const bundleCard = isTaskBundle ? flagDueDatesModel.missedSummary(data.count, lang) : null;
+    const shown = taskCard ? {...data, ...taskCard} : bundleCard ? {...data, ...bundleCard} : data;
     const card = document.createElement("div");
     // Отмену встречи выделяем тревожным акцентом - в отличие от переноса
     // или смены места, её лучше явно отличить визуально от прочих карточек.
     card.className = "card" + (isChange && data.change === "cancelled" ? " cancel" : "");
-    const brandName = isTask||isTaskBundle ? "Дела" : isEvent ? "Напоминание" : isChange ? (data.brand || "Календарь") : "truemail";
+    const brandName = isTask||isTaskBundle ? (lang === "en" ? "Tasks" : "Дела") : isEvent ? "Напоминание" : isChange ? (data.brand || "Календарь") : "truemail";
     const icon = isTask||isTaskBundle ? "!" : isEvent ? "◷" : isChange ? (data.change === "cancelled" ? "✕" : "▤") : "✉";
     card.innerHTML =
       `<div class="head"><div class="brand"><span class="dot">${icon}</span><span>${escapeHtml(brandName)}</span></div>` +
-      `<button class="close-x" title="Закрыть">×</button></div>` +
+      `<button class="close-x" title="${lang === "en" ? "Close" : "Закрыть"}">×</button></div>` +
       `<div class="title"></div><div class="subject"></div>` +
       (shown.preview ? `<div class="preview"></div>` : "") +
       (shown.details ? `<div class="details"></div>` : "") +
@@ -118,7 +123,7 @@
       };
       taskCard.actions.forEach((action, index) => actions.appendChild(mkBtn(action.title, index === 0, handlers[action.id])));
     } else if (isTaskBundle) {
-      actions.appendChild(mkBtn("Открыть дела", true, () => { window.__TAURI__?.event?.emit("truemail-open-tasks", null).catch(() => {});dismiss(card); }));
+      actions.appendChild(mkBtn(bundleCard.action, true, () => { window.__TAURI__?.event?.emit("truemail-open-tasks", null).catch(() => {});dismiss(card); }));
     } else {
       const open = mkBtn("Открыть", true, () => { invoke("notify_open", { messageId: data.message_id ?? null, eventId: null }).catch(() => {}); dismiss(card); });
       const read = mkBtn("Прочитано", false, () => {
@@ -133,7 +138,7 @@
       });
       actions.append(open, read);
     }
-    const close = mkBtn("Закрыть", false, () => dismiss(card));
+    const close = mkBtn(lang === "en" ? "Close" : "Закрыть", false, () => dismiss(card));
     actions.appendChild(close);
     card.querySelector(".close-x").onclick = () => dismiss(card);
 

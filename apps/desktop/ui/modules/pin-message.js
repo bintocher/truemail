@@ -45,6 +45,10 @@
       : `${message.account_id}|m:${message.id}`;
   }
 
+  // Представителем беседы всегда остаётся самое свежее её письмо: по
+  // сортировке "по отправителю" или "по теме" им оказывалось бы произвольное
+  // письмо. Беседы между собой выстроены выбранной сортировкой, а раскрытые
+  // письма идут сразу за своим представителем и по списку не расходятся.
   function collapsedRows(rows, options) {
     if (options.collapseThreads === false) return rows;
     const expanded = options.expandedThreads instanceof Set
@@ -56,16 +60,23 @@
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(message);
     });
-    const result = [];
+    const threads = [];
     for (const items of groups.values()) {
-      const ordered = [...items].sort((a, b) => compareMessages(a, b, options.sort, options.locale));
-      const key = conversationKey(ordered[0]);
-      result.push({...ordered[0], _convKey: key, _convCount: ordered.length, threadCount: ordered.length});
-      if (ordered.length > 1 && expanded.has(key)) {
-        ordered.slice(1).forEach(message => result.push({...message, _convKey: key, _convChild: true}));
-      }
+      const byDate = [...items].sort((a, b) => compareMessages(a, b, 'date-desc', options.locale));
+      const key = conversationKey(byDate[0]);
+      threads.push({
+        head: {...byDate[0], _convKey: key, _convCount: byDate.length, threadCount: byDate.length},
+        children: byDate.slice(1).map(message => ({...message, _convKey: key, _convChild: true})),
+        expanded: expanded.has(key),
+      });
     }
-    return result.sort((a, b) => compareMessages(a, b, options.sort, options.locale));
+    threads.sort((a, b) => compareMessages(a.head, b.head, options.sort, options.locale));
+    const result = [];
+    threads.forEach(thread => {
+      result.push(thread.head);
+      if (thread.expanded) result.push(...thread.children);
+    });
+    return result;
   }
 
   function buildRows(pinned, ordinary, options = {}) {
@@ -107,6 +118,9 @@
     return [...byId.values()];
   }
 
+  // Край папки и число пришедших писем считаются только по обычным письмам:
+  // закреплённые приходят отдельным перечнем любой давности и к границе
+  // страницы отношения не имеют (S-021).
   function mergeReloadedPages(state, options = {}) {
     const oldPinned = uniqueMessages(state?.pinned);
     const oldNormal = uniqueMessages(state?.normal);
@@ -115,7 +129,7 @@
     const pageSize = Number(options.pageSize) || 0;
     const counts = new Map();
     const edges = new Map();
-    fresh.forEach(message => {
+    fresh.filter(message => !message.pinned_at).forEach(message => {
       counts.set(message.folder_id, (counts.get(message.folder_id) || 0) + 1);
       const edge = edges.get(message.folder_id);
       if (!edge || compareMessages(message, edge, 'date-asc') < 0) edges.set(message.folder_id, message);
@@ -130,7 +144,14 @@
       if (options.fullPageEdge != null) return String(message.date || '') < String(options.fullPageEdge);
       return !freshIds.size;
     });
-    const pinned = uniqueMessages(oldPinned.concat(fresh.filter(message => message.pinned_at)));
+    // Перечень закреплённых не только пополняется: письмо, пришедшее заново без
+    // времени закрепления, из закреплённой части уходит, иначе откреплённое
+    // письмо держалось бы вверху до перезапуска программы (S-063).
+    const unpinned = new Set(fresh.filter(message => !message.pinned_at).map(message => message.id));
+    const pinned = uniqueMessages(
+      oldPinned.filter(message => !unpinned.has(message.id))
+        .concat(fresh.filter(message => message.pinned_at)),
+    );
     const pinnedIds = new Set(pinned.map(message => message.id));
     const normal = uniqueMessages(survived.concat(fresh.filter(message => !message.pinned_at)))
       .filter(message => !pinnedIds.has(message.id));
@@ -153,7 +174,7 @@
 
   async function togglePin(bridge, ids, pinned) {
     const result = await bridge.setMessagesPinned([...new Set(ids || [])], Boolean(pinned));
-    const rejected = Number(result?.rejected ?? result?.rejected_limit ?? 0);
+    const rejected = rejectedCount(result);
     return {...(result || {}), rejected, rejected_limit: rejected};
   }
 
@@ -175,8 +196,14 @@
     return lang === 'en' ? `${base} - ${hidden} more not shown` : `${base} - не показано еще ${hidden}`;
   }
 
+  // Ядро отвечает полем rejected_limit, а ранние ответы моста несли rejected:
+  // обе подписи считает одним и тем же числом отклонённых пределом писем.
+  function rejectedCount(result) {
+    return Number(result?.rejected ?? result?.rejected_limit ?? 0);
+  }
+
   function pinLimitText(result, lang = 'ru') {
-    const rejected = Number(result?.rejected ?? result?.rejected_limit ?? 0);
+    const rejected = rejectedCount(result);
     if (!rejected) return '';
     return lang === 'en'
       ? `Could not pin: ${rejected}. The mailbox pin limit has been reached`
@@ -186,6 +213,7 @@
   return {
     PINNED_VISIBLE_LIMIT,
     compareMessages,
+    conversationKey,
     filterMessages,
     buildRows,
     messageRows,

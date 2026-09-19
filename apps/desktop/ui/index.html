@@ -86,8 +86,10 @@
           <button class="btn" data-act="replyall"><i data-i="replyall"></i><span data-i18n="actionReplyAll">Ответить всем</span></button>
           <button class="btn" data-act="forward"><i data-i="forward"></i><span data-i18n="actionForward">Переслать</span></button>
           <span class="sp"></span>
-          <button class="iconbtn" data-i18n-title="flagMessage" title="Флажок" data-act="flag-message"><i data-i="flag"></i></button>
-          <button class="iconbtn" data-i18n-title="taskDates" title="Сроки дела" data-act="task-message"><i data-i="cal"></i></button>
+          <!-- Постоянные кнопки: настройка панели прячет все кнопки разметки,
+               кроме помеченных, а заменяющих кнопок у флажка и сроков нет. -->
+          <button class="iconbtn" data-toolbar-persistent data-i18n-title="flagMessage" title="Флажок" data-act="flag-message"><i data-i="flag"></i></button>
+          <button class="iconbtn" data-toolbar-persistent data-i18n-title="taskDates" title="Сроки дела" data-act="task-message"><i data-i="cal"></i></button>
           <button class="iconbtn" data-i18n-title="actionArchive" title="В архив" data-act="archive"><i data-i="archive"></i></button>
           <button class="iconbtn" data-i18n-title="actionDelete" title="Удалить" data-act="trash"><i data-i="trash"></i></button>
           <button class="iconbtn thread-more-button" id="threadMoreButton" data-toolbar-persistent data-i18n-title="tipMore" title="Ещё действия" aria-haspopup="menu" aria-expanded="false"><i data-i="dots"></i></button>
@@ -785,21 +787,21 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.3.0"></script>
+<script src="modules/app-version.js?v=0.3.1"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
-<script src="modules/shell.js?v=20260918-6"></script>
-<script src="modules/calendar-contacts.js?v=20260918-7"></script>
+<script src="modules/shell.js?v=20260919-2"></script>
+<script src="modules/calendar-contacts.js?v=20260919-1"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
-<script src="modules/commands-accessibility.js?v=20260918-1"></script>
+<script src="modules/commands-accessibility.js?v=20260918-2"></script>
 <script src="modules/mail-rules.js?v=20260918-2"></script>
-<script src="modules/flag-due-dates.js?v=20260918-1"></script>
-<script src="modules/pin-message.js?v=20260918-1"></script>
-<script src="modules/quick-steps.js?v=20260918-1"></script>
+<script src="modules/flag-due-dates.js?v=20260919-1"></script>
+<script src="modules/pin-message.js?v=20260919-2"></script>
+<script src="modules/quick-steps.js?v=20260919-2"></script>
 <script src="modules/sender-lists.js?v=20260918-2"></script>
-<script src="modules/smart-rules.js?v=20260918-11"></script>
+<script src="modules/smart-rules.js?v=20260919-2"></script>
 <script src="modules/i18n-onboarding.js?v=20260918-5"></script>
 <script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
@@ -808,18 +810,18 @@
 <script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260918-14"></script>
+<script src="modules/mail.js?v=20260919-2"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
 <script src="modules/outbox.js?v=20260918-3"></script>
 <script src="modules/out-of-office.js?v=20260918-2"></script>
 <script src="modules/recipient-history.js?v=20260918-1"></script>
 <script src="modules/composer.js?v=20260918-8"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260918-1"></script>
+<script src="modules/settings.js?v=20260919-1"></script>
 <script src="modules/sender-actions.js?v=20260918-2"></script>
 <script src="modules/queue-sections.js?v=20260918-3"></script>
 <script src="modules/window-chrome.js?v=20260918-1"></script>
-<script src="bridge.js?v=20260918-11"></script>
+<script src="bridge.js?v=20260919-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

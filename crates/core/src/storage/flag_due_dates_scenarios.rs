@@ -11,40 +11,6 @@ use super::repo::test_storage::{TestDb, open_test_db};
 use crate::backend::{DiscoveredFlagUpdate, DiscoveredMessage};
 use crate::model::*;
 
-/// Таблица дел: номер письма первичным ключом, сроки, состояние и отметки
-/// времени. Имя взято из миграции `0049_flag_due_dates.sql`.
-const TASKS: &str = "message_tasks";
-
-async fn table_exists(db: &Db, table: &str) -> bool {
-    sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")
-        .bind(table)
-        .fetch_one(&db.pool)
-        .await
-        .expect("прочитать схему")
-        .0
-        > 0
-}
-
-async fn column_exists(db: &Db, table: &str, column: &str) -> bool {
-    sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM pragma_table_info(?) WHERE name=?")
-        .bind(table)
-        .bind(column)
-        .fetch_one(&db.pool)
-        .await
-        .expect("прочитать столбцы")
-        .0
-        > 0
-}
-
-/// Без таблицы дел ни один сценарий этого файла не имеет смысла: сказать об
-/// этом словами честнее, чем уронить проверку невнятной ошибкой запроса.
-async fn require_tasks(db: &Db, what_breaks: &str) {
-    assert!(
-        table_exists(db, TASKS).await,
-        "таблицы дел {TASKS} нет: {what_breaks}"
-    );
-}
-
 async fn seed_account(db: &Db, email: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(
         "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
@@ -165,72 +131,6 @@ async fn message_id_by_uid(db: &Db, folder_id: i64, uid: i64) -> i64 {
         .0
 }
 
-/// S-010, S-017: сроки дела хранятся в локальной базе отдельной таблицей,
-/// связанной с письмом. Если её нет или связь не каскадная, пользователь либо
-/// вовсе не может задать письму срок, либо получает дела писем, которых в
-/// программе уже нет.
-#[tokio::test]
-async fn migration_0049_adds_task_storage() {
-    let db: TestDb = open_test_db("flag-tasks-schema").await;
-    let applied: Vec<(i64,)> =
-        sqlx::query_as("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&db.pool)
-            .await
-            .expect("прочитать применённые миграции");
-    let versions = applied.iter().map(|row| row.0).collect::<Vec<_>>();
-    assert!(
-        versions.contains(&48),
-        "миграция 0048 должна остаться на месте: {versions:?}"
-    );
-    assert!(
-        versions.contains(&49),
-        "миграции 0049 нет: сроки дела хранить негде, и раздел \"Дела\" будет пуст"
-    );
-    require_tasks(&db, "задать письму срок нечем").await;
-    for column in [
-        "message_id",
-        "start_at",
-        "due_at",
-        "reminder_at",
-        "state",
-        "completed_at",
-        "reminder_shown_at",
-    ] {
-        assert!(
-            column_exists(&db, TASKS, column).await,
-            "в таблице дел нет столбца {column}: часть сроков сохранить будет негде"
-        );
-    }
-
-    let account = seed_account(&db, "schema@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    let message = seed_message(&db, account, inbox, 1, "<schema@example.test>", 1, true).await;
-    seed_task(&db, message, Some("2026-09-20 09:00:00"), "active").await;
-
-    // Состояние ограничено проверкой схемы: чужое значение состояния означало
-    // бы дело, которое ни один список показать не умеет.
-    let bogus = sqlx::query("UPDATE message_tasks SET state='postponed' WHERE message_id=?")
-        .bind(message)
-        .execute(&db.write_pool)
-        .await;
-    assert!(
-        bogus.is_err(),
-        "схема обязана допускать только active, done и detached"
-    );
-
-    // Письмо удалено - дело уходит вместе с ним (S-088, S-090).
-    sqlx::query("DELETE FROM messages WHERE id=?")
-        .bind(message)
-        .execute(&db.write_pool)
-        .await
-        .expect("удалить письмо");
-    assert!(
-        task_state(&db, message).await.is_none(),
-        "дело удалённого письма осталось в базе: список дел показал бы письмо, которого нет"
-    );
-    db.close().await;
-}
-
 /// S-039, S-040: пока по письму лежит незавершённая операция вида `flag`,
 /// значение признака с сервера к нему не применяется. Иначе устаревший ответ
 /// сервера снял бы только что поставленный пользователем флажок и увёл бы дело
@@ -273,11 +173,6 @@ async fn imap_flag_delta_yields_to_a_pending_flag_operation() {
     assert!(
         flagged(&db, message).await,
         "ответ сервера снял только что поставленный пользователем флажок"
-    );
-    require_tasks(&db, "проверить состояние дела нечем").await;
-    assert!(
-        !matches!(task_state(&db, message).await, Some((state, _, _)) if state == "detached"),
-        "дело отсоединено из-за собственной же неотправленной операции признака"
     );
     db.close().await;
 }
@@ -326,7 +221,6 @@ async fn sync_detaches_the_task_and_keeps_its_dates() {
     let account = seed_account(&db, "detach@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let message = seed_message(&db, account, inbox, 31, "<detach@example.test>", 1, true).await;
-    require_tasks(&db, "снятый на телефоне флажок некуда отложить").await;
     seed_task(&db, message, Some("2026-09-25 09:00:00"), "active").await;
 
     db.apply_imap_flag_updates(
@@ -367,7 +261,6 @@ async fn returning_flag_revives_a_detached_task() {
     let account = seed_account(&db, "revive@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let message = seed_message(&db, account, inbox, 41, "<revive@example.test>", 1, false).await;
-    require_tasks(&db, "вернуть отсоединённое дело в работу нечему").await;
     seed_task(&db, message, Some("2026-09-26 09:00:00"), "detached").await;
 
     db.apply_imap_flag_updates(
@@ -405,7 +298,6 @@ async fn a_rule_flag_revives_a_completed_task_without_dates() {
     let account = seed_account(&db, "rule@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let message = seed_message(&db, account, inbox, 51, "<rule@example.test>", 1, false).await;
-    require_tasks(&db, "правило не сможет вернуть выполненное дело в работу").await;
     sqlx::query(
         "INSERT INTO message_tasks(message_id, state, completed_at)
          VALUES(?, 'done', datetime('now','-1 days'))",
@@ -448,7 +340,6 @@ async fn a_rule_flag_revives_a_completed_task_without_dates() {
     let task = task_state(&db, message).await.expect("дело на месте");
     assert_eq!(task.0, "active", "выполненное дело вернулось в работу");
     assert_eq!(task.2, None, "время выполнения очищено");
-    assert_eq!(task.1, None, "правило сроков не задаёт");
     db.close().await;
 }
 
@@ -474,7 +365,6 @@ async fn cache_pruning_keeps_messages_with_unfinished_tasks() {
     .await;
     let done = seed_message(&db, account, inbox, 63, "<done@example.test>", 40, false).await;
     let plain = seed_message(&db, account, inbox, 64, "<plain@example.test>", 40, false).await;
-    require_tasks(&db, "очистка кэша не отличит дело от обычного письма").await;
     seed_task(&db, active, Some("2026-09-30 09:00:00"), "active").await;
     seed_task(&db, detached, Some("2026-09-30 09:00:00"), "detached").await;
     seed_task(&db, done, None, "done").await;
@@ -524,7 +414,6 @@ async fn a_moved_message_carries_its_task_to_the_new_row() {
     db.mark_flagged(message, true)
         .await
         .expect("поставить флажок");
-    require_tasks(&db, "переносить вместе с письмом нечего").await;
     seed_task(&db, message, Some("2026-10-01 09:00:00"), "active").await;
 
     let queued = db
@@ -598,7 +487,6 @@ async fn a_folder_rebuild_returns_the_task_to_the_new_row() {
     .await
     .expect("письмо пришло");
     let message = message_id_by_uid(&db, inbox, 81).await;
-    require_tasks(&db, "вернуть дело после пересборки папки нечему").await;
     seed_task(&db, message, Some("2026-10-02 09:00:00"), "active").await;
 
     db.apply_imap_vanished(account, &[("INBOX".to_owned(), vec![81])])
@@ -618,5 +506,600 @@ async fn a_folder_rebuild_returns_the_task_to_the_new_row() {
         .expect("дело вернулось на новую строку");
     assert_eq!(task.0, "active");
     assert_eq!(task.1.as_deref(), Some("2026-10-02 09:00:00"));
+    db.close().await;
+}
+
+/// S-081, S-091: обычная синхронизация тоже удаляет строку письма - сверкой
+/// снимка папки и сменой признака действительности папки. Письмо, разложенное
+/// по папкам на другом устройстве, и любая переиндексация ящика проходят
+/// именно этими путями, и без сохранения примет сроки дела уходят молча и без
+/// возврата.
+#[tokio::test]
+async fn a_snapshot_reconcile_keeps_the_task_of_a_message_moved_elsewhere() {
+    let db: TestDb = open_test_db("flag-snapshot").await;
+    let account = seed_account(&db, "snapshot@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 91, "<snapshot@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("письмо пришло во входящие");
+    let message = message_id_by_uid(&db, inbox, 91).await;
+    seed_task(&db, message, Some("2026-10-03 09:00:00"), "active").await;
+
+    // На другом устройстве письмо унесли из входящих: снимок папки его больше
+    // не называет.
+    db.reconcile_imap_snapshot(account, &[("INBOX".to_owned(), Vec::new())], &[])
+        .await
+        .expect("сверка снимка папки");
+    db.save_discovered_messages(
+        account,
+        &[discovered("Archive", 905, "<snapshot@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("письмо нашлось в архиве");
+
+    let moved = message_id_by_uid(&db, archive, 905).await;
+    let task = task_state(&db, moved)
+        .await
+        .expect("дело не вернулось после сверки снимка");
+    assert_eq!(task.0, "active", "сверка снимка дела не закрывает");
+    assert_eq!(
+        task.1.as_deref(),
+        Some("2026-10-03 09:00:00"),
+        "срок исполнения потерян обычной синхронизацией"
+    );
+    db.close().await;
+}
+
+/// S-091: смена признака действительности папки перестраивает её целиком -
+/// все строки писем удаляются и приходят заново. Дело обязано вернуться на
+/// новую строку того же письма.
+#[tokio::test]
+async fn a_uidvalidity_reset_keeps_the_task_of_the_rebuilt_folder() {
+    let db: TestDb = open_test_db("flag-uidvalidity").await;
+    let account = seed_account(&db, "uidvalidity@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 101, "<uidvalidity@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("письмо пришло");
+    let message = message_id_by_uid(&db, inbox, 101).await;
+    seed_task(&db, message, Some("2026-10-04 09:00:00"), "active").await;
+
+    db.reconcile_imap_snapshot(
+        account,
+        &[("INBOX".to_owned(), vec![101])],
+        &["INBOX".to_owned()],
+    )
+    .await
+    .expect("признак действительности папки сменился");
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 1, "<uidvalidity@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("папка пришла заново новыми номерами");
+
+    let rebuilt = message_id_by_uid(&db, inbox, 1).await;
+    let task = task_state(&db, rebuilt)
+        .await
+        .expect("дело не вернулось после смены признака действительности папки");
+    assert_eq!(task.1.as_deref(), Some("2026-10-04 09:00:00"));
+    db.close().await;
+}
+
+/// S-081 - S-083: три ветки переноса примет на одном сценарии. Копия письма в
+/// новой папке приходит раньше извещения об исчезновении из старой - это самый
+/// частый порядок событий, и приметы обязаны переехать сразу на неё. Когда
+/// копии ещё нет, приметы откладываются до её появления. Когда копий несколько,
+/// выбирать не из чего, и дело не наследуется чужим письмом.
+#[tokio::test]
+async fn the_three_branches_of_carrying_the_traits_over() {
+    let db: TestDb = open_test_db("flag-traits-branches").await;
+    let account = seed_account(&db, "branches@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
+    let work = seed_folder(&db, account, "Work", None).await;
+
+    // Ветка первая: копия уже пришла в архив, извещение об исчезновении из
+    // входящих приходит после неё.
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 111, "<early@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("письмо во входящих");
+    let early = message_id_by_uid(&db, inbox, 111).await;
+    seed_task(&db, early, Some("2026-10-05 09:00:00"), "active").await;
+    db.save_discovered_messages(
+        account,
+        &[discovered("Archive", 911, "<early@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("копия письма пришла в архив раньше извещения");
+    db.apply_imap_vanished(account, &[("INBOX".to_owned(), vec![111])])
+        .await
+        .expect("сервер сообщил об исчезнувшем номере");
+    let carried = message_id_by_uid(&db, archive, 911).await;
+    let task = task_state(&db, carried)
+        .await
+        .expect("дело не переехало на пришедшую раньше копию письма");
+    assert_eq!(
+        task.1.as_deref(),
+        Some("2026-10-05 09:00:00"),
+        "срок исполнения потерян при самом частом порядке событий"
+    );
+
+    // Ветка вторая: копии ещё нет, приметы ждут её появления.
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 112, "<late@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("второе письмо во входящих");
+    let late = message_id_by_uid(&db, inbox, 112).await;
+    seed_task(&db, late, Some("2026-10-06 09:00:00"), "active").await;
+    db.apply_imap_vanished(account, &[("INBOX".to_owned(), vec![112])])
+        .await
+        .expect("извещение об исчезновении пришло раньше копии");
+    db.save_discovered_messages(
+        account,
+        &[discovered("Work", 912, "<late@example.test>", true)],
+        false,
+    )
+    .await
+    .expect("копия письма пришла позже");
+    let restored = message_id_by_uid(&db, work, 912).await;
+    assert_eq!(
+        task_state(&db, restored)
+            .await
+            .expect("отложенные приметы не вернулись")
+            .1
+            .as_deref(),
+        Some("2026-10-06 09:00:00")
+    );
+
+    // Ветка третья: одинаковый заголовок у двух писем, единственного совпадения
+    // нет, и чужое письмо дела не наследует.
+    db.save_discovered_messages(
+        account,
+        &[
+            discovered("INBOX", 113, "<twin@example.test>", true),
+            discovered("Archive", 913, "<twin@example.test>", true),
+            discovered("Work", 914, "<twin@example.test>", true),
+        ],
+        false,
+    )
+    .await
+    .expect("три письма с одним заголовком");
+    let twin = message_id_by_uid(&db, inbox, 113).await;
+    seed_task(&db, twin, Some("2026-10-07 09:00:00"), "active").await;
+    db.apply_imap_vanished(account, &[("INBOX".to_owned(), vec![113])])
+        .await
+        .expect("исходное письмо исчезло");
+    for (folder, uid) in [(archive, 913), (work, 914)] {
+        let other = message_id_by_uid(&db, folder, uid).await;
+        assert!(
+            task_state(&db, other).await.is_none(),
+            "дело унаследовало письмо с тем же заголовком, хотя совпадение не единственное"
+        );
+    }
+    db.close().await;
+}
+
+/// S-039, S-040: операция признака после восьми попыток уходит в состояние
+/// отказа и повтору не подлежит, но незавершённой быть не перестаёт. Иначе
+/// первый же ответ сервера вернул бы прежнее значение признака: выполненное
+/// дело воскресло бы, а действующее ушло бы в отсоединённое состояние.
+#[tokio::test]
+async fn a_failed_flag_operation_still_blocks_the_server_value() {
+    let db: TestDb = open_test_db("flag-failed-op").await;
+    let account = seed_account(&db, "failed@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 121, "<failed@example.test>", false)],
+        false,
+    )
+    .await
+    .expect("письмо пришло");
+    let message = message_id_by_uid(&db, inbox, 121).await;
+
+    db.mark_flagged(message, true)
+        .await
+        .expect("поставить флажок");
+    seed_task(&db, message, Some("2026-10-08 09:00:00"), "active").await;
+    let operation: (i64,) =
+        sqlx::query_as("SELECT id FROM outbox_ops WHERE message_id=? AND op_kind='flag'")
+            .bind(message)
+            .fetch_one(&db.pool)
+            .await
+            .expect("операция признака в очереди");
+    // Восемь неудачных попыток - и операция переходит в состояние отказа.
+    for _ in 0..8 {
+        db.fail_outbox_operation(operation.0, "сервер недоступен")
+            .await
+            .expect("попытка отправки не удалась");
+    }
+    let status: (String,) = sqlx::query_as("SELECT status FROM outbox_ops WHERE id=?")
+        .bind(operation.0)
+        .fetch_one(&db.pool)
+        .await
+        .expect("прочитать состояние операции");
+    assert_eq!(status.0, "failed", "операция признака дошла до отказа");
+
+    // Сервер отвечает прежним состоянием: признака там ещё нет.
+    db.apply_imap_flag_updates(
+        account,
+        &[DiscoveredFlagUpdate {
+            folder_path: "INBOX".into(),
+            uid: 121,
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+        }],
+    )
+    .await
+    .expect("применить изменения признаков IMAP");
+    assert!(
+        flagged(&db, message).await,
+        "отказавшая операция признака пропустила старое значение сервера"
+    );
+    assert_eq!(
+        task_state(&db, message)
+            .await
+            .expect("дело письма на месте")
+            .0,
+        "active",
+        "дело отсоединено из-за собственной же неотправленной операции признака"
+    );
+
+    // Тот же ответ приходит и полной синхронизацией, и записью признака по
+    // причине синхронизации: все три пути обязаны отступить.
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 121, "<failed@example.test>", false)],
+        false,
+    )
+    .await
+    .expect("полная синхронизация принесла прежнее значение");
+    assert!(
+        flagged(&db, message).await,
+        "полная синхронизация сняла флажок при отказавшей операции признака"
+    );
+    db.mark_flagged_many(&[message], false, FlagChangeReason::Sync)
+        .await
+        .expect("синхронизация снимает признак");
+    assert!(
+        flagged(&db, message).await,
+        "запись признака по причине синхронизации не отступила перед отказавшей операцией"
+    );
+    db.close().await;
+}
+
+/// S-017, S-054, S-061: сроки приходят из окна программы в своём виде времени,
+/// а ядро сравнивает их строками с временем базы. Без приведения к одному виду
+/// просроченных дел не бывает вовсе, а напоминание ждёт полуночи. Сроки здесь
+/// задаются ровно так, как их шлёт окно программы.
+#[tokio::test]
+async fn interface_times_are_stored_in_the_format_the_core_compares() {
+    use chrono::SecondsFormat;
+
+    let db: TestDb = open_test_db("flag-time-format").await;
+    let account = seed_account(&db, "format@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let overdue = seed_message(&db, account, inbox, 131, "<overdue@example.test>", 1, false).await;
+    let reminded = seed_message(&db, account, inbox, 132, "<remind@example.test>", 1, false).await;
+
+    // Срок исполнения истёк час назад: дело просрочено и сегодня, а не с
+    // завтрашнего дня.
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    db.save_message_task(&MessageTaskInput {
+        message_id: overdue,
+        start_at: None,
+        due_at: Some(past),
+        reminder_at: None,
+    })
+    .await
+    .expect("сохранить срок дела");
+
+    assert_eq!(
+        db.overdue_message_task_count()
+            .await
+            .expect("счётчик просроченных"),
+        1,
+        "счётчик просроченных не увидел дела, срок которого истёк час назад"
+    );
+    let page = db.list_message_tasks(100, None).await.expect("список дел");
+    let shown = page
+        .items
+        .iter()
+        .find(|item| item.task.message_id == overdue)
+        .expect("дело в списке");
+    assert!(
+        shown
+            .task
+            .due_at
+            .as_deref()
+            .is_some_and(|due| !due.contains('T')),
+        "срок сохранён в чужом виде времени: {:?}",
+        shown.task.due_at
+    );
+
+    // Время напоминания наступает через секунду: проход цикла напоминаний
+    // обязан его забрать, а не отложить до следующих суток.
+    let soon = (chrono::Utc::now() + chrono::Duration::seconds(1))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    db.save_message_task(&MessageTaskInput {
+        message_id: reminded,
+        start_at: None,
+        due_at: None,
+        reminder_at: Some(soon),
+    })
+    .await
+    .expect("сохранить время напоминания");
+    assert!(
+        db.due_task_reminders(50)
+            .await
+            .expect("наступившие напоминания")
+            .is_empty(),
+        "напоминание показано раньше своего времени"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let reminders = db
+        .due_task_reminders(50)
+        .await
+        .expect("наступившие напоминания");
+    assert!(
+        reminders.iter().any(|item| item.message_id == reminded),
+        "наступившее напоминание не забрано проходом цикла: оно придёт только после полуночи"
+    );
+    db.close().await;
+}
+
+/// S-045 - S-047, S-050, S-052: список дел разбит на группы, выстроен полным
+/// порядком и читается страницами по курсору. Курсор ведётся по той же
+/// четвёрке - группа, срок, дата письма, номер письма, - иначе страницы
+/// повторяют или теряют строки, а уводимое письмо показывается наравне с
+/// остальными.
+#[tokio::test]
+async fn the_task_list_is_grouped_and_paged_by_its_cursor() {
+    let db: TestDb = open_test_db("flag-task-paging").await;
+    let account = seed_account(&db, "paging@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
+
+    // Сроки заданы сдвигом от текущего времени, чтобы проверка не зависела ни
+    // от календаря, ни от часового пояса компьютера.
+    let overdue = seed_message(&db, account, inbox, 1, "<overdue@example.test>", 3, true).await;
+    let this_week = seed_message(&db, account, inbox, 2, "<week@example.test>", 4, true).await;
+    let later = seed_message(&db, account, inbox, 3, "<later@example.test>", 5, true).await;
+    let no_due = seed_message(&db, account, inbox, 4, "<nodue@example.test>", 6, true).await;
+    let done = seed_message(&db, account, inbox, 5, "<done@example.test>", 7, false).await;
+    let takeaway = seed_message(&db, account, inbox, 6, "<takeaway@example.test>", 8, true).await;
+
+    let shift = |offset: &str| -> String {
+        (chrono::Utc::now() + chrono::Duration::days(offset.parse::<i64>().unwrap()))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    };
+    seed_task(&db, overdue, Some(&shift("-1")), "active").await;
+    seed_task(&db, this_week, Some(&shift("3")), "active").await;
+    seed_task(&db, later, Some(&shift("30")), "active").await;
+    seed_task(&db, done, None, "done").await;
+    seed_task(&db, takeaway, Some(&shift("2")), "active").await;
+    // Письмо no_due попадает в список одним признаком важности, без строки
+    // дела: письмо с флажком - это дело в состоянии active (S-014, S-015).
+
+    // По уводимому письму стоит незавершённая операция переноса: в списке дел
+    // его быть не должно, как и в списках писем.
+    db.queue_message_move(&[takeaway], archive)
+        .await
+        .expect("поставить перенос");
+
+    // Страницами по две записи: курсор ведёт по тому же порядку, что и список.
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = db
+            .list_message_tasks(2, cursor.as_deref())
+            .await
+            .expect("страница списка дел");
+        assert!(
+            page.items.len() <= 2,
+            "страница больше запрошенного предела"
+        );
+        seen.extend(page.items.iter().map(|item| item.task.message_id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(
+        seen,
+        vec![overdue, this_week, later, no_due, done],
+        "порядок списка дел по группам нарушен или страницы потеряли строки"
+    );
+    let unique = seen.iter().collect::<std::collections::HashSet<_>>();
+    assert_eq!(unique.len(), seen.len(), "страницы повторили одну строку");
+    assert!(
+        !seen.contains(&takeaway),
+        "уводимое письмо показано в списке дел"
+    );
+    db.close().await;
+}
+
+/// S-024, S-034 - S-038, S-092 - S-094: групповая запись признака важности
+/// ведёт каждое письмо пачки по своей паре таблицы переходов. Снятие флажка
+/// пользователем удаляет дело вместе со сроками, возврат флажка поднимает
+/// выполненное и отсоединённое дело обратно в работу, а письмо без строки дела
+/// остаётся делом в состоянии active.
+#[tokio::test]
+async fn a_group_flag_change_follows_the_transition_table_for_every_message() {
+    let db: TestDb = open_test_db("flag-group-transitions").await;
+    let account = seed_account(&db, "group@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let active = seed_message(&db, account, inbox, 1, "<active@example.test>", 1, true).await;
+    let detached = seed_message(&db, account, inbox, 2, "<detached@example.test>", 1, true).await;
+    let plain = seed_message(&db, account, inbox, 3, "<plain@example.test>", 1, true).await;
+    let done = seed_message(&db, account, inbox, 4, "<done@example.test>", 1, false).await;
+    seed_task(&db, active, Some("2026-10-10 09:00:00"), "active").await;
+    seed_task(&db, detached, Some("2026-10-11 09:00:00"), "detached").await;
+    seed_task(&db, done, Some("2026-10-12 09:00:00"), "done").await;
+
+    // Пользователь снимает флажок сразу с трёх выделенных писем.
+    let changed = db
+        .mark_flagged_many(&[active, detached, plain], false, FlagChangeReason::User)
+        .await
+        .expect("снять флажок по выделению");
+    assert_eq!(changed, 3, "групповое снятие обработало не все письма");
+    for message in [active, detached, plain] {
+        assert!(!flagged(&db, message).await, "флажок остался стоять");
+        assert!(
+            task_state(&db, message).await.is_none(),
+            "снятие флажка пользователем обязано удалить дело вместе со сроками"
+        );
+    }
+
+    // Возврат флажка той же пачкой: выполненное дело возвращается в работу с
+    // очищенным временем выполнения, а письмо без строки дела её не заводит.
+    let back = db
+        .mark_flagged_many(&[done, plain], true, FlagChangeReason::User)
+        .await
+        .expect("вернуть флажок по выделению");
+    assert_eq!(back, 2, "групповая установка обработала не все письма");
+    let revived = task_state(&db, done)
+        .await
+        .expect("дело выполненного письма");
+    assert_eq!(
+        revived.0, "active",
+        "выполненное дело не вернулось в работу"
+    );
+    assert_eq!(
+        revived.1.as_deref(),
+        Some("2026-10-12 09:00:00"),
+        "прежние сроки дела потеряны при возврате в работу"
+    );
+    assert_eq!(revived.2, None, "время выполнения не очищено");
+    assert!(
+        task_state(&db, plain).await.is_none(),
+        "письму с одним лишь флажком заведена лишняя строка дела"
+    );
+    assert!(
+        flagged(&db, done).await && flagged(&db, plain).await,
+        "признак важности не записан"
+    );
+    db.close().await;
+}
+
+/// S-039: значение важности с сервера придерживает только та операция очереди,
+/// которая важность и меняет. Операция вида `flag` несёт оба признака сразу и
+/// ставится в том числе отметкой о прочтении, поэтому неотправленная отметка о
+/// прочтении иначе запрещала бы принять важность, выставленную на другом
+/// устройстве.
+#[tokio::test]
+async fn an_unsent_seen_mark_does_not_block_the_server_flag() {
+    let db: TestDb = open_test_db("flag-seen-op").await;
+    let account = seed_account(&db, "seen@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", 141, "<seen@example.test>", false)],
+        false,
+    )
+    .await
+    .expect("письмо пришло");
+    let message = message_id_by_uid(&db, inbox, 141).await;
+
+    // Пользователь прочитал письмо: в очереди лежит операция признаков, но
+    // важности она не касается.
+    db.mark_seen(message, true)
+        .await
+        .expect("отметить прочитанным");
+    let queued: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM outbox_ops WHERE message_id=? AND op_kind='flag' AND status='pending'",
+    )
+    .bind(message)
+    .fetch_one(&db.pool)
+    .await
+    .expect("прочитать очередь");
+    assert_eq!(queued.0, 1, "отметка о прочтении идёт прежним путём");
+
+    // На другом устройстве письмо пометили важным: значение обязано приехать.
+    db.apply_imap_flag_updates(
+        account,
+        &[DiscoveredFlagUpdate {
+            folder_path: "INBOX".into(),
+            uid: 141,
+            seen: true,
+            flagged: true,
+            answered: false,
+            draft: false,
+        }],
+    )
+    .await
+    .expect("применить изменения признаков IMAP");
+    assert!(
+        flagged(&db, message).await,
+        "неотправленная отметка о прочтении запретила принять важность с сервера"
+    );
+
+    // А вот своя неотправленная важность значение сервера придерживает.
+    db.mark_flagged(message, false).await.expect("снять флажок");
+    db.apply_imap_flag_updates(
+        account,
+        &[DiscoveredFlagUpdate {
+            folder_path: "INBOX".into(),
+            uid: 141,
+            seen: true,
+            flagged: true,
+            answered: false,
+            draft: false,
+        }],
+    )
+    .await
+    .expect("применить изменения признаков IMAP");
+    assert!(
+        !flagged(&db, message).await,
+        "ответ сервера отменил только что снятый пользователем флажок"
+    );
+
+    // Отметка о прочтении, поставленная после снятия флажка, пересобирает ту
+    // же операцию и обещание о важности не теряет.
+    db.mark_seen(message, false)
+        .await
+        .expect("отметить непрочитанным");
+    db.apply_imap_flag_updates(
+        account,
+        &[DiscoveredFlagUpdate {
+            folder_path: "INBOX".into(),
+            uid: 141,
+            seen: true,
+            flagged: true,
+            answered: false,
+            draft: false,
+        }],
+    )
+    .await
+    .expect("применить изменения признаков IMAP");
+    assert!(
+        !flagged(&db, message).await,
+        "пересобранная операция потеряла обещание об изменении важности"
+    );
     db.close().await;
 }

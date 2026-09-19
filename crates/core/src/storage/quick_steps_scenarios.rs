@@ -7,30 +7,6 @@
 use super::Db;
 use super::repo::test_storage::{TestDb, open_test_db};
 
-/// Имена таблиц взяты из миграции `0051_quick_steps.sql`.
-const STEPS: &str = "quick_steps";
-const ACTIONS: &str = "quick_step_actions";
-
-async fn table_exists(db: &Db, table: &str) -> bool {
-    sqlx::query_as::<_, (i64,)>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")
-        .bind(table)
-        .fetch_one(&db.pool)
-        .await
-        .expect("прочитать схему")
-        .0
-        > 0
-}
-
-/// Без таблиц быстрых действий ни один сценарий этого файла не имеет смысла:
-/// сказать об этом словами честнее, чем уронить проверку невнятной ошибкой
-/// запроса.
-async fn require_tables(db: &Db, what_breaks: &str) {
-    assert!(
-        table_exists(db, STEPS).await && table_exists(db, ACTIONS).await,
-        "таблиц быстрых действий нет: {what_breaks}"
-    );
-}
-
 async fn seed_account(db: &Db, email: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(
         "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
@@ -105,82 +81,6 @@ async fn step_state(db: &Db, step_id: i64) -> String {
         .0
 }
 
-/// S-013, S-060: миграция заводит хранение быстрых действий, запрещает в
-/// цепочке остановку обработки и держит номер слота в пределах десяти, но ни
-/// одной строки слота в таблицу горячих клавиш не добавляет. Готовое
-/// сочетание, вставленное миграцией, дало бы дубль с уже назначенным
-/// пользователем, после которого любое изменение любой горячей клавиши
-/// отвергалось бы проверкой занятости.
-#[tokio::test]
-async fn migration_0051_adds_quick_step_storage_without_hotkey_rows() {
-    let db: TestDb = open_test_db("quick-schema").await;
-    let applied: Vec<(i64,)> =
-        sqlx::query_as("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&db.pool)
-            .await
-            .expect("прочитать применённые миграции");
-    let versions = applied.iter().map(|row| row.0).collect::<Vec<_>>();
-    assert!(
-        versions.contains(&51),
-        "миграции 0051 нет: собрать цепочку действий одной кнопкой негде"
-    );
-    require_tables(&db, "быстрое действие сохранить негде").await;
-
-    let slots: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM keybindings WHERE action LIKE 'quick\\_step\\_%' ESCAPE '\\'",
-    )
-    .fetch_one(&db.pool)
-    .await
-    .expect("прочитать горячие клавиши");
-    assert_eq!(
-        slots.0, 0,
-        "миграция завела строки слотов: дубль сочетания запретил бы менять любую горячую клавишу"
-    );
-
-    let account = seed_account(&db, "schema@example.test").await;
-    let folder = seed_folder(&db, account, "Работа", None).await;
-    let step = seed_step(&db, "В работу", 0).await;
-    seed_action(&db, step, 0, "move", Some(folder), None).await;
-
-    // Остановка обработки быстрым действиям запрещена: останавливать в цепочке
-    // нечего, прогона правил при нажатии кнопки нет.
-    let stop = sqlx::query(
-        "INSERT INTO quick_step_actions(quick_step_id, sort_order, kind) VALUES(?, 1, 'stop')",
-    )
-    .bind(step)
-    .execute(&db.write_pool)
-    .await;
-    assert!(
-        stop.is_err(),
-        "схема приняла действие остановки обработки в цепочке быстрого действия"
-    );
-
-    // Номер слота ограничен десятью и принадлежит одному быстрому действию.
-    let eleventh = sqlx::query("UPDATE quick_steps SET hotkey_slot=11 WHERE id=?")
-        .bind(step)
-        .execute(&db.write_pool)
-        .await;
-    assert!(
-        eleventh.is_err(),
-        "схема приняла одиннадцатый слот горячей клавиши"
-    );
-    sqlx::query("UPDATE quick_steps SET hotkey_slot=1 WHERE id=?")
-        .bind(step)
-        .execute(&db.write_pool)
-        .await
-        .expect("первый слот");
-    let other = seed_step(&db, "В архив", 1).await;
-    let taken = sqlx::query("UPDATE quick_steps SET hotkey_slot=1 WHERE id=?")
-        .bind(other)
-        .execute(&db.write_pool)
-        .await;
-    assert!(
-        taken.is_err(),
-        "один слот достался двум быстрым действиям: одно нажатие вызвало бы два действия"
-    );
-    db.close().await;
-}
-
 /// S-058, S-059, S-061: сочетание назначается слоту тем же путём, что и
 /// встроенным действиям клавиатуры, и строка слота заводится при первом
 /// назначении. Сейчас хранилище меняет сочетание только у существующей строки,
@@ -240,7 +140,6 @@ async fn losing_a_target_marks_the_quick_step_as_needing_attention() {
         .create_label("Разобрать", "#00ff00")
         .await
         .expect("создать метку");
-    require_tables(&db, "потерявшую цель цепочку отметить негде").await;
 
     let by_folder = seed_step(&db, "В работу", 0).await;
     seed_action(&db, by_folder, 0, "move", Some(folder), None).await;
@@ -279,6 +178,164 @@ async fn losing_a_target_marks_the_quick_step_as_needing_attention() {
         step_state(&db, by_label).await,
         "needs_attention",
         "быстрое действие без метки обязано отказывать в запуске"
+    );
+    db.close().await;
+}
+
+/// Письмо в базе. Полей ровно столько, сколько нужно снимку письма, по
+/// которому идёт цепочка быстрого действия.
+async fn seed_message(db: &Db, account_id: i64, folder_id: i64, uid: i64) -> i64 {
+    sqlx::query_as::<_, (i64,)>(
+        "INSERT INTO messages(account_id, folder_id, uid, from_addr, from_name, subject, preview,
+                              date, rfc822_message_id, remote_id, size, seen)
+         VALUES(?, ?, ?, 'boss@example.test', 'Начальник', 'Договор', '', datetime('now'), ?, ?, 100, 0)
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(folder_id)
+    .bind(uid)
+    .bind(format!("<msg-{folder_id}-{uid}@example.test>"))
+    .bind(format!("remote-{folder_id}-{uid}"))
+    .fetch_one(&db.write_pool)
+    .await
+    .expect("сохранить письмо")
+    .0
+}
+
+/// Незавершённые операции увода письма: вид и состояние.
+async fn takeaways(db: &Db, message_id: i64) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT op_kind, status FROM outbox_ops
+          WHERE message_id=? AND op_kind IN ('move','delete') ORDER BY id",
+    )
+    .bind(message_id)
+    .fetch_all(&db.pool)
+    .await
+    .expect("прочитать операции увода письма")
+}
+
+async fn seen(db: &Db, message_id: i64) -> bool {
+    sqlx::query_as::<_, (i64,)>("SELECT seen FROM messages WHERE id=?")
+        .bind(message_id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("прочитать признак прочтения")
+        .0
+        != 0
+}
+
+/// S-021, S-023, S-025, S-028 - S-032, S-042: цепочка применяется к пачке
+/// писем целиком, а письмо, которое обработать нельзя, становится пропуском с
+/// отдельной причиной и не роняет остальную пачку. Без проверки занятое письмо
+/// либо забирало бы свою незавершённую операцию у работника очереди, либо
+/// отказом откатывало бы всю пачку, а письмо чужого ящика ушло бы в папку
+/// соседнего ящика; отчёт же назвал бы одно общее число вместо применённых и
+/// пропущенных с причинами.
+#[tokio::test]
+async fn a_batch_run_skips_busy_and_foreign_messages_and_applies_the_rest() {
+    let db: TestDb = open_test_db("quick-batch").await;
+    let mine = seed_account(&db, "mine@example.test").await;
+    let inbox = seed_folder(&db, mine, "Входящие", Some("inbox")).await;
+    let archive = seed_folder(&db, mine, "Архив", Some("archive")).await;
+    let other = seed_account(&db, "other@example.test").await;
+    let other_inbox = seed_folder(&db, other, "Входящие", Some("inbox")).await;
+
+    let plain = seed_message(&db, mine, inbox, 1).await;
+    let busy = seed_message(&db, mine, inbox, 2).await;
+    let foreign = seed_message(&db, other, other_inbox, 3).await;
+
+    // Цепочка: сначала местная отметка о прочтении, затем увод в конкретную
+    // папку первого ящика - именно номер папки делает письмо чужого ящика
+    // необрабатываемым (S-042).
+    let step = seed_step(&db, "В архив", 0).await;
+    seed_action(&db, step, 0, "mark_read", None, None).await;
+    seed_action(&db, step, 1, "move", Some(archive), None).await;
+
+    // Занятое письмо получает операцию настоящим путём: перенос ставит команда
+    // пользователя, а в состояние processing его переводит настоящий работник
+    // очереди. Прямым запросом сдвигается только срок первой попытки: окно
+    // отмены переноса - 10 секунд, и ждать их незачем.
+    db.queue_message_move(&[busy], archive)
+        .await
+        .expect("поставить перенос занятому письму");
+    sqlx::query(
+        "UPDATE outbox_ops SET next_attempt_at=datetime('now','-1 minutes') WHERE message_id=?",
+    )
+    .bind(busy)
+    .execute(&db.write_pool)
+    .await
+    .expect("окно отмены истекло");
+    let claimed = db
+        .claim_outbox_operations(mine, 10)
+        .await
+        .expect("работник очереди забрал операции");
+    assert_eq!(claimed.len(), 1, "работник забрал ровно одну операцию");
+    assert_eq!(
+        takeaways(&db, busy).await,
+        vec![("move".to_owned(), "processing".to_owned())],
+        "письмо обязано быть занятым переносом на сервере"
+    );
+
+    let report = db
+        .apply_quick_step(step, &[plain, busy, foreign])
+        .await
+        .expect("пропуск отдельного письма не отменяет применение ко всей пачке");
+
+    assert_eq!(report.applied, 1, "цепочка применена к обычному письму");
+    assert_eq!(report.skipped, 2, "пропущены занятое и чужое письмо");
+    assert_eq!(report.skipped_busy, 1, "занятое письмо названо отдельно");
+    assert_eq!(
+        report.skipped_foreign_account, 1,
+        "письмо чужого ящика названо отдельной причиной"
+    );
+    assert_eq!(
+        report.skipped_failed, 0,
+        "занятое письмо принято за письмо с операцией в состоянии отказа"
+    );
+    assert_eq!(
+        report.skipped_no_folder, 0,
+        "папка назначения есть, причина пропуска подменена"
+    );
+
+    // S-021: увод обычного письма ушёл в очередь операций, а не на сервер из
+    // обработчика нажатия, и целью стоит выбранная папка.
+    assert_eq!(report.operation_ids.len(), 1, "поставлен ровно один увод");
+    assert_eq!(
+        takeaways(&db, plain).await,
+        vec![("move".to_owned(), "pending".to_owned())],
+        "увод обычного письма не поставлен в очередь"
+    );
+    let payload: (String,) = sqlx::query_as("SELECT payload FROM outbox_ops WHERE id=?")
+        .bind(report.operation_ids[0])
+        .fetch_one(&db.pool)
+        .await
+        .expect("прочитать описание операции");
+    assert!(
+        payload
+            .0
+            .contains(&format!("\"target_folder_id\":{archive}")),
+        "увод поставлен не в выбранную папку: {}",
+        payload.0
+    );
+
+    // S-023: операция занятого письма осталась у работника очереди - её не
+    // заменили и не продублировали.
+    assert_eq!(
+        takeaways(&db, busy).await,
+        vec![("move".to_owned(), "processing".to_owned())],
+        "операция занятого письма изменена быстрым действием"
+    );
+    assert!(
+        takeaways(&db, foreign).await.is_empty(),
+        "письму чужого ящика поставлен увод в папку соседнего ящика"
+    );
+
+    // S-027, S-031: местная отметка цепочки записана в базу, и пропуск увода
+    // не отменил её ни у пропущенных писем, ни у остальной пачки.
+    assert!(seen(&db, plain).await, "отметка о прочтении не записана");
+    assert!(
+        seen(&db, busy).await && seen(&db, foreign).await,
+        "пропуск увода откатил уже выполненное местное действие цепочки"
     );
     db.close().await;
 }

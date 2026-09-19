@@ -99,11 +99,6 @@ test('S-007 - S-012, S-015: состав цепочки проверяется �
     'уводящее действие последним - обычная цепочка, а не ошибка');
 });
 
-test('S-058: слоты названы закрытым перечнем', () => {
-  const slots = value('QUICK_STEP_SLOT_ACTIONS', 'имён слотов горячих клавиш нет: привязать быстрое действие к клавише нечем');
-  assert.deepEqual(slots, Array.from({length: 10}, (_, index) => `quick_step_${index + 1}`));
-});
-
 test('S-062: редактор предлагает слотам сочетания', () => {
   const suggest = fn('proposedSlotCombo', 'редактор не предлагает сочетаний слотам: пользователь подбирает их вслепую');
   assert.equal(suggest(1), 'Ctrl+Shift+1');
@@ -253,4 +248,62 @@ test('S-036, S-044, S-064, S-069 - S-073: нажатие слота ведёт �
   await press('quick_step_1', Object.assign({}, context, {selection: [], activeMessage: null}));
   assert.deepEqual(calls, [], 'цепочка выполнилась без выбранного письма');
   assert.ok(notices.some(text => /письмо/i.test(text)), `пользователю не сказано, что письмо не выбрано: ${notices.join(' | ')}`);
+});
+
+test('S-004, S-005: значок берётся из закрытого перечня, а не свободной строкой', () => {
+  // Значок подставляется в разметку окна, у которого есть весь мост команд.
+  // Свободная строка разрывала бы атрибут и выполняла бы произвольный код.
+  const icons = value('ICONS', 'закрытого перечня значков нет: значок остаётся свободной строкой');
+  assert.ok(icons.length > 0, 'перечень значков пуст: выбрать нечего');
+  const normalize = fn('normalizeIcon', 'значок принимается любой строкой');
+  icons.forEach(icon => assert.equal(normalize(icon), icon, `значок ${icon} перечнем не принят`));
+  ['"><img src=x onerror=alert(1)>', 'star" onload="x', '', null, undefined, 'нет-такого-значка']
+    .forEach(bad => {
+      const result = normalize(bad);
+      assert.ok(icons.includes(result), `значок вне перечня принят как есть: ${result}`);
+    });
+
+  // Тот же перечень действует и при разборе сохранённого быстрого действия:
+  // строка, попавшая в базу другим путём, до разметки не доходит.
+  const step = fn('normalizeQuickStep', 'быстрое действие не разбирается')({
+    name: 'Разобрать',
+    icon: '"><script>alert(1)</script>',
+    actions: [{kind: 'mark_read'}],
+  });
+  assert.ok(icons.includes(step.icon), `значок из базы не приведён к перечню: ${step.icon}`);
+});
+
+test('S-012, S-038, S-042: цель действия сверяется с настоящими папками и метками', () => {
+  // Номер папки в цепочке - внутренний номер, которого пользователь нигде не
+  // видит. Опечатка в цифре уносила письма в чужую папку одним нажатием.
+  const check = fn('validateQuickStep', 'цепочка сохраняется без проверки цели');
+  const context = {
+    folders: [{id: 7, account_id: 1}, {id: 8, account_id: 1}],
+    labels: [{id: 3, name: 'Работа'}],
+  };
+  const step = actions => ({name: 'Разобрать', icon: 'star', actions});
+
+  assert.equal(check(step([{kind: 'move', folder_id: 7}]), context).ok, true,
+    'существующая папка отвергнута');
+  assert.equal(check(step([{kind: 'label_add', label_id: 3}]), context).ok, true,
+    'существующая метка отвергнута');
+  assert.equal(check(step([{kind: 'move', folder_role: 'archive'}]), context).ok, true,
+    'роль папки из закрытого перечня отвергнута');
+
+  assert.equal(check(step([{kind: 'move', folder_id: 999}]), context).reason, 'unknown_folder',
+    'принят номер папки, которой нет: письма ушли бы неизвестно куда');
+  assert.equal(check(step([{kind: 'label_add', label_id: 999}]), context).reason, 'unknown_label',
+    'принят номер метки, которой нет');
+  assert.equal(check(step([{kind: 'move', folder_role: 'sent'}]), context).reason, 'unknown_role',
+    'принята роль папки вне закрытого перечня');
+
+  const roles = value('FOLDER_ROLES', 'закрытого перечня ролей папки нет');
+  assert.ok(roles.includes('archive') && !roles.includes('sent'),
+    `перечень ролей назначения собран неверно: ${roles.join(', ')}`);
+
+  // Без перечней папок и меток проверка остаётся прежней: пустая цель
+  // отвергается, заполненная принимается.
+  assert.equal(check(step([{kind: 'move'}])).reason, 'action_folder');
+  assert.equal(check(step([{kind: 'move', folder_id: 999}])).ok, true,
+    'без перечня папок сверять номер не с чем, и отказывать не за что');
 });

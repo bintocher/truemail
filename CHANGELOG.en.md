@@ -7,6 +7,25 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-19
+
+### Fixed
+
+- Task dates and pinned messages no longer disappear on their own. A routine mail check used to erase them: moving a message from a phone, or the mailbox being reindexed, was enough for the marks to vanish without warning. They now travel with the message.
+- Clearing the flag on several messages at once no longer wipes their dates silently. The program used to ask about dates for one of the selected messages only: if that one had no date, no question appeared at all and the other messages lost their tasks.
+- Completed tasks no longer come back to life. When the importance mark failed to reach the server eight times, the server returned the old value and the task was reopened.
+- Overdue tasks are visible again and reminders arrive on time. Because a task time was stored in one format and compared in another, there were no overdue tasks at all, and a reminder only arrived after midnight. Existing dates are corrected on first start.
+- A pinned message no longer disappears from smart folders and from the list shown at startup.
+- Refreshing the message list no longer drops previously loaded pages: a gap appeared in the list that only a restart could close.
+- The flag and task buttons in the message header are reachable again: the toolbar hid them without offering a replacement.
+- A task reminder is shown in the language of the program instead of always in Russian.
+
+### Security
+
+- A quick step icon is accepted only from a fixed set. It used to be typed as free text that reached the window markup unprocessed, which is enough to run foreign code inside the program.
+- The folder and the label of a quick step are picked from a list. They used to be entered by internal number, and a typo sent messages to someone else's folder.
+
+
 ## [0.3.0] - 2026-09-19
 
 ### Added
