@@ -6,7 +6,7 @@ mod imap;
 mod jmap;
 mod smtp;
 
-pub use ews::{EwsBackend, EwsTimeouts, discover_ews_url};
+pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
 pub use imap::{
     DiscoveredFlagUpdate, DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery,
     apply_gmail_operation, apply_password_operation, apply_yandex_operation, discover_gmail,
@@ -16,7 +16,9 @@ pub use imap::{
     wait_for_password_change, wait_for_yandex_change,
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
-pub use smtp::{OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex};
+pub use smtp::{
+    OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex, validate_outgoing,
+};
 
 #[derive(Debug)]
 pub enum SendOutcome {
@@ -24,6 +26,75 @@ pub enum SendOutcome {
     SavedOnServer,
     /// SMTP доставил письмо; эти точные MIME-байты ещё нужно APPEND-ить в Sent.
     NeedsSentAppend(Vec<u8>),
+}
+
+/// Отказ передачи письма. Признак ставит сам транспорт в той точке, где отказ
+/// случился, а не разбор вида ошибки снаружи: до передачи байтов письма отказ
+/// достоверно означает, что письма у сервера нет, а после передачи итог
+/// неизвестен, и повтор способен доставить получателю второй экземпляр
+/// (specs/undo-send.md, S-048, S-049).
+#[derive(Debug)]
+pub struct SendFailure {
+    pub error: crate::Error,
+    pub after_handoff: bool,
+}
+
+/// Итог попытки передачи письма серверному модулю.
+pub type SendResult = std::result::Result<SendOutcome, SendFailure>;
+
+impl SendFailure {
+    /// Отказ до передачи письма серверу: письмо не собрано, соединение не
+    /// установлено, учётные данные не приняты.
+    pub fn before_handoff(error: crate::Error) -> Self {
+        Self {
+            error,
+            after_handoff: false,
+        }
+    }
+
+    /// Отказ после того, как байты письма уже ушли серверу.
+    pub fn after_handoff(error: crate::Error) -> Self {
+        Self {
+            error,
+            after_handoff: true,
+        }
+    }
+}
+
+/// Отказ запроса к серверу поверх HTTP. Недоступная сеть, отказ соединения,
+/// непринятые учётные данные и явно отвергнутый сервером запрос случаются до
+/// того, как письмо оказалось у сервера. Истечение времени ожидания и
+/// нераспознанный отказ приходят уже после отправки запроса, поэтому письмо
+/// могло быть принято, и повторять его нельзя.
+pub fn request_failure(error: crate::Error) -> SendFailure {
+    use crate::error::ErrorKind;
+    let before = matches!(
+        error.kind(),
+        ErrorKind::NetworkUnavailable
+            | ErrorKind::ServerUnavailable
+            | ErrorKind::CertificateError
+            | ErrorKind::InvalidCredentials
+            | ErrorKind::NeedsReauth
+            | ErrorKind::RateLimited
+            | ErrorKind::Forbidden
+            | ErrorKind::AccountConfig
+            | ErrorKind::StorageError
+            | ErrorKind::SecretStoreError
+            | ErrorKind::CryptoError
+    );
+    if before {
+        SendFailure::before_handoff(error)
+    } else {
+        SendFailure::after_handoff(error)
+    }
+}
+
+/// Отказ, случившийся до обращения к серверу: `?` внутри передачи означает
+/// именно его, потому что дальше письма ещё не было.
+impl From<crate::Error> for SendFailure {
+    fn from(error: crate::Error) -> Self {
+        Self::before_handoff(error)
+    }
 }
 
 /// ID последних писем Gmail Входящих - для быстрых уведомлений о новой почте.
@@ -219,7 +290,9 @@ pub trait MailBackend: Send + Sync {
     ) -> Result<String>;
     async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome>;
+    /// Передать письмо серверу. Отказ несёт признак точки, в которой он
+    /// случился: повторять можно только отказ до передачи письма (S-049).
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult;
     async fn append_sent(&self, email: &str, credential: &str, raw: &[u8]) -> Result<()> {
         let _ = (email, credential, raw);
         Err(crate::Error::AccountConfig(
@@ -342,7 +415,7 @@ impl MailBackend for YandexBackend {
         imap::delete_oauth_folder("imap.yandex.ru", email, credential, remote_path).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
         let raw =
             smtp::send_oauth_with_raw(message, credential, "smtp.yandex.com", 465, Security::Ssl)
                 .await?;
@@ -471,8 +544,13 @@ impl MailBackend for GmailBackend {
         gmail_api::delete_label(credential, remote_path).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
-        send_gmail(message, credential).await?;
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
+        // Сборка письма отказывает до запроса, поэтому она отделена от самого
+        // запроса: их отказы означают разное.
+        let raw = smtp::build_message(message)?.formatted();
+        smtp::send_gmail_raw(&raw, credential)
+            .await
+            .map_err(request_failure)?;
         Ok(SendOutcome::SavedOnServer)
     }
 
@@ -596,7 +674,7 @@ impl MailBackend for OutlookBackend {
         imap::wait_for_oauth_change("outlook.office365.com", email, credential).await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
         let raw = smtp::send_oauth_with_raw(
             message,
             credential,
@@ -792,7 +870,7 @@ impl MailBackend for GenericImapBackend {
         .await
     }
 
-    async fn send(&self, message: OutgoingMessage, credential: &str) -> Result<SendOutcome> {
+    async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
         let smtp = self.smtp.as_ref().ok_or_else(|| {
             crate::Error::AccountConfig("для аккаунта не настроен SMTP-сервер".into())
         })?;

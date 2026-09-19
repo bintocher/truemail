@@ -108,17 +108,19 @@ let coreReloadCount=0;
 // вылетала бы сразу после загрузки, курсор не двигался, и список замирал.
 function trimMessages(list,keepIds=null){
   if(list.length<=MESSAGE_MEMORY_LIMIT)return list;
-  const pinned=new Set(currentMessageRows.map(message=>message.id));
-  if(activeMessage)pinned.add(activeMessage.id);
-  selectedMessageIds.forEach(id=>pinned.add(id));
-  if(keepIds)keepIds.forEach(id=>pinned.add(id));
+  const held=new Set(pinMessageModel.messageRows(currentMessageRows).map(message=>message.id));
+  if(activeMessage)held.add(activeMessage.id);
+  selectedMessageIds.forEach(id=>held.add(id));
+  if(keepIds)keepIds.forEach(id=>held.add(id));
   // Письма открытой умной папки удерживаем, но не больше общего потолка:
   // иначе одна разросшаяся папка отменяла бы ограничение памяти целиком.
   const smartFolder=currentSmartIndex!==null?smartFolders[currentSmartIndex]:null;
-  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).slice(0,MESSAGE_MEMORY_LIMIT).forEach(message=>pinned.add(message.id));
-  const kept=list.filter(message=>pinned.has(message.id));
-  const rest=list.filter(message=>!pinned.has(message.id)).sort(byDateDesc);
-  return kept.concat(rest.slice(0,Math.max(0,MESSAGE_MEMORY_LIMIT-kept.length)));
+  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).slice(0,MESSAGE_MEMORY_LIMIT).forEach(message=>held.add(message.id));
+  const trimmed=pinMessageModel.trimToMemoryLimit({
+    pinned:list.filter(message=>message.pinned_at),
+    normal:list.filter(message=>!message.pinned_at),
+  },{limit:MESSAGE_MEMORY_LIMIT,keepIds:[...held]});
+  return trimmed.pinned.concat(trimmed.normal);
 }
 window.trimMessages=trimMessages;
 // Окно скрыли (свернули в панель задач или в трей) - смотреть на список некому.
@@ -314,6 +316,9 @@ const BACKFILL_PAGE_SIZE=15;
 const SMART_BACKFILL_FOLDERS=5;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
+const ordinaryPageCursors=new Map();
+function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id),date=String(message.date||'');if(!current||date<String(current.date||'')||date===String(current.date||'')&&message.id<current.id)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{if(!ordinaryPageCursors.has(folderId))ordinaryPageCursors.set(folderId,{date:message.date||'',id:message.id});});}
+window.seedOrdinaryPageCursors=seedOrdinaryPageCursors;
 let loadingMoreMessages=false;
 let loadingSmartCoverage=false;
 let queuedSmartCoverage=null;
@@ -341,7 +346,7 @@ function selectMessageRange(index,preserve=false){
   if(anchor<0){selectedMessageIds.add(currentMessageRows[index].id);selectionAnchorId=currentMessageRows[index].id;updateSelectionUi();return;}
   if(!preserve)selectedMessageIds.clear();
   const from=Math.min(index,anchor),to=Math.max(index,anchor);
-  for(let i=from;i<=to;i++)selectedMessageIds.add(currentMessageRows[i].id);
+  for(let i=from;i<=to;i++)if(!currentMessageRows[i]?.kind)selectedMessageIds.add(currentMessageRows[i].id);
   updateSelectionUi();
 }
 document.addEventListener('pointerup',()=>{selectionDragMode=null;});
@@ -419,12 +424,12 @@ async function loadNextMessagePage(serverBackfill=false){
   if(currentFolderId===null){if(currentSmartIndex!==null)loadSmartCoveragePage(currentSmartIndex,false,serverBackfill);return;}if(loadingMoreMessages)return;const folderIds=folderHasMore.get(currentFolderId)===false?[]:[currentFolderId];if(!folderIds.length)return;
   loadingMoreMessages=true;const currentFolder=coreFolders.find(item=>item.id===currentFolderId);setListLoading(true,currentFolder?folderTitle(currentFolder):'письма');
   try{
-    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId);
+    const known=new Set(messages.map(message=>message.id));for(const folderId of folderIds){const loaded=messages.filter(message=>message.folder_id===folderId&&!message.pinned_at);
       // Курсор - ИСТИННЫЙ минимум (самая старая дата, затем наименьший id).
       // Сортировка только по дате давала неверный курсор при равных датах, и
       // запрос возвращал уже показанные письма (дубли), из-за чего прокрутка
       // крутилась вхолостую, а догрузка не запускалась.
-      const cursor=loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+      const cursor=ordinaryPageCursors.get(folderId)||loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
       if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       let fresh=page.filter(message=>!known.has(message.id));
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
@@ -432,7 +437,7 @@ async function loadNextMessagePage(serverBackfill=false){
       // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
       let backfillDone=false;
       if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
-      messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));
+      messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));const pageLast=page[page.length-1];if(pageLast)ordinaryPageCursors.set(folderId,{date:pageLast.date||'',id:pageLast.id});
       // Концом папки считаем только удавшийся проход: пустая страница без похода
       // на сервер и упавший запрос догрузки его не подтверждают - письма на
       // сервере есть, и прокрутка пользователя должна их достать.
@@ -496,7 +501,8 @@ msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=
   if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage(true);}},{passive:true});
 
 /* thread action buttons -> compose */
-document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=()=>{
+document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
-  else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);});
-
+  else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
+  else if(b.dataset.act==='flag-message'&&activeMessage){const flagged=!activeMessage.flags?.flagged;if(!flagged&&activeMessage.task_due_at&&!confirm(L('Снять флажок и удалить сроки дела?','Clear the flag and delete task dates?')))return;try{await window.tm.markFlagged([activeMessage.id],flagged,'user');await window.reloadCoreData();}catch(error){showToast(error);}}
+  else if(b.dataset.act==='task-message'&&activeMessage)window.openMessageTaskEditor?.(activeMessage);});

@@ -73,9 +73,67 @@ window.corePageSize = 100;
     listUnifiedSources: () => invoke("list_unified_sources"),
     setUnifiedSource: (folderId, included) => invoke("set_unified_source", { folderId, included }),
     listMailRules: () => invoke("list_mail_rules"),
-    saveMailRule: (rule, applyExisting) => invoke("save_mail_rule", { rule, applyExisting }),
+    saveMailRule: (rule, applyExisting, knownRuleIds = null) => invoke("save_mail_rule", { rule, applyExisting, knownRuleIds }),
     setMailRuleEnabled: (id, enabled) => invoke("set_mail_rule_enabled", { id, enabled }),
     deleteMailRule: (id) => invoke("delete_mail_rule", { id }),
+    reorderMailRules: (ids) => invoke("reorder_mail_rules", { ids }),
+    mailRuleDeleteConfirmation: (rule) => invoke("mail_rule_delete_confirmation", { rule }),
+    runMailRules: (accountId, folderIds, ruleIds = null) => invoke("run_mail_rules", { accountId, folderIds, ruleIds }),
+    continueMailRuleRun: (runId) => invoke("continue_mail_rule_run", { runId }),
+    lastMailRuleRun: () => invoke("last_mail_rule_run"),
+    pendingMailRuleRuns: () => invoke("pending_mail_rule_runs"),
+    // Списки заблокированных и доверенных отправителей (blocked-senders.md, S-050).
+    listSenderPolicies: () => invoke("list_sender_policies"),
+    previewSenderPolicy: (kind, value) => invoke("preview_sender_policy", { kind, value }),
+    saveSenderPolicy: (kind, value, decision, confirmOwnDomain = false) => invoke("save_sender_policy", { kind, value, decision, confirmOwnDomain }),
+    deleteSenderPolicy: (id) => invoke("delete_sender_policy", { id }),
+    startSenderPolicySweep: (policyId, snapshotKey, consent) => invoke("start_sender_policy_sweep", { policyId, snapshotKey, consent }),
+    continueSenderPolicySweep: (jobId) => invoke("continue_sender_policy_sweep", { jobId }),
+    cancelSenderPolicySweep: (jobId) => invoke("cancel_sender_policy_sweep", { jobId }),
+    pendingSenderPolicyJobs: () => invoke("pending_sender_policy_jobs"),
+    // Игнорирование переписки (ignore-conversation.md, S-051).
+    listIgnoredConversations: () => invoke("list_ignored_conversations"),
+    previewIgnoreConversation: (messageId) => invoke("preview_ignore_conversation", { messageId }),
+    enableIgnoreConversation: (messageId, snapshotKey, confirmed) => invoke("enable_ignore_conversation", { messageId, snapshotKey, confirmed }),
+    disableIgnoreConversation: (conversationId, returnMessages) => invoke("disable_ignore_conversation", { conversationId, returnMessages }),
+    continueIgnoreJob: (jobId) => invoke("continue_ignore_job", { jobId }),
+    pendingIgnoreJobs: () => invoke("pending_ignore_jobs"),
+    // Автоочистка писем по отправителю (sweep-by-sender.md, S-047).
+    listSenderSweepRules: () => invoke("list_sender_sweep_rules"),
+    previewSenderSweep: (input) => invoke("preview_sender_sweep", { input }),
+    startSenderSweep: (input, snapshotKey) => invoke("start_sender_sweep", { input, snapshotKey }),
+    setSenderSweepEnabled: (id, enabled) => invoke("set_sender_sweep_enabled", { id, enabled }),
+    updateSenderSweepMode: (id, mode, days, sweepArchive) => invoke("update_sender_sweep_mode", { id, mode, days, sweepArchive }),
+    deleteSenderSweepRule: (id) => invoke("delete_sender_sweep_rule", { id }),
+    continueSenderSweepJob: (jobId) => invoke("continue_sender_sweep_job", { jobId }),
+    cancelSenderSweepJob: (jobId) => invoke("cancel_sender_sweep_job", { jobId }),
+    pendingSenderSweepJobs: () => invoke("pending_sender_sweep_jobs"),
+    // Очередь отправки: окно отмены, раздел "Исходящие" и возврат отменённого
+    // письма в композер (specs/undo-send.md).
+    undoSendSeconds: () => invoke("undo_send_seconds"),
+    setUndoSendSeconds: (seconds) => invoke("set_undo_send_seconds", { seconds }),
+    listOutboxSends: (accountId, limit, offset) => invoke("list_outbox_sends", { accountId, limit, offset }),
+    cancelSend: (accountId, operationId) => invoke("cancel_send", { accountId, operationId }),
+    openCancelledSend: (accountId, operationId) => invoke("open_cancelled_send", { accountId, operationId }),
+    deleteSend: (accountId, operationId) => invoke("delete_send", { accountId, operationId }),
+    retrySend: (accountId, operationId) => invoke("retry_send", { accountId, operationId }),
+    startupSendState: () => invoke("startup_send_state"),
+    releaseUndoWindows: () => invoke("release_undo_windows"),
+    // Автоответ "нет на месте" (specs/out-of-office.md).
+    outOfOffice: (accountId) => invoke("out_of_office", { accountId }),
+    saveOutOfOffice: (input) => invoke("save_out_of_office", { input }),
+    disableOutOfOffice: (accountId) => invoke("disable_out_of_office", { accountId }),
+    listOutOfOfficeReplies: (accountId, limit) => invoke("list_out_of_office_replies", { accountId, limit }),
+    // История получателей (specs/recipient-history.md).
+    recipientCandidates: (accountId) => invoke("recipient_candidates", { accountId }),
+    listRecipientHistory: (accountId, limit, offset) => invoke("list_recipient_history", { accountId, limit, offset }),
+    updateRecipientHistory: (accountId, entryId, name, address) => invoke("update_recipient_history", { accountId, entryId, name, address }),
+    deleteRecipientHistoryEntry: (accountId, entryId) => invoke("delete_recipient_history_entry", { accountId, entryId }),
+    clearRecipientHistory: (accountId) => invoke("clear_recipient_history", { accountId }),
+    failedMessageOperations: () => invoke("failed_message_operations"),
+    retryMessageOperation: (operationId) => invoke("retry_message_operation", { operationId }),
+    discardMessageOperation: (operationId) => invoke("discard_message_operation", { operationId }),
+    accountsWithoutTrash: () => invoke("accounts_without_trash"),
     listContacts: (query) => invoke("list_contacts", { query }),
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
@@ -97,10 +155,30 @@ window.corePageSize = 100;
     syncAccounts: () => invoke("sync_accounts"),
     syncAuxiliaryAccounts: () => invoke("sync_auxiliary_accounts"),
     startRealtime: () => invoke("start_realtime"),
-    sendMessage: (request) => invoke("send_message", { request }),
+    // Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
+    // второй операции не создаёт (specs/undo-send.md, S-053).
+    sendMessage: (request, requestKey) => invoke("send_message", { request, requestKey }),
     scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
-    markFlagged: (messageId, flagged) => invoke("mark_flagged", { messageId, flagged }),
+    markFlagged: (messageIds, flagged, reason = "user") => invoke("mark_flagged", { messageIds: Array.isArray(messageIds) ? messageIds : [messageIds], flagged, reason }),
+    setMessagesPinned: (messageIds, pinned) => invoke("set_messages_pinned", { messageIds, pinned }),
+    listPinnedMessages: (viewKind, viewValue = null) => invoke("list_pinned_messages", { viewKind, viewValue }),
+    saveMessageTask: (input) => invoke("save_message_task", { input }),
+    getMessageTask: (messageId) => invoke("get_message_task", { messageId }),
+    listMessageTasks: (limit = 100, cursor = null) => invoke("list_message_tasks", { limit, cursor }),
+    completeMessageTask: (messageId) => invoke("complete_message_task", { messageId }),
+    reopenMessageTask: (messageId) => invoke("reopen_message_task", { messageId }),
+    deleteMessageTask: (messageId) => invoke("delete_message_task", { messageId }),
+    overdueMessageTaskCount: () => invoke("overdue_message_task_count"),
+    dueTaskReminders: (limit = 50) => invoke("due_task_reminders", { limit }),
+    markTaskRemindersShown: (messageIds) => invoke("mark_task_reminders_shown", { messageIds }),
+    snoozeTaskReminder: (messageId) => invoke("snooze_task_reminder", { messageId }),
+    listQuickSteps: () => invoke("list_quick_steps"),
+    saveQuickStep: (input) => invoke("save_quick_step", { input }),
+    deleteQuickStep: (id) => invoke("delete_quick_step", { id }),
+    reorderQuickSteps: (ids) => invoke("reorder_quick_steps", { ids }),
+    bindQuickStepSlot: (id, slot) => invoke("bind_quick_step_slot", { id, slot }),
+    applyQuickStep: (id, messageIds) => invoke("apply_quick_step", { id, messageIds }),
     snoozeMessages: (messageIds, until) => invoke("snooze_messages", { messageIds, until }),
     unsnoozeMessages: (messageIds) => invoke("unsnooze_messages", { messageIds }),
     releaseDueSnoozes: () => invoke("release_due_snoozes"),
@@ -206,6 +284,7 @@ window.corePageSize = 100;
     try { await window.reloadCoreData?.(); } catch (_) {}
     await window.openMessageById?.(id);
   }).catch(console.error);
+  tauri.event?.listen("truemail-open-tasks", () => window.openTasksSection?.()).catch(console.error);
 
   // Переход в календарь по клику "Открыть" в карточке изменения встречи.
   tauri.event?.listen("truemail-open-event", event => {
@@ -277,10 +356,13 @@ window.corePageSize = 100;
     const unifiedSources = await window.tm.listUnifiedSources();
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
-    const [contacts, calendarData, smartFolders, storage] = await Promise.all([
-      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(),
+    const [contacts, calendarData, smartFolders, storage, pinned, overdueTasks] = await Promise.all([
+      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount(),
     ]);
-    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat(), contacts, calendarData, smartFolders, storage);
+    const taskCount = document.getElementById("tasksOverdueCount");
+    if (taskCount) taskCount.textContent = overdueTasks > 0 ? String(overdueTasks) : "";
+    window.corePinnedMessages = pinned.messages || [];
+    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat().concat(pinned.ordinary || [], window.corePinnedMessages), contacts, calendarData, smartFolders, storage);
   }
   // Перезагрузки выстраиваем в очередь: reloadCoreData зовут и обработчик
   // событий, и модули после действий пользователя. Параллельные проходы
@@ -320,6 +402,7 @@ window.corePageSize = 100;
       // preview_lines, contacts_view, notify_position).
       const settings = await window.tm.allSettings();
       await window.refreshKeybindings?.();
+      await window.reloadQuickSteps?.();
       const onboardingCompleted = settings.onboarding_completed;
       // Выставляем до загрузки данных: renderCoreAccounts по этому флагу решает,
       // можно ли открывать композер для файлов из меню "Отправить".
@@ -329,6 +412,13 @@ window.corePageSize = 100;
       if (window.applyCoreSettings) window.applyCoreSettings(settings);
       window.markSettingsLoaded?.();
       await window.reloadMailRules?.();
+      await window.reloadSenderSections?.();
+      await window.reloadQueueSections?.();
+      await window.loadUndoSendSetting?.();
+      // undo-send.md S-034 - S-036: незакончившиеся окна отмены восстанавливаются
+      // карточкой с фактически оставшимся временем, а письма с истёкшим окном
+      // показываются одним сообщением, а не карточкой на каждое письмо.
+      window.restoreUndoWindows?.().catch(console.error);
       console.info("truemail: подключено к ядру, аккаунтов:", accounts.length);
       if (accounts.length === 0 && window.showEmptyMailbox) window.showEmptyMailbox();
       // Стартовая загрузка тоже наполняет список: пока она идёт, освобождение

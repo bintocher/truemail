@@ -23,9 +23,14 @@ use truemail_core::api::{
     ApiAuditEntry, ApiClient, Capability, CreatedApiClient, McpTool, mcp_tools,
 };
 use truemail_core::model::{
-    Account, AuthKind, BackendKind, Contact, Event, EventStatus, Folder, Keybinding, MailRule,
-    MailRuleInput, MessageFull, MessageMeta, MessageTemplate, Provider, RsvpResponse, Security,
-    ServerConfig, Signature, SmartFolder, SmartFolderCount, resolve_my_attendance,
+    Account, AuthKind, BackendKind, Contact, Event, EventStatus, FlagChangeReason, Folder,
+    IgnoreConversationPreview, IgnoreJobReport, IgnoredConversation, Keybinding, MailRule,
+    MailRuleInput, MessageFull, MessageMeta, MessageTask, MessageTaskInput, MessageTemplate,
+    PinMessagesResult, PinnedMessageList, Provider, QuickStep, QuickStepInput, QuickStepReport,
+    RsvpResponse, Security, SenderPolicy, SenderPolicyPreview, SenderPolicyReleaseReport,
+    SenderPolicySweepReport, SenderSweepInput, SenderSweepJobReport, SenderSweepPreview,
+    SenderSweepRule, ServerConfig, Signature, SmartFolder, SmartFolderCount, TaskListPage,
+    TaskReminder, is_quick_step_key_action, normalize_key_combo, resolve_my_attendance,
 };
 use truemail_core::storage::repo::{
     CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
@@ -89,6 +94,10 @@ pub struct AppState {
     // исчерпаны, временный сбой не всплывает: программа сама переподключается,
     // и человеку показывать нечего. Успешный проход обнуляет счёт.
     pub mail_failures: Arc<tokio::sync::Mutex<HashMap<i64, u32>>>,
+    // Принятое письмо будит работников очереди отправки. Без этого письмо,
+    // принятое сразу после прохода, ждало бы конца общего сна: окно отмены в
+    // пять секунд превращалось бы примерно в десять (undo-send.md, S-024).
+    pub send_wakeup: Arc<tokio::sync::Notify>,
 }
 
 /// Сколько сбоев подряд по одному аккаунту считаются исчерпанными повторами:
@@ -1024,7 +1033,7 @@ async fn notify_new_mail(
         let mut guard = notified.lock().await;
         dedupe_notified(&mut guard, new_message_ids)
     };
-    let Some(&message_id) = fresh.last() else {
+    if fresh.is_empty() {
         tracing::debug!(
             source,
             account = %truemail_core::logging::mask_email(&account.email),
@@ -1032,8 +1041,32 @@ async fn notify_new_mail(
             "уведомление подавлено: письма уже показаны другим путём"
         );
         return;
+    }
+    // S-010: между сбором списка и показом письмо могло быть уведено стадией
+    // или действием пользователя. Проверяется каждое письмо списка: проверка
+    // одного лишь последнего прятала бы уведомление о настоящей новой почте,
+    // когда уведено именно оно.
+    let mut notifiable = Vec::with_capacity(fresh.len());
+    for candidate in &fresh {
+        if core
+            .db
+            .message_is_notifiable(*candidate)
+            .await
+            .unwrap_or(true)
+        {
+            notifiable.push(*candidate);
+        }
+    }
+    let Some(&message_id) = notifiable.last() else {
+        tracing::debug!(
+            source,
+            account = %truemail_core::logging::mask_email(&account.email),
+            candidates = new_message_ids.len(),
+            "уведомление подавлено: все письма уведены стадиями обработки"
+        );
+        return;
     };
-    let count = fresh.len();
+    let count = notifiable.len();
     let meta = core
         .db
         .message_notification_preview(message_id)
@@ -1609,6 +1642,7 @@ fn parse_event_start(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// Фоновый цикл: уведомляет о встречах, начинающихся в ближайшие 10 минут.
 async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
     let mut notified: HashSet<String> = HashSet::new();
+    let mut last_task_cleanup = None;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         let events = match core.db.list_calendars_and_events().await {
@@ -1674,6 +1708,85 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
         if notified.len() > 1000 {
             notified.clear();
         }
+        loop {
+            let reminders = match core.db.due_task_reminders(50).await {
+                Ok(value) => value,
+                Err(_) => break,
+            };
+            if reminders.is_empty() {
+                break;
+            }
+            let ids = reminders
+                .iter()
+                .map(|item| item.message_id)
+                .collect::<Vec<_>>();
+            if core.db.mark_task_reminders_shown(&ids).await.is_err() {
+                break;
+            }
+            for reminder in reminders {
+                let sender = reminder
+                    .sender_name
+                    .clone()
+                    .or(reminder.sender_address.clone())
+                    .unwrap_or_else(|| "Отправитель неизвестен".into());
+                push_notification(
+                    &app,
+                    serde_json::json!({
+                        "kind": "task",
+                        "title": "Напоминание о деле",
+                        "subject": if reminder.subject.is_empty() { "Без темы" } else { &reminder.subject },
+                        "preview": sender,
+                        "details": reminder.due_at,
+                        "message_id": reminder.message_id,
+                    }),
+                    "task-reminder",
+                );
+            }
+        }
+        let today = chrono::Utc::now().date_naive();
+        if last_task_cleanup != Some(today) {
+            let _ = core.db.purge_completed_message_tasks().await;
+            last_task_cleanup = Some(today);
+        }
+    }
+}
+
+async fn show_missed_task_reminders(core: &Core, app: &AppHandle) {
+    let mut recent = 0usize;
+    loop {
+        let Ok(reminders) = core.db.due_task_reminders(50).await else {
+            return;
+        };
+        if reminders.is_empty() {
+            break;
+        }
+        let now = chrono::Utc::now();
+        for reminder in &reminders {
+            if parse_event_start(&reminder.reminder_at)
+                .is_some_and(|time| now.signed_duration_since(time) <= chrono::Duration::days(7))
+            {
+                recent += 1;
+            }
+        }
+        let ids = reminders
+            .iter()
+            .map(|item| item.message_id)
+            .collect::<Vec<_>>();
+        if core.db.mark_task_reminders_shown(&ids).await.is_err() {
+            return;
+        }
+    }
+    if recent != 0 {
+        push_notification(
+            app,
+            serde_json::json!({
+                "kind": "task-bundle",
+                "title": "Пропущенные напоминания",
+                "subject": format!("Пропущено напоминаний: {recent}"),
+                "count": recent,
+            }),
+            "task-reminder-bundle",
+        );
     }
 }
 
@@ -2788,13 +2901,123 @@ pub async fn save_mail_rule(
     state: State<'_, AppState>,
     rule: MailRuleInput,
     apply_existing: bool,
+    known_rule_ids: Option<Vec<String>>,
 ) -> CmdResult<MailRule> {
     let core = core(&state).await?;
-    let saved = core.db.save_mail_rule(&rule, apply_existing).await?;
-    if saved.enabled {
+    let saved = core
+        .db
+        .save_mail_rule(&rule, apply_existing, known_rule_ids.as_deref())
+        .await?;
+    if saved.enabled && saved.state == "ok" {
         core.db.process_mail_rules().await?;
     }
     Ok(saved)
+}
+
+/// Одноразовый ключ подтверждения удаления навсегда: интерфейс показывает
+/// название правила и его область, а ключ привязан к составу правила (S-048).
+#[tauri::command]
+pub async fn mail_rule_delete_confirmation(
+    state: State<'_, AppState>,
+    rule: MailRuleInput,
+) -> CmdResult<String> {
+    Ok(core(&state)
+        .await?
+        .db
+        .issue_delete_confirmation(&rule)
+        .await?)
+}
+
+/// Новый порядок правил приходит полным перечнем идентификаторов (S-059).
+#[tauri::command]
+pub async fn reorder_mail_rules(state: State<'_, AppState>, ids: Vec<String>) -> CmdResult<()> {
+    Ok(core(&state).await?.db.reorder_mail_rules(&ids).await?)
+}
+
+/// Ручной прогон по выбранным папкам (S-065 - S-073).
+#[tauri::command]
+pub async fn run_mail_rules(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    folder_ids: Vec<i64>,
+    rule_ids: Option<Vec<String>>,
+) -> CmdResult<truemail_core::model::MailRuleRunReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_mail_rule_run(account_id, &folder_ids, rule_ids.as_deref())
+        .await?)
+}
+
+/// Продолжить прогон, остановленный пределом писем (S-070).
+#[tauri::command]
+pub async fn continue_mail_rule_run(
+    state: State<'_, AppState>,
+    run_id: i64,
+) -> CmdResult<truemail_core::model::MailRuleRunReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_mail_rule_run(run_id)
+        .await?)
+}
+
+/// Отчёт последнего ручного прогона для списка правил (S-073).
+#[tauri::command]
+pub async fn last_mail_rule_run(
+    state: State<'_, AppState>,
+) -> CmdResult<Option<truemail_core::model::MailRuleRunReport>> {
+    Ok(core(&state).await?.db.last_mail_rule_run().await?)
+}
+
+/// Незавершённые задания ручного прогона: продолжение не должно зависеть от
+/// отчёта текущей сессии, поэтому раздел правил показывает их отдельно
+/// (S-070, S-072).
+#[tauri::command]
+pub async fn pending_mail_rule_runs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::model::MailRuleRunReport>> {
+    Ok(core(&state).await?.db.pending_mail_rule_runs().await?)
+}
+
+/// Операции увода в состоянии отказа: письмо считается не уведённым, пока
+/// пользователь не повторит операцию или не откажется от неё (S-052, S-053).
+#[tauri::command]
+pub async fn failed_message_operations(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<truemail_core::storage::repo::FailedOperation>> {
+    Ok(core(&state).await?.db.failed_takeaway_operations().await?)
+}
+
+#[tauri::command]
+pub async fn retry_message_operation(
+    state: State<'_, AppState>,
+    operation_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .retry_failed_operation(operation_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn discard_message_operation(
+    state: State<'_, AppState>,
+    operation_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .discard_failed_operation(operation_id)
+        .await?)
+}
+
+/// Ящики без папки с ролью корзины: без неё стадии обработки молча оставляют
+/// почту на месте, поэтому интерфейс показывает предупреждение (S-014).
+#[tauri::command]
+pub async fn accounts_without_trash(state: State<'_, AppState>) -> CmdResult<Vec<i64>> {
+    Ok(core(&state).await?.db.accounts_without_trash().await?)
 }
 
 #[tauri::command]
@@ -2814,6 +3037,279 @@ pub async fn set_mail_rule_enabled(
 #[tauri::command]
 pub async fn delete_mail_rule(state: State<'_, AppState>, id: String) -> CmdResult<()> {
     Ok(core(&state).await?.db.delete_mail_rule(&id).await?)
+}
+
+/// Списки заблокированных и доверенных отправителей (blocked-senders.md,
+/// S-045, S-050).
+#[tauri::command]
+pub async fn list_sender_policies(state: State<'_, AppState>) -> CmdResult<Vec<SenderPolicy>> {
+    Ok(core(&state).await?.db.list_sender_policies().await?)
+}
+
+/// Предпросмотр блокировки: канонический вид значения, защита собственного
+/// адреса и домена, число уже полученных писем по каждому ящику и ключ снимка
+/// кандидатов уборки (S-019, S-020, S-029, S-031).
+#[tauri::command]
+pub async fn preview_sender_policy(
+    state: State<'_, AppState>,
+    kind: String,
+    value: String,
+) -> CmdResult<SenderPolicyPreview> {
+    Ok(core(&state)
+        .await?
+        .db
+        .preview_sender_policy(&kind, &value)
+        .await?)
+}
+
+/// Добавить запись списка или сменить её решение (S-039, S-043, S-044).
+#[tauri::command]
+pub async fn save_sender_policy(
+    state: State<'_, AppState>,
+    kind: String,
+    value: String,
+    decision: String,
+    confirm_own_domain: bool,
+) -> CmdResult<SenderPolicy> {
+    Ok(core(&state)
+        .await?
+        .db
+        .save_sender_policy(&kind, &value, &decision, confirm_own_domain)
+        .await?)
+}
+
+/// Снять блокировку: неисполненные перемещения отменяются, уже убранные письма
+/// остаются в корзине (S-039 - S-042).
+#[tauri::command]
+pub async fn delete_sender_policy(
+    state: State<'_, AppState>,
+    id: i64,
+) -> CmdResult<SenderPolicyReleaseReport> {
+    Ok(core(&state).await?.db.delete_sender_policy(id).await?)
+}
+
+/// Уборка уже полученных писем по отдельному согласию и по ключу снимка
+/// (S-030 - S-033).
+#[tauri::command]
+pub async fn start_sender_policy_sweep(
+    state: State<'_, AppState>,
+    policy_id: i64,
+    snapshot_key: String,
+    consent: bool,
+) -> CmdResult<Vec<SenderPolicySweepReport>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_sender_policy_sweep(policy_id, &snapshot_key, consent)
+        .await?)
+}
+
+/// Продолжить уборку следующей пачкой (S-036).
+#[tauri::command]
+pub async fn continue_sender_policy_sweep(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderPolicySweepReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_sender_policy_sweep(job_id)
+        .await?)
+}
+
+/// Отменить незавершённую уборку с отчётом о неотменимых перемещениях (S-042).
+#[tauri::command]
+pub async fn cancel_sender_policy_sweep(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderPolicyReleaseReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancel_sender_policy_sweep(job_id)
+        .await?)
+}
+
+/// Незавершённые уборки списков отправителей (S-045).
+#[tauri::command]
+pub async fn pending_sender_policy_jobs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderPolicySweepReport>> {
+    Ok(core(&state).await?.db.pending_sender_policy_jobs().await?)
+}
+
+/// Список игнорируемых переписок (ignore-conversation.md, S-031, S-051).
+#[tauri::command]
+pub async fn list_ignored_conversations(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<IgnoredConversation>> {
+    Ok(core(&state).await?.db.list_ignored_conversations().await?)
+}
+
+/// Предпросмотр игнорирования: тема, ящик, число писем и ключ снимка
+/// кандидатов (S-013, S-014).
+#[tauri::command]
+pub async fn preview_ignore_conversation(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<IgnoreConversationPreview> {
+    Ok(core(&state)
+        .await?
+        .db
+        .preview_ignore_conversation(message_id)
+        .await?)
+}
+
+/// Включить игнорирование переписки по подтверждению (S-015, S-016).
+#[tauri::command]
+pub async fn enable_ignore_conversation(
+    state: State<'_, AppState>,
+    message_id: i64,
+    snapshot_key: String,
+    confirmed: bool,
+) -> CmdResult<IgnoredConversation> {
+    Ok(core(&state)
+        .await?
+        .db
+        .enable_ignore_conversation(message_id, &snapshot_key, confirmed)
+        .await?)
+}
+
+/// Прекратить игнорирование с возвратом писем или без него (S-033, S-034).
+#[tauri::command]
+pub async fn disable_ignore_conversation(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    return_messages: bool,
+) -> CmdResult<IgnoreJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .disable_ignore_conversation(conversation_id, return_messages)
+        .await?)
+}
+
+/// Продолжить задание уборки или возврата следующей пачкой (S-024, S-041).
+#[tauri::command]
+pub async fn continue_ignore_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<IgnoreJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_ignored_conversation_job(job_id)
+        .await?)
+}
+
+/// Незавершённые задания игнорирования (S-031).
+#[tauri::command]
+pub async fn pending_ignore_jobs(state: State<'_, AppState>) -> CmdResult<Vec<IgnoreJobReport>> {
+    Ok(core(&state).await?.db.pending_ignore_jobs().await?)
+}
+
+/// Записи автоочистки по отправителю в общем списке правил (sweep-by-sender.md,
+/// S-037, S-047).
+#[tauri::command]
+pub async fn list_sender_sweep_rules(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderSweepRule>> {
+    Ok(core(&state).await?.db.list_sender_sweep_rules().await?)
+}
+
+/// Предварительный подсчёт уборки: число писем, папки и ключ снимка (S-010,
+/// S-011).
+#[tauri::command]
+pub async fn preview_sender_sweep(
+    state: State<'_, AppState>,
+    input: SenderSweepInput,
+) -> CmdResult<SenderSweepPreview> {
+    Ok(core(&state).await?.db.preview_sender_sweep(input).await?)
+}
+
+/// Подтверждённая уборка: разовая, постоянная запись или правило режима
+/// новых писем (S-022 - S-025).
+#[tauri::command]
+pub async fn start_sender_sweep(
+    state: State<'_, AppState>,
+    input: SenderSweepInput,
+    snapshot_key: String,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .start_sender_sweep(input, &snapshot_key)
+        .await?)
+}
+
+/// Выключить или включить запись автоочистки (S-038).
+#[tauri::command]
+pub async fn set_sender_sweep_enabled(
+    state: State<'_, AppState>,
+    id: i64,
+    enabled: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_sender_sweep_enabled(id, enabled)
+        .await?)
+}
+
+/// Сменить режим записи одной неделимой операцией (S-028).
+#[tauri::command]
+pub async fn update_sender_sweep_mode(
+    state: State<'_, AppState>,
+    id: i64,
+    mode: String,
+    days: Option<i64>,
+    sweep_archive: bool,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .update_sender_sweep_mode(id, &mode, days, sweep_archive)
+        .await?)
+}
+
+/// Удалить запись автоочистки: убранные письма остаются в корзине (S-039).
+#[tauri::command]
+pub async fn delete_sender_sweep_rule(state: State<'_, AppState>, id: i64) -> CmdResult<()> {
+    Ok(core(&state).await?.db.delete_sender_sweep_rule(id).await?)
+}
+
+/// Продолжить проход уборки следующей пачкой (S-018).
+#[tauri::command]
+pub async fn continue_sender_sweep_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .continue_sender_sweep_job(job_id)
+        .await?)
+}
+
+/// Отменить незавершённую уборку с отчётом о неотменимых перемещениях (S-041).
+#[tauri::command]
+pub async fn cancel_sender_sweep_job(
+    state: State<'_, AppState>,
+    job_id: i64,
+) -> CmdResult<SenderSweepJobReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancel_sender_sweep_job(job_id)
+        .await?)
+}
+
+/// Незавершённые проходы автоочистки (S-018, S-040).
+#[tauri::command]
+pub async fn pending_sender_sweep_jobs(
+    state: State<'_, AppState>,
+) -> CmdResult<Vec<SenderSweepJobReport>> {
+    Ok(core(&state).await?.db.pending_sender_sweep_jobs().await?)
 }
 
 #[tauri::command]
@@ -3754,6 +4250,8 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         .reminders_started
         .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
+        let _ = core.db.purge_completed_message_tasks().await;
+        show_missed_task_reminders(&core, &app).await;
         let reminder_core = core.clone();
         let reminder_app = app.clone();
         tokio::spawn(async move { reminders_loop(reminder_core, reminder_app).await });
@@ -3992,6 +4490,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
 
         let outbox_core = core.clone();
         let outbox_account = account.clone();
+        let send_wakeup = state.send_wakeup.clone();
         let outbox_app = app.clone();
         let outbox_generation = state.generation.clone();
         let generation = outbox_generation.load(std::sync::atomic::Ordering::SeqCst);
@@ -4000,6 +4499,11 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                 if outbox_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     break;
                 }
+                // Ожидание объявляется до прохода: письмо, принятое во время
+                // прохода, иначе разбудило бы работника, который ещё не начал
+                // ждать, и его пробуждение пропало бы (S-024).
+                let mut wakeup_signal = std::pin::pin!(send_wakeup.notified());
+                wakeup_signal.as_mut().enable();
                 match outbox_core
                     .accounts
                     .process_mail_outbox(&outbox_account)
@@ -4015,19 +4519,39 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         "outbox временно недоступен"
                     ),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // undo-send.md S-024: работник ждёт ближайший срок отмены, а
+                // не общий интервал прохода. Опрос раз в 10 секунд удлинял бы
+                // выбранное пользователем окно ещё на 0 - 10 секунд.
+                // Контрольный проход остаётся на случай пропущенного срока, а
+                // принятое письмо будит работника сразу: его собственный срок
+                // может наступить раньше того, который работник видел.
+                let wakeup = outbox_core
+                    .db
+                    .next_send_wakeup_seconds(outbox_account.id)
+                    .await
+                    .unwrap_or(None)
+                    .map(|seconds| seconds.clamp(1, 10))
+                    .unwrap_or(10);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)) => {}
+                    _ = wakeup_signal => {}
+                }
             }
         });
     }
     Ok(())
 }
 
+/// Принять письмо в очередь отправки. Композер очищается только после
+/// подтверждённой записи, поэтому отказ хранилища письмо не теряет
+/// (specs/undo-send.md, S-001 - S-003).
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SendMessageRequest,
-) -> CmdResult<()> {
+    request_key: Option<String>,
+) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
         .db
@@ -4039,9 +4563,322 @@ pub async fn send_message(
             message: "Аккаунт отправителя не найден".into(),
         })?;
     let outgoing = outgoing_message(&account, request);
-    core.accounts.send_outgoing(account.id, outgoing).await?;
+    let queued = core
+        .accounts
+        .queue_outgoing(
+            account.id,
+            outgoing,
+            truemail_core::model::SEND_ORIGIN_ORDINARY,
+            request_key,
+        )
+        .await?;
+    // S-024: передача начинается не позднее чем через секунду после срока
+    // отмены, а работник в этот момент может спать до десяти секунд.
+    state.send_wakeup.notify_waiters();
     let _ = app.emit("truemail-data-changed", account.id);
+    Ok(queued)
+}
+
+/// Письма внутри окна отмены при выходе из программы через меню трея.
+///
+/// Вопрос задаётся только здесь: закрытие окна прячет программу в трей и работу
+/// не заканчивает, поэтому там спрашивать не о чем (specs/undo-send.md, S-031,
+/// S-032). Ответ выполняется до завершения работы: выбранная отправка идёт
+/// немедленно, а отказ оставляет письма ждать следующего запуска.
+pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let core = tauri::async_runtime::block_on(async { state.core.read().await.clone() });
+    let Some(core) = core else { return };
+    let waiting = match tauri::async_runtime::block_on(core.db.startup_send_state()) {
+        Ok(state) => state.pending.len(),
+        Err(error) => {
+            tracing::warn!(%error, "очередь отправки при выходе не прочитана");
+            return;
+        }
+    };
+    if waiting == 0 {
+        return;
+    }
+    let answer = rfd::MessageDialog::new()
+        .set_title("truemail")
+        .set_description(format!(
+            "Писем ждёт окна отмены: {waiting}.\n\nОтправить их сейчас? Если нет, они уйдут при следующем запуске программы."
+        ))
+        .set_level(rfd::MessageLevel::Info)
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show();
+    if answer != rfd::MessageDialogResult::Yes {
+        return;
+    }
+    tauri::async_runtime::block_on(async move {
+        if let Err(error) = core.db.release_undo_windows().await {
+            tracing::warn!(%error, "окна отмены не отпущены при выходе");
+            return;
+        }
+        let Ok(accounts) = core.db.list_accounts().await else {
+            return;
+        };
+        for account in accounts.into_iter().filter(|account| account.enabled) {
+            // Выход не должен зависнуть на недоступном сервере: письмо,
+            // которое не успело уйти, остаётся в очереди и уйдёт при следующем
+            // запуске.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                core.accounts.process_mail_outbox(&account),
+            )
+            .await;
+        }
+    });
+}
+
+/// Длительность окна отмены: одно значение на все ящики (S-011, S-014).
+#[tauri::command]
+pub async fn undo_send_seconds(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.undo_send_seconds().await?)
+}
+
+/// Сохранить длительность окна отмены. Границы проверяет ядро (S-012, S-013).
+#[tauri::command]
+pub async fn set_undo_send_seconds(state: State<'_, AppState>, seconds: i64) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_undo_send_seconds(seconds)
+        .await?)
+}
+
+/// Раздел "Исходящие": операции отправки ящика страницами по 100 строк (S-020,
+/// S-022).
+#[tauri::command]
+pub async fn list_outbox_sends(
+    state: State<'_, AppState>,
+    account_id: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> CmdResult<Vec<truemail_core::model::OutboxSendEntry>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_outbox_sends(account_id, limit.unwrap_or(100), offset.unwrap_or(0))
+        .await?)
+}
+
+/// Отменить отправку, пока работник не начал передачу (S-037, S-038).
+#[tauri::command]
+pub async fn cancel_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<truemail_core::model::CancelSendOutcome> {
+    let core = core(&state).await?;
+    let outcome = core
+        .db
+        .cancel_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(outcome)
+}
+
+/// Открыть отменённое письмо: композер получает его целиком, вместе с
+/// вложениями (S-040).
+#[tauri::command]
+pub async fn open_cancelled_send(
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<truemail_core::model::CancelledSendMessage> {
+    Ok(core(&state)
+        .await?
+        .db
+        .cancelled_send_message(account_id, operation_id)
+        .await?)
+}
+
+/// Удалить письмо из раздела "Исходящие" вместе с его большими объектами.
+/// Подтверждение спрашивает интерфейс: другой копии письма у программы нет
+/// (S-043).
+#[tauri::command]
+pub async fn delete_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db
+        .delete_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
     Ok(())
+}
+
+/// Ручной повтор отправки с неопределённым итогом или с отказом. Закреплённый
+/// идентификатор письма сохраняется (S-051).
+#[tauri::command]
+pub async fn retry_send(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: i64,
+    operation_id: i64,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    core.db
+        .retry_send_operation(account_id, operation_id)
+        .await?;
+    let _ = app.emit("truemail-data-changed", account_id);
+    Ok(())
+}
+
+/// Состояние очереди отправки на запуске: незакончившиеся окна отмены, число
+/// писем с истёкшим окном и число неопределённых итогов (S-034 - S-036).
+#[tauri::command]
+pub async fn startup_send_state(
+    state: State<'_, AppState>,
+) -> CmdResult<truemail_core::model::StartupSendState> {
+    Ok(core(&state).await?.db.startup_send_state().await?)
+}
+
+/// Отпустить письма, ждущие окна отмены: пользователь выбрал отправить их перед
+/// выходом из программы (S-031).
+#[tauri::command]
+pub async fn release_undo_windows(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.release_undo_windows().await?)
+}
+
+/// Настройка автоответа выбранного ящика (specs/out-of-office.md, S-001, S-011).
+#[tauri::command]
+pub async fn out_of_office(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .out_of_office(account_id)
+        .await?)
+}
+
+/// Сохранить автоответ. Режим выбирает программа: Exchange хранит настройку на
+/// сервере, остальные ящики - у себя (S-002, S-012).
+#[tauri::command]
+pub async fn save_out_of_office(
+    state: State<'_, AppState>,
+    input: truemail_core::model::OutOfOfficeInput,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    Ok(core(&state)
+        .await?
+        .accounts
+        .save_out_of_office(input)
+        .await?)
+}
+
+/// Отключить автоответ (S-017, S-067).
+#[tauri::command]
+pub async fn disable_out_of_office(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<truemail_core::model::OutOfOfficeSettings> {
+    let core = core(&state).await?;
+    let current = core.accounts.out_of_office(account_id).await?;
+    core.accounts
+        .save_out_of_office(truemail_core::model::OutOfOfficeInput {
+            account_id,
+            enabled: false,
+            starts_at: current.starts_at.unwrap_or_default(),
+            ends_at: current.ends_at.unwrap_or_default(),
+            internal_text: current.internal_text,
+            external_text: current.external_text,
+            internal_domains: current.internal_domains,
+        })
+        .await
+        .map_err(Into::into)
+}
+
+/// Последние отправленные автоответы ящика: их показывает раздел автоответа.
+#[tauri::command]
+pub async fn list_out_of_office_replies(
+    state: State<'_, AppState>,
+    account_id: i64,
+    limit: Option<i64>,
+) -> CmdResult<Vec<truemail_core::storage::out_of_office::OutOfOfficeReply>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_out_of_office_replies(account_id, limit.unwrap_or(50))
+        .await?)
+}
+
+/// Кандидаты подсказки получателей: история выбранного ящика, объединённая с
+/// контактами и упорядоченная ядром (specs/recipient-history.md, S-031).
+#[tauri::command]
+pub async fn recipient_candidates(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<Vec<truemail_core::model::RecipientCandidate>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .recipient_candidates(account_id)
+        .await?)
+}
+
+/// Раздел управления историей получателей (S-042).
+#[tauri::command]
+pub async fn list_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> CmdResult<Vec<truemail_core::model::RecipientHistoryEntry>> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_recipient_history(account_id, limit.unwrap_or(100), offset.unwrap_or(0))
+        .await?)
+}
+
+/// Изменить имя или адрес записи истории (S-043 - S-045).
+#[tauri::command]
+pub async fn update_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+    entry_id: i64,
+    name: Option<String>,
+    address: Option<String>,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .update_recipient_history_entry(account_id, entry_id, name, address)
+        .await?)
+}
+
+/// Убрать адрес из истории: запись остаётся скрытой пользователем (S-046).
+#[tauri::command]
+pub async fn delete_recipient_history_entry(
+    state: State<'_, AppState>,
+    account_id: i64,
+    entry_id: i64,
+) -> CmdResult<()> {
+    Ok(core(&state)
+        .await?
+        .db
+        .hide_recipient_history_entry(account_id, entry_id)
+        .await?)
+}
+
+/// Очистить историю ящика вместе с сохранением границы очистки (S-047).
+#[tauri::command]
+pub async fn clear_recipient_history(
+    state: State<'_, AppState>,
+    account_id: i64,
+) -> CmdResult<i64> {
+    Ok(core(&state)
+        .await?
+        .db
+        .clear_recipient_history(account_id)
+        .await?)
 }
 
 fn outgoing_message(
@@ -4065,6 +4902,7 @@ fn outgoing_message(
                 data: item.data,
             })
             .collect(),
+        ..Default::default()
     }
 }
 
@@ -4093,18 +4931,20 @@ pub async fn schedule_message(
         });
     }
     let outgoing = outgoing_message(&account, request);
-    let payload = serde_json::to_string(&outgoing).map_err(truemail_core::Error::from)?;
-    Ok(core
+    let operation_id = core
         .db
         .queue_scheduled_send(
             account.id,
-            &payload,
+            outgoing,
             &send_at
                 .with_timezone(&chrono::Utc)
                 .format("%Y-%m-%d %H:%M:%S")
                 .to_string(),
         )
-        .await?)
+        .await?
+        .operation_id;
+    state.send_wakeup.notify_waiters();
+    Ok(operation_id)
 }
 
 #[tauri::command]
@@ -4117,13 +4957,188 @@ pub async fn mark_seen(state: State<'_, AppState>, message_id: i64, seen: bool) 
 #[tauri::command]
 pub async fn mark_flagged(
     state: State<'_, AppState>,
-    message_id: i64,
+    message_ids: Vec<i64>,
     flagged: bool,
+    reason: String,
+) -> CmdResult<usize> {
+    let reason = FlagChangeReason::parse(&reason).ok_or_else(|| ApiError {
+        message: "неизвестная причина изменения признака важности".into(),
+    })?;
+    Ok(core(&state)
+        .await?
+        .db
+        .mark_flagged_many(&message_ids, flagged, reason)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn set_messages_pinned(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+    pinned: bool,
+) -> CmdResult<PinMessagesResult> {
+    Ok(core(&state)
+        .await?
+        .db
+        .set_messages_pinned(&message_ids, pinned)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_pinned_messages(
+    state: State<'_, AppState>,
+    view_kind: String,
+    view_value: Option<String>,
+) -> CmdResult<PinnedMessageList> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_pinned_messages(&view_kind, view_value.as_deref())
+        .await?)
+}
+
+#[tauri::command]
+pub async fn save_message_task(
+    state: State<'_, AppState>,
+    input: MessageTaskInput,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state).await?.db.save_message_task(&input).await?)
+}
+
+#[tauri::command]
+pub async fn get_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<Option<MessageTask>> {
+    Ok(core(&state).await?.db.get_message_task(message_id).await?)
+}
+
+#[tauri::command]
+pub async fn list_message_tasks(
+    state: State<'_, AppState>,
+    limit: i64,
+    cursor: Option<String>,
+) -> CmdResult<TaskListPage> {
+    Ok(core(&state)
+        .await?
+        .db
+        .list_message_tasks(limit, cursor.as_deref())
+        .await?)
+}
+
+#[tauri::command]
+pub async fn complete_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .complete_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn reopen_message_task(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .reopen_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn delete_message_task(state: State<'_, AppState>, message_id: i64) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .delete_message_task(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn overdue_message_task_count(state: State<'_, AppState>) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.overdue_message_task_count().await?)
+}
+
+#[tauri::command]
+pub async fn due_task_reminders(
+    state: State<'_, AppState>,
+    limit: i64,
+) -> CmdResult<Vec<TaskReminder>> {
+    Ok(core(&state).await?.db.due_task_reminders(limit).await?)
+}
+
+#[tauri::command]
+pub async fn mark_task_reminders_shown(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<usize> {
+    Ok(core(&state)
+        .await?
+        .db
+        .mark_task_reminders_shown(&message_ids)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn snooze_task_reminder(
+    state: State<'_, AppState>,
+    message_id: i64,
+) -> CmdResult<MessageTask> {
+    Ok(core(&state)
+        .await?
+        .db
+        .snooze_task_reminder(message_id)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn list_quick_steps(state: State<'_, AppState>) -> CmdResult<Vec<QuickStep>> {
+    Ok(core(&state).await?.db.list_quick_steps().await?)
+}
+
+#[tauri::command]
+pub async fn save_quick_step(state: State<'_, AppState>, input: QuickStepInput) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.save_quick_step(&input).await?)
+}
+
+#[tauri::command]
+pub async fn delete_quick_step(state: State<'_, AppState>, id: i64) -> CmdResult<bool> {
+    Ok(core(&state).await?.db.delete_quick_step(id).await?)
+}
+
+#[tauri::command]
+pub async fn reorder_quick_steps(state: State<'_, AppState>, ids: Vec<i64>) -> CmdResult<()> {
+    Ok(core(&state).await?.db.reorder_quick_steps(&ids).await?)
+}
+
+#[tauri::command]
+pub async fn bind_quick_step_slot(
+    state: State<'_, AppState>,
+    id: i64,
+    slot: Option<i64>,
 ) -> CmdResult<()> {
     Ok(core(&state)
         .await?
         .db
-        .mark_flagged(message_id, flagged)
+        .bind_quick_step_slot(id, slot)
+        .await?)
+}
+
+#[tauri::command]
+pub async fn apply_quick_step(
+    state: State<'_, AppState>,
+    id: i64,
+    message_ids: Vec<i64>,
+) -> CmdResult<QuickStepReport> {
+    Ok(core(&state)
+        .await?
+        .db
+        .apply_quick_step(id, &message_ids)
         .await?)
 }
 
@@ -4253,6 +5268,9 @@ pub async fn message_action(
         "archive" => "archive",
         "trash" => "trash",
         "spam" => "spam",
+        // S-013: безвозвратное удаление приходит отдельным действием и из
+        // переноса в корзину никогда не получается.
+        "delete" => "delete",
         _ => {
             return Err(ApiError {
                 message: "Неизвестное действие с письмом".into(),
@@ -4324,15 +5342,22 @@ pub async fn set_keybinding(
     action: String,
     combo: String,
 ) -> CmdResult<()> {
-    let combo = combo.trim();
-    if combo.is_empty() {
+    let Some(combo) = normalize_key_combo(combo.trim()) else {
         return Err(ApiError {
             message: "сочетание клавиш не может быть пустым".into(),
         });
-    }
+    };
     let core = core(&state).await?;
     let previous = core.db.list_keybindings().await?;
     let mut updated = previous.clone();
+    if is_quick_step_key_action(&action) && !updated.iter().any(|binding| binding.action == action)
+    {
+        updated.push(Keybinding {
+            action: action.clone(),
+            scope: "local".into(),
+            combo: combo.clone(),
+        });
+    }
     let binding = updated
         .iter_mut()
         .find(|binding| binding.action == action)
@@ -4340,16 +5365,19 @@ pub async fn set_keybinding(
             message: "неизвестное действие клавиатуры".into(),
         })?;
     if binding.scope == "global" {
-        Shortcut::from_str(combo).map_err(|error| ApiError {
+        Shortcut::from_str(&combo).map_err(|error| ApiError {
             message: format!("неверное сочетание клавиш: {error}"),
         })?;
     }
-    binding.combo = combo.to_owned();
+    binding.combo = combo.clone();
     let mut seen = HashSet::new();
-    if updated
-        .iter()
-        .any(|binding| !seen.insert(binding.combo.to_ascii_lowercase()))
-    {
+    if updated.iter().any(|binding| {
+        !seen.insert(
+            normalize_key_combo(&binding.combo)
+                .unwrap_or_else(|| binding.combo.clone())
+                .to_ascii_lowercase(),
+        )
+    }) {
         return Err(ApiError {
             message: "это сочетание уже назначено другому действию".into(),
         });
@@ -4360,7 +5388,7 @@ pub async fn set_keybinding(
             message: format!("не удалось зарегистрировать сочетание: {error}"),
         });
     }
-    if let Err(error) = core.db.set_keybinding(&action, combo).await {
+    if let Err(error) = core.db.set_keybinding(&action, &combo).await {
         let _ = register_global_shortcuts(&app, &previous);
         return Err(error.into());
     }

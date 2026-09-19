@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260917-4">
+  <link rel="stylesheet" href="styles.css?v=20260918-4">
 </head>
 <body>
 
@@ -46,6 +46,7 @@
 
       <button type="button" class="navitem topnav" data-nav="calendar"><i data-i="cal"></i><span data-i18n="navCalendar">Календарь</span><span class="count">3</span></button>
       <button type="button" class="navitem topnav" data-nav="contacts"><i data-i="people"></i><span data-i18n="navContacts">Контакты</span></button>
+      <button type="button" class="navitem topnav" id="tasksNav" data-nav="tasks"><i data-i="check"></i><span data-i18n="navTasks">Дела</span><span class="count" id="tasksOverdueCount"></span></button>
 
       <div class="navlabel"><span data-i18n="navSmartFolders">Умные папки</span> <button type="button" class="add" id="addSmart" data-i18n-title="createSmartFolder" title="Создать умную папку"><i data-i="plus"></i></button></div>
       <button type="button" class="navitem active" data-nav="mail" data-smart-id="all-inbox"><i data-i="inbox"></i><span class="smart-label" data-i18n="navAllInbox">Все входящие</span><span class="count"></span></button>
@@ -67,7 +68,7 @@
 
     <section class="list">
       <div class="listhead">
-        <div class="row1"><div><h2 class="d-inline" data-i18n="navAllInbox">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
+        <div class="row1"><div><span class="head-tag-dot hidden" id="headTagDot"></span><h2 class="d-inline" data-i18n="navAllInbox">Все входящие</h2><span class="sub" id="mailAccountCount"></span></div>
           <div class="fields-inline"><div class="filter-clear-wrap hidden" id="filterClearWrap"><button class="iconbtn filter-clear" id="filterClearBtn" data-i18n-title="tipFilterClear" title="Сбросить фильтр"><i data-i="filterOff"></i></button><div class="filter-active-tip" id="filterActiveTip"></div></div><button class="iconbtn" id="filterBtn" data-i18n-title="tipFilter" title="Фильтр"><i data-i="filter"></i></button><button class="iconbtn" id="sortBtn" data-i18n-title="tipSort" title="Сортировка"><i data-i="sort"></i></button></div></div>
         <div class="list-options hidden" id="filterMenu"><div class="filter-text"><input id="filterText" data-i18n-placeholder="filterPlaceholder" placeholder="Фильтр по тексту…" autocomplete="off"></div><label><input type="checkbox" data-filter="unread"> <span data-i18n="filterUnread">Только непрочитанные</span></label><label><input type="checkbox" data-filter="attachments"> <span data-i18n="filterAttachments">С вложениями</span></label><label><input type="checkbox" data-filter="flagged"> <span data-i18n="filterFlagged">Важные</span></label></div>
         <div class="list-options hidden" id="sortMenu"><button data-sort="date-desc" data-i18n="sortNewest">Сначала новые</button><button data-sort="date-asc" data-i18n="sortOldest">Сначала старые</button><button data-sort="sender" data-i18n="sortSender">По отправителю</button><button data-sort="subject" data-i18n="sortSubject">По теме</button></div>
@@ -85,6 +86,8 @@
           <button class="btn" data-act="replyall"><i data-i="replyall"></i><span data-i18n="actionReplyAll">Ответить всем</span></button>
           <button class="btn" data-act="forward"><i data-i="forward"></i><span data-i18n="actionForward">Переслать</span></button>
           <span class="sp"></span>
+          <button class="iconbtn" data-i18n-title="flagMessage" title="Флажок" data-act="flag-message"><i data-i="flag"></i></button>
+          <button class="iconbtn" data-i18n-title="taskDates" title="Сроки дела" data-act="task-message"><i data-i="cal"></i></button>
           <button class="iconbtn" data-i18n-title="actionArchive" title="В архив" data-act="archive"><i data-i="archive"></i></button>
           <button class="iconbtn" data-i18n-title="actionDelete" title="Удалить" data-act="trash"><i data-i="trash"></i></button>
           <button class="iconbtn thread-more-button" id="threadMoreButton" data-toolbar-persistent data-i18n-title="tipMore" title="Ещё действия" aria-haspopup="menu" aria-expanded="false"><i data-i="dots"></i></button>
@@ -94,6 +97,10 @@
             <button type="button" data-thread-action="raw"><i data-i="edit"></i><span data-i18n="viewSource">Исходный текст</span></button>
             <button type="button" data-thread-action="export-eml"><i data-i="download"></i><span data-i18n="saveAsEml">Сохранить как .eml</span></button>
             <button type="button" data-thread-action="create-rule"><i data-i="filter"></i><span data-i18n="createRuleFromMessage">Создать правило из письма</span></button>
+            <button type="button" data-thread-action="block-sender"><i data-i="shield"></i><span data-i18n="blockSenderMenu">Заблокировать отправителя</span></button>
+            <button type="button" data-thread-action="ignore-conversation"><i data-i="snooze"></i><span data-i18n="ignoreConversationMenu">Игнорировать переписку</span></button>
+            <button type="button" data-thread-action="sweep-sender"><i data-i="trash"></i><span data-i18n="sweepSenderMenu">Автоочистка по отправителю</span></button>
+            <button type="button" data-thread-action="senders"><i data-i="settings"></i><span data-i18n="setSenders">Отправители</span></button>
             <button type="button" data-thread-action="rules"><i data-i="settings"></i><span data-i18n="processingRules">Правила обработки</span></button>
             <div class="thread-menu-separator"></div>
             <button type="button" data-thread-action="settings"><i data-i="settings"></i><span data-i18n="configureMailToolbar">Настроить панель письма</span></button>
@@ -149,6 +156,10 @@
       <button type="button" class="sec" data-set="smart"><i data-i="star"></i><span data-i18n="navSmartFolders">Умные папки</span></button>
       <button type="button" class="sec" data-set="tags"><i data-i="flag"></i><span data-i18n="navTags">Метки</span></button>
       <button type="button" class="sec" data-set="rules"><i data-i="filter"></i><span data-i18n="processingRules">Правила обработки</span></button>
+      <button type="button" class="sec" data-set="senders"><i data-i="shield"></i><span data-i18n="setSenders">Отправители</span></button>
+      <button type="button" class="sec" data-set="outbox"><i data-i="send"></i><span data-i18n="setOutbox">Исходящие</span></button>
+      <button type="button" class="sec" data-set="absence"><i data-i="clock"></i><span data-i18n="setAbsence">Автоответ</span></button>
+      <button type="button" class="sec" data-set="history"><i data-i="user"></i><span data-i18n="setRecipientHistory">История получателей</span></button>
       <button type="button" class="sec" data-set="unified"><i data-i="inbox"></i><span data-i18n="setUnified">Сквозные папки</span></button>
       <button type="button" class="sec" data-set="folders"><i data-i="folder"></i><span data-i18n="setFolders">Сопоставление папок</span></button>
       <button type="button" class="sec" data-set="calendars"><i data-i="cal"></i><span data-i18n="setCalendars">Календари</span></button>
@@ -172,6 +183,7 @@
           <div class="frow hidden" id="sendToRow"><div class="fl"><div class="t" data-i18n="sendToMenu">Пункт truemail в меню "Отправить"</div><div class="d" data-i18n="sendToMenuDesc">В контекстном меню проводника появится "Отправить -> truemail": выбранные файлы сразу лягут вложениями в новое письмо.</div></div><div class="fc"><div class="toggle" id="sendToToggle"></div></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="applicationUpdates">Обновления программы</div><div class="d" id="updateStatus" data-i18n="applicationUpdatesDesc">Новые подписанные версии проверяются автоматически.</div></div><div class="fc"><button class="btn" id="checkUpdates" type="button"><i data-i="sync"></i><span data-i18n="checkUpdates">Проверить</span></button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="notifyPosition">Где показывать уведомления</div><div class="d" data-i18n="notifyPositionDesc">Угол основного монитора, в котором появляются карточки о новых письмах и напоминания.</div></div><div class="fc"><select class="sel" id="notifyPosition"><option value="top-left" data-i18n="notifyTopLeft">Сверху слева</option><option value="top-center" data-i18n="notifyTopCenter">Сверху по центру</option><option value="top-right" data-i18n="notifyTopRight">Сверху справа</option><option value="bottom-left" data-i18n="notifyBottomLeft">Снизу слева</option><option value="bottom-center" data-i18n="notifyBottomCenter">Снизу по центру</option><option value="bottom-right" data-i18n="notifyBottomRight">Снизу справа</option></select></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="undoSendTitle">Окно отмены отправки</div><div class="d" data-i18n="undoSendDesc">Сколько секунд письмо ждёт перед отправкой на сервер. Всё это время его можно вернуть в композер. Значение 0 отправляет письмо сразу. Одно значение на все ящики.</div></div><div class="fc"><input type="number" class="inp" id="undoSendSeconds" min="0" max="60" step="1" value="5"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="setupWizard">Мастер настройки</div><div class="d" data-i18n="setupWizardDesc">Повторно выбрать язык и подключить аккаунт.</div></div><div class="fc"><button class="btn" id="restartWizard"><i data-i="user"></i><span data-i18n="run">Запустить</span></button></div></div>
         </div></div>
       </div>
@@ -180,6 +192,7 @@
         <h1 data-i18n="toolbarTitle">Панель над письмом</h1><p class="lead" data-i18n="toolbarLead">Выберите, какие кнопки показывать над открытым письмом и в каком порядке. Тумблер справа - показывать кнопку; стрелки - менять порядок.</p>
         <div class="card"><div class="cb"><div class="frow"><div class="fl"><div class="t" data-i18n="alignment">Расположение</div><div class="d" data-i18n="alignmentDesc">Слева — рядом с началом письма; справа — у правого края.</div></div><div class="fc"><div class="seg" id="toolbarAlign"><button data-align="left" class="on" data-i18n="alignLeft">Слева</button><button data-align="right" data-i18n="alignRight">Справа</button></div></div></div></div></div>
         <div class="card"><div class="cb" id="tbList"></div></div>
+        <div class="card"><div class="cb"><div class="set-section-title"><b data-i18n="quickSteps">Быстрые действия</b><button class="btn sm ml-auto" type="button" id="quickStepAdd"><i data-i="plus"></i><span data-i18n="quickStepAdd">Добавить</span></button></div><div id="quickStepList"></div></div></div>
       </div>
 
       <div class="setpage" id="set-accounts">
@@ -242,25 +255,74 @@
       </div>
 
       <div class="setpage" id="set-rules">
-        <h1 data-i18n="processingRules">Правила обработки</h1><p class="lead" data-i18n="rulesLead">Автоматически обрабатывайте новые письма по отправителю или теме: перемещайте в папку, архив, спам или корзину.</p>
-        <button class="btn primary" id="ruleNew"><i data-i="plus"></i><span data-i18n="createRule">Создать правило</span></button>
-        <div class="card mt-20 hidden" id="ruleEditor"><div class="ch"><span id="ruleEditorTitle" data-i18n="newRule">Новое правило</span></div><div class="cb">
-          <div class="fld"><label data-i18n="ruleNameLabel">Название</label><input class="inp" id="ruleName" data-i18n-placeholder="ruleNamePlaceholder" placeholder="Например: Чеки в Финансы"></div>
+        <h1 data-i18n="processingRules">Правила обработки</h1><p class="lead" data-i18n="rulesLead">Автоматически обрабатывайте новые письма: собирайте правило из групп условий и выстраивайте цепочку действий - метку, отметку, перемещение или удаление.</p>
+        <div class="btn-row"><button class="btn primary" id="ruleNew"><i data-i="plus"></i><span data-i18n="createRule">Создать правило</span></button><button class="btn" id="ruleRunOpen"><i data-i="filter"></i><span data-i18n="ruleRunOpen">Запустить по папкам</span></button></div>
+        <div class="card mt-20 hidden" id="ruleEditor"><div class="ch"><span id="ruleEditorTitle"></span></div><div class="cb">
           <div class="rule-condition-grid">
-            <div class="fld"><label data-i18n="ruleFieldLabel">Поле</label><select class="sel" id="ruleField"><option value="sender" data-i18n="fieldSender">Отправитель</option><option value="subject" data-i18n="fieldSubject">Тема</option></select></div>
-            <div class="fld"><label data-i18n="ruleOperatorLabel">Сравнение</label><select class="sel" id="ruleOperator"><option value="contains" data-i18n="opContains">содержит</option><option value="equals" data-i18n="opEquals">равно</option></select></div>
-            <div class="fld rule-value-field"><label data-i18n="ruleValueLabel">Значение</label><input class="inp" id="ruleValue"></div>
-          </div>
-          <div class="rule-condition-grid rule-action-grid">
+            <div class="fld"><label data-i18n="ruleNameLabel">Название</label><input class="inp" id="ruleName" data-i18n-placeholder="ruleNamePlaceholder" placeholder="Например: Чеки в Финансы"></div>
             <div class="fld"><label data-i18n="ruleAccountLabel">Аккаунт</label><select class="sel" id="ruleAccount"></select></div>
-            <div class="fld"><label data-i18n="ruleActionLabel">Действие</label><select class="sel" id="ruleAction"><option value="move" data-i18n="actMoveToFolder">Переместить в папку</option><option value="archive" data-i18n="actionArchive">В архив</option><option value="spam" data-i18n="actToSpam">В спам</option><option value="trash" data-i18n="actionDelete">Удалить</option><option value="label" data-i18n="actAssignTag">Назначить метку</option></select></div>
-            <div class="fld rule-target-field"><label data-i18n="ruleFolderLabel">Папка</label><select class="sel" id="ruleTarget"></select></div>
-            <div class="fld rule-tag-field hidden"><label data-i18n="ruleTagLabel">Метка</label><select class="sel" id="ruleTag"></select></div>
           </div>
+          <div class="rule-section-head"><span data-i18n="ruleConditionsTitle">Условия</span><button type="button" class="btn sm" id="ruleAddGroup"><i data-i="plus"></i><span data-i18n="ruleAddGroup">Группа условий</span></button></div>
+          <div id="ruleGroups" class="rule-groups"></div>
+          <div class="rule-section-head"><span data-i18n="ruleExceptionsTitle">Исключения</span><button type="button" class="btn sm" id="ruleAddException"><i data-i="plus"></i><span data-i18n="ruleAddException">Группа исключений</span></button></div>
+          <div id="ruleExceptions" class="rule-groups"></div>
+          <p class="note-muted" data-i18n="ruleFolderScopeNote">Автоматический прогон берёт письма только из рабочих папок, поэтому тип папки предлагает Входящие, Архив и папки без типа.</p>
+          <div class="rule-section-head"><span data-i18n="ruleActionsTitle">Действия</span><button type="button" class="btn sm" id="ruleAddAction"><i data-i="plus"></i><span data-i18n="ruleAddAction">Действие</span></button></div>
+          <div id="ruleActions" class="rule-actions"></div>
           <label class="aux-check"><input type="checkbox" id="ruleExisting"> <span data-i18n="ruleApplyExisting">Применить также к уже загруженным письмам</span></label>
           <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="ruleCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i><span data-i18n="deleteRule">Удалить правило</span></button></div>
         </div></div>
+        <div class="card mt-20 hidden" id="ruleRunPanel"><div class="ch"><span data-i18n="ruleRunTitle">Ручной прогон правил</span></div><div class="cb">
+          <p class="note-muted" data-i18n="ruleRunHint">Выберите папки: правила пройдут по их письмам, включая поднятые прокруткой. За один запуск разбирается не больше 5000 писем.</p>
+          <div id="ruleRunFolders" class="rule-run-folders"></div>
+          <div class="btn-row mt-20"><button class="btn primary" id="ruleRunStart"><i data-i="check"></i><span data-i18n="ruleRunStart">Запустить</span></button><button class="btn hidden" id="ruleRunContinue" data-i18n="ruleRunContinue">Продолжить</button><button class="btn" id="ruleRunClose" data-i18n="close">Закрыть</button></div>
+          <p class="note-muted" id="ruleRunReport"></p>
+        </div></div>
+        <div id="ruleTrashWarnings" class="mt-20"></div>
+        <div id="rulePendingRuns" class="mt-20"></div>
+        <div id="senderSweepList" class="mt-20"></div>
+        <div id="ruleFailedOps" class="mt-20"></div>
         <div class="card mt-20"><div class="cb" id="rulesList"><p class="note-muted" data-i18n="noRules">Правил пока нет.</p></div></div>
+      </div>
+      <div class="setpage" id="set-senders">
+        <h1 data-i18n="setSenders">Отправители</h1><p class="lead" data-i18n="sendersLead">Заблокированные и доверенные отправители и игнорируемые переписки. Списки общие для всех подключённых ящиков, а письма уходят только в корзину и восстанавливаются оттуда до её очистки.</p>
+        <div class="btn-row"><button class="btn primary" id="senderPolicyAddBlocked"><i data-i="plus"></i><span data-i18n="senderAddBlocked">Заблокировать значение</span></button><button class="btn" id="senderPolicyAddTrusted"><i data-i="plus"></i><span data-i18n="senderAddTrusted">Добавить доверенное</span></button></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="senderListsTitle">Списки отправителей</span></div><div class="cb" id="senderPoliciesList" data-no-i18n></div></div>
+        <div id="senderPendingJobs" class="mt-20"></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="ignoredConversationsTitle">Игнорируемые переписки</span></div><div class="cb" id="ignoredConversationsList" data-no-i18n></div></div>
+      </div>
+
+      <div class="setpage" id="set-outbox">
+        <h1 data-i18n="setOutbox">Исходящие</h1><p class="lead" data-i18n="outboxLead">Письма, принятые программой, но ещё не подтверждённые сервером: ожидающие окна отмены, отложенные по времени, отменённые и те, чей итог передачи неизвестен. Это представление очереди отправки, а не папка на сервере.</p>
+        <div class="btn-row"><select class="sel" id="outboxAccount" data-no-i18n></select><button class="btn" id="outboxRefresh" type="button"><i data-i="sync"></i><span data-i18n="refresh">Обновить</span></button></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="outboxQueueTitle">Очередь отправки</span></div><div class="cb" id="outboxList" data-no-i18n></div></div>
+      </div>
+
+      <div class="setpage" id="set-absence">
+        <h1 data-i18n="setAbsence">Автоответ</h1><p class="lead" data-i18n="absenceLead">Ответ на входящие письма в период отсутствия: один раз каждому адресату, отдельно для своих и для внешних отправителей. Режим программа выбирает сама по виду ящика.</p>
+        <div class="btn-row"><select class="sel" id="absenceAccount" data-no-i18n></select></div>
+        <div class="card mt-20"><div class="cb">
+          <div class="note-muted" id="absenceMode" data-no-i18n></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="absenceEnabled">Включить автоответ</div></div><div class="fc"><div class="toggle" id="absenceToggle"></div></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="absenceFrom">Начало периода</div></div><div class="fc"><input type="datetime-local" class="inp" id="absenceStart"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="absenceTo">Окончание периода</div></div><div class="fc"><input type="datetime-local" class="inp" id="absenceEnd"></div></div>
+          <div class="t" data-i18n="absenceInternalText">Текст для своих</div>
+          <textarea class="inp" id="absenceInternal" rows="3"></textarea>
+          <div class="t mt-20" data-i18n="absenceExternalText">Текст для внешних отправителей</div>
+          <textarea class="inp" id="absenceExternal" rows="3"></textarea>
+          <div class="t mt-20" data-i18n="absenceDomains">Внутренние домены</div>
+          <div class="d" data-i18n="absenceDomainsDesc">Отправители этих доменов и их поддоменов получают текст для своих. Не больше 20 значений, через запятую.</div>
+          <input type="text" class="inp" id="absenceDomains">
+          <div class="btn-row mt-20"><button class="btn primary" id="absenceSave" type="button"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="absenceDisable" type="button"><i data-i="close"></i><span data-i18n="absenceDisableAction">Отключить</span></button></div>
+          <div class="wz-connect-status" id="absenceStatus" aria-live="polite" data-no-i18n></div>
+        </div></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="absenceRepliesTitle">Отправленные автоответы</span></div><div class="cb" id="absenceReplies" data-no-i18n></div></div>
+      </div>
+
+      <div class="setpage" id="set-history">
+        <h1 data-i18n="setRecipientHistory">История получателей</h1><p class="lead" data-i18n="historyLead">Адреса, которым вы писали с выбранного ящика. Подсказка в поле получателя учитывает, как часто и как давно вы к ним обращались. Убранный отсюда адрес не возвращается после синхронизации, но вернётся, если вы снова напишете на него.</p>
+        <div class="btn-row"><select class="sel" id="historyAccount" data-no-i18n></select><button class="btn" id="historyClear" type="button"><i data-i="trash"></i><span data-i18n="historyClearAction">Очистить историю ящика</span></button></div>
+        <div class="card mt-20"><div class="ch"><span data-i18n="historyListTitle">Записи истории</span></div><div class="cb" id="historyList" data-no-i18n></div></div>
       </div>
 
       <div class="setpage" id="set-unified">
@@ -363,6 +425,16 @@
           <div class="frow"><div class="fl"><div class="t" data-i18n="snooze">Отложить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="snooze" value="H"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="keyNextPrev">Следующее / предыдущее письмо</div></div><div class="fc fc-inline"><input class="inp keybind-input keybind-short" data-key-action="next_message" value="J"><input class="inp keybind-input keybind-short" data-key-action="prev_message" value="K"></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="actionDelete">Удалить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="delete" value="Del"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot1">Быстрое действие 1</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_1" placeholder="Ctrl+Shift+1"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot2">Быстрое действие 2</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_2" placeholder="Ctrl+Shift+2"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot3">Быстрое действие 3</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_3" placeholder="Ctrl+Shift+3"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot4">Быстрое действие 4</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_4" placeholder="Ctrl+Shift+4"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot5">Быстрое действие 5</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_5" placeholder="Ctrl+Shift+5"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot6">Быстрое действие 6</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_6" placeholder="Ctrl+Shift+6"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot7">Быстрое действие 7</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_7" placeholder="Ctrl+Shift+7"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot8">Быстрое действие 8</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_8" placeholder="Ctrl+Shift+8"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot9">Быстрое действие 9</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_9" placeholder="Ctrl+Shift+9"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot10">Быстрое действие 10</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_10" placeholder="Ctrl+Shift+0"></div></div>
         </div></div>
       </div>
 
@@ -713,30 +785,41 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.2.19"></script>
+<script src="modules/app-version.js?v=0.3.0"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
-<script src="modules/shell.js?v=20260916-1"></script>
-<script src="modules/calendar-contacts.js?v=20260916-2"></script>
+<script src="modules/shell.js?v=20260918-6"></script>
+<script src="modules/calendar-contacts.js?v=20260918-7"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
-<script src="modules/commands-accessibility.js?v=20260916-1"></script>
-<script src="modules/smart-rules.js?v=20260916-1"></script>
-<script src="modules/i18n-onboarding.js?v=20260917-1"></script>
-<script src="modules/error-presentation.js?v=20260917-4"></script>
+<script src="modules/commands-accessibility.js?v=20260918-1"></script>
+<script src="modules/mail-rules.js?v=20260918-2"></script>
+<script src="modules/flag-due-dates.js?v=20260918-1"></script>
+<script src="modules/pin-message.js?v=20260918-1"></script>
+<script src="modules/quick-steps.js?v=20260918-1"></script>
+<script src="modules/sender-lists.js?v=20260918-2"></script>
+<script src="modules/smart-rules.js?v=20260918-11"></script>
+<script src="modules/i18n-onboarding.js?v=20260918-5"></script>
+<script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
+<script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260917-1"></script>
+<script src="modules/mail.js?v=20260918-14"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
-<script src="modules/composer.js?v=20260917-4"></script>
+<script src="modules/outbox.js?v=20260918-3"></script>
+<script src="modules/out-of-office.js?v=20260918-2"></script>
+<script src="modules/recipient-history.js?v=20260918-1"></script>
+<script src="modules/composer.js?v=20260918-8"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260917-4"></script>
-<script src="modules/window-chrome.js?v=20260917-4"></script>
-<script src="bridge.js?v=20260917-4"></script>
+<script src="modules/settings.js?v=20260918-1"></script>
+<script src="modules/sender-actions.js?v=20260918-2"></script>
+<script src="modules/queue-sections.js?v=20260918-3"></script>
+<script src="modules/window-chrome.js?v=20260918-1"></script>
+<script src="bridge.js?v=20260918-11"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

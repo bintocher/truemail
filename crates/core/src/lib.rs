@@ -42,6 +42,10 @@ impl Core {
         let crypto = Arc::new(crypto::StorageCrypto::open(&data_dir)?);
         let db = storage::Db::open(&data_dir, crypto.clone()).await?;
         db.migrate().await?;
+        // S-035: полный проход записи автоочистки положен при запуске
+        // программы. Без этого шага у пользователя без синхронизации запись
+        // просто не работала бы.
+        db.resume_stage_jobs().await?;
         let (removed_blobs, missing_blobs) = db.garbage_collect_blobs().await?;
         if removed_blobs > 0 {
             tracing::info!(removed_blobs, "удалены потерянные blob-файлы");

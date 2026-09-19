@@ -30,6 +30,10 @@ pub enum Category {
     Uuid,
     Uid,
     MessageIdHeader,
+    /// Содержимое письма и значения условий правил: тема, предпросмотр, адреса
+    /// в полях записи и текст ошибки очереди операций
+    /// (mail-rules-conditions-and-actions.md, S-084).
+    Content,
 }
 
 impl Category {
@@ -46,6 +50,7 @@ impl Category {
             Self::Uuid => "uuid",
             Self::Uid => "uid",
             Self::MessageIdHeader => "message_id_header",
+            Self::Content => "content",
         }
     }
 
@@ -58,6 +63,30 @@ impl Category {
             "message_id" => Some(Self::MessageId),
             "uid" => Some(Self::Uid),
             "collection" | "folder" | "mailbox" | "remote_path" => Some(Self::Folder),
+            // S-084: тема, предпросмотр, адреса, значение условия правила и
+            // текст ошибки очереди в архив открытым текстом не попадают.
+            // Значения списков отправителей, адрес записи автоочистки, тема и
+            // участники игнорируемой переписки попадают сюда же
+            // (blocked-senders.md S-052, ignore-conversation.md S-053,
+            // sweep-by-sender.md S-049).
+            "subject"
+            | "preview"
+            | "body"
+            | "value"
+            | "rule_value"
+            | "condition_value"
+            | "from"
+            | "from_addr"
+            | "to"
+            | "to_addrs"
+            | "recipient"
+            | "sender"
+            | "last_error"
+            | "policy_value"
+            | "address"
+            | "domain"
+            | "participants"
+            | "conversation_subject" => Some(Self::Content),
             _ => None,
         }
     }
@@ -125,6 +154,14 @@ static_regex!(
 static_regex!(
     field_folder_re,
     r#"(?i)\b(collection|folder|mailbox|remote_path)\s*=\s*("[^"]*"|[^\s,;}]+)"#
+);
+// Поля с содержимым письма и значениями условий правил: subject="...",
+// value="...", last_error="..." (S-084). Идут раньше шаблонов адреса, узла и
+// пути: внутри такого значения может оказаться и адрес, и текст ошибки
+// сервера, и всё оно целиком заменяется одним псевдонимом.
+static_regex!(
+    field_content_re,
+    r#"(?i)\b(subject|preview|body|value|rule_value|condition_value|from|from_addr|to|to_addrs|recipient|sender|last_error|policy_value|address|domain|participants|conversation_subject)\s*=\s*("[^"]*"|[^\s,;}]+)"#
 );
 // Пути: якорь (начало строки или пробел/кавычка/скобка/знак равенства) не
 // входит в замену - иначе разделитель перед путём терялся бы. Без якоря путь
@@ -271,6 +308,7 @@ pub fn anonymize_line(line: &str, salt: &[u8; 16], counts: &mut ReplacementCount
     text = replace_whole_match(uuid_re(), Category::Uuid, salt, &text, counts);
     text = replace_named_field(field_id_re(), salt, &text, counts);
     text = replace_named_field(field_folder_re(), salt, &text, counts);
+    text = replace_named_field(field_content_re(), salt, &text, counts);
     // Домашний каталог - раньше общих шаблонов пути (F1): иначе общий шаблон
     // уже оборвал бы совпадение на первом пробеле имени пользователя.
     text = replace_anchored_value(windows_home_re(), Category::Path, salt, &text, counts);
@@ -470,6 +508,43 @@ mod tests {
         let plain = anonymize_line("schernov@yandex.ru", &salt, &mut counts);
         let encoded = anonymize_line("schernov%40yandex.ru", &salt, &mut counts);
         assert_eq!(plain, encoded);
+    }
+
+    #[test]
+    fn message_content_and_rule_values_are_masked() {
+        // mail-rules-conditions-and-actions.md, S-084: тема письма, значение
+        // условия правила и текст ошибки очереди в архив открытым текстом не
+        // попадают.
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "rule_id=r1 value=\"Счет от ООО\" subject=\"Отчёт за месяц\" last_error=\"NO [OVERQUOTA] boss@example.test\"",
+            &salt(9),
+            &mut counts,
+        );
+        assert!(!line.contains("Счет от ООО"), "{line}");
+        assert!(!line.contains("Отчёт за месяц"), "{line}");
+        assert!(!line.contains("OVERQUOTA"), "{line}");
+        assert!(line.contains("rule_id=r1"), "{line}");
+    }
+
+    #[test]
+    fn sender_lists_and_conversation_metadata_are_masked() {
+        // blocked-senders.md S-052, ignore-conversation.md S-053,
+        // sweep-by-sender.md S-049: значения списков отправителей, адрес
+        // записи автоочистки, тема и участники переписки и идентификатор
+        // письма открытым текстом в архив не попадают.
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "policy_id=7 policy_value=\"boss@example.test\" domain=\"spam.test\" participants=\"Иван Петров\" conversation_subject=\"Договор на поставку\" header=<abc123@example.test>",
+            &salt(11),
+            &mut counts,
+        );
+        assert!(!line.contains("boss@example.test"), "{line}");
+        assert!(!line.contains("spam.test"), "{line}");
+        assert!(!line.contains("Иван Петров"), "{line}");
+        assert!(!line.contains("Договор на поставку"), "{line}");
+        assert!(!line.contains("abc123"), "{line}");
+        assert!(line.contains("policy_id=7"), "{line}");
     }
 
     #[test]

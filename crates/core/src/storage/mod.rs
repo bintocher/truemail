@@ -4,7 +4,30 @@
 
 mod blobs;
 pub mod encoded_words;
+#[cfg(test)]
+mod flag_due_dates_scenarios;
+pub mod ignored_conversations;
+#[cfg(test)]
+mod migration_scenarios;
+pub mod out_of_office;
+#[cfg(test)]
+mod out_of_office_scenarios;
+pub mod outbox_send;
+#[cfg(test)]
+mod pinned_messages_scenarios;
+#[cfg(test)]
+mod quick_steps_scenarios;
+pub mod recipient_history;
+#[cfg(test)]
+mod recipient_history_scenarios;
 pub mod repo;
+#[cfg(test)]
+mod send_scenarios;
+pub mod sender_policies;
+pub mod sender_sweep;
+#[cfg(test)]
+mod stage_scenarios;
+mod stages;
 
 pub use blobs::BlobStore;
 
@@ -27,9 +50,21 @@ pub struct Db {
     pub write_pool: SqlitePool,
     pub blobs: BlobStore,
     crypto: Arc<StorageCrypto>,
+    /// Выданные ключи подтверждения удаления навсегда: подтверждение
+    /// одноразовое и живёт только до сохранения правила (S-048).
+    delete_confirmations: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 const ENCRYPTED_SETTING_PREFIX: &[u8] = b"TMSET1\0";
+
+/// Ключ отметки минимальной совместимой версии программы в `storage_meta`
+/// (S-079).
+const MIN_APP_VERSION_KEY: &str = "min_app_version";
+
+/// Версия программы, начиная с которой понимается схема правил с группами и
+/// цепочками действий. Отметка описывает схему, а не текущую сборку, поэтому
+/// растёт только вместе с несовместимым изменением схемы.
+const MIN_COMPATIBLE_APP_VERSION: &str = "0.2.19";
 
 impl Db {
     /// Открыть/создать базу в data_dir/truemail.db и blob-store в data_dir/blobs.
@@ -88,6 +123,9 @@ impl Db {
             write_pool,
             blobs,
             crypto,
+            delete_confirmations: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 
@@ -119,13 +157,120 @@ impl Db {
 
     /// Прогнать все миграции из crates/core/migrations.
     pub async fn migrate(&self) -> Result<()> {
+        // S-080: отметка читается до мигратора. Мигратор запускается первым
+        // шагом и на слишком новой базе упал бы техническим текстом раньше
+        // любой прикладной проверки.
+        self.check_min_app_version().await?;
         sqlx::migrate!("./migrations")
             .run(&self.write_pool)
             .await
-            .map_err(|e| crate::Error::Other(format!("миграции: {e}")))?;
+            .map_err(migrator_error)?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
         self.import_legacy_mail_rules().await?;
+        // S-074 - S-077: перенос прежних правил в группы и действия идёт
+        // прикладным шагом, уже после структурной части.
+        self.migrate_mail_rules_to_groups().await?;
+        // Начальный курсор стадий: запись, заведённая до первой синхронизации,
+        // не должна доставать стадии всю историю писем
+        // (blocked-senders.md S-021, ignore-conversation.md S-025,
+        // sweep-by-sender.md S-036). Шаг прикладной: уже применённая миграция
+        // не меняется.
+        self.seed_stage_cursors().await?;
+        // Снимки кандидатов, которых никто не подтвердил, живут не дольше
+        // суток: диалог открывают часто, а подтверждают редко.
+        self.purge_stale_stage_snapshots().await?;
+        self.mark_min_app_version().await?;
+        // S-072: задание, прерванное закрытием программы, продолжается с
+        // сохранённого курсора. Задания уборки списков отправителей,
+        // игнорирования переписки и автоочистки возвращаются в очередь по той
+        // же причине (blocked-senders.md S-038, ignore-conversation.md S-048,
+        // sweep-by-sender.md S-043).
+        self.restore_mail_rule_runs().await?;
+        self.restore_sender_policy_jobs().await?;
+        self.restore_ignore_jobs().await?;
+        self.restore_sender_sweep_jobs().await?;
+        // undo-send.md S-027: операция отправки, застигнутая аварийным
+        // завершением в состоянии передачи, получает неопределённый итог. Её
+        // повтор без решения пользователя отправил бы письмо второй раз.
+        self.recover_sending_operations().await?;
+        self.purge_send_request_keys().await?;
+        // out-of-office.md S-050 и recipient-history.md S-010: память об
+        // ответах и об отметках собственных отправок стареет фоновым
+        // обслуживанием, а не растёт без предела.
+        self.purge_out_of_office_replies().await?;
+        self.purge_recipient_own_sends().await?;
+        // recipient-history.md S-002: почтовые контакты прежнего сбора
+        // переносятся в историю получателей прикладным шагом миграции.
+        self.migrate_mail_contacts_to_history().await?;
+        Ok(())
+    }
+
+    /// Продвинуть задания стадий один раз после применения миграций. Полный
+    /// проход включённой записи автоочистки положен при запуске программы, а не
+    /// только по сроку (sweep-by-sender.md S-035); там же продолжаются уборки
+    /// списков и возвраты игнорирования. Шаг отделён от `migrate`: он ставит
+    /// операции в очередь и выполняется на уже открытой базе.
+    pub async fn resume_stage_jobs(&self) -> Result<()> {
+        self.start_sender_sweep_full_passes().await?;
+        self.advance_sender_policy_jobs().await?;
+        self.advance_ignored_conversation_jobs().await?;
+        self.advance_sender_sweep_jobs().await?;
+        Ok(())
+    }
+
+    /// Отказаться открывать базу, изменённую более новой версией программы
+    /// (S-080).
+    async fn check_min_app_version(&self) -> Result<()> {
+        let stored: std::result::Result<Option<(String,)>, sqlx::Error> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = ?")
+                .bind(MIN_APP_VERSION_KEY)
+                .fetch_optional(&self.pool)
+                .await;
+        let stored = match stored {
+            Ok(value) => value,
+            // Таблицы отметок в базе прежних версий ещё нет - это не более
+            // новая база, а более старая. Любая другая ошибка чтения означает
+            // недоступную или повреждённую базу, и проглатывать её нельзя:
+            // иначе повреждение выглядело бы как старая база.
+            Err(error) if missing_storage_meta(&error) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let Some((required,)) = stored else {
+            return Ok(());
+        };
+        let running = env!("CARGO_PKG_VERSION");
+        if version_is_newer(&required, running) {
+            return Err(crate::Error::Other(format!(
+                "база данных изменена более новой версией программы ({required}), обновите truemail: текущая версия {running}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Записать отметку минимальной совместимой версии программы (S-079).
+    async fn mark_min_app_version(&self) -> Result<()> {
+        let stored: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM storage_meta WHERE key = ?")
+                .bind(MIN_APP_VERSION_KEY)
+                .fetch_optional(&self.pool)
+                .await?;
+        // Отметку опускать нельзя: её мог поднять более новый выпуск программы,
+        // а сравнивать версии строками нельзя - "0.10.0" строкой меньше "0.9.9".
+        if stored
+            .as_ref()
+            .is_some_and(|(value,)| !version_is_newer(MIN_COMPATIBLE_APP_VERSION, value))
+        {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO storage_meta(key, value) VALUES(?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(MIN_APP_VERSION_KEY)
+        .bind(MIN_COMPATIBLE_APP_VERSION)
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 
@@ -231,6 +376,49 @@ impl Db {
         .await?;
         Ok(())
     }
+}
+
+/// Понятное сообщение вместо технического текста мигратора: применённая
+/// миграция, которой нет во встроенном наборе, означает базу более новой
+/// версии программы (S-081).
+fn migrator_error(error: sqlx::migrate::MigrateError) -> crate::Error {
+    // S-081 говорит о применённой миграции, которой нет во встроенном наборе.
+    // Изменённая контрольная сумма - другая беда: она означает подменённую
+    // миграцию, а не более новую программу, и объяснять её обновлением нельзя.
+    if matches!(error, sqlx::migrate::MigrateError::VersionMissing(_)) {
+        return crate::Error::Other(
+            "база данных создана более новой версией программы, обновите truemail".into(),
+        );
+    }
+    crate::Error::Other(format!("миграции: {error}"))
+}
+
+/// Ошибка чтения отметки, означающая только отсутствие таблицы `storage_meta`
+/// в базе прежних версий.
+fn missing_storage_meta(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Database(database)
+        if database.message().contains("no such table: storage_meta"))
+}
+
+/// Сравнение версий по числам: "0.10.0" новее "0.9.9", хотя по строкам это не
+/// так. Нечисловые части считаются нулями.
+fn version_is_newer(candidate: &str, baseline: &str) -> bool {
+    let parts = |value: &str| -> Vec<u64> {
+        value
+            .split(|symbol: char| !symbol.is_ascii_digit())
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let left = parts(candidate);
+    let right = parts(baseline);
+    for index in 0..left.len().max(right.len()) {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        if a != b {
+            return a > b;
+        }
+    }
+    false
 }
 
 fn encrypted_options(
@@ -461,6 +649,30 @@ fn secure_remove_file(path: &Path) -> Result<()> {
 
 fn escape_sql_literal(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::{migrator_error, version_is_newer};
+
+    /// S-080: отметка больше версии программы означает базу более новой
+    /// версии, а равная и меньшая - совместимую.
+    #[test]
+    fn version_comparison_uses_numbers() {
+        assert!(version_is_newer("0.10.0", "0.9.9"));
+        assert!(version_is_newer("1.0.0", "0.2.19"));
+        assert!(!version_is_newer("0.2.19", "0.2.19"));
+        assert!(!version_is_newer("0.2.18", "0.2.19"));
+    }
+
+    /// S-081: техническая жалоба мигратора на неизвестную применённую миграцию
+    /// превращается в понятное предложение обновиться.
+    #[test]
+    fn unknown_applied_migration_is_explained() {
+        let error = sqlx::migrate::MigrateError::VersionMissing(44);
+        let text = migrator_error(error).to_string();
+        assert!(text.contains("более новой версией программы"), "{text}");
+    }
 }
 
 #[cfg(test)]
@@ -2163,7 +2375,8 @@ mod tests {
     #[tokio::test]
     async fn mail_rules_queue_each_matching_message_once() {
         use crate::model::{
-            AuthKind, BackendKind, MailRuleInput, NewAccount, Provider, Security, ServerConfig,
+            AuthKind, BackendKind, MailRuleAction, MailRuleCondition, MailRuleGroup, MailRuleInput,
+            NewAccount, Provider, Security, ServerConfig,
         };
 
         let root = std::env::temp_dir().join(format!("truemail-rules-{}", uuid::Uuid::new_v4()));
@@ -2235,16 +2448,29 @@ mod tests {
             &MailRuleInput {
                 id: "archive-alerts".into(),
                 name: "Archive alerts".into(),
-                field: "sender".into(),
-                operator: "contains".into(),
-                value: "alerts@".into(),
                 account_id: Some(account.id),
-                action: "archive".into(),
-                folder_id: None,
-                label_id: None,
                 enabled: true,
+                groups: vec![MailRuleGroup {
+                    logic: "all".into(),
+                    conditions: vec![MailRuleCondition {
+                        field: "sender".into(),
+                        op: "contains".into(),
+                        value: "alerts@".into(),
+                        unit: None,
+                        value2: None,
+                    }],
+                }],
+                exceptions: Vec::new(),
+                actions: vec![MailRuleAction {
+                    kind: "archive".into(),
+                    folder_id: None,
+                    folder_role: None,
+                    label_id: None,
+                }],
+                confirm_key: None,
             },
             true,
+            None,
         )
         .await
         .expect("save rule");
@@ -2417,27 +2643,32 @@ mod tests {
         assert_eq!(second_exists.0, 1);
 
         let scheduled = db
-            .queue_scheduled_send(account.id, "{\"message\":true}", "2000-01-01 00:00:00")
+            .queue_outgoing_send(
+                account.id,
+                crate::backend::OutgoingMessage {
+                    from: "me@example.test".into(),
+                    to: vec!["you@example.test".into()],
+                    subject: "тема".into(),
+                    body_text: "текст".into(),
+                    ..Default::default()
+                },
+                crate::model::SEND_ORIGIN_SCHEDULED,
+                None,
+                0,
+            )
             .await
-            .expect("queue scheduled send");
-        db.convert_outbox_to_sent_append(scheduled, "{\"raw\":\"bWltZQ==\"}", "append failed")
+            .expect("queue scheduled send")
+            .operation_id;
+        db.convert_send_to_sent_append(scheduled, b"mime")
             .await
             .expect("convert delivered SMTP operation");
-        let converted: (String, String, String, i64) =
-            sqlx::query_as("SELECT op_kind, payload, status, attempts FROM outbox_ops WHERE id=?")
+        let converted: (String, String, i64) =
+            sqlx::query_as("SELECT op_kind, status, attempts FROM outbox_ops WHERE id=?")
                 .bind(scheduled)
                 .fetch_one(&db.pool)
                 .await
                 .expect("read append-only retry");
-        assert_eq!(
-            converted,
-            (
-                "append_sent".into(),
-                "{\"raw\":\"bWltZQ==\"}".into(),
-                "retry".into(),
-                0
-            )
-        );
+        assert_eq!(converted, ("append_sent".into(), "retry".into(), 0));
 
         db.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");

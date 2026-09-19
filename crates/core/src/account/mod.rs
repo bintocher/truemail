@@ -40,10 +40,255 @@ use crate::storage::repo::AuxiliarySaveResult;
 use base64::Engine as _;
 use zeroize::Zeroizing;
 
-fn sent_append_payload(raw: &[u8]) -> Result<String> {
-    Ok(serde_json::to_string(&serde_json::json!({
-        "raw": base64::engine::general_purpose::STANDARD.encode(raw)
-    }))?)
+/// Состояние сервера в том виде, в каком его хранит локальная база.
+fn server_state_input(
+    account_id: i64,
+    state: &crate::backend::OofState,
+) -> crate::model::OutOfOfficeInput {
+    crate::model::OutOfOfficeInput {
+        account_id,
+        enabled: state.enabled,
+        starts_at: state.starts_at.clone(),
+        ends_at: state.ends_at.clone(),
+        internal_text: state.internal_text.clone(),
+        external_text: state.external_text.clone(),
+        internal_domains: Vec::new(),
+    }
+}
+
+/// Время во всемирном времени: сервер Exchange принимает период только в нём
+/// (specs/out-of-office.md, S-013).
+fn utc_stamp(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value.trim())
+        .map(|parsed| {
+            parsed
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        })
+        .unwrap_or_else(|_| value.trim().to_owned())
+}
+
+/// Передать захваченное письмо готовым серверным модулем и довести операцию до
+/// итога. Отдельная функция от `AccountsService` нужна проверкам: они проходят
+/// весь путь передачи с поддельным серверным модулем, не заводя учётных данных
+/// (specs/undo-send.md, S-047 - S-052).
+pub(crate) async fn transmit_with_backend(
+    db: &Db,
+    account_email: &str,
+    backend: &dyn MailBackend,
+    token: &str,
+    operation: &crate::storage::repo::OutboxOperation,
+) -> usize {
+    let payload = match db.read_send_payload(operation.id, &operation.payload).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            fail_send(db, operation.id, &error).await;
+            return 0;
+        }
+    };
+    let message = match db.outgoing_from_payload(&payload).await {
+        Ok(message) => message,
+        Err(error) => {
+            // Большой объект письма недоступен: письмо без вложения не уходит, а
+            // операция требует вмешательства пользователя.
+            fail_send(db, operation.id, &error).await;
+            return 0;
+        }
+    };
+    let outcome = match backend.send(message, token).await {
+        Ok(outcome) => outcome,
+        Err(failure) if !failure.after_handoff => {
+            defer_send(db, operation.id, &failure.error).await;
+            return 0;
+        }
+        Err(failure) => {
+            // S-049: письмо уже ушло серверу, и ответа на него нет. Повтор без
+            // решения пользователя доставил бы получателю второй экземпляр.
+            if let Err(error) = db
+                .mark_send_uncertain(operation.id, &failure.error.to_string())
+                .await
+            {
+                warn_send(
+                    account_email,
+                    operation.id,
+                    &error,
+                    "неопределённый итог не записан",
+                );
+            }
+            tracing::warn!(
+                account = %crate::logging::mask_email(account_email),
+                operation = operation.id,
+                error_kind = failure.error.code(),
+                "итог передачи письма неизвестен, решение за пользователем"
+            );
+            return 0;
+        }
+    };
+    // recipient-history.md S-009, S-015: обращения записываются в момент
+    // подтверждения сервером и до превращения операции в дозапись копии - её
+    // данные перечня адресатов уже не хранят.
+    record_send_history(db, operation.account_id, &payload).await;
+    if let Err(error) = db
+        .mark_out_of_office_reply_state(operation.id, "sent")
+        .await
+    {
+        warn_send(
+            account_email,
+            operation.id,
+            &error,
+            "состояние автоответа не записано",
+        );
+    }
+    let raw = match outcome {
+        SendOutcome::SavedOnServer => None,
+        SendOutcome::NeedsSentAppend(raw) => Some(raw),
+    };
+    let Some(raw) = raw else {
+        complete_send(db, account_email, operation.id).await;
+        return 1;
+    };
+    // S-052: операция становится дозаписью копии до попытки добавить копию.
+    // Аварийное завершение между подтверждением сервера и этим переводом
+    // оставило бы её отправкой, и повтор ушёл бы получателю второй раз.
+    if let Err(error) = db.convert_send_to_sent_append(operation.id, &raw).await {
+        warn_send(
+            account_email,
+            operation.id,
+            &error,
+            "письмо доставлено, но операция осталась отправкой: итог решит пользователь",
+        );
+        return 1;
+    }
+    match backend.append_sent(account_email, token, &raw).await {
+        Ok(()) => complete_send(db, account_email, operation.id).await,
+        Err(error) => {
+            // S-052: письмо получателю уже доставлено, поэтому повторяется
+            // только добавление копии.
+            if let Err(write) = db
+                .fail_outbox_operation(operation.id, &error.to_string())
+                .await
+            {
+                warn_send(
+                    account_email,
+                    operation.id,
+                    &write,
+                    "отказ дозаписи копии не записан",
+                );
+            }
+            // S-063: в журнал идёт вид ошибки, а не её текст - сервер повторяет
+            // в нём адрес и тему письма.
+            tracing::warn!(
+                account = %crate::logging::mask_email(account_email),
+                operation = operation.id,
+                error_kind = error.code(),
+                "письмо доставлено; повтор продолжит только сохранение копии"
+            );
+        }
+    }
+    1
+}
+
+/// Закрыть успешную отправку. Отказ записи письма второй раз не отправляет:
+/// операция остаётся в состоянии передачи и на следующем запуске получает
+/// неопределённый итог (S-027).
+async fn complete_send(db: &Db, account_email: &str, operation_id: i64) {
+    if let Err(error) = db.complete_send_operation(operation_id).await {
+        warn_send(
+            account_email,
+            operation_id,
+            &error,
+            "успешная отправка не закрыта",
+        );
+    }
+}
+
+/// Отсрочка после отказа, не дошедшего до передачи письма (S-028, S-048).
+async fn defer_send(db: &Db, operation_id: i64, reason: &crate::Error) {
+    if let Err(error) = db
+        .defer_send_operation(operation_id, &reason.to_string())
+        .await
+    {
+        tracing::warn!(
+            operation = operation_id,
+            error_kind = error.code(),
+            "отсрочка отправки не записана"
+        );
+    }
+}
+
+/// Отказ, зависящий от содержимого письма: попытку он расходует (S-048).
+async fn fail_send(db: &Db, operation_id: i64, reason: &crate::Error) {
+    if let Err(error) = db
+        .fail_outbox_operation(operation_id, &reason.to_string())
+        .await
+    {
+        tracing::warn!(
+            operation = operation_id,
+            error_kind = error.code(),
+            "отказ отправки не записан"
+        );
+    }
+}
+
+/// Запись в журнал об отправке: адрес маскируется, а от ошибки остаётся только
+/// её вид - текст сервера повторяет адреса и тему письма (S-063).
+fn warn_send(account_email: &str, operation_id: i64, error: &crate::Error, message: &str) {
+    tracing::warn!(
+        account = %crate::logging::mask_email(account_email),
+        operation = operation_id,
+        error_kind = error.code(),
+        "{message}"
+    );
+}
+
+/// Записать обращения к адресатам подтверждённой отправки и отметку своего
+/// письма (recipient-history.md S-009, S-010, S-014).
+async fn record_send_history(db: &Db, account_id: i64, payload: &crate::model::SendPayload) {
+    let used_at = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    let touches = payload
+        .to
+        .iter()
+        .chain(&payload.cc)
+        .chain(&payload.bcc)
+        .map(|address| {
+            // S-024, S-038: адресат записан одной строкой вместе с именем. Без
+            // разбора имя терялось бы, а ключом записи становилась бы вся
+            // строка целиком.
+            let (name, email) = crate::model::split_display_address(address);
+            crate::storage::recipient_history::RecipientTouch {
+                email,
+                name,
+                message_key: payload.message_id.clone(),
+                used_at: used_at.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = db.record_own_send(account_id, &payload.message_id).await {
+        // S-058: в журнал уходит только маскированный текст ошибки - она охотно
+        // повторяет адрес письма.
+        tracing::warn!(
+            error = %crate::logging::mask_error_text(&error.to_string()),
+            "отметка собственной отправки не записана"
+        );
+    }
+    if let Err(error) = db
+        .record_recipient_touches(
+            account_id,
+            &touches,
+            crate::storage::recipient_history::TouchOrigin::OwnSend,
+        )
+        .await
+    {
+        // Отказ записи обращения доставку письма не отменяет, а текст ошибки
+        // маскируется (S-058).
+        tracing::warn!(
+            error = %crate::logging::mask_error_text(&error.to_string()),
+            "обращения к адресатам письма не записаны"
+        );
+    }
 }
 
 fn sent_append_raw(payload: &str) -> Result<Vec<u8>> {
@@ -1183,9 +1428,20 @@ impl AccountManager {
         self.db
             .save_discovered_messages(account.id, &discovery.messages, false)
             .await?;
-        // Письма к этому моменту уже в БД и получили локальные id - можно
-        // достать их для уведомления. Только Входящие (роль 'inbox'): другие
-        // папки уведомлению не нужны.
+        self.db
+            .save_folder_sync_tokens(account.id, &discovery.folders)
+            .await?;
+        let rules_applied = match self.db.process_sync_batch_stages().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
+                0
+            }
+        };
+        // S-010, S-011: список для уведомления собирается после стадий
+        // обработки и по письмам этой же синхронизационной пачки, поэтому
+        // уведённое правилом письмо в уведомление уже не попадает. Только
+        // Входящие (роль 'inbox'): другие папки уведомлению не нужны.
         let new_message_ids = if unknown_remote_ids.is_empty() {
             Vec::new()
         } else {
@@ -1198,16 +1454,6 @@ impl AccountManager {
                     Some(&not_after),
                 )
                 .await?
-        };
-        self.db
-            .save_folder_sync_tokens(account.id, &discovery.folders)
-            .await?;
-        let rules_applied = match self.db.process_mail_rules().await {
-            Ok(count) => count,
-            Err(error) => {
-                tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
-                0
-            }
         };
         let changed = downloaded > 0
             || folders_changed
@@ -1386,10 +1632,12 @@ impl AccountManager {
             });
         }
         let count = messages.len();
-        // Правила не должны срабатывать на старую переписку, поднятую прокруткой.
+        // Правила не должны срабатывать на старую переписку, поднятую прокруткой:
+        // по догруженным письмам выполняются только стадии пути догрузки (S-063).
         self.db
             .save_discovered_messages(account.id, &messages, true)
             .await?;
+        self.db.process_backfill_stages().await?;
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(BackfillPage {
             fetched: count,
@@ -1917,16 +2165,23 @@ impl AccountManager {
                 mime_type: "text/calendar; method=REPLY; charset=UTF-8".into(),
                 data: ics.into_bytes(),
             }],
+            ..Default::default()
         };
         self.send_outgoing(account.id, message).await
     }
 
-    /// Отправить письмо через транспорт выбранного аккаунта; поле From задаёт core.
-    pub async fn send_outgoing(
+    /// Принять письмо в очередь отправки; поле From задаёт ядро.
+    ///
+    /// Прямого обращения к серверному модулю здесь больше нет: письмо принято
+    /// локально сразу, а передача начинается после окна отмены и повторяется по
+    /// правилам очереди операций (specs/undo-send.md, S-001, S-057, S-059).
+    pub async fn queue_outgoing(
         &self,
         account_id: i64,
         mut message: crate::backend::OutgoingMessage,
-    ) -> Result<()> {
+        origin: &str,
+        request_key: Option<String>,
+    ) -> Result<crate::model::SendQueued> {
         let account = self
             .db
             .list_accounts()
@@ -1935,30 +2190,164 @@ impl AccountManager {
             .find(|account| account.id == account_id)
             .ok_or_else(|| crate::Error::AccountConfig("аккаунт отправителя не найден".into()))?;
         message.from = account.email.clone();
-        let credential = self.mail_credential(&account).await?;
-        let backend = Self::mail_backend(&account)?;
-        let provider = backend.provider_id();
-        if let SendOutcome::NeedsSentAppend(raw) = backend.send(message, &credential).await?
-            && let Err(error) = backend.append_sent(&account.email, &credential, &raw).await
-        {
-            let payload = sent_append_payload(&raw)?;
-            self.db
-                .queue_sent_append(account.id, &payload, &error.to_string())
-                .await?;
-            tracing::warn!(
-                account = %crate::logging::mask_email(&account.email),
-                provider,
-                %error,
-                "SMTP доставил письмо; сохранение в Отправленные поставлено в отдельный retry"
-            );
-            return Ok(());
-        }
+        // S-011, S-055, S-057: окно отмены получает только обычная отправка
+        // пользователя. Служебное письмо, письмо локального интерфейса
+        // приложений и отправка по времени уходят без него.
+        let undo_seconds = if origin == crate::model::SEND_ORIGIN_ORDINARY {
+            self.db.undo_send_seconds().await?
+        } else {
+            0
+        };
+        let queued = self
+            .db
+            .queue_outgoing_send(account.id, message, origin, request_key, undo_seconds)
+            .await?;
         tracing::info!(
             account = %crate::logging::mask_email(&account.email),
-            provider,
-            "письмо отправлено, серверная копия сохранена"
+            operation = queued.operation_id,
+            origin,
+            undo_seconds,
+            "письмо принято в очередь отправки"
         );
+        Ok(queued)
+    }
+
+    /// Служебное письмо программы: ответ на приглашение календаря и автоответ
+    /// уходят тем же путём, что и письмо пользователя (S-057).
+    pub async fn send_outgoing(
+        &self,
+        account_id: i64,
+        message: crate::backend::OutgoingMessage,
+    ) -> Result<()> {
+        self.queue_outgoing(
+            account_id,
+            message,
+            crate::model::SEND_ORIGIN_AUTOMATIC,
+            None,
+        )
+        .await?;
         Ok(())
+    }
+
+    /// Построить модуль Exchange отдельной ветвью: общее построение модуля
+    /// отдаёт обобщённый объект интерфейса почтового модуля, у которого
+    /// операций отсутствия нет вовсе (specs/out-of-office.md, S-010).
+    fn exchange_backend(account: &Account) -> Result<crate::backend::EwsBackend> {
+        if account.provider != Provider::Exchange {
+            return Err(crate::Error::AccountConfig(
+                "серверный автоответ доступен только ящику Exchange".into(),
+            ));
+        }
+        Ok(crate::backend::EwsBackend {
+            endpoint: account.ews_url.clone().ok_or_else(|| {
+                crate::Error::AccountConfig("для Exchange не настроен адрес EWS".into())
+            })?,
+            username: account
+                .username
+                .clone()
+                .unwrap_or_else(|| account.email.clone()),
+            timeouts: crate::backend::EwsTimeouts::background(),
+        })
+    }
+
+    async fn account_by_id(&self, account_id: i64) -> Result<Account> {
+        self.db
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .ok_or_else(|| crate::Error::AccountConfig("ящик не найден".into()))
+    }
+
+    /// Настройка автоответа выбранного ящика. Для серверного режима состояние
+    /// читается с сервера и показывается именно оно (S-011).
+    pub async fn out_of_office(
+        &self,
+        account_id: i64,
+    ) -> Result<crate::model::OutOfOfficeSettings> {
+        let settings = self.db.out_of_office_settings(account_id).await?;
+        if settings.mode != crate::model::OUT_OF_OFFICE_MODE_SERVER || !settings.available {
+            return Ok(settings);
+        }
+        let account = self.account_by_id(account_id).await?;
+        match self.read_server_out_of_office(&account).await {
+            Ok(()) => self.db.out_of_office_settings(account_id).await,
+            Err(error) => {
+                // S-018: отказ чтения не подменяется ранее введённым значением
+                // и не включает вместо серверного режима локальный.
+                self.db
+                    .save_out_of_office_error(account_id, &error.to_string())
+                    .await?;
+                self.db.out_of_office_settings(account_id).await
+            }
+        }
+    }
+
+    async fn read_server_out_of_office(&self, account: &Account) -> Result<()> {
+        let credential = self.mail_credential(account).await?;
+        let backend = Self::exchange_backend(account)?;
+        let state = backend
+            .read_oof_settings(&credential, &account.email)
+            .await?;
+        self.db
+            .save_server_out_of_office_state(
+                account.id,
+                &server_state_input(account.id, &state),
+                None,
+            )
+            .await
+    }
+
+    /// Сохранить настройку автоответа. Режим выбирает программа: ящик Exchange
+    /// хранит её на сервере, остальные ящики - у себя (S-002, S-003, S-005).
+    pub async fn save_out_of_office(
+        &self,
+        input: crate::model::OutOfOfficeInput,
+    ) -> Result<crate::model::OutOfOfficeSettings> {
+        let current = self.db.out_of_office_settings(input.account_id).await?;
+        if !current.available {
+            return Err(crate::Error::AccountConfig(
+                current
+                    .unavailable_reason
+                    .unwrap_or_else(|| "автоответ для этого ящика недоступен".into()),
+            ));
+        }
+        if current.mode != crate::model::OUT_OF_OFFICE_MODE_SERVER {
+            return self.db.save_local_out_of_office(&input).await;
+        }
+        let account = self.account_by_id(input.account_id).await?;
+        let credential = self.mail_credential(&account).await?;
+        let backend = Self::exchange_backend(&account)?;
+        let state = crate::backend::OofState {
+            enabled: input.enabled,
+            starts_at: utc_stamp(&input.starts_at),
+            ends_at: utc_stamp(&input.ends_at),
+            internal_text: input.internal_text.trim().to_owned(),
+            external_text: input.external_text.trim().to_owned(),
+        };
+        // S-016, S-018: успех объявляется только по перечитанному состоянию, а
+        // отказ записи показанное состояние не меняет.
+        match backend
+            .write_oof_settings(&credential, &account.email, &state)
+            .await
+        {
+            Ok(confirmed) => {
+                self.db
+                    .save_server_out_of_office_state(
+                        account.id,
+                        &server_state_input(account.id, &confirmed),
+                        None,
+                    )
+                    .await?;
+                self.db.out_of_office_settings(account.id).await
+            }
+            Err(error) => {
+                self.db
+                    .save_out_of_office_error(account.id, &error.to_string())
+                    .await?;
+                Err(error)
+            }
+        }
     }
 
     /// Ждать серверное изменение через механизм выбранного транспорта.
@@ -1986,47 +2375,22 @@ impl AccountManager {
                 .await
                 .insert(account.id);
         }
+        // S-025: письма передаются по одному, и письмо, ещё не дошедшее до
+        // своей очереди, остаётся ожидающим и доступным для отмены.
+        let mut completed = 0;
+        while let Some(operation) = self.db.claim_send_operation(account.id).await? {
+            completed += self.transmit_queued_message(account, &operation).await?;
+        }
         let operations = self.db.claim_outbox_operations(account.id, 50).await?;
         if operations.is_empty() {
-            return Ok(0);
+            return Ok(completed);
         }
         // Не трогаем transport/OAuth/quota gate, когда отправлять нечего.
         let token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
-        let mut completed = 0;
         for operation in operations {
-            let applied = if operation.op_kind == "send" {
-                match serde_json::from_str::<crate::backend::OutgoingMessage>(&operation.payload) {
-                    Ok(message) => match backend.send(message, &token).await {
-                        Ok(SendOutcome::SavedOnServer) => Ok(()),
-                        Ok(SendOutcome::NeedsSentAppend(raw)) => {
-                            match backend.append_sent(&account.email, &token, &raw).await {
-                                Ok(()) => Ok(()),
-                                Err(error) => {
-                                    let payload = sent_append_payload(&raw)?;
-                                    self.db
-                                        .convert_outbox_to_sent_append(
-                                            operation.id,
-                                            &payload,
-                                            &error.to_string(),
-                                        )
-                                        .await?;
-                                    tracing::warn!(
-                                        account = %crate::logging::mask_email(&account.email),
-                                        operation = operation.id,
-                                        %error,
-                                        "SMTP доставил scheduled-письмо; retry продолжит только IMAP APPEND"
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(error) => Err(error),
-                    },
-                    Err(error) => Err(crate::Error::Json(error)),
-                }
-            } else if operation.op_kind == "append_sent" {
-                match sent_append_raw(&operation.payload) {
+            let applied = if operation.op_kind == "append_sent" {
+                match self.sent_append_bytes_of(&operation).await {
                     Ok(raw) => backend.append_sent(&account.email, &token, &raw).await,
                     Err(error) => Err(error),
                 }
@@ -2046,20 +2410,72 @@ impl AccountManager {
                     completed += 1;
                 }
                 Err(error) => {
-                    self.db
-                        .fail_outbox_operation(operation.id, &error.to_string())
-                        .await?;
+                    // S-084: текст ошибки сервера маскируется и в журнале, и в
+                    // поле последней ошибки очереди - он повторяет адреса и
+                    // тему письма.
+                    let reason = crate::logging::mask_error_text(&error.to_string());
+                    self.db.fail_outbox_operation(operation.id, &reason).await?;
                     tracing::warn!(
                         account = %crate::logging::mask_email(&account.email),
                         operation = operation.id,
                         attempts = operation.attempts + 1,
-                        %error,
+                        last_error = %reason,
                         "операция outbox будет повторена"
                     );
                 }
             }
         }
         Ok(completed)
+    }
+
+    /// Передать одно письмо очереди отправки серверу.
+    ///
+    /// Отказ, случившийся после захвата операции, наверх не уходит: операция,
+    /// оставленная в состоянии передачи, дождалась бы следующего запуска и была
+    /// бы объявлена там неопределённым итогом, хотя серверу письма никто не
+    /// передавал (specs/undo-send.md, S-027, S-048).
+    async fn transmit_queued_message(
+        &self,
+        account: &Account,
+        operation: &crate::storage::repo::OutboxOperation,
+    ) -> Result<usize> {
+        let token = match self.mail_credential(account).await {
+            Ok(token) => token,
+            Err(error) => {
+                // S-028, S-048: отказ учётных данных и недоступность сети не
+                // сжигают восемь попыток на заведомо неверный пароль и не
+                // теряют письмо при суточном отсутствии связи.
+                defer_send(&self.db, operation.id, &error).await;
+                return Ok(0);
+            }
+        };
+        let backend = match Self::mail_backend(account) {
+            Ok(backend) => backend,
+            Err(error) => {
+                defer_send(&self.db, operation.id, &error).await;
+                return Ok(0);
+            }
+        };
+        Ok(transmit_with_backend(
+            &self.db,
+            &account.email,
+            backend.as_ref(),
+            &token,
+            operation,
+        )
+        .await)
+    }
+
+    /// Точные байты письма для дозаписи копии: новые операции хранят их в
+    /// хранилище больших объектов, прежние - строкой в данных операции.
+    async fn sent_append_bytes_of(
+        &self,
+        operation: &crate::storage::repo::OutboxOperation,
+    ) -> Result<Vec<u8>> {
+        match serde_json::from_str::<crate::model::SendPayload>(&operation.payload) {
+            Ok(payload) if payload.raw_ref.is_some() => self.db.sent_append_bytes(&payload),
+            _ => sent_append_raw(&operation.payload),
+        }
     }
 
     /// Предел проверки учётных данных на уже определённом сервере -
@@ -2869,8 +3285,10 @@ impl AccountManager {
                                                     .await
                                                 {
                                                     Ok(()) => {
-                                                        if let Err(error) =
-                                                            self.db.process_mail_rules().await
+                                                        if let Err(error) = self
+                                                            .db
+                                                            .process_sync_batch_stages()
+                                                            .await
                                                         {
                                                             tracing::warn!(%error, "правила обработки будут повторены при следующей синхронизации");
                                                         }

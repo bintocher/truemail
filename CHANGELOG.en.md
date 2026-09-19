@@ -7,6 +7,25 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-19
+
+### Added
+
+- Mail rules are now complete. A rule used to support a single condition and a single action, and only the first matching rule was applied to a message. A rule now has condition groups "all of" and "any of" with exceptions, several actions in a row, its own position in the rule order, a manual run over selected folders and an option to stop further processing of the message.
+- Blocked and trusted sender lists, by address and by domain. A sender can be blocked from the message itself or from the list, and the check runs before the rules.
+- Sweep by sender in four modes: remove all messages from the sender, remove new ones as they arrive, keep only the latest message, remove messages older than a given number of days. Messages go to the trash instead of being deleted for good.
+- Ignore conversation: the whole thread goes to the trash together with new messages that arrive in it. A thread is identified by message identifiers rather than by subject, so messages that used to stay outside any thread are now included; restoring looks for them in the trash.
+- Undo send. After "Send" a countdown appears and the message can be returned to the composer. Sending now goes through the queue as a whole, so a dropped connection no longer loses the message together with its text: it goes out on the next connection.
+- Out of office replies. On Exchange accounts the reply is set on the server and works while the computer is off; on other accounts the app replies itself and states plainly that it only does so while running. Fifteen silence rules keep it from replying to mailing lists, other automatic replies and delivery reports, so two robots never start a conversation.
+- Recipient suggestions use the history of sent mail: people you write to often and recently come first instead of namesakes in alphabetical order. Contacts are no longer created from messages automatically; the ones added by hand stay as they are.
+- Due dates on the message flag and a separate task list: start date, due date, reminder and a completion mark. Setting the flag from the app window is fixed along the way - previously it could not be set at all. Due dates are stored on the computer only, the same way for every account.
+- Pinning a message in the list: a pinned message stays on top regardless of its date. Counters of smart folders and tags keep counting as before.
+- Quick steps: your own button with a name, an icon, a position in the panel and a shortcut that runs a chain of actions in one press.
+
+### Fixed
+
+- A tag on a message is visible in the list again. The colored badge used to go into the date column, where there is no spare room, and fell below the row border: the only way to see a tag was the context menu. Now the tag color is carried by a stripe along the left edge of the row, and the number of tags is shown by dots next to the sender; with several tags the stripe splits into segments, so all of them are visible. Tag names appear in a tooltip on the row and as chips in the header of the open message, where a tag can be removed right away.
+
 ## [0.2.19] - 2026-09-17
 
 ### Fixed

@@ -128,6 +128,7 @@ const tbActions=[
   {k:'unread',t:'Непрочитанное',en:'Mark unread',i:'inbox',on:false},{k:'unsub',t:'Отписаться',en:'Unsubscribe',on:false},{k:'print',t:'Печать',en:'Print',on:false}];
 const tbLabel=a=>smartIsEnglish()&&a.en?a.en:a.t;
 const tbList=document.getElementById('tbList');
+let quickStepSnapshot=[];
 tbActions.forEach(a=>{const r=document.createElement('div');r.className='tbrow'+(a.on?'':' off');r.draggable=true;r.dataset.action=a.k;
   r.dataset.labels='text';r.innerHTML=`<span class="grip"><i data-i="grip"></i></span><i data-i="${a.i||a.k}"></i><span class="nm">${escapeHtml(tbLabel(a))}</span><button type="button" class="btn sm action-label-mode" title="${smartIsEnglish()?'Toggle label':'Переключить подпись'}">${smartIsEnglish()?'Icon + text':'Значок + текст'}</button>
     <span class="ord"><button class="iconbtn" data-dir="up"><i data-i="up"></i></button><button class="iconbtn" data-dir="down"><i data-i="down"></i></button></span>
@@ -139,16 +140,25 @@ tbActions.forEach(a=>{const r=document.createElement('div');r.className='tbrow'+
   r.querySelector('.action-label-mode').onclick=event=>{event.stopPropagation();r.dataset.labels=r.dataset.labels==='icons'?'text':'icons';event.currentTarget.textContent=r.dataset.labels==='icons'?(smartIsEnglish()?'Icon only':'Только значок'):(smartIsEnglish()?'Icon + text':'Значок + текст');save();};
   r.querySelector('.toggle').onclick=(e)=>{e.stopPropagation();const t=e.currentTarget;t.classList.toggle('on');r.classList.toggle('off',!t.classList.contains('on'));save();};
   tbList.appendChild(r);});
+function appendQuickStepToolbarRow(step){const action={k:`quick_step:${step.id}`,t:step.name,en:step.name,i:step.icon||'star',on:false,quick:true};tbActions.push(action);const row=document.createElement('div');row.className='tbrow off';row.draggable=true;row.dataset.action=action.k;row.dataset.quickStep='1';row.dataset.labels='text';row.innerHTML=`<span class="grip"><i data-i="grip"></i></span><i data-i="${action.i}"></i><span class="nm">${escapeHtml(step.name)}</span><button type="button" class="btn sm action-label-mode">${smartIsEnglish()?'Icon + text':'Значок + текст'}</button><span class="ord"><button class="iconbtn" data-dir="up"><i data-i="up"></i></button><button class="iconbtn" data-dir="down"><i data-i="down"></i></button></span><div class="toggle"></div>`;renderIcons(row);const save=()=>{applyToolbar();persistToolbar();};row.querySelector('[data-dir="up"]').onclick=()=>{const previous=row.previousElementSibling;if(previous)tbList.insertBefore(row,previous);save();};row.querySelector('[data-dir="down"]').onclick=()=>{const next=row.nextElementSibling;if(next)tbList.insertBefore(next,row);save();};row.querySelector('.action-label-mode').onclick=event=>{event.stopPropagation();row.dataset.labels=row.dataset.labels==='icons'?'text':'icons';event.currentTarget.textContent=row.dataset.labels==='icons'?(smartIsEnglish()?'Icon only':'Только значок'):(smartIsEnglish()?'Icon + text':'Значок + текст');save();};row.querySelector('.toggle').onclick=event=>{event.stopPropagation();event.currentTarget.classList.toggle('on');row.classList.toggle('off',!event.currentTarget.classList.contains('on'));save();};tbList.appendChild(row);}
+function applyQuickStepToolbarSet(layout){
+  const builtin=[...tbList.children].filter(row=>!row.dataset.quickStep).map(row=>({id:row.dataset.action,visible:!row.classList.contains('off'),labels:row.dataset.labels||'text'}));
+  quickStepsModel.toolbarSet(builtin,quickStepSnapshot,layout).forEach(item=>{const row=tbList.querySelector(`[data-action="${item.id}"]`);if(!row)return;row.classList.toggle('off',!item.visible);row.querySelector('.toggle')?.classList.toggle('on',item.visible);row.dataset.labels=item.labels||'text';tbList.appendChild(row);});
+}
+function renderQuickStepList(){const host=document.getElementById('quickStepList');if(!host)return;host.innerHTML='';quickStepSnapshot.forEach(step=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div class="rule-row-main"><div class="rule-row-title"></div><div class="rule-row-description"></div></div><button class="btn sm quick-step-edit">${L('Изменить','Edit')}</button><button class="btn sm quick-step-slot"></button><button class="iconbtn quick-step-delete"><i data-i="trash"></i></button>`;row.querySelector('.rule-row-title').textContent=step.name;row.querySelector('.rule-row-description').textContent=step.actions.map(action=>mailRulesModel.ruleAction(action.id||action.kind)?.label?.[smartIsEnglish()?1:0]||action.kind).join(' - ')+(step.state==='needs_attention'?` - ${L('требует выбрать цель','target required')}`:'');row.querySelector('.quick-step-edit').onclick=async()=>{const name=prompt(L('Название быстрого действия','Quick step name'),step.name);if(!name)return;const icon=prompt(L('Значок','Icon'),step.icon||'star')||'star',order=prompt(L('Порядок действий номерами через запятую','Action order as comma-separated numbers'),step.actions.map((_,index)=>index+1).join(','));if(!order)return;const actions=order.split(',').map(value=>step.actions[Number(value.trim())-1]).filter(Boolean).map(action=>({...action}));if(actions.length!==step.actions.length){showToast(L('Порядок действий указан неверно','Action order is invalid'));return;}for(const action of actions){const definition=quickStepsModel.availableActions().find(item=>item.id===action.kind);if(definition?.folder){const value=prompt(L('Номер папки или роль','Folder id or role'),action.folder_id||action.folder_role||'archive');if(!value)return;action.folder_id=/^\d+$/.test(value)?Number(value):null;action.folder_role=/^\d+$/.test(value)?null:value;}if(definition?.label){const value=prompt(L('Номер метки','Label id'),action.label_id||'');if(!/^\d+$/.test(value||''))return;action.label_id=Number(value);}}const input={id:step.id,name,icon,sort_order:step.sort_order,hotkey_slot:step.hotkey_slot,actions},check=quickStepsModel.validateQuickStep(input);if(!check.ok){showToast(check.reason);return;}try{await window.tm.saveQuickStep(input);await reloadQuickSteps();}catch(error){showToast(error);}};row.querySelector('.quick-step-slot').textContent=step.hotkey_slot?L(`Слот ${step.hotkey_slot}`,`Slot ${step.hotkey_slot}`):L('Назначить слот','Assign slot');row.querySelector('.quick-step-slot').onclick=async()=>{const raw=prompt(L('Номер слота от 1 до 10','Slot number from 1 to 10'),step.hotkey_slot||'');if(raw===null)return;const slot=raw.trim()?Number(raw):null;try{await window.tm.bindQuickStepSlot(step.id,slot);await reloadQuickSteps();}catch(error){showToast(error);}};row.querySelector('.quick-step-delete').onclick=async()=>{if(!confirm(L('Удалить быстрое действие?','Delete quick step?')))return;try{await window.tm.deleteQuickStep(step.id);await reloadQuickSteps();persistToolbar();}catch(error){showToast(error);}};host.appendChild(row);renderIcons(row);});if(!quickStepSnapshot.length)host.textContent=L('Быстрых действий пока нет','No quick steps yet');}
+async function reloadQuickSteps(){if(!window.tm?.listQuickSteps)return;const layout=toolbarState().actions.map(action=>({id:action.key,visible:action.visible,labels:action.labels}));quickStepSnapshot=await window.tm.listQuickSteps();tbList.querySelectorAll('[data-quick-step]').forEach(row=>row.remove());for(let index=tbActions.length-1;index>=0;index--)if(tbActions[index].quick)tbActions.splice(index,1);quickStepSnapshot.forEach(appendQuickStepToolbarRow);applyQuickStepToolbarSet(layout);renderQuickStepList();document.querySelectorAll('#ctxmenu .quick-step-context').forEach(item=>item.remove());quickStepSnapshot.forEach(step=>{const item=document.createElement('div');item.className='tmi quick-step-context';item.dataset.contextAction=`quick-step:${step.id}`;item.innerHTML=`<i data-i="${step.icon||'star'}"></i>${escapeHtml(step.name)}`;ctxmenu?.appendChild(item);});renderIcons(ctxmenu);applyToolbar();}
+window.reloadQuickSteps=reloadQuickSteps;
+document.getElementById('quickStepAdd')?.addEventListener('click',async()=>{const name=prompt(L('Название быстрого действия','Quick step name'),'');if(!name)return;const icon=prompt(L('Значок: star, flag, archive, inbox, check','Icon: star, flag, archive, inbox, check'),'star')||'star',actions=[],choices=quickStepsModel.availableActions().map(action=>action.id).join(', ');while(actions.length<10){const kind=prompt(`${L('Действие','Action')} ${actions.length+1}: ${choices}`,actions.length?'':'mark_read');if(!kind){if(actions.length)break;return;}const definition=quickStepsModel.availableActions().find(action=>action.id===kind);if(!definition){showToast(L('Неизвестное действие','Unknown action'));return;}const action={kind};if(definition.folder){const value=prompt(L('Номер папки или роль archive, spam, trash','Folder id or role archive, spam, trash'),'archive');if(!value)return;if(/^\d+$/.test(value))action.folder_id=Number(value);else action.folder_role=value;}if(definition.label){const value=prompt(L('Номер метки','Label id'),'');if(!/^\d+$/.test(value||''))return;action.label_id=Number(value);}actions.push(action);if(definition.takeaway||!confirm(L('Добавить еще одно действие в цепочку?','Add another action to the chain?')))break;}const input={name,icon,sort_order:quickStepSnapshot.length,actions},check=quickStepsModel.validateQuickStep(input);if(!check.ok){showToast(check.reason);return;}try{await window.tm.saveQuickStep(input);await reloadQuickSteps();persistToolbar();}catch(error){showToast(error);}});
 let draggedToolbarRow=null;tbList.addEventListener('dragstart',e=>{draggedToolbarRow=e.target.closest('.tbrow');});tbList.addEventListener('dragover',e=>{e.preventDefault();const row=e.target.closest('.tbrow');if(row&&draggedToolbarRow&&row!==draggedToolbarRow){const rect=row.getBoundingClientRect();tbList.insertBefore(draggedToolbarRow,e.clientY<rect.top+rect.height/2?row:row.nextSibling);}});tbList.addEventListener('drop',()=>{applyToolbar();persistToolbar();});
 tbList.addEventListener('pointerdown',event=>{const grip=event.target.closest('.grip'),row=grip?.closest('.tbrow');if(!row||event.button!==0)return;event.preventDefault();draggedToolbarRow=row;row.classList.add('pointer-dragging');grip.setPointerCapture(event.pointerId);});
 tbList.addEventListener('pointermove',event=>{if(!draggedToolbarRow)return;const target=document.elementFromPoint(event.clientX,event.clientY)?.closest('.tbrow');if(!target||target===draggedToolbarRow||target.parentElement!==tbList)return;const rect=target.getBoundingClientRect();tbList.insertBefore(draggedToolbarRow,event.clientY<rect.top+rect.height/2?target:target.nextSibling);});
 tbList.addEventListener('pointerup',event=>{if(!draggedToolbarRow)return;event.target.closest('.grip')?.releasePointerCapture?.(event.pointerId);draggedToolbarRow.classList.remove('pointer-dragging');draggedToolbarRow=null;applyToolbar();persistToolbar();});
 function toolbarState(){return {actions:[...tbList.children].map(row=>({key:row.dataset.action,visible:!row.classList.contains('off'),labels:row.dataset.labels||'text'})),align:document.querySelector('#toolbarAlign .on')?.dataset.align||'left'};}
-function persistToolbar(){window.tm?.setSetting('toolbar_layout',JSON.stringify(toolbarState())).catch(console.error);}
+function persistToolbar(){const state=toolbarState();window.tm?.setSetting('toolbar_layout',JSON.stringify(state)).catch(console.error);const quickIds=state.actions.filter(action=>action.key.startsWith('quick_step:')).map(action=>Number(action.key.slice(11)));if(quickIds.length)window.tm?.reorderQuickSteps(quickIds).catch(console.error);}
 function applyToolbar(){const state=toolbarState(),bar=document.querySelector('.thread .actions');if(!bar)return;bar.classList.toggle('toolbar-right',state.align==='right');bar.querySelectorAll('[data-toolbar-generated]').forEach(el=>el.remove());const anchor=bar.querySelector('.sp');state.actions.filter(action=>action.visible).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.className=`${action.key==='reply'?'btn primary':'btn'}${action.labels==='icons'?' toolbar-action-icons':''}`;button.dataset.toolbarGenerated='1';button.dataset.act=action.key;button.title=tbLabel(meta);button.innerHTML=`<i data-i="${meta.i||action.key}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;renderIcons(button);bar.insertBefore(button,anchor);});bar.querySelectorAll(':scope > button:not([data-toolbar-generated]):not([data-toolbar-persistent])').forEach(button=>button.classList.add('toolbar-original-hidden'));
   // Меню "Ещё" показывает только те действия, что скрыты из панели - без дублей.
   const menuDyn=document.getElementById('threadMenuDynamic');
-  if(menuDyn){menuDyn.innerHTML='';state.actions.filter(action=>!action.visible).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.type='button';button.dataset.toolbarMenu=action.key;button.innerHTML=`<i data-i="${meta.i||action.key}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;menuDyn.appendChild(button);});renderIcons(menuDyn);const sep=document.getElementById('threadMenuDynSep');if(sep)sep.style.display=menuDyn.children.length?'':'none';}}
+  if(menuDyn){menuDyn.innerHTML='';quickStepsModel.toolbarMoreMenu(state.actions).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.type='button';button.dataset.toolbarMenu=action.key;button.innerHTML=`<i data-i="${meta.i||action.key}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;menuDyn.appendChild(button);});renderIcons(menuDyn);const sep=document.getElementById('threadMenuDynSep');if(sep)sep.style.display=menuDyn.children.length?'':'none';}}
 document.querySelectorAll('#toolbarAlign button').forEach(button=>button.onclick=()=>{button.parentElement.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===button));applyToolbar();persistToolbar();});
 applyToolbar();
 function embeddedUnsubscribeUrl(message){
@@ -173,7 +183,14 @@ function openSnoozeDialog(){const ids=selectedOrActiveMessageIds();if(!ids.lengt
   const apply=async date=>{try{await window.tm.snoozeMessages(ids,date.toISOString());clearMessageSelection();activeMessage=null;activeFullMessage=null;await window.reloadCoreData();close();showToast(L(`Отложено писем: ${ids.length}`,`Snoozed messages: ${ids.length}`),L('Отменить','Undo'),async()=>{await window.tm.unsnoozeMessages(ids);await window.reloadCoreData();});}catch(error){showToast(error);}};
   overlay.querySelector('[data-offset="hour"]').onclick=()=>apply(new Date(Date.now()+60*60*1000));overlay.querySelector('[data-offset="tomorrow"]').onclick=()=>{const d=new Date();d.setDate(d.getDate()+1);d.setHours(9,0,0,0);apply(d);};overlay.querySelector('[data-offset="monday"]').onclick=()=>apply(nextMondayMorning());overlay.querySelector('.snooze-apply').onclick=()=>{const d=new Date(custom.value);if(Number.isNaN(d.getTime())||d<=new Date()){showToast(L('Выберите будущее время','Choose a future time'));return;}apply(d);};overlay.querySelectorAll('.x,.snooze-cancel').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};custom.focus();}
 async function exportActiveMessageEml(){if(!activeMessage){showToast(L('Сначала выберите письмо','Select a message first'));return;}const safe=(activeMessage.subject||'message').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').trim().slice(0,100)||'message';try{const path=await window.tm.saveFileDialog(`${safe}.eml`);if(!path)return;await window.tm.exportMessageEml(activeMessage.id,path);showToast(L('Письмо сохранено в .eml','Message saved as .eml'));}catch(error){showToast(error);}}
-async function executeToolbarAction(action){if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog();return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
+function quickStepRunContext(){
+  const collapsedThread=conversationsEnabled&&activeMessage&&!expandedConversations.has(conversationKey(activeMessage))?activeMessage:null;
+  return {bridge:window.tm,steps:quickStepSnapshot,selection:[...selectedMessageIds],activeMessage,collapsedThread,loaded:lastListRows.length?lastListRows:messages,inTextField:Boolean(document.activeElement?.matches?.('input,textarea,select,[contenteditable="true"]')),lang:wizardLocale,confirm:async text=>confirm(text),notify:showToast,onApplied:async(report,ids)=>{window.forgetMessages?.(report.operation_ids?.length?ids:[]);await window.reloadCoreData?.();showToast(quickStepsModel.reportText(report,wizardLocale));if(report.operation_ids?.length)showToast(L('Перенос можно отменить. Метки и отметки цепочки не снимаются','The move can be undone. Labels and flags are not reverted'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(report.operation_ids);await window.reloadCoreData();});}};
+}
+async function executeQuickStep(id){const step=quickStepSnapshot.find(item=>item.id===Number(id));if(!step)return;try{return await quickStepsModel.runQuickStep(step,quickStepRunContext());}catch(error){showToast(error);return null;}}
+window.executeQuickStep=executeQuickStep;
+window.executeQuickStepSlot=slot=>quickStepsModel.handleSlotPress(`quick_step_${slot}`,quickStepRunContext()).catch(showToast);
+async function executeToolbarAction(action){if(action.startsWith('quick_step:')){await executeQuickStep(action.slice(11));return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog();return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
   if(uns?.one_click_url){showToast(L('Отправляю запрос на отписку…','Sending unsubscribe request…'));const fallback=()=>window.tm?.openExternal(uns.http||uns.one_click_url).catch(error=>showToast(error));try{const status=await window.tm.unsubscribeOneClick(uns.one_click_url);if(status>=200&&status<300)showToast(L('Готово: вы отписаны от рассылки (сервер подтвердил, код '+status+')','Done: you have been unsubscribed (server confirmed, code '+status+')'));else{showToast(L('Сервер отписки ответил кодом '+status+'. Открываю страницу отписки…','The unsubscribe server responded with code '+status+'. Opening the unsubscribe page…'));fallback();}}catch(error){showToast(error);fallback();}return;}
   const target=uns?.http||embeddedUnsubscribeUrl(activeFullMessage);if(target){try{await window.tm.openExternal(target);showToast(L('Открыл страницу отписки в браузере — завершите отписку там','Opened the unsubscribe page in your browser — finish there'));}catch(error){showToast(error);}return;}
   const mailto=uns?.mailto;if(mailto){resetComposer();setRecipients('compTo',[String(mailto).replace(/^mailto:/i,'').split('?')[0]]);document.getElementById('compSubj').value=L('Отписаться','Unsubscribe');showView('composeView');showToast(L('Отправьте это письмо, чтобы отписаться','Send this message to unsubscribe'));return;}
@@ -185,40 +202,370 @@ threadMoreButton.onclick=event=>{event.stopPropagation();if(threadMoreMenu.class
 threadMoreMenu.onclick=async event=>{const toolbarItem=event.target.closest('[data-toolbar-menu]');if(toolbarItem){closeThreadMore();executeToolbarAction(toolbarItem.dataset.toolbarMenu);return;}const button=event.target.closest('[data-thread-action]');if(!button)return;closeThreadMore();const action=button.dataset.threadAction;if(action==='settings'){showView('settingsView');setSection('toolbar');return;}if(action==='rules'){showView('settingsView');setSection('rules');return;}if(action==='raw'){openRawViewer(activeMessage?.id);return;}if(action==='export-eml'){exportActiveMessageEml();return;}if(action==='create-rule'){openRuleEditor(activeMessage);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(['archive','trash'].includes(action))performMessageAction(action);};
 
 
-/* Server-side mail actions driven by locally stored, editable rules. */
-const ruleEditor=document.getElementById('ruleEditor'),ruleAccount=document.getElementById('ruleAccount'),ruleAction=document.getElementById('ruleAction'),ruleTarget=document.getElementById('ruleTarget'),ruleTag=document.getElementById('ruleTag');
-function populateRuleTags(selectedLabelId=null){const previous=selectedLabelId??(Number(ruleTag.value)||null);ruleTag.innerHTML=(coreTags||[]).map(tag=>`<option value="${tag.id}">${escapeHtml(tag.name)}</option>`).join('');if(previous&&ruleTag.querySelector(`option[value="${previous}"]`))ruleTag.value=String(previous);}
-function ruleAccountFolders(){const accountId=Number(ruleAccount.value);return coreFolders.filter(folder=>folder.account_id===accountId);}
-function populateRuleTargets(selectedFolderId=null){
-  const previous=selectedFolderId??(Number(ruleTarget.value)||null);
-  ruleTarget.innerHTML=ruleAccountFolders().map(folder=>`<option value="${folder.id}">${escapeHtml(folderTitle(folder))}</option>`).join('');
-  if(previous&&ruleTarget.querySelector(`option[value="${previous}"]`))ruleTarget.value=String(previous);
+/* Правила обработки почты: группы условий, группы исключений и цепочка
+   действий. Словарь и проверки состава живут в modules/mail-rules.js, здесь
+   только отрисовка и обращения к ядру. См.
+   specs/mail-rules-conditions-and-actions.md. */
+const ruleEditor=document.getElementById('ruleEditor'),ruleAccount=document.getElementById('ruleAccount');
+const ruleGroupsHost=document.getElementById('ruleGroups'),ruleExceptionsHost=document.getElementById('ruleExceptions'),ruleActionsHost=document.getElementById('ruleActions');
+const ruleLang=()=>smartIsEnglish()?'en':'ru';
+const ruleFieldLabel=field=>mailRulesModel.ruleText(field,ruleLang());
+const ruleOpLabel=id=>(mailRulesModel.RULE_OPS[id]||[id,id])[smartIsEnglish()?1:0];
+let lastRuleRun=null,ruleListSnapshot=[];
+function ruleAccountFolders(accountId){return coreFolders.filter(folder=>folder.account_id===accountId);}
+/* Значение условия: перечисление, дата, размер или обычный текст. Разметка
+   повторяет редактор умной папки, чтобы оба редактора выглядели одинаково. */
+function renderRuleConditionValue(row,condition){
+  const field=mailRulesModel.ruleField(condition.field),host=row.querySelector('.cond-value');host.className='cond-value';host.innerHTML='';
+  if(field.type==='enum'){
+    const select=document.createElement('select');select.className='cond-input';select.innerHTML=field.values.map(item=>`<option value="${item[0]}">${escapeHtml(mailRulesModel.ruleOptionText(item,ruleLang()))}</option>`).join('');select.value=field.values.some(item=>item[0]===condition.value)?condition.value:field.values[0][0];host.appendChild(select);
+  }else if(field.type==='date'&&['within_last','older_than'].includes(condition.op)){
+    host.classList.add('relative-date');const input=document.createElement('input');input.className='cond-input';input.type='number';input.min='1';input.step='1';input.value=/^\d+$/.test(condition.value)?condition.value:'24';
+    const unit=document.createElement('select');unit.className='cond-unit';unit.innerHTML=mailRulesModel.RULE_DATE_UNITS.map(item=>`<option value="${item[0]}">${escapeHtml(mailRulesModel.ruleOptionText(item,ruleLang()))}</option>`).join('');unit.value=mailRulesModel.RULE_DATE_UNITS.some(item=>item[0]===condition.unit)?condition.unit:'hours';host.append(input,unit);
+  }else if(field.type==='size'){
+    host.classList.add('relative-date');const input=document.createElement('input');input.className='cond-input';input.type='number';input.min='0';input.step='0.1';input.value=/^\d+(?:\.\d+)?$/.test(condition.value)?condition.value:'10';host.appendChild(input);
+    if(condition.op==='between'){const second=document.createElement('input');second.className='cond-max';second.type='number';second.min='0';second.step='0.1';second.value=/^\d+(?:\.\d+)?$/.test(condition.value2)?condition.value2:'50';host.appendChild(second);}
+    const unit=document.createElement('select');unit.className='cond-unit';unit.innerHTML=mailRulesModel.RULE_SIZE_UNITS.map(item=>`<option value="${item[0]}">${escapeHtml(mailRulesModel.ruleOptionText(item,ruleLang()))}</option>`).join('');unit.value=mailRulesModel.RULE_SIZE_UNITS.some(item=>item[0]===condition.unit)?condition.unit:'mb';host.appendChild(unit);
+  }else{
+    const input=document.createElement('input');input.className='cond-input';input.type=field.type==='date'?'date':'text';input.placeholder=L('значение','value');input.value=condition.value||'';host.appendChild(input);
+  }
 }
-function updateRuleActionFields(){
-  const moving=ruleAction.value==='move',tagging=ruleAction.value==='label';document.querySelector('.rule-target-field').classList.toggle('hidden',!moving);document.querySelector('.rule-tag-field').classList.toggle('hidden',!tagging);
-  if(moving&&ruleAccount.value==='all'){ruleAccount.value=String(coreAccounts[0]?.id||'');populateRuleTargets();}
+function readRuleConditionRow(row){
+  return mailRulesModel.normalizeRuleCondition({
+    field:row.querySelector('.cond-field').value,
+    op:row.querySelector('.cond-op').value,
+    value:row.querySelector('.cond-input')?.value||'',
+    value2:row.querySelector('.cond-max')?.value||'',
+    unit:row.querySelector('.cond-unit')?.value,
+  });
+}
+function ruleConditionRow(source={}){
+  const condition=mailRulesModel.normalizeRuleCondition(source),row=document.createElement('div');row.className='cond';
+  row.innerHTML=`<select class="cond-field">${mailRulesModel.RULE_FIELDS.map(field=>`<option value="${field.id}">${escapeHtml(ruleFieldLabel(field))}</option>`).join('')}</select><select class="cond-op"></select><div class="cond-value"></div><button type="button" class="del iconbtn" title="${escapeHtml(L('Удалить условие','Delete condition'))}"><i data-i="trash"></i></button>`;
+  const fieldSelect=row.querySelector('.cond-field'),opSelect=row.querySelector('.cond-op');fieldSelect.value=condition.field;
+  const rebuild=selected=>{const field=mailRulesModel.ruleField(fieldSelect.value),operators=mailRulesModel.ruleOperators(field.type);opSelect.innerHTML=operators.map(id=>`<option value="${id}">${escapeHtml(ruleOpLabel(id))}</option>`).join('');opSelect.value=operators.includes(selected)?selected:operators[0];renderRuleConditionValue(row,mailRulesModel.normalizeRuleCondition({field:field.id,op:opSelect.value,value:field.id===condition.field?condition.value:'',unit:condition.unit,value2:condition.value2}));};
+  fieldSelect.onchange=()=>rebuild();opSelect.onchange=()=>rebuild(opSelect.value);rebuild(condition.op);
+  row.querySelector('.del').onclick=()=>{row.remove();renumberRuleGroups();};renderIcons(row);return row;
+}
+function renumberRuleGroups(){
+  [ruleGroupsHost,ruleExceptionsHost].forEach(host=>{
+    host.querySelectorAll('.cond-group').forEach((group,index)=>{group.querySelector('.cond-group-title').textContent=`${L('Группа','Group')} ${index+1}`;});
+  });
+}
+function ruleConditionGroup(source={conditions:[{}]}){
+  const state=mailRulesModel.normalizeRuleGroup(source),group=document.createElement('div');group.className='cond-group';group.dataset.logic=state.logic;
+  group.innerHTML=`<div class="cond-group-head"><span class="cond-group-title"></span><div class="logic"><button type="button" data-l="all">${escapeHtml(L('Все (И)','All (AND)'))}</button><button type="button" data-l="any">${escapeHtml(L('Любое (ИЛИ)','Any (OR)'))}</button></div><button type="button" class="btn sm cond-group-add">${escapeHtml(L('Условие','Condition'))}</button><button type="button" class="iconbtn cond-group-remove" title="${escapeHtml(L('Удалить группу','Delete group'))}"><i data-i="trash"></i></button></div>`;
+  group.querySelectorAll('.logic button').forEach(button=>{button.classList.toggle('on',button.dataset.l===state.logic);button.onclick=()=>{group.dataset.logic=button.dataset.l;group.querySelectorAll('.logic button').forEach(item=>item.classList.toggle('on',item===button));};});
+  (state.conditions.length?state.conditions:[{}]).forEach(condition=>group.appendChild(ruleConditionRow(condition)));
+  group.querySelector('.cond-group-add').onclick=()=>{group.appendChild(ruleConditionRow());};
+  group.querySelector('.cond-group-remove').onclick=()=>{group.remove();renumberRuleGroups();};
+  renderIcons(group);return group;
+}
+/* Группы читаются как есть, включая пустые: отброшенная группа исключений
+   молча сохраняла бы правило, которое уводит защищённые письма (S-018). */
+function readRuleGroups(host){
+  return [...host.querySelectorAll('.cond-group')].map(group=>({logic:group.dataset.logic==='any'?'any':'all',conditions:[...group.querySelectorAll('.cond')].map(readRuleConditionRow)}));
+}
+/* Дополнительное поле действия: папка назначения или метка. Правило для всех
+   ящиков выбирает папку по её типу, а не по номеру (S-045). */
+function renderRuleActionTarget(row,action){
+  const meta=mailRulesModel.ruleAction(action.kind),host=row.querySelector('.rule-action-target');host.innerHTML='';
+  if(meta.needs==='folder'){
+    const accountId=ruleAccount.value==='all'?null:Number(ruleAccount.value),select=document.createElement('select');select.className='sel rule-action-folder';
+    if(accountId){select.innerHTML=ruleAccountFolders(accountId).map(folder=>`<option value="folder:${folder.id}">${escapeHtml(folderTitle(folder))}</option>`).join('');}
+    const roles=[['inbox',L('Тип: Входящие','Type: Inbox')],['archive',L('Тип: Архив','Type: Archive')],['spam',L('Тип: Спам','Type: Spam')],['trash',L('Тип: Корзина','Type: Trash')]];
+    select.innerHTML+=roles.map(([id,title])=>`<option value="role:${id}">${escapeHtml(title)}</option>`).join('');
+    const wanted=action.folder_id?`folder:${action.folder_id}`:action.folder_role?`role:${action.folder_role}`:'';
+    if(wanted&&select.querySelector(`option[value="${wanted}"]`))select.value=wanted;
+    host.appendChild(select);
+  }else if(meta.needs==='label'){
+    const select=document.createElement('select');select.className='sel rule-action-label';select.innerHTML=(coreTags||[]).map(tag=>`<option value="${tag.id}">${escapeHtml(tag.name)}</option>`).join('');
+    if(action.label_id&&select.querySelector(`option[value="${action.label_id}"]`))select.value=String(action.label_id);
+    host.appendChild(select);
+  }
+}
+function ruleActionRow(source={}){
+  const action=mailRulesModel.normalizeRuleAction(source),row=document.createElement('div');row.className='rule-action-row';
+  row.innerHTML=`<span class="grip"><i data-i="grip"></i></span><select class="sel rule-action-kind">${mailRulesModel.RULE_ACTIONS.map(item=>`<option value="${item.id}">${escapeHtml(mailRulesModel.ruleText(item,ruleLang()))}</option>`).join('')}</select><div class="rule-action-target"></div><span class="ord"><button type="button" class="iconbtn" data-dir="up"><i data-i="up"></i></button><button type="button" class="iconbtn" data-dir="down"><i data-i="down"></i></button></span><button type="button" class="del iconbtn" title="${escapeHtml(L('Удалить действие','Delete action'))}"><i data-i="trash"></i></button>`;
+  const kind=row.querySelector('.rule-action-kind');kind.value=action.kind;
+  // Смена вида действия и смена ящика сохраняют уже выбранную папку или
+  // метку: молчаливый возврат к первому варианту терял выбор пользователя.
+  kind.onchange=()=>renderRuleActionTarget(row,{...readRuleActionRow(row),kind:kind.value});
+  renderRuleActionTarget(row,action);
+  row.querySelector('[data-dir="up"]').onclick=()=>{const previous=row.previousElementSibling;if(previous)ruleActionsHost.insertBefore(row,previous);};
+  row.querySelector('[data-dir="down"]').onclick=()=>{const next=row.nextElementSibling;if(next)ruleActionsHost.insertBefore(next,row);};
+  row.querySelector('.del').onclick=()=>row.remove();
+  renderIcons(row);return row;
+}
+function readRuleActionRow(row){
+  const kind=row.querySelector('.rule-action-kind').value,target=row.querySelector('.rule-action-folder')?.value||'',label=row.querySelector('.rule-action-label')?.value||'';
+  return mailRulesModel.normalizeRuleAction({
+    kind,
+    folder_id:target.startsWith('folder:')?Number(target.slice(7)):null,
+    folder_role:target.startsWith('role:')?target.slice(5):null,
+    label_id:label?Number(label):null,
+  });
+}
+function readRuleActions(){
+  return [...ruleActionsHost.querySelectorAll('.rule-action-row')].map(readRuleActionRow);
+}
+function editorRule(){
+  const accountValue=ruleAccount.value;
+  return {
+    id:editingRuleId||`rule-${Date.now()}`,
+    name:document.getElementById('ruleName').value.trim(),
+    account_id:accountValue==='all'?null:Number(accountValue),
+    enabled:mailRules.find(rule=>rule.id===editingRuleId)?.enabled??true,
+    groups:readRuleGroups(ruleGroupsHost),
+    exceptions:readRuleGroups(ruleExceptionsHost),
+    actions:readRuleActions(),
+  };
 }
 function openRuleEditor(source=null,rule=null){
   showView('settingsView');setSection('rules');editingRuleId=rule?.id??null;ruleEditor.classList.remove('hidden');
-  document.getElementById('ruleEditorTitle').textContent=rule?L('Изменить правило','Edit rule'):L('Новое правило','New rule');
-  ruleAccount.innerHTML=`<option value="all">${L('Все аккаунты','All accounts')}</option>`+coreAccounts.map(account=>`<option value="${account.id}">${escapeHtml(account.email)}</option>`).join('');
-  const sourceEmail=source?.from?.email||'',sourceAccount=source?.account_id||coreAccounts[0]?.id||'all';ruleEditor.dataset.sourceSender=sourceEmail;ruleEditor.dataset.sourceSubject=source?.subject||'';
-  document.getElementById('ruleName').value=rule?.name||(sourceEmail?L(`Письма от ${sourceEmail}`,`Mail from ${sourceEmail}`):'');document.getElementById('ruleField').value=rule?.field||'sender';document.getElementById('ruleOperator').value=rule?.operator||'contains';document.getElementById('ruleValue').value=rule?.value||sourceEmail;ruleAccount.value=String(rule?.account_id??sourceAccount);ruleAction.value=rule?.action||'move';populateRuleTargets(rule?.folder_id);populateRuleTags(rule?.label_id);updateRuleActionFields();document.getElementById('ruleExisting').checked=false;document.getElementById('ruleDelete').classList.toggle('hidden',!rule);document.getElementById('ruleName').focus();
+  document.getElementById('ruleEditorTitle').textContent=rule?.id?L('Изменить правило','Edit rule'):L('Новое правило','New rule');
+  ruleAccount.innerHTML=`<option value="all">${escapeHtml(L('Все аккаунты','All accounts'))}</option>`+coreAccounts.map(account=>`<option value="${account.id}">${escapeHtml(account.email)}</option>`).join('');
+  const sourceEmail=source?.from?.email||'';
+  document.getElementById('ruleName').value=rule?.name||(sourceEmail?L(`Письма от ${sourceEmail}`,`Mail from ${sourceEmail}`):'');
+  ruleAccount.value=String(rule?.account_id??source?.account_id??'all');
+  ruleGroupsHost.innerHTML='';ruleExceptionsHost.innerHTML='';ruleActionsHost.innerHTML='';
+  const groups=rule?.groups?.length?rule.groups:[{logic:'all',conditions:[sourceEmail?{field:'sender_address',op:'equals',value:sourceEmail}:{}]}];
+  groups.forEach(group=>ruleGroupsHost.appendChild(ruleConditionGroup(group)));
+  (rule?.exceptions||[]).forEach(group=>ruleExceptionsHost.appendChild(ruleConditionGroup(group)));
+  (rule?.actions?.length?rule.actions:[{kind:'move'}]).forEach(action=>ruleActionsHost.appendChild(ruleActionRow(action)));
+  renumberRuleGroups();
+  document.getElementById('ruleExisting').checked=false;
+  document.getElementById('ruleDelete').classList.toggle('hidden',!rule);
+  document.getElementById('ruleName').focus();
 }
 function closeRuleEditor(){ruleEditor.classList.add('hidden');editingRuleId=null;}
 function ruleDescription(rule){
-  const en=smartIsEnglish(),fields=en?{sender:'Sender',subject:'Subject'}:{sender:'Отправитель',subject:'Тема'},operators=en?{contains:'contains',equals:'equals'}:{contains:'содержит',equals:'равно'},actions=en?{archive:'archive',spam:'move to spam',trash:'delete'}:{archive:'в архив',spam:'в спам',trash:'удалить'};const account=rule.account_id?coreAccounts.find(item=>item.id===rule.account_id)?.email:L('все аккаунты','all accounts');let action=actions[rule.action];if(rule.action==='move')action=L(`в папку «${folderTitle(coreFolders.find(folder=>folder.id===rule.folder_id))}»`,`to folder "${folderTitle(coreFolders.find(folder=>folder.id===rule.folder_id))}"`);if(rule.action==='label'){const tag=(coreTags||[]).find(item=>item.id===rule.label_id);action=L(`метка «${tag?.name||'?'}»`,`tag "${tag?.name||'?'}"`);}return `${fields[rule.field]} ${operators[rule.operator]} «${rule.value}» → ${action||L('действие не настроено','action not set')} · ${account||L('аккаунт удалён','account removed')}`;
+  return mailRulesModel.ruleSummary(rule,{lang:ruleLang(),accounts:coreAccounts,folders:coreFolders,labels:coreTags||[]});
 }
 function renderRulesList(){
   // Имена правил задаёт пользователь: словарь автоперевода их не трогает.
-  const list=document.getElementById('rulesList');list.dataset.noI18n='1';list.innerHTML='';if(!mailRules.length){list.innerHTML=`<p class="rule-empty">${L('Правил пока нет.','No rules yet.')}</p>`;return;}
-  mailRules.forEach(rule=>{const row=document.createElement('div');row.className='rule-row';row.innerHTML=`<div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div><div class="rule-row-title"></div><div class="rule-row-description"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${L('Изменить','Edit')}</button>`;row.querySelector('.rule-row-title').textContent=rule.name;row.querySelector('.rule-row-description').textContent=ruleDescription(rule);row.querySelector('.toggle').onclick=async()=>{try{await window.tm.setMailRuleEnabled(rule.id,!rule.enabled);await reloadMailRules();}catch(error){showToast(error);}};row.querySelector('button').onclick=()=>openRuleEditor(null,rule);list.appendChild(row);});renderIcons(list);
+  const list=document.getElementById('rulesList');list.dataset.noI18n='1';list.innerHTML='';
+  if(lastRuleRun){const report=document.createElement('p');report.className='note-muted';report.textContent=`${L('Последний ручной прогон','Last manual run')}: ${mailRulesModel.runReportText(lastRuleRun,ruleLang())}`;list.appendChild(report);}
+  if(!mailRules.length){const empty=document.createElement('p');empty.className='rule-empty';empty.textContent=L('Правил пока нет.','No rules yet.');list.appendChild(empty);return;}
+  mailRules.forEach((rule,index)=>{
+    const row=document.createElement('div');row.className='rule-row';row.dataset.ruleId=rule.id;row.draggable=true;
+    row.innerHTML=`<span class="grip"><i data-i="grip"></i></span><div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div class="rule-row-body"><div class="rule-row-title"></div><div class="rule-row-description"></div><div class="rule-row-state"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${escapeHtml(L('Изменить','Edit'))}</button>`;
+    row.querySelector('.rule-row-title').textContent=`${index+1}. ${rule.name}`;
+    row.querySelector('.rule-row-description').textContent=ruleDescription(rule);
+    const state=row.querySelector('.rule-row-state');state.textContent=mailRulesModel.ruleStateText(rule,ruleLang());state.classList.toggle('hidden',!state.textContent);
+    row.querySelector('.toggle').onclick=async()=>{try{await window.tm.setMailRuleEnabled(rule.id,!rule.enabled);await reloadMailRules();}catch(error){showToast(error);}};
+    row.querySelector('button').onclick=()=>openRuleEditor(null,rule);
+    list.appendChild(row);
+  });
+  renderIcons(list);
 }
-async function reloadMailRules(){mailRules=await window.tm.listMailRules();renderRulesList();}
+/* Перетаскивание правила меняет его порядковый номер: ядро получает полный
+   перечень идентификаторов в новом порядке (S-059). */
+let draggedRuleRow=null;
+/* Новый порядок строк вычисляет mailRulesModel.moveRule: перестановка в
+   списке и проверка порядка идут по одному и тому же коду (S-059). */
+function placeRuleRow(list,target,before){
+  if(!draggedRuleRow||target===draggedRuleRow)return;
+  const rows=[...list.querySelectorAll('.rule-row')],ids=rows.map(row=>row.dataset.ruleId);
+  const from=ids.indexOf(draggedRuleRow.dataset.ruleId);let to=ids.indexOf(target.dataset.ruleId);
+  if(from<0||to<0)return;
+  if(!before&&to<from)to+=1;
+  if(before&&to>from)to-=1;
+  const order=mailRulesModel.moveRule(ids,from,to);
+  order.forEach(id=>{const row=rows.find(item=>item.dataset.ruleId===id);if(row)list.appendChild(row);});
+}
+function finishRuleDragging(event){
+  if(!draggedRuleRow)return;
+  event?.target?.closest?.('.grip')?.releasePointerCapture?.(event.pointerId);
+  draggedRuleRow.classList.remove('pointer-dragging');
+  draggedRuleRow=null;
+  persistRuleOrder();
+}
+function bindRuleDragging(){
+  const list=document.getElementById('rulesList');
+  list.addEventListener('dragstart',event=>{draggedRuleRow=event.target.closest('.rule-row');});
+  list.addEventListener('dragover',event=>{event.preventDefault();const row=event.target.closest('.rule-row');if(!row||!draggedRuleRow)return;const rect=row.getBoundingClientRect();placeRuleRow(list,row,event.clientY<rect.top+rect.height/2);});
+  list.addEventListener('drop',event=>{event.preventDefault();finishRuleDragging(event);});
+  // Перетаскивание, брошенное вне списка, тоже обязано завершиться: иначе
+  // следующее движение указателя продолжило бы переставлять строки.
+  list.addEventListener('dragend',event=>finishRuleDragging(event));
+  list.addEventListener('pointerdown',event=>{const grip=event.target.closest('.grip'),row=grip?.closest('.rule-row');if(!row||event.button!==0)return;event.preventDefault();draggedRuleRow=row;row.classList.add('pointer-dragging');grip.setPointerCapture(event.pointerId);});
+  list.addEventListener('pointermove',event=>{if(!draggedRuleRow)return;const target=document.elementFromPoint(event.clientX,event.clientY)?.closest('.rule-row');if(!target||target.parentElement!==list)return;const rect=target.getBoundingClientRect();placeRuleRow(list,target,event.clientY<rect.top+rect.height/2);});
+  list.addEventListener('pointerup',event=>finishRuleDragging(event));
+  list.addEventListener('pointercancel',event=>finishRuleDragging(event));
+}
+async function persistRuleOrder(){
+  const ids=[...document.querySelectorAll('#rulesList .rule-row')].map(row=>row.dataset.ruleId);
+  if(!ids.length||ids.join()===mailRules.map(rule=>rule.id).join())return;
+  try{await window.tm.reorderMailRules(ids);await reloadMailRules();showToast(L('Порядок правил сохранён','Rule order saved'));}catch(error){showToast(error);await reloadMailRules();}
+}
+async function reloadMailRules(){
+  mailRules=await window.tm.listMailRules();
+  ruleListSnapshot=mailRules.map(rule=>rule.id);
+  try{lastRuleRun=await window.tm.lastMailRuleRun();}catch(_){lastRuleRun=null;}
+  renderRulesList();
+  renderFailedOperations();
+  renderPendingRuleRuns();
+  warnAboutMissingTrash();
+}
+/* S-052, S-053: операция, дошедшая до состояния отказа, держит письмо на
+   месте. Выйти из этого состояния можно только решением пользователя:
+   повторить операцию или отказаться от неё. */
+async function renderFailedOperations(){
+  const host=document.getElementById('ruleFailedOps');if(!host)return;
+  host.innerHTML='';
+  let failed=[];
+  try{failed=await window.tm.failedMessageOperations();}catch(_){return;}
+  if(!failed.length)return;
+  const block=document.createElement('div');block.className='rule-failed-ops';
+  const title=document.createElement('div');title.className='rule-failed-title';
+  title.textContent=L('Операции с письмами, завершившиеся отказом','Message operations that ended in failure');
+  block.appendChild(title);
+  failed.forEach(operation=>{
+    const row=document.createElement('div');row.className='rule-failed-row';
+    const text=document.createElement('span');
+    const kind=operation.op_kind==='delete'?L('удаление','deletion'):L('перемещение','move');
+    text.textContent=`${kind}: ${operation.last_error||L('без объяснения сервера','no server explanation')}`;
+    const retry=document.createElement('button');retry.type='button';retry.className='btn sm';retry.textContent=L('Повторить','Retry');
+    retry.onclick=async()=>{try{await window.tm.retryMessageOperation(operation.id);await reloadMailRules();}catch(error){showToast(error);}};
+    const discard=document.createElement('button');discard.type='button';discard.className='btn sm';discard.textContent=L('Отказаться','Discard');
+    discard.onclick=async()=>{try{await window.tm.discardMessageOperation(operation.id);await reloadMailRules();}catch(error){showToast(error);}};
+    row.append(text,retry,discard);block.appendChild(row);
+  });
+  host.appendChild(block);
+}
+/* S-070, S-072: незавершённое задание ручного прогона продолжается кнопкой в
+   разделе правил, а не только из отчёта текущей сессии - иначе прерванный
+   закрытием программы прогон некому было бы довести до конца. */
+async function renderPendingRuleRuns(){
+  const host=document.getElementById('rulePendingRuns');if(!host)return;
+  host.innerHTML='';
+  let runs=[];
+  try{runs=await window.tm.pendingMailRuleRuns();}catch(_){return;}
+  if(!runs.length)return;
+  const block=document.createElement('div');block.className='rule-failed-ops';
+  const title=document.createElement('div');title.className='rule-failed-title';
+  title.textContent=L('Незавершённые прогоны правил','Unfinished rule runs');
+  block.appendChild(title);
+  runs.forEach(run=>{
+    const row=document.createElement('div');row.className='rule-failed-row';
+    const text=document.createElement('span');
+    text.textContent=mailRulesModel.runReportText(run,ruleLang());
+    const resume=document.createElement('button');resume.type='button';resume.className='btn sm';
+    resume.textContent=L('Продолжить','Continue');
+    resume.onclick=async()=>{try{showRuleRunReport(await window.tm.continueMailRuleRun(run.run_id));await reloadMailRules();}catch(error){showToast(error);}};
+    row.append(text,resume);block.appendChild(row);
+  });
+  host.appendChild(block);
+}
 window.reloadMailRules=reloadMailRules;
-document.getElementById('ruleNew').onclick=()=>openRuleEditor();document.getElementById('ruleCancel').onclick=closeRuleEditor;ruleAccount.onchange=()=>populateRuleTargets();ruleAction.onchange=updateRuleActionFields;document.getElementById('ruleField').onchange=event=>{if(editingRuleId!==null)return;const value=event.target.value==='subject'?ruleEditor.dataset.sourceSubject:ruleEditor.dataset.sourceSender;if(value)document.getElementById('ruleValue').value=value;};
-document.getElementById('ruleSave').onclick=async()=>{const name=document.getElementById('ruleName').value.trim(),value=document.getElementById('ruleValue').value.trim(),accountValue=ruleAccount.value,action=ruleAction.value,folderId=action==='move'?Number(ruleTarget.value):null,labelId=action==='label'?Number(ruleTag.value):null;if(!name||!value){showToast(L('Заполните название и значение условия','Fill in the name and condition value'));return;}if(action==='move'&&!folderId){showToast(L('Выберите папку назначения','Choose a destination folder'));return;}if(action==='label'&&!labelId){showToast(L('Выберите метку','Choose a tag'));return;}const existing=mailRules.find(rule=>rule.id===editingRuleId),applyExisting=document.getElementById('ruleExisting').checked,rule={id:existing?.id||`rule-${Date.now()}`,name,field:document.getElementById('ruleField').value,operator:document.getElementById('ruleOperator').value,value,account_id:accountValue==='all'?null:Number(accountValue),action,folder_id:folderId,label_id:labelId,enabled:existing?.enabled??true};try{await window.tm.saveMailRule(rule,applyExisting);await reloadMailRules();closeRuleEditor();showToast(L('Правило сохранено','Rule saved'));setTimeout(()=>window.reloadCoreData?.().catch(console.error),350);}catch(error){showToast(error);}};
-document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило «${rule.name}»?`,`Delete the rule "${rule.name}"?`)))return;try{await window.tm.deleteMailRule(rule.id);await reloadMailRules();closeRuleEditor();}catch(error){showToast(error);}};
+document.getElementById('ruleNew').onclick=()=>openRuleEditor();
+document.getElementById('ruleCancel').onclick=closeRuleEditor;
+document.getElementById('ruleAddGroup').onclick=()=>{ruleGroupsHost.appendChild(ruleConditionGroup());renumberRuleGroups();};
+document.getElementById('ruleAddException').onclick=()=>{ruleExceptionsHost.appendChild(ruleConditionGroup());renumberRuleGroups();};
+document.getElementById('ruleAddAction').onclick=()=>{ruleActionsHost.appendChild(ruleActionRow());};
+// Смена ящика меняет перечень папок назначения у действий перемещения.
+ruleAccount.onchange=()=>{[...ruleActionsHost.querySelectorAll('.rule-action-row')].forEach(row=>renderRuleActionTarget(row,readRuleActionRow(row)));};
+document.getElementById('ruleSave').onclick=async()=>{
+  const rule=editorRule(),check=mailRulesModel.validateRule(rule);
+  if(!check.ok){showToast(mailRulesModel.ruleErrorText(check.reason,ruleLang()));return;}
+  const applyExisting=document.getElementById('ruleExisting').checked;
+  try{
+    // S-048: удаление навсегда подтверждается отдельно, с названием правила и
+    // его областью, и ключ подтверждения выдаёт ядро.
+    if(rule.actions.some(action=>action.kind==='delete')){
+      const scope=rule.account_id?(coreAccounts.find(account=>account.id===rule.account_id)?.email||''):L('все аккаунты','all accounts');
+      const question=L(`Правило "${rule.name}" (${scope}) будет удалять письма навсегда, без корзины и без отмены. Продолжить?`,`The rule "${rule.name}" (${scope}) will delete messages permanently, with no trash and no undo. Continue?`);
+      if(!await confirmAction(question))return;
+      rule.confirm_key=await window.tm.mailRuleDeleteConfirmation(rule);
+    }
+    await window.tm.saveMailRule(rule,applyExisting,ruleListSnapshot);
+    await reloadMailRules();closeRuleEditor();showToast(L('Правило сохранено','Rule saved'));
+    setTimeout(()=>window.reloadCoreData?.().catch(console.error),350);
+  }catch(error){showToast(error);}
+};
+document.getElementById('ruleDelete').onclick=async()=>{const rule=mailRules.find(item=>item.id===editingRuleId);if(!rule||!await confirmAction(L(`Удалить правило "${rule.name}"?`,`Delete the rule "${rule.name}"?`)))return;try{await window.tm.deleteMailRule(rule.id);await reloadMailRules();closeRuleEditor();}catch(error){showToast(error);}};
+/* Ручной прогон: выбранные папки, отчёт и продолжение по курсору задания
+   (S-065, S-070, S-073). */
+const ruleRunPanel=document.getElementById('ruleRunPanel'),ruleRunFolders=document.getElementById('ruleRunFolders'),ruleRunReport=document.getElementById('ruleRunReport'),ruleRunContinue=document.getElementById('ruleRunContinue');
+const RULE_RUN_SKIPPED_ROLES=['sent','drafts','spam','trash'];
+function renderRuleRunFolders(){
+  ruleRunFolders.innerHTML='';
+  coreAccounts.forEach(account=>{
+    // Отправленные, черновики, спам и корзина не рабочие папки ни в одной
+    // стадии: прогон по ним увёл бы почту, которую никто не получал.
+    const folders=ruleAccountFolders(account.id).filter(folder=>!RULE_RUN_SKIPPED_ROLES.includes(folder.role));if(!folders.length)return;
+    const block=document.createElement('div');block.className='rule-run-account';
+    block.innerHTML=`<div class="rule-run-account-title">${escapeHtml(account.email)}</div>`;
+    folders.forEach(folder=>{
+      const label=document.createElement('label');label.className='aux-check';
+      label.innerHTML=`<input type="checkbox" data-account="${account.id}" value="${folder.id}"> <span></span>`;
+      label.querySelector('span').textContent=folderTitle(folder);
+      block.appendChild(label);
+    });
+    ruleRunFolders.appendChild(block);
+  });
+}
+document.getElementById('ruleRunOpen').onclick=()=>{renderRuleRunFolders();ruleRunReport.textContent='';ruleRunContinue.classList.add('hidden');ruleRunPanel.classList.remove('hidden');};
+document.getElementById('ruleRunClose').onclick=()=>ruleRunPanel.classList.add('hidden');
+function showRuleRunReport(report){
+  lastRuleRun=report;
+  ruleRunReport.textContent=`${L('Прогон завершён','The run has finished')}: ${mailRulesModel.runReportText(report,ruleLang())}`;
+  // Остаток писем означает, что прогон упёрся в предел запуска и продолжается
+  // с сохранённого курсора задания (S-069, S-070).
+  ruleRunContinue.classList.toggle('hidden',!report||report.remaining<=0);
+  ruleRunContinue.dataset.runId=report?.run_id||'';
+  renderRulesList();
+}
+document.getElementById('ruleRunStart').onclick=async()=>{
+  const checked=[...ruleRunFolders.querySelectorAll('input:checked')];
+  if(!checked.length){showToast(L('Выберите хотя бы одну папку','Choose at least one folder'));return;}
+  const accounts=new Set(checked.map(input=>input.dataset.account));
+  if(accounts.size>1){showToast(L('Выберите папки одного ящика','Choose folders of one mailbox'));return;}
+  const accountId=Number([...accounts][0]),folderIds=checked.map(input=>Number(input.value));
+  try{showRuleRunReport(await window.tm.runMailRules(accountId,folderIds,null));await reloadMailRules();}catch(error){showToast(error);}
+};
+ruleRunContinue.onclick=async()=>{
+  const runId=Number(ruleRunContinue.dataset.runId||0);if(!runId)return;
+  try{showRuleRunReport(await window.tm.continueMailRuleRun(runId));await reloadMailRules();}catch(error){showToast(error);}
+};
+bindRuleDragging();
+/* S-083: смена языка перерисовывает не только список правил, но и открытый
+   редактор с панелью прогона - иначе часть экрана осталась бы на прежнем
+   языке до повторного открытия. */
+function relocalizeRuleSection(){
+  if(!ruleEditor.classList.contains('hidden')){
+    const draft=editorRule(),existing=mailRules.find(rule=>rule.id===editingRuleId)||null;
+    // Несохранённое правило остаётся новым: пустой идентификатор оставляет
+    // заголовок "Новое правило" и не привязывает черновик к списку.
+    openRuleEditor(null,existing?{...existing,...draft}:{...draft,id:null});
+  }
+  if(!ruleRunPanel.classList.contains('hidden')){
+    renderRuleRunFolders();
+    if(lastRuleRun)showRuleRunReport(lastRuleRun);
+  }
+  renderPendingRuleRuns();
+  renderFailedOperations();
+  warnAboutMissingTrash();
+}
+window.relocalizeRuleSection=relocalizeRuleSection;
+/* S-014: у ящика без папки корзины стадии обработки и действия с письмами
+   оставляют почту на месте, поэтому раздел правил говорит об этом прямо. */
+async function warnAboutMissingTrash(){
+  try{
+    const ids=await window.tm.accountsWithoutTrash();
+    const host=document.getElementById('ruleTrashWarnings');if(!host)return;
+    host.innerHTML='';
+    if(!ids.length)return;
+    ids.forEach(id=>{
+      const name=coreAccounts.find(account=>account.id===id)?.email||id;
+      const warning=document.createElement('p');warning.className='note-muted rule-trash-warning';
+      warning.textContent=L(`Ящик ${name}: не назначена папка корзины. Правила и действия с письмами оставят его почту на месте.`,`Mailbox ${name}: no trash folder assigned. Rules and message actions will leave its mail where it is.`);
+      host.appendChild(warning);
+    });
+  }catch(_){/* Предупреждение не обязано мешать работе со списком правил. */}
+}
+window.warnAboutMissingTrash=warnAboutMissingTrash;
 
 /* smart folders management list */
 const builtinSmartDefaults=[
