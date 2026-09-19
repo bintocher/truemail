@@ -93,9 +93,19 @@
   /* Что нового в выпуске: окно появляется сразу при наведении на кнопку
      обновления - список изменений виден, не нажимая (issue #83). */
   .titlebar-update-wrap{position:relative;display:inline-flex;align-items:center;z-index:1600;}
-  .update-notes{position:absolute;top:calc(100% + 6px);left:0;z-index:1700;width:min(420px,80vw);max-height:60vh;overflow:auto;padding:12px 14px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);color:var(--text);font-size:12.5px;line-height:1.5;text-align:left;white-space:pre-wrap;}
+  /* Зазор до кнопки сделан отступом внутри окна, а не снаружи: иначе между
+     кнопкой и окном остаётся полоса, на которой указатель не принадлежит
+     ни тому, ни другому, и окно закрывается на полпути (issue #99). */
+  .update-notes{position:absolute;top:100%;left:0;z-index:1700;width:min(460px,80vw);max-height:70vh;overflow:auto;overscroll-behavior:contain;margin-top:0;padding:18px 14px 14px;background:var(--bg);border:1px solid var(--border-strong);border-radius:10px;box-shadow:var(--shadow);color:var(--text);font-size:12.5px;line-height:1.55;text-align:left;}
+  .update-notes.pinned{border-color:var(--accent);}
+  .update-notes-section{margin:12px 0 4px;font-size:12.5px;font-weight:650;color:var(--text);}
+  .update-notes-section:first-child{margin-top:0;}
+  .update-notes-text{margin:0 0 8px;}
+  .update-notes-list{margin:0 0 8px;padding-left:18px;}
+  .update-notes-list li{margin-bottom:6px;}
   .update-notes-head{font-weight:650;margin-bottom:6px;}
   .update-notes-body{color:var(--text-2);}
+  .update-notes-body .update-notes-section{color:var(--text);}
   .titlebar-update[disabled]{opacity:.7;cursor:default;filter:none;}
   .titlebar-update i svg{width:13px;height:13px;}
   .wincontrols{position:relative;z-index:1600;display:flex;align-self:stretch;flex:none;}
