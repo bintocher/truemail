@@ -299,8 +299,9 @@ const expandedConversations=new Set();
 // себя одного: по одной теме объединять нельзя ни в списке, ни тем более в
 // действиях - иначе одно нажатие уносило бы в корзину письма разных
 // отправителей с темой вида "Счёт", а thread_id есть далеко не у всех писем
-// (его получают только ответы и те, кому ответили).
-function conversationKey(message){return message.thread_id!=null?`${message.account_id}|t:${message.thread_id}`:`${message.account_id}|m:${message.id}`;}
+// (его получают только ответы и те, кому ответили). Правило одно с закреплённой
+// частью: два ключа одной беседы разорвали бы её на две в одном списке.
+function conversationKey(message){return pinMessageModel.conversationKey(message);}
 // В режиме диалогов групповая операция над свёрнутой беседой применяется ко всем
 // её письмам. Развёрнутую беседу не расширяем - действие идёт по конкретному письму.
 function expandConversationIds(ids){

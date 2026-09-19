@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_QUICK_STEPS: usize = 20;
 pub const MAX_QUICK_STEP_MESSAGES: usize = 500;
+/// Слотов горячих клавиш ровно столько, сколько цифр на ряду клавиатуры,
+/// поэтому номер слота проверяют и правила, и хранилище, и разбор сочетания.
+pub const QUICK_STEP_SLOTS: i64 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickStep {

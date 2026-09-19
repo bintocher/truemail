@@ -7,12 +7,12 @@ pub struct Keybinding {
     pub combo: String,
 }
 
-/// Имена слотов - закрытый перечень из десяти точных строк. Разбор числа
-/// принимал бы и "quick_step_01", и "quick_step_+1": такая строка заводила бы
+/// Имена слотов - закрытый перечень точных строк по числу слотов. Разбор
+/// числа принимал бы и "quick_step_01", и "quick_step_+1": такая строка заводила бы
 /// в таблице горячих клавиш запись, которая занимает сочетание и не удаляется
 /// ниоткуда (quick-steps.md, S-058 и S-059).
 pub fn is_quick_step_key_action(action: &str) -> bool {
-    (1..=10).any(|slot| action == format!("quick_step_{slot}"))
+    (1..=super::QUICK_STEP_SLOTS).any(|slot| action == format!("quick_step_{slot}"))
 }
 
 pub fn normalize_key_combo(combo: &str) -> Option<String> {

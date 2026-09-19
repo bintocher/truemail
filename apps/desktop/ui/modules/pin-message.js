@@ -174,7 +174,7 @@
 
   async function togglePin(bridge, ids, pinned) {
     const result = await bridge.setMessagesPinned([...new Set(ids || [])], Boolean(pinned));
-    const rejected = Number(result?.rejected ?? result?.rejected_limit ?? 0);
+    const rejected = rejectedCount(result);
     return {...(result || {}), rejected, rejected_limit: rejected};
   }
 
@@ -196,8 +196,14 @@
     return lang === 'en' ? `${base} - ${hidden} more not shown` : `${base} - не показано еще ${hidden}`;
   }
 
+  // Ядро отвечает полем rejected_limit, а ранние ответы моста несли rejected:
+  // обе подписи считает одним и тем же числом отклонённых пределом писем.
+  function rejectedCount(result) {
+    return Number(result?.rejected ?? result?.rejected_limit ?? 0);
+  }
+
   function pinLimitText(result, lang = 'ru') {
-    const rejected = Number(result?.rejected ?? result?.rejected_limit ?? 0);
+    const rejected = rejectedCount(result);
     if (!rejected) return '';
     return lang === 'en'
       ? `Could not pin: ${rejected}. The mailbox pin limit has been reached`
@@ -207,6 +213,7 @@
   return {
     PINNED_VISIBLE_LIMIT,
     compareMessages,
+    conversationKey,
     filterMessages,
     buildRows,
     messageRows,

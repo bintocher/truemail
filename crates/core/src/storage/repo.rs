@@ -1321,21 +1321,21 @@ impl Db {
             .bind(&update.folder_path)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(concat!(
-                "UPDATE message_tasks SET
-                    state=CASE WHEN ? THEN 'active' WHEN state='active' THEN 'detached' ELSE state END,
-                    completed_at=CASE WHEN ? THEN NULL ELSE completed_at END,
-                    updated_at=datetime('now')
+            sqlx::query(AssertSqlSafe(format!(
+                concat!(
+                    "UPDATE message_tasks SET {transition}
                   WHERE state IN ('active','detached','done') AND message_id IN (
                     SELECT m.id FROM messages m WHERE m.account_id=? AND m.uid=?
                      AND m.folder_id=(SELECT id FROM folders WHERE account_id=? AND remote_path=?)
                      AND NOT EXISTS(SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
                          AND o.op_kind='flag' AND o.status IN ",
-                unfinished_flag_op_sql!(),
-                flag_op_changes_flag_sql!("o."),
-                ")
+                    unfinished_flag_op_sql!(),
+                    flag_op_changes_flag_sql!("o."),
+                    ")
                   )"
-            ))
+                ),
+                transition = TASK_SYNC_FLAG_TRANSITION_SQL
+            )))
             .bind(update.flagged)
             .bind(update.flagged)
             .bind(account_id)
@@ -2435,13 +2435,10 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await?;
                 if pending_flag.0 == 0 {
-                    sqlx::query(
-                        "UPDATE message_tasks SET
-                            state=CASE WHEN ? THEN 'active' WHEN state='active' THEN 'detached' ELSE state END,
-                            completed_at=CASE WHEN ? THEN NULL ELSE completed_at END,
-                            updated_at=datetime('now')
+                    sqlx::query(AssertSqlSafe(format!(
+                        "UPDATE message_tasks SET {TASK_SYNC_FLAG_TRANSITION_SQL}
                           WHERE message_id=? AND state IN ('active','detached','done')",
-                    )
+                    )))
                     .bind(source.flagged)
                     .bind(source.flagged)
                     .bind(message_row_id)
@@ -3026,7 +3023,7 @@ impl Db {
                 .bind(account_id)
                 .fetch_one(&mut *tx)
                 .await?;
-                if count.0 >= 20 {
+                if count.0 >= MAX_PINNED_PER_ACCOUNT {
                     result.rejected_limit += 1;
                     continue;
                 }
@@ -3078,13 +3075,45 @@ impl Db {
         )
         .fetch_all(&mut *snapshot)
         .await?;
+        let mut messages = self
+            .pinned_messages_for_view(&mut snapshot, view_kind, view_value, rows)
+            .await?;
+        snapshot.commit().await?;
+        self.attach_labels(&mut messages).await?;
+        let total = messages.len();
+        let mut ordinary = self.ordinary_page_for_view(view_kind, view_value).await?;
+        self.attach_labels(&mut ordinary).await?;
+        let shown = messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<std::collections::HashSet<_>>();
+        ordinary.retain(|message| !shown.contains(&message.id));
+        Ok(PinnedMessageList {
+            messages,
+            total,
+            ordinary,
+        })
+    }
+
+    /// Оставить из закреплённых писем те, что попадают в представление. Вид
+    /// без своего значения - ошибка вызова, а не пустой список: пустой ответ
+    /// выглядел бы как "закреплённых писем нет" и прятал бы ошибку.
+    async fn pinned_messages_for_view(
+        &self,
+        snapshot: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        view_kind: &str,
+        view_value: Option<&str>,
+        rows: Vec<MessageRow>,
+    ) -> Result<Vec<MessageMeta>> {
+        // Умная папка и объединённый список отбирают письма тем же разбором
+        // видимости, каким идёт и обычная страница.
         let mut context = if matches!(view_kind, "smart" | "unified") {
             Some(self.smart_selection_context(true).await?)
         } else {
             None
         };
-        // Умная папка и объединённое представление читают отбор уже после
-        // закрытия снимка: обход базы под писателем задержал бы всю запись.
+        // Отбор умной папки читается своими запросами мимо снимка: под писателем
+        // держится только чтение самих закреплённых писем.
         let smart = if view_kind == "smart" {
             let id =
                 view_value.ok_or_else(|| crate::Error::Other("умная папка не указана".into()))?;
@@ -3105,7 +3134,7 @@ impl Db {
                   WHERE l.name=?",
             )
             .bind(label)
-            .fetch_all(&mut *snapshot)
+            .fetch_all(&mut **snapshot)
             .await?
             .into_iter()
             .map(|row| row.0)
@@ -3113,7 +3142,6 @@ impl Db {
         } else {
             std::collections::HashSet::new()
         };
-        snapshot.commit().await?;
         let folder_id = if view_kind == "folder" {
             Some(
                 view_value
@@ -3145,15 +3173,26 @@ impl Db {
             }
             messages.push(message);
         }
-        self.attach_labels(&mut messages).await?;
-        let total = messages.len();
-        let mut ordinary = match view_kind {
+        Ok(messages)
+    }
+
+    /// Первая страница писем представления без закрепления: та же выборка, в
+    /// которую список идёт и без закреплённой части.
+    async fn ordinary_page_for_view(
+        &self,
+        view_kind: &str,
+        view_value: Option<&str>,
+    ) -> Result<Vec<MessageMeta>> {
+        const PAGE: i64 = 100;
+        Ok(match view_kind {
             "folder" => {
-                self.list_folder_first_page(folder_id.unwrap_or_default(), 100)
-                    .await?
+                let folder_id = view_value
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or_default();
+                self.list_folder_first_page(folder_id, PAGE).await?
             }
             "label" => {
-                self.list_label_messages_page(view_value.unwrap_or_default(), None, None, 100)
+                self.list_label_messages_page(view_value.unwrap_or_default(), None, None, PAGE)
                     .await?
             }
             "smart" => {
@@ -3161,10 +3200,12 @@ impl Db {
                     view_value.unwrap_or_default(),
                     None,
                     None,
-                    100,
+                    PAGE as usize,
                 )
                 .await?
             }
+            // У объединённого списка своей страницы нет: читаем общий поток
+            // писем и берём видимые, пока не наберётся страница.
             _ => {
                 let rows = sqlx::query_as::<_, MessageRow>(SMART_PAGE_FIRST_SQL)
                     .bind(1_000_i64)
@@ -3173,20 +3214,9 @@ impl Db {
                 let mut context = self.smart_selection_context(true).await?;
                 rows.into_iter()
                     .filter_map(|row| context.prepare(row, true))
-                    .take(100)
+                    .take(PAGE as usize)
                     .collect()
             }
-        };
-        self.attach_labels(&mut ordinary).await?;
-        let shown = messages
-            .iter()
-            .map(|message| message.id)
-            .collect::<std::collections::HashSet<_>>();
-        ordinary.retain(|message| !shown.contains(&message.id));
-        Ok(PinnedMessageList {
-            messages,
-            total,
-            ordinary,
         })
     }
 
@@ -3242,13 +3272,10 @@ impl Db {
     }
 
     pub async fn get_message_task(&self, message_id: i64) -> Result<Option<MessageTask>> {
-        let row = sqlx::query_as::<_, MessageTaskRow>(
-            "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
-                    reminder_shown_at,created_at,updated_at FROM message_tasks WHERE message_id=?",
-        )
-        .bind(message_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
+            .bind(message_id)
+            .fetch_optional(&self.pool)
+            .await?;
         if let Some(row) = row {
             return Ok(Some(row.into()));
         }
@@ -4213,34 +4240,7 @@ impl Db {
                 .bind(message_id)
                 .execute(&mut *tx)
                 .await?;
-            match (reason, flagged) {
-                (FlagChangeReason::User, false) => {
-                    sqlx::query("DELETE FROM message_tasks WHERE message_id=?")
-                        .bind(message_id)
-                        .execute(&mut *tx)
-                        .await?;
-                }
-                (FlagChangeReason::Sync, false) => {
-                    sqlx::query(
-                        "UPDATE message_tasks SET state='detached',updated_at=datetime('now')
-                          WHERE message_id=? AND state='active'",
-                    )
-                    .bind(message_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                (_, true) => {
-                    sqlx::query(
-                        "UPDATE message_tasks SET state='active',completed_at=NULL,
-                                updated_at=datetime('now')
-                          WHERE message_id=? AND state IN ('done','detached')",
-                    )
-                    .bind(message_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-                _ => {}
-            }
+            apply_task_flag_transition(&mut tx, message_id, reason, flagged).await?;
             if reason != FlagChangeReason::Sync {
                 Self::queue_flag_sync(
                     &mut tx,
@@ -4679,9 +4679,9 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await?;
             if count.0 >= MAX_QUICK_STEPS as i64 {
-                return Err(crate::Error::Other(
-                    "достигнут предел в 20 быстрых действий".into(),
-                ));
+                return Err(crate::Error::Other(format!(
+                    "достигнут предел в {MAX_QUICK_STEPS} быстрых действий"
+                )));
             }
         }
         // Слот пишется здесь же, и без проверки занятости пользователь получал
@@ -4822,10 +4822,10 @@ impl Db {
     }
 
     pub async fn bind_quick_step_slot(&self, id: i64, slot: Option<i64>) -> Result<()> {
-        if slot.is_some_and(|value| !(1..=10).contains(&value)) {
-            return Err(crate::Error::Other(
-                "номер слота должен быть от 1 до 10".into(),
-            ));
+        if slot.is_some_and(|value| !(1..=QUICK_STEP_SLOTS).contains(&value)) {
+            return Err(crate::Error::Other(format!(
+                "номер слота должен быть от 1 до {QUICK_STEP_SLOTS}"
+            )));
         }
         let mut tx = self.begin_write().await?;
         if let Some(slot) = slot {
@@ -4864,9 +4864,9 @@ impl Db {
             return Err(crate::Error::Other("письмо не выбрано".into()));
         }
         if message_ids.len() > MAX_QUICK_STEP_MESSAGES {
-            return Err(crate::Error::Other(
-                "выберите не больше 500 писем для одного запуска".into(),
-            ));
+            return Err(crate::Error::Other(format!(
+                "выберите не больше {MAX_QUICK_STEP_MESSAGES} писем для одного запуска"
+            )));
         }
         let step = self
             .list_quick_steps()
@@ -4894,98 +4894,10 @@ impl Db {
         }
         let mut report = QuickStepReport::default();
         for snapshot in &snapshots {
-            let mut flags = MessageFlags {
-                seen: snapshot.seen,
-                flagged: snapshot.flagged,
-            };
-            let mut skipped = false;
-            for action in &step.actions {
-                if is_local_action(&action.kind) {
-                    self.apply_local_action(&mut tx, action, snapshot, &mut flags)
-                        .await?;
-                    continue;
-                }
-                let target = if action.kind == "delete" {
-                    TakeawayTarget::Delete
-                } else if action.kind == "move" {
-                    if let Some(folder_id) = action.folder_id {
-                        let folder: Option<(i64, String)> =
-                            sqlx::query_as("SELECT account_id,remote_path FROM folders WHERE id=?")
-                                .bind(folder_id)
-                                .fetch_optional(&mut *tx)
-                                .await?;
-                        match folder {
-                            Some((account_id, path)) if account_id == snapshot.account_id => {
-                                TakeawayTarget::Folder {
-                                    id: folder_id,
-                                    path,
-                                }
-                            }
-                            Some(_) => {
-                                report.skipped_foreign_account += 1;
-                                skipped = true;
-                                break;
-                            }
-                            None => {
-                                report.skipped_no_folder += 1;
-                                skipped = true;
-                                break;
-                            }
-                        }
-                    } else {
-                        let role = action.folder_role.as_deref().unwrap_or_default();
-                        match resolve_role_folder(&mut tx, snapshot.account_id, role).await? {
-                            Some((id, path)) => TakeawayTarget::Folder { id, path },
-                            None => {
-                                report.skipped_no_folder += 1;
-                                skipped = true;
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    let role = takeaway_target_role(&action.kind).unwrap_or_default();
-                    match resolve_role_folder(&mut tx, snapshot.account_id, role).await? {
-                        Some((id, path)) => TakeawayTarget::Folder { id, path },
-                        None => {
-                            report.skipped_no_folder += 1;
-                            skipped = true;
-                            break;
-                        }
-                    }
-                };
-                if !matches!(target, TakeawayTarget::Delete)
-                    && message_traits_at_risk(&mut tx, snapshot.id, snapshot.account_id).await?
-                {
-                    report.traits_at_risk += 1;
-                }
-                match queue_takeaway_operation(
-                    &mut tx,
-                    &snapshot.takeaway_message(),
-                    &target,
-                    TakeawayActor::User,
-                    None,
-                    10,
-                )
+            if self
+                .run_quick_step_chain(&mut tx, &step, snapshot, &mut report)
                 .await?
-                {
-                    TakeawayOutcome::Queued(id) => report.operation_ids.push(id),
-                    TakeawayOutcome::Busy | TakeawayOutcome::Conflict => {
-                        report.skipped_busy += 1;
-                        skipped = true;
-                    }
-                    TakeawayOutcome::Failed => {
-                        report.skipped_failed += 1;
-                        skipped = true;
-                    }
-                    TakeawayOutcome::NeedsAttention => {
-                        report.skipped_no_folder += 1;
-                        skipped = true;
-                    }
-                    TakeawayOutcome::Unchanged => {}
-                }
-            }
-            if skipped {
+            {
                 report.skipped += 1;
             } else {
                 report.applied += 1;
@@ -4993,6 +4905,73 @@ impl Db {
         }
         tx.commit().await?;
         Ok(report)
+    }
+
+    /// Выполнить цепочку быстрого действия над одним письмом. Возвращает
+    /// признак пропуска: письмо считается пропущенным один раз, каким бы
+    /// действием цепочка ни оборвалась, а причина уходит в отчёт отдельным
+    /// счётчиком.
+    async fn run_quick_step_chain(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        step: &QuickStep,
+        snapshot: &RuleMessageSnapshot,
+        report: &mut QuickStepReport,
+    ) -> Result<bool> {
+        let mut flags = MessageFlags {
+            seen: snapshot.seen,
+            flagged: snapshot.flagged,
+        };
+        let mut skipped = false;
+        for action in &step.actions {
+            if is_local_action(&action.kind) {
+                self.apply_local_action(tx, action, snapshot, &mut flags)
+                    .await?;
+                continue;
+            }
+            let target = match resolve_quick_step_target(tx, action, snapshot).await? {
+                QuickStepTarget::Takeaway(target) => target,
+                QuickStepTarget::ForeignAccount => {
+                    report.skipped_foreign_account += 1;
+                    return Ok(true);
+                }
+                QuickStepTarget::NoFolder => {
+                    report.skipped_no_folder += 1;
+                    return Ok(true);
+                }
+            };
+            if !matches!(target, TakeawayTarget::Delete)
+                && message_traits_at_risk(tx, snapshot.id, snapshot.account_id).await?
+            {
+                report.traits_at_risk += 1;
+            }
+            match queue_takeaway_operation(
+                tx,
+                &snapshot.takeaway_message(),
+                &target,
+                TakeawayActor::User,
+                None,
+                10,
+            )
+            .await?
+            {
+                TakeawayOutcome::Queued(id) => report.operation_ids.push(id),
+                TakeawayOutcome::Busy | TakeawayOutcome::Conflict => {
+                    report.skipped_busy += 1;
+                    skipped = true;
+                }
+                TakeawayOutcome::Failed => {
+                    report.skipped_failed += 1;
+                    skipped = true;
+                }
+                TakeawayOutcome::NeedsAttention => {
+                    report.skipped_no_folder += 1;
+                    skipped = true;
+                }
+                TakeawayOutcome::Unchanged => {}
+            }
+        }
+        Ok(skipped)
     }
 
     // ---------- Правила обработки почты ----------
@@ -5661,15 +5640,9 @@ impl Db {
                     flags.flagged = true;
                     // И правило, и быстрое действие используют этот путь:
                     // прежнее выполненное или отсоединённое дело возвращается
-                    // в работу, но сроки остаются прежними.
-                    sqlx::query(
-                        "UPDATE message_tasks SET state='active',completed_at=NULL,
-                                updated_at=datetime('now')
-                          WHERE message_id=? AND state IN ('done','detached')",
-                    )
-                    .bind(snapshot.id)
-                    .execute(&mut **tx)
-                    .await?;
+                    // в работу теми же переходами, что и ручная отметка.
+                    apply_task_flag_transition(tx, snapshot.id, FlagChangeReason::Rule, true)
+                        .await?;
                 }
                 let (seen, flagged) = (flags.seen, flags.flagged);
                 sqlx::query("UPDATE messages SET seen=?, flagged=? WHERE id=?")
@@ -7399,18 +7372,64 @@ fn validate_task_times(input: &MessageTaskInput) -> Result<NormalizedTaskTimes> 
     })
 }
 
+/// Чтение строки дела по письму: повторяется во всех местах, где дело
+/// возвращается пользователю, а расхождение столбцов означало бы, что одна и та
+/// же строка читается в разных местах по-разному.
+const MESSAGE_TASK_BY_ID_SQL: &str =
+    "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
+    reminder_shown_at,created_at,updated_at
+   FROM message_tasks WHERE message_id=?";
+
+/// Переход состояния дела при смене признака с сервера: поднявшийся флажок
+/// возвращает дело в работу и очищает время выполнения, снявшийся отсоединяет
+/// активное дело, выполненное не трогает.
+const TASK_SYNC_FLAG_TRANSITION_SQL: &str = "state=CASE WHEN ? THEN 'active' \
+    WHEN state='active' THEN 'detached' ELSE state END, \
+    completed_at=CASE WHEN ? THEN NULL ELSE completed_at END, \
+    updated_at=datetime('now')";
+
+/// Дело следует за признаком важности письма, и переход зависит от того, чьё
+/// это действие: своё снятие флажка удаляет дело вместе со сроками, снятие с
+/// сервера только отвязывает дело, чтобы сроки пережили чужую правку, а
+/// возвращённый флажок возвращает дело в работу с прежними сроками. Пары
+/// "состояние - причина" перечислены таблицей переходов
+/// (specs/flag-due-dates.md, S-036), поэтому решение о переходе принимается в
+/// одном месте, а не у каждого вызывающего.
+async fn apply_task_flag_transition(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+    reason: FlagChangeReason,
+    flagged: bool,
+) -> Result<()> {
+    let query = match (reason, flagged) {
+        (FlagChangeReason::User, false) => "DELETE FROM message_tasks WHERE message_id=?",
+        (FlagChangeReason::Sync, false) => {
+            "UPDATE message_tasks SET state='detached',updated_at=datetime('now')
+              WHERE message_id=? AND state='active'"
+        }
+        (_, true) => {
+            "UPDATE message_tasks SET state='active',completed_at=NULL,
+                    updated_at=datetime('now')
+              WHERE message_id=? AND state IN ('done','detached')"
+        }
+        _ => return Ok(()),
+    };
+    sqlx::query(query)
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn read_message_task(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: i64,
 ) -> Result<MessageTask> {
-    Ok(sqlx::query_as::<_, MessageTaskRow>(
-        "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
-                reminder_shown_at,created_at,updated_at FROM message_tasks WHERE message_id=?",
-    )
-    .bind(message_id)
-    .fetch_one(&mut **tx)
-    .await?
-    .into())
+    Ok(sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
+        .bind(message_id)
+        .fetch_one(&mut **tx)
+        .await?
+        .into())
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -7435,6 +7454,83 @@ fn transferred_traits_key(account_id: i64, fixed_id: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     format!("message_traits:{account_id}:{suffix}")
+}
+
+/// Отложить дело и закрепление письма, чья прежняя строка удалена, а
+/// единственного совпадения по `Message-ID` в ящике ещё нет: приметы сработают,
+/// когда та же почта придёт с сервера (restore_transferred_message_traits).
+async fn store_transferred_message_traits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    fixed_id: &str,
+    pinned_at: Option<String>,
+    task: Option<MessageTask>,
+) -> Result<()> {
+    let key = transferred_traits_key(account_id, fixed_id);
+    let value = serde_json::to_string(&TransferredMessageTraits {
+        pinned_at,
+        task,
+        saved_at: Some(chrono::Utc::now().format(TASK_TIME_FORMAT).to_string()),
+    })?;
+    sqlx::query(
+        "INSERT INTO storage_meta(key,value) VALUES(?,?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Куда уводит действие быстрого шага. Отдельный разбор цели нужен потому,
+/// что быстрому действию мало знать о недостижимой цели: в отчёте пропуск
+/// называет причину, а у правил (apply_takeaway) любая недостижимая цель
+/// одинаково останавливает только своё правило.
+enum QuickStepTarget {
+    Takeaway(TakeawayTarget),
+    ForeignAccount,
+    NoFolder,
+}
+
+async fn resolve_quick_step_target(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    action: &MailRuleAction,
+    snapshot: &RuleMessageSnapshot,
+) -> Result<QuickStepTarget> {
+    if action.kind == "delete" {
+        return Ok(QuickStepTarget::Takeaway(TakeawayTarget::Delete));
+    }
+    if action.kind == "move"
+        && let Some(folder_id) = action.folder_id
+    {
+        let folder: Option<(i64, String)> =
+            sqlx::query_as("SELECT account_id,remote_path FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        return Ok(match folder {
+            Some((account_id, path)) if account_id == snapshot.account_id => {
+                QuickStepTarget::Takeaway(TakeawayTarget::Folder {
+                    id: folder_id,
+                    path,
+                })
+            }
+            Some(_) => QuickStepTarget::ForeignAccount,
+            None => QuickStepTarget::NoFolder,
+        });
+    }
+    let role = if action.kind == "move" {
+        action.folder_role.as_deref().unwrap_or_default()
+    } else {
+        takeaway_target_role(&action.kind).unwrap_or_default()
+    };
+    Ok(
+        match resolve_role_folder(tx, snapshot.account_id, role).await? {
+            Some((id, path)) => QuickStepTarget::Takeaway(TakeawayTarget::Folder { id, path }),
+            None => QuickStepTarget::NoFolder,
+        },
+    )
 }
 
 async fn message_traits_at_risk(
@@ -7497,15 +7593,11 @@ async fn preserve_message_traits(
     let Some((account_id, Some(fixed_id), pinned_at)) = source else {
         return Ok(());
     };
-    let task: Option<MessageTask> = sqlx::query_as::<_, MessageTaskRow>(
-        "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
-                reminder_shown_at,created_at,updated_at
-           FROM message_tasks WHERE message_id=?",
-    )
-    .bind(message_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(Into::into);
+    let task: Option<MessageTask> = sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
+        .bind(message_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(Into::into);
     if pinned_at.is_none() && task.is_none() {
         return Ok(());
     }
@@ -7542,27 +7634,14 @@ async fn preserve_message_traits(
             set_pinned_within_limit(tx, target_id, pinned_at).await?;
         }
     } else if candidates.is_empty() {
-        let key = transferred_traits_key(account_id, &fixed_id);
-        let value = serde_json::to_string(&TransferredMessageTraits {
-            pinned_at,
-            task,
-            saved_at: Some(chrono::Utc::now().format(TASK_TIME_FORMAT).to_string()),
-        })?;
-        sqlx::query(
-            "INSERT INTO storage_meta(key,value) VALUES(?,?)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&mut **tx)
-        .await?;
+        store_transferred_message_traits(tx, account_id, &fixed_id, pinned_at, task).await?;
     }
     Ok(())
 }
 
 /// Вернуть закрепление письму, не выходя за предел закреплений ящика: перенос
 /// и восстановление примет идут мимо команды закрепления, и без этой проверки
-/// ящик мог набрать больше двадцати закреплённых писем (pin-message.md,
+/// ящик мог набрать больше предела закреплённых писем (pin-message.md,
 /// S-007 и S-008).
 async fn set_pinned_within_limit(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -7578,7 +7657,7 @@ async fn set_pinned_within_limit(
     .bind(message_id)
     .fetch_one(&mut **tx)
     .await?;
-    if room.0 >= 20 {
+    if room.0 >= MAX_PINNED_PER_ACCOUNT {
         return Ok(());
     }
     sqlx::query("UPDATE messages SET pinned_at=? WHERE id=?")

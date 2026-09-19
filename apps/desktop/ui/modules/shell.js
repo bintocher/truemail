@@ -319,7 +319,7 @@ const ordinaryPageCursors=new Map();
    выбрасывает часть догруженных страниц, а курсор, который двигается только
    вперёд, оставлял бы между первой страницей и собой дыру навсегда
    (S-016 - S-018). */
-function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id),date=String(message.date||'');if(!current||date<String(current.date||'')||date===String(current.date||'')&&message.id<current.id)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{const current=ordinaryPageCursors.get(folderId),next={date:message.date||'',id:message.id},currentDate=String(current?.date||'');if(!current||currentDate<next.date||currentDate===next.date&&Number(current.id)<Number(next.id))ordinaryPageCursors.set(folderId,next);});}
+function seedOrdinaryPageCursors(rows){const byFolder=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const items=byFolder.get(message.folder_id);if(items)items.push(message);else byFolder.set(message.folder_id,[message]);});const grouped=new Map();byFolder.forEach((items,folderId)=>{const oldest=pinMessageModel.ordinaryCursor(items);if(oldest)grouped.set(folderId,oldest);});grouped.forEach((message,folderId)=>{const current=ordinaryPageCursors.get(folderId),next={date:message.date||'',id:message.id},currentDate=String(current?.date||'');if(!current||currentDate<next.date||currentDate===next.date&&Number(current.id)<Number(next.id))ordinaryPageCursors.set(folderId,next);});}
 window.seedOrdinaryPageCursors=seedOrdinaryPageCursors;
 let loadingMoreMessages=false;
 let loadingSmartCoverage=false;
@@ -430,8 +430,10 @@ async function loadNextMessagePage(serverBackfill=false){
       // Курсор - ИСТИННЫЙ минимум (самая старая дата, затем наименьший id).
       // Сортировка только по дате давала неверный курсор при равных датах, и
       // запрос возвращал уже показанные письма (дубли), из-за чего прокрутка
-      // крутилась вхолостую, а догрузка не запускалась.
-      const cursor=ordinaryPageCursors.get(folderId)||loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+      // крутилась вхолостую, а догрузка не запускалась. Запасной минимум по
+      // загруженным письмам считает ordinaryCursor - то же правило, что и у
+      // стартового курсора.
+      const cursor=ordinaryPageCursors.get(folderId)||pinMessageModel.ordinaryCursor(loaded);
       if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       let fresh=page.filter(message=>!known.has(message.id));
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
