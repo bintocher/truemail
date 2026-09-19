@@ -9,6 +9,25 @@
   const MAX_ACTIONS = 10;
   const MAX_MESSAGES = 500;
   const QUICK_STEP_SLOT_ACTIONS = Array.from({length: 10}, (_, index) => `quick_step_${index + 1}`);
+  // Закрытый перечень значков. Свободная строка значка подставляется в
+  // разметку окна, у которого есть весь мост команд, поэтому выбирать можно
+  // только из известных имён набора значков; тем же перечнем пользуется выбор
+  // значка умной папки.
+  const ICONS = [
+    'star', 'flag', 'inbox', 'archive', 'trash', 'spam', 'draft', 'send', 'sync',
+    'cal', 'people', 'sun', 'compose', 'filter', 'sort', 'search', 'reply',
+    'replyall', 'forward', 'snooze', 'paperclip', 'shield', 'settings', 'palette',
+    'user', 'globe', 'keyboard', 'copy', 'lock', 'key', 'server', 'edit', 'list',
+    'link', 'at', 'upload', 'download', 'image', 'storage', 'unsub', 'print',
+    'translate', 'pin', 'openext',
+  ];
+  // Роли папки назначения: тот же закрытый перечень, что у действий правил.
+  const FOLDER_ROLES = ['inbox', 'archive', 'spam', 'trash'];
+
+  function normalizeIcon(value) {
+    const icon = String(value || '');
+    return ICONS.includes(icon) ? icon : ICONS[0];
+  }
 
   const availableActions = () => rules.RULE_ACTIONS
     .filter(action => action.id !== 'stop')
@@ -18,7 +37,7 @@
     return {
       id: source.id ?? null,
       name: String(source.name || ''),
-      icon: String(source.icon || 'star'),
+      icon: normalizeIcon(source.icon),
       sort_order: Number(source.sort_order ?? source.position) || 0,
       hotkey_slot: source.hotkey_slot ?? null,
       state: source.state || 'ok',
@@ -26,7 +45,31 @@
     };
   }
 
-  function validateQuickStep(source) {
+  // Цель действия проверяется по настоящим папкам и меткам программы: номер,
+  // которого нет, унёс бы письма в чужую папку одним нажатием. Контекст не
+  // задан - проверяется только заполненность цели.
+  function targetIssue(action, definition, context) {
+    if (definition.needs === 'folder') {
+      if (!action.folder_id && !action.folder_role) return 'action_folder';
+      if (action.folder_role && !FOLDER_ROLES.includes(String(action.folder_role))) {
+        return 'unknown_role';
+      }
+      if (action.folder_id && context?.folders
+        && !context.folders.some(folder => Number(folder.id) === Number(action.folder_id))) {
+        return 'unknown_folder';
+      }
+    }
+    if (definition.needs === 'label') {
+      if (!action.label_id) return 'action_label';
+      if (context?.labels
+        && !context.labels.some(label => Number(label.id) === Number(action.label_id))) {
+        return 'unknown_label';
+      }
+    }
+    return null;
+  }
+
+  function validateQuickStep(source, context = null) {
     const step = normalizeQuickStep(source);
     if (!step.name.trim() || [...step.name.trim()].length > 40) return {ok: false, reason: 'name'};
     if (!step.actions.length) return {ok: false, reason: 'empty'};
@@ -36,10 +79,8 @@
       const action = step.actions[index];
       const definition = availableActions().find(item => item.id === action.kind);
       if (!definition) return {ok: false, reason: 'unknown_action'};
-      if (definition.needs === 'folder' && !action.folder_id && !action.folder_role) {
-        return {ok: false, reason: 'action_folder'};
-      }
-      if (definition.needs === 'label' && !action.label_id) return {ok: false, reason: 'action_label'};
+      const issue = targetIssue(action, definition, context);
+      if (issue) return {ok: false, reason: issue, index};
       if (definition.takeaway) {
         if (takeaway >= 0) return {ok: false, reason: 'two_takeaways'};
         takeaway = index;
@@ -205,11 +246,32 @@
       : `Выполнено: ${report.applied || 0}, пропущено: ${report.skipped || 0}${reasons.length ? ` (${reasons.join(', ')})` : ''}`;
   }
 
+  function quickStepErrorText(reason, lang = 'ru') {
+    const text = {
+      name: ['Имя быстрого действия - от одного до сорока знаков', 'Quick step name must be 1 to 40 characters'],
+      empty: ['В цепочке нет ни одного действия', 'The chain has no actions'],
+      actions_limit: ['В цепочке больше десяти действий', 'The chain has more than ten actions'],
+      unknown_action: ['Такого действия нет в словаре', 'This action is not in the dictionary'],
+      action_folder: ['У перемещения не выбрана папка', 'The move action has no folder'],
+      action_label: ['У действия с меткой не выбрана метка', 'The label action has no label'],
+      unknown_folder: ['Выбранной папки больше нет', 'The selected folder no longer exists'],
+      unknown_label: ['Выбранной метки больше нет', 'The selected label no longer exists'],
+      unknown_role: ['Такого типа папки нет', 'There is no such folder type'],
+      two_takeaways: ['Письмо можно увести только один раз', 'A message can be taken away only once'],
+      after_takeaway: ['После ухода письма остальные действия не выполнятся', 'Actions after the takeaway will not run'],
+    };
+    return (text[reason] || [reason, reason])[lang === 'en' ? 1 : 0];
+  }
+
   return {
     MAX_STEPS,
     MAX_ACTIONS,
     MAX_MESSAGES,
     QUICK_STEP_SLOT_ACTIONS,
+    ICONS,
+    FOLDER_ROLES,
+    normalizeIcon,
+    quickStepErrorText,
     availableActions,
     normalizeQuickStep,
     validateQuickStep,

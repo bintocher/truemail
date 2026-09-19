@@ -197,8 +197,16 @@ async function refreshTagsNav(){try{coreTags=await window.tm.listLabels();}catch
   try{coreTagCounts=new Map(await window.tm.labelMessageCounts());}catch(_){coreTagCounts=new Map();}
   renderTagsNav();renderTagSettings();}
 document.getElementById('tagNew2')?.addEventListener('click',()=>openLabelCreator(null));
-function filterTag(tag){window.setListLoading?.(false);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));currentTagName=tag.name;currentFolderId=null;currentSmartIndex=null;window.resetTagPaging?.(tag.name);applyListOptions(true,tag.name);renderTagsNav();window.loadNextTagPage?.();}
-async function openTasksSection(){window.setListLoading?.(true);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));document.getElementById('tasksNav')?.classList.add('active');currentTagName=null;currentFolderId=null;currentSmartIndex=null;try{let cursor=null,items=[];do{const page=await window.tm.listMessageTasks(100,cursor);items=items.concat(page.items);cursor=page.next_cursor;}while(cursor);items=flagDueDatesModel.sortTasks(flagDueDatesModel.visibleTasks(items));const rows=[],plain=[];let group=null;items.forEach(item=>{const nextGroup=flagDueDatesModel.taskGroup(item);if(nextGroup!==group){group=nextGroup;rows.push({kind:'task_separator',label:flagDueDatesModel.groupLabel(group,wizardLocale)});}const message={id:item.task.message_id,account_id:item.account_id,folder_id:item.folder_id,thread_id:null,uid:0,message_id:null,from:{name:item.sender_name,email:item.sender_address||''},to:[],cc:[],subject:item.subject||L('Без темы','No subject'),preview:flagDueDatesModel.taskRowText(item,wizardLocale),date:item.message_date,size:null,flags:{seen:true,flagged:item.task.state==='active'},has_attachments:false,auth:{},labels:[],pinned_at:null,task_due_at:item.task.due_at,task_state:item.task.state,snoozed_until:item.snoozed_until,_taskSource:true};rows.push(message);plain.push(message);});const known=new Set(messages.map(item=>item.id));messages=messages.concat(plain.filter(item=>!known.has(item.id)));renderMessageList(rows,L('Дела','Tasks'),true);}catch(error){showToast(error);}finally{window.setListLoading?.(false);}}
+function filterTag(tag){window.setListLoading?.(false);tasksSectionOpen=false;clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));currentTagName=tag.name;currentFolderId=null;currentSmartIndex=null;window.resetTagPaging?.(tag.name);applyListOptions(true,tag.name);renderTagsNav();window.loadNextTagPage?.();}
+/* Раздел "Дела" показывает первую страницу сразу и догружает остальные по
+   курсору: ожидание всех страниц до первой отрисовки держало бы список пустым
+   тем дольше, чем больше дел. Строки дел помечены признаком источника и в
+   списки папок, меток и умных папок не подмешиваются (S-050, S-051). */
+let tasksSectionOpen=false;
+async function openTasksSection(){window.setListLoading?.(true);clearMessageSelection();goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));document.getElementById('tasksNav')?.classList.add('active');currentTagName=null;currentFolderId=null;currentSmartIndex=null;tasksSectionOpen=true;try{let cursor=null,items=[],first=true;do{const page=await window.tm.listMessageTasks(100,cursor);items=items.concat(page.items);cursor=page.next_cursor;renderTaskSectionRows(items,first);first=false;}while(cursor&&tasksSectionOpen);}catch(error){showToast(error);}finally{window.setListLoading?.(false);}}
+function renderTaskSectionRows(source,resetScroll){const items=flagDueDatesModel.sortTasks(flagDueDatesModel.visibleTasks(source)),rows=[],plain=[];let group=null;items.forEach(item=>{const nextGroup=flagDueDatesModel.taskGroup(item);if(nextGroup!==group){group=nextGroup;rows.push({kind:'task_separator',label:flagDueDatesModel.groupLabel(group,wizardLocale)});}const message={id:item.task.message_id,account_id:item.account_id,folder_id:item.folder_id,thread_id:null,uid:0,message_id:null,from:{name:item.sender_name,email:item.sender_address||''},to:[],cc:[],subject:item.subject||L('Без темы','No subject'),preview:flagDueDatesModel.taskRowText(item,wizardLocale),date:item.message_date,size:null,flags:{seen:true,flagged:item.task.state==='active'},has_attachments:false,auth:{},labels:[],pinned_at:null,task_due_at:item.task.due_at,task_state:item.task.state,snoozed_until:item.snoozed_until,_taskSource:true};rows.push(message);plain.push(message);});const known=new Set(messages.map(item=>item.id));messages=messages.concat(plain.filter(item=>!known.has(item.id)));renderMessageList(rows,L('Дела','Tasks'),resetScroll);}
+window.refreshTasksSection=()=>{if(tasksSectionOpen)openTasksSection();return tasksSectionOpen;};
+window.leaveTasksSection=()=>{tasksSectionOpen=false;};
 document.getElementById('tasksNav')?.addEventListener('click',openTasksSection);
 window.openTasksSection=openTasksSection;
 window.refreshTagsNav=refreshTagsNav;
@@ -365,13 +373,54 @@ async function setMessagesPinnedFromUi(ids,pinned){
   }
 }
 window.setMessagesPinnedFromUi=setMessagesPinnedFromUi;
+/* Перечень закреплённых писем читается у ядра с видом открытого представления
+   и его приметой. Страницы списка закреплённые письма исключают, поэтому без
+   отдельного перечня закреплённое письмо пропадает из умной папки, из списка
+   метки и из стартового вида (S-009, S-010, S-014, S-038 - S-041). */
+let pinnedViewKey=null;
+window.pinnedViewMessages=[];
+function currentPinnedView(){
+  if(currentTagName!=null&&currentFolderId===null&&currentSmartIndex==null)return {kind:'label',value:currentTagName};
+  if(currentFolderId!==null)return {kind:'folder',value:String(currentFolderId)};
+  const smart=smartFolders[currentSmartIndex??0];
+  return smart?{kind:'smart',value:String(smart.id)}:{kind:'unified',value:null};
+}
+async function refreshPinnedForView(force=false){
+  if(!window.tm?.listPinnedMessages)return;
+  const view=currentPinnedView(),key=`${view.kind}:${view.value??''}`;
+  if(!force&&key===pinnedViewKey)return;
+  pinnedViewKey=key;window.pinnedViewMessages=[];
+  try{
+    const list=await window.tm.listPinnedMessages(view.kind,view.value??null);
+    if(pinnedViewKey!==key)return;
+    window.pinnedViewMessages=list.messages||[];
+    window.corePinnedMessages=window.pinnedViewMessages;
+    const known=new Set(messages.map(item=>item.id));
+    messages=messages.concat(window.pinnedViewMessages.filter(item=>!known.has(item.id)));
+    applyListOptions(false,lastListTitle);
+  }catch(error){
+    // S-069: без закреплённой части список остаётся работоспособным.
+    showToast(error);
+  }
+}
+window.refreshPinnedForView=refreshPinnedForView;
+/* Сроки собираются по всем выбранным письмам: подтверждение, построенное по
+   одному письму, молча стирало бы дела всех остальных (S-024, S-025). */
+function selectedMessageTasks(ids,fallback){
+  return ids.map(id=>{
+    const message=messages.find(item=>item.id===id)||currentMessageRows.find(item=>item.id===id)||(Number(fallback?.id)===id?fallback:null);
+    if(!message)return null;
+    return {message_id:id,start_at:message.task_start_at??null,due_at:message.task_due_at??null,reminder_at:message.task_reminder_at??null};
+  }).filter(Boolean);
+}
 async function setMessagesFlaggedFromUi(ids,flagged,task=null){
   const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];
   const original=new Map(unique.map(id=>[id,Boolean(messages.find(message=>message.id===id)?.flags?.flagged)]));
-  const taskState=task?{due_at:task.due_at??task.task_due_at??null}:null;
+  const tasks=selectedMessageTasks(unique,task);
+  const dated=flagDueDatesModel.datedTasks(tasks);
   try{
-    const result=await flagDueDatesModel.toggleFlag(window.tm,unique,flagged,{reason:'user',task:taskState,lang:wizardLocale,confirm:async text=>confirm(text),onOptimistic:changed=>{changed.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.flags.flagged=flagged;});applyListOptions(false);}});
-    if(!flagged&&taskState?.due_at&&result===0)return 0;
+    const result=await flagDueDatesModel.toggleFlag(window.tm,unique,flagged,{reason:'user',tasks,lang:wizardLocale,confirm:async text=>confirm(text),onOptimistic:changed=>{changed.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.flags.flagged=flagged;});applyListOptions(false);}});
+    if(!flagged&&dated.length&&result===0)return 0;
     await window.reloadCoreData();return result;
   }catch(error){
     unique.forEach(id=>{const message=messages.find(item=>item.id===id);if(message)message.flags.flagged=original.get(id);});
@@ -618,7 +667,7 @@ async function showMessage(message){
   body.innerHTML=`<div class="mail-loading">${L('Загрузка письма…','Loading message…')}</div>`;
   // Признак активной строки и остановка Tab идут вместе: сюда приходят и клик,
   // и навигация клавишами, а окно списка при этом не перестраивается (S-005).
-  const rows=[...document.querySelectorAll('.msg')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active));row.tabIndex=active?0:-1;});
+  const rows=[...document.querySelectorAll('.msg[data-message-id]')];rows.forEach(row=>{const active=+row.dataset.messageId===message.id;row.classList.toggle('active',active);row.setAttribute('aria-selected',String(active));row.tabIndex=active?0:-1;});
   // Строки активного письма в окне может не быть (открыто из палитры, а список
   // прокручен в другое место) - тогда остановка Tab достаётся первой строке,
   // иначе список выпал бы из обхода целиком.
@@ -853,7 +902,7 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
 // resetScroll=true - пользователь сам открыл умную папку: разрешаем ей снова
 // сходить на сервер. resetScroll=false - это фоновая перезагрузка данных, она
 // только обновляет страницу из локальной базы.
-function filterSmart(index,resetScroll=true){window.setListLoading?.(false);currentSmartIndex=index;currentFolderId=null;currentTagName=null;const folder=smartFolders[index];if(resetScroll&&folder){smartServerExhausted.delete(folder.id);smartCircleFetched.delete(folder.id);smartBackfillVisited.delete(folder.id);smartBackfillCursor.clear();}applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true,resetScroll);}
+function filterSmart(index,resetScroll=true){window.setListLoading?.(false);tasksSectionOpen=false;currentSmartIndex=index;currentFolderId=null;currentTagName=null;const folder=smartFolders[index];if(resetScroll&&folder){smartServerExhausted.delete(folder.id);smartCircleFetched.delete(folder.id);smartBackfillVisited.delete(folder.id);smartBackfillCursor.clear();}applyListOptions(resetScroll,smartFolderTitle(smartFolders[index])||messagesTitle());loadSmartCoveragePage(index,true,resetScroll);}
 
 // Признак состояния синхронизации почты рядом с заголовком аккаунта в боковой
 // панели (mail-sync-visible-state.md, S-006, S-007). Показывается только для
@@ -906,7 +955,6 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   const listAnchor=messageView.listAnchorAt(currentMessageRows,messageScroll,messageRowHeight);
   rememberListFocus();
   window.clearDemoData(true);
-  window.seedOrdinaryPageCursors?.(loadedMessages);
   coreAccounts=accounts;setCoreFolders(foldersByAccount.flat());coreContacts=contacts;coreCalendarData=calendarData;
   // coreContacts обновился - кэши ключей транслитерации по всем поверхностям
   // устарели (person-search-translit.md, S-012): раздел контактов (эта же
@@ -924,7 +972,11 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // Старую копию храним только если она за границей свежей страницы папки: письмо
   // внутри страницы, которого в выборке нет, из папки ушло (перемещено, удалено,
   // ждёт отправки в очереди) - иначе оно продолжало бы висеть в прежней папке.
-  {const fresh=loadedMessages.map(applyPendingSeen),merged=pinMessageModel.mergeReloadedPages({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},{fresh,pageSize:window.corePageSize||100});messages=trimMessages(merged.pinned.concat(merged.normal),fresh.map(message=>message.id));}
+  /* Край папки считается по письмам без закрепления: закреплённые письма
+     приходят перечнем любой давности, и по ним край уезжал в прошлое, унося
+     почти все догруженные страницы (S-021). Курсор пересевается уже по
+     уцелевшему набору. */
+  {const fresh=loadedMessages.map(applyPendingSeen).filter(message=>!message.pinned_at),merged=pinMessageModel.mergeReloadedPages({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},{fresh,pageSize:window.corePageSize||100});messages=trimMessages(merged.pinned.concat(merged.normal),fresh.map(message=>message.id));window.seedOrdinaryPageCursors?.(messages);}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Счётчики умных папок пересчитываем после каждой перезагрузки данных: письма
   // могли прийти, уйти или стать прочитанными. Прежние числа возвращаем на
@@ -951,7 +1003,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // цикла по папкам давал квадратичный обход (десятки папок на десятки тысяч
   // писем) и заметно грузил процессор на каждой перезагрузке данных.
   {const localCounts=new Map();messages.filter(message=>!message.pinned_at).forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
-   coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount===MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});}
+   coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount>=MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});}
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;
@@ -970,7 +1022,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
       const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;
       row.querySelector('.folder-name').textContent=folderTitle(folder);updateFolderBadge(row,folder);
-      const openFolder=()=>{window.setListLoading?.(false);goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openPopupMenu('folder',`folder:${folder.id}`);contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
+      const openFolder=()=>{window.setListLoading?.(false);tasksSectionOpen=false;goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openPopupMenu('folder',`folder:${folder.id}`);contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
     anchor.after(sub);anchor=sub;
   });
   renderIcons(document.querySelector('.nav'));

@@ -40,6 +40,13 @@ pub struct MessageMeta {
     /// Срок исполнения нужен строке списка без отдельного чтения дела.
     #[serde(default)]
     pub task_due_at: Option<String>,
+    /// Срок начала и время напоминания нужны подтверждению снятия флажка по
+    /// выделению: спрашивать надо при любом из трёх сроков, а читать дело
+    /// каждого выбранного письма отдельным запросом незачем.
+    #[serde(default)]
+    pub task_start_at: Option<String>,
+    #[serde(default)]
+    pub task_reminder_at: Option<String>,
     /// Состояние существует и без строки дела: у письма с флажком это active.
     #[serde(default)]
     pub task_state: Option<String>,

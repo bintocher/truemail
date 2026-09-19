@@ -239,7 +239,25 @@ const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElem
 // Открыли фильтр - сразу ставим курсор в поле ввода: набирать текст можно
 // не целясь мышью. Фокус даём после снятия hidden, скрытый элемент его не берёт.
 filterButton.onclick=e=>{e.stopPropagation();const opened=filterMenu.classList.contains('hidden');closePopupMenus(['filter']);if(opened){openPopupMenu('filter','filter');filterMenu.classList.remove('hidden');const input=document.getElementById('filterText');input?.focus();input?.select();}};sortButton.onclick=e=>{e.stopPropagation();const opened=sortMenu.classList.contains('hidden');closePopupMenus(['sort']);if(opened){openPopupMenu('sort','sort');sortMenu.classList.remove('hidden');}};
-function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyReadIds.clear();window.resetAutoFill?.();window.forgetHiddenAnchor?.();}let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);if(active.includes('unread'))rows=rows.filter(m=>!m.flags?.seen);if(active.includes('attachments'))rows=rows.filter(m=>m.has_attachments);if(active.includes('flagged'))rows=rows.filter(m=>m.flags?.flagged);
+function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyReadIds.clear();window.resetAutoFill?.();window.forgetHiddenAnchor?.();}
+  // Открытый раздел "Дела" перечитывает себя сам: иначе любое действие
+  // выбрасывало бы пользователя в умную папку (S-043, S-051).
+  if(window.refreshTasksSection?.())return;
+  // Смена представления перечитывает закреплённые письма этого представления:
+  // повторный вызов с тем же видом ничего не запрашивает (S-009, S-014).
+  window.refreshPinnedForView?.();let rows=currentTagName!=null?messages.filter(m=>(m.labels||[]).includes(currentTagName)):currentFolderId!==null?messages.filter(m=>m.folder_id===currentFolderId):smartRows(currentSmartIndex??0);
+  // Строки раздела "Дела" собраны из дел, а не из страниц списка: в папках,
+  // метках и умных папках им делать нечего.
+  rows=rows.filter(m=>!m._taskSource);
+  // Закреплённые письма представления приходят отдельным перечнем и проходят
+  // те же фильтры и ту же сортировку, что и обычные (S-037).
+  {const pinnedView=window.pinnedViewMessages||[];if(pinnedView.length){const present=new Set(rows.map(m=>m.id));rows=rows.concat(pinnedView.filter(m=>!present.has(m.id)));}}
+  // Отбор и сортировка списка выполняются одной функцией модуля закрепления:
+  // вторая копия тех же правил разошлась бы с первой при первом же изменении
+  // (S-030 - S-037).
+  const active=[...filterMenu.querySelectorAll('input[type="checkbox"]:checked')].map(input=>input.dataset.filter);
+  const listOptions={unread:active.includes('unread'),attachments:active.includes('attachments'),flagged:active.includes('flagged'),sort:sortMenu.dataset.sort||'date-desc',locale:wizardLocale};
+  rows=pinMessageModel.filterMessages(rows,listOptions);
   // Удержать письма, прочитанные в этом показе списка: они выпали из smartRows
   // (умная папка "непрочитанные") или из unread-фильтра только из-за смены seen.
   if(stickyReadIds.size){const present=new Set(rows.map(m=>m.id));stickyReadIds.forEach(id=>{if(present.has(id))return;const held=messages.find(m=>m.id===id);if(!held)return;
@@ -247,7 +265,11 @@ function applyListOptions(resetScroll=false,title=null){if(resetScroll){stickyRe
     // иначе перемещённое (архив/корзина) всплыло бы в чужой папке.
     const belongs=currentTagName!=null?(held.labels||[]).includes(currentTagName):currentFolderId!==null?held.folder_id===currentFolderId:true;
     if(belongs)rows.push(held);});}
-  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));const sort=sortMenu.dataset.sort||'date-desc';rows.sort((a,b)=>sort==='date-asc'?byDateAsc(a,b):sort==='sender'?String(a.from?.name||a.from?.email||'').localeCompare(String(b.from?.name||b.from?.email||'')):sort==='subject'?String(a.subject||'').localeCompare(String(b.subject||'')):byDateDesc(a,b));renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);window.updateFilterIndicator?.();}
+  const filterText=(document.getElementById('filterText')?.value||'').trim();if(filterText)rows=rows.filter(m=>matchQ(`${m.from?.name||''} ${m.from?.email||''} ${m.subject||''} ${m.preview||''}`,filterText));
+  // Удержанные письма приходят после отбора, поэтому порядок собирается ещё
+  // раз той же функцией, но уже без фильтров.
+  rows=pinMessageModel.filterMessages(rows,{sort:listOptions.sort,locale:listOptions.locale});
+  renderMessageList(rows,title||document.querySelector('.listhead h2').textContent,resetScroll);window.updateFilterIndicator?.();}
 // Кнопка сброса фильтра появляется рядом с воронкой, только когда фильтр
 // действительно что-то отсекает. При наведении показывает, какие условия стоят -
 // иначе пользователю пришлось бы открывать меню, чтобы это вспомнить.

@@ -7,6 +7,34 @@ use crate::model::*;
 use futures::TryStreamExt;
 use sqlx::AssertSqlSafe;
 
+/// Состояния операции признака важности, при которых значение сервера к письму
+/// не применяется. Состояние отказа входит сюда наравне с остальными: после
+/// восьми попыток операция повтору не подлежит и лежит в очереди до решения
+/// пользователя, а значение сервера тем временем вернуло бы прежний признак и
+/// воскресило бы выполненное дело (flag-due-dates.md, S-039 и S-040).
+/// Макрос, а не константа: строки запросов собираются на компиляции
+/// через `concat!`.
+macro_rules! unfinished_flag_op_sql {
+    () => {
+        "('pending','processing','retry','failed')"
+    };
+}
+
+/// Операция вида `flag` несёт оба признака сразу и ставится в том числе
+/// отметкой о прочтении. Придержать значение сервера должна только та, что
+/// действительно меняет важность: иначе неотправленная отметка о прочтении
+/// молча запрещала бы принимать важность с сервера. Записи прежних выпусков
+/// поля не имеют и считаются меняющими важность, как было до правки.
+macro_rules! flag_op_changes_flag_sql {
+    ($alias:literal) => {
+        concat!(
+            " AND COALESCE(json_extract(",
+            $alias,
+            "payload,'$.sets_flagged'),1)=1"
+        )
+    };
+}
+
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
@@ -353,7 +381,17 @@ pub struct OutboxOperation {
 /// Строка исчезнувшего с сервера письма: номер, ссылка на хранилище больших
 /// объектов, заголовок Message-ID и время закрепления. Нужна отдельным именем,
 /// потому что кортеж из четырёх значений в теле функции нечитаем.
-type VanishedMessageRow = (i64, Option<String>, Option<String>, Option<String>);
+type VanishedMessageRow = (i64, Option<String>);
+
+/// Закрепление и сроки дела, дочитываемые к странице списка писем.
+type MessageDetailsRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 impl Db {
     pub async fn list_keybindings(&self) -> Result<Vec<Keybinding>> {
@@ -1175,6 +1213,9 @@ impl Db {
             if let Some(reference) = raw_ref {
                 blob_refs.push(reference.clone());
             }
+            // Проекция письма убрана провайдером - строка уходит, а сроки дела
+            // и закрепление остаются: письмо то же самое.
+            preserve_message_traits(&mut tx, *id).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1227,6 +1268,10 @@ impl Db {
                     .fetch_all(&mut *tx)
                     .await?;
             blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
+            // Сверка снимка и смена признака действительности папки удаляют
+            // строку письма, которое на сервере осталось: приметы сохраняются
+            // ровно как при своём переносе.
+            preserve_message_traits(&mut tx, *id).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1252,17 +1297,20 @@ impl Db {
         let mut tx = self.begin_write().await?;
         let mut changed = 0usize;
         for update in updates {
-            let result = sqlx::query(
+            let result = sqlx::query(concat!(
                 "UPDATE messages SET seen=?,
                     flagged=CASE WHEN EXISTS(
                         SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                         AND o.op_kind='flag' AND o.status IN ('pending','processing','retry')
+                         AND o.op_kind='flag' AND o.status IN ",
+                unfinished_flag_op_sql!(),
+                flag_op_changes_flag_sql!("o."),
+                "
                     ) THEN flagged ELSE ? END,
                     answered=?, draft=?
                  WHERE account_id=? AND uid=? AND folder_id=(
                     SELECT id FROM folders WHERE account_id=? AND remote_path=?
-                 )",
-            )
+                 )"
+            ))
             .bind(update.seen)
             .bind(update.flagged)
             .bind(update.answered)
@@ -1273,7 +1321,7 @@ impl Db {
             .bind(&update.folder_path)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(
+            sqlx::query(concat!(
                 "UPDATE message_tasks SET
                     state=CASE WHEN ? THEN 'active' WHEN state='active' THEN 'detached' ELSE state END,
                     completed_at=CASE WHEN ? THEN NULL ELSE completed_at END,
@@ -1282,9 +1330,12 @@ impl Db {
                     SELECT m.id FROM messages m WHERE m.account_id=? AND m.uid=?
                      AND m.folder_id=(SELECT id FROM folders WHERE account_id=? AND remote_path=?)
                      AND NOT EXISTS(SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id
-                         AND o.op_kind='flag' AND o.status IN ('pending','processing','retry'))
-                  )",
-            )
+                         AND o.op_kind='flag' AND o.status IN ",
+                unfinished_flag_op_sql!(),
+                flag_op_changes_flag_sql!("o."),
+                ")
+                  )"
+            ))
             .bind(update.flagged)
             .bind(update.flagged)
             .bind(account_id)
@@ -1322,7 +1373,7 @@ impl Db {
         for (path, uids) in vanished {
             for uid in uids {
                 let row: Option<VanishedMessageRow> = sqlx::query_as(
-                    "SELECT m.id, m.raw_blob_ref, m.rfc822_message_id, m.pinned_at FROM messages m
+                    "SELECT m.id, m.raw_blob_ref FROM messages m
                      JOIN folders f ON f.id=m.folder_id
                      WHERE m.account_id=? AND f.remote_path=? AND m.uid=?",
                 )
@@ -1331,7 +1382,7 @@ impl Db {
                 .bind(i64::from(*uid))
                 .fetch_optional(&mut *tx)
                 .await?;
-                if let Some((id, raw_ref, fixed_id, pinned_at)) = row {
+                if let Some((id, raw_ref)) = row {
                     let attachment_refs: Vec<(Option<String>,)> =
                         sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
                             .bind(id)
@@ -1341,47 +1392,14 @@ impl Db {
                     if let Some(reference) = raw_ref {
                         blob_refs.push(reference);
                     }
-                    let task = sqlx::query_as::<_, MessageTaskRow>(
-                        "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
-                                reminder_shown_at,created_at,updated_at
-                           FROM message_tasks WHERE message_id=?",
-                    )
-                    .bind(id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .map(Into::into);
-                    if let Some(fixed_id) = fixed_id
-                        && (pinned_at.is_some() || task.is_some())
-                    {
-                        let matches: (i64,) = sqlx::query_as(
-                            "SELECT count(*) FROM messages
-                              WHERE account_id=? AND rfc822_message_id=?",
-                        )
-                        .bind(account_id)
-                        .bind(&fixed_id)
-                        .fetch_one(&mut *tx)
-                        .await?;
-                        if matches.0 == 1 {
-                            let key = transferred_traits_key(account_id, &fixed_id);
-                            let value = serde_json::to_string(&TransferredMessageTraits {
-                                pinned_at,
-                                task,
-                            })?;
-                            sqlx::query(
-                                "INSERT INTO storage_meta(key,value) VALUES(?,?)
-                                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                            )
-                            .bind(key)
-                            .bind(value)
-                            .execute(&mut *tx)
-                            .await?;
-                        }
-                    }
                     delete_ids.push(id);
                 }
             }
         }
         for id in &delete_ids {
+            // Письмо исчезло из этой папки, но в ящике оно чаще всего уже
+            // лежит на новом месте: приметы уходят туда, а не пропадают.
+            preserve_message_traits(&mut tx, *id).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -2330,7 +2348,7 @@ impl Db {
                 } else {
                     raw_ref.clone()
                 };
-                sqlx::query(
+                sqlx::query(concat!(
                     // backfilled намеренно не входит в DO UPDATE SET: письмо,
                     // уже лежавшее в базе, не должно стать "догруженным" из-за
                     // перекрытия страниц - иначе правила его больше не увидят.
@@ -2344,7 +2362,10 @@ impl Db {
                         seen=excluded.seen,
                         flagged=CASE WHEN EXISTS(
                             SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
-                             AND o.op_kind='flag' AND o.status IN ('pending','processing','retry')
+                             AND o.op_kind='flag' AND o.status IN ",
+                        unfinished_flag_op_sql!(),
+                        flag_op_changes_flag_sql!("o."),
+                        "
                         ) THEN messages.flagged ELSE excluded.flagged END,
                         answered=excluded.answered,
                         draft=excluded.draft,
@@ -2361,8 +2382,8 @@ impl Db {
                         return_path_empty=CASE WHEN excluded.silence_headers_known=1 THEN excluded.return_path_empty ELSE messages.return_path_empty END,
                         auto_response_suppress=CASE WHEN excluded.silence_headers_known=1 THEN excluded.auto_response_suppress ELSE messages.auto_response_suppress END,
                         reply_to_addrs=excluded.reply_to_addrs,
-                        silence_headers_known=CASE WHEN messages.silence_headers_known=1 THEN 1 ELSE excluded.silence_headers_known END",
-                )
+                        silence_headers_known=CASE WHEN messages.silence_headers_known=1 THEN 1 ELSE excluded.silence_headers_known END"
+                ))
                 .bind(account_id).bind(folder_id).bind(source.uid as i64).bind(&source.remote_id).bind(&message_id)
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
@@ -2404,10 +2425,12 @@ impl Db {
                     )
                     .await?;
                 }
-                let pending_flag: (i64,) = sqlx::query_as(
-                    "SELECT count(*) FROM outbox_ops WHERE message_id=? AND op_kind='flag'
-                      AND status IN ('pending','processing','retry')",
-                )
+                let pending_flag: (i64,) = sqlx::query_as(concat!(
+                    "SELECT count(*) FROM outbox_ops o WHERE o.message_id=? AND o.op_kind='flag'
+                      AND o.status IN ",
+                    unfinished_flag_op_sql!(),
+                    flag_op_changes_flag_sql!("o.")
+                ))
                 .bind(message_row_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -2546,7 +2569,8 @@ impl Db {
         let mut details = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT m.id, m.pinned_at, t.due_at,
                     CASE WHEN t.state IS NOT NULL THEN t.state
-                         WHEN m.flagged=1 THEN 'active' END
+                         WHEN m.flagged=1 THEN 'active' END,
+                    t.start_at, t.reminder_at
                FROM messages m LEFT JOIN message_tasks t ON t.message_id=m.id
               WHERE m.id IN (",
         );
@@ -2556,31 +2580,58 @@ impl Db {
         }
         separated.push_unseparated(")");
         let details = details
-            .build_query_as::<(i64, Option<String>, Option<String>, Option<String>)>()
+            .build_query_as::<MessageDetailsRow>()
             .fetch_all(&self.pool)
             .await?;
         let mut details = details
             .into_iter()
-            .map(|row| (row.0, (row.1, row.2, row.3)))
+            .map(|row| (row.0, (row.1, row.2, row.3, row.4, row.5)))
             .collect::<std::collections::HashMap<_, _>>();
         for message in messages.iter_mut() {
-            if let Some((pinned_at, due_at, state)) = details.remove(&message.id) {
+            if let Some((pinned_at, due_at, state, start_at, reminder_at)) =
+                details.remove(&message.id)
+            {
                 message.pinned_at = pinned_at;
                 message.task_due_at = due_at;
                 message.task_state = state;
+                message.task_start_at = start_at;
+                message.task_reminder_at = reminder_at;
             }
         }
         Ok(())
     }
 
+    /// Письма папки для внешнего интерфейса приложений: закреплённые письма
+    /// отсюда не исключаются. Исключение существует ради того, чтобы письмо не
+    /// показывалось дважды в окне программы, и стоит только в запросах страниц
+    /// списка (pin-message.md, S-012).
     pub async fn list_messages(&self, folder_id: i64, limit: i64) -> Result<Vec<MessageMeta>> {
+        self.list_folder_messages(folder_id, limit, false).await
+    }
+
+    /// Первая страница списка папки: закреплённые письма приходят отдельным
+    /// перечнем и из страницы исключаются (S-011).
+    pub async fn list_folder_first_page(
+        &self,
+        folder_id: i64,
+        limit: i64,
+    ) -> Result<Vec<MessageMeta>> {
+        self.list_folder_messages(folder_id, limit, true).await
+    }
+
+    async fn list_folder_messages(
+        &self,
+        folder_id: i64,
+        limit: i64,
+        skip_pinned: bool,
+    ) -> Result<Vec<MessageMeta>> {
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
                     from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size,
                     seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass
              FROM messages
              WHERE folder_id = ?
-               AND pinned_at IS NULL
+               AND (? = 0 OR pinned_at IS NULL)
                AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
                AND NOT EXISTS (
                  SELECT 1 FROM outbox_ops o
@@ -2590,6 +2641,7 @@ impl Db {
              ORDER BY date DESC, id DESC LIMIT ?",
         )
         .bind(folder_id)
+        .bind(i64::from(skip_pinned))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -2625,7 +2677,7 @@ impl Db {
     ) -> Result<Vec<MessageMeta>> {
         let limit = limit.clamp(1, 500);
         if before_date.is_none() || before_id.is_none() {
-            return self.list_messages(folder_id, limit).await;
+            return self.list_folder_first_page(folder_id, limit).await;
         }
         let date = before_date.unwrap_or_default();
         let id = before_id.unwrap_or(i64::MAX);
@@ -3006,8 +3058,12 @@ impl Db {
                 "неизвестный вид списка закрепленных писем".into(),
             ));
         }
-        // BEGIN IMMEDIATE не дает закреплению измениться между чтением двух
-        // частей. Иначе письмо могло исчезнуть из обеих или прийти в обе.
+        // Снимок закреплённых писем берётся отдельной неделимой операцией и
+        // сразу закрывается: единственное соединение записи иначе держалось бы
+        // на весь обход базы, и очередь операций, синхронизация и прогон
+        // правил вставали бы вместе с ним. Обычная часть собирается после
+        // снимка, а письма снимка из неё отсеиваются, поэтому письмо,
+        // откреплённое между двумя чтениями, не приходит дважды.
         let mut snapshot = self.begin_write().await?;
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, account_id, folder_id, thread_id, uid, rfc822_message_id,
@@ -3027,6 +3083,8 @@ impl Db {
         } else {
             None
         };
+        // Умная папка и объединённое представление читают отбор уже после
+        // закрытия снимка: обход базы под писателем задержал бы всю запись.
         let smart = if view_kind == "smart" {
             let id =
                 view_value.ok_or_else(|| crate::Error::Other("умная папка не указана".into()))?;
@@ -3055,6 +3113,7 @@ impl Db {
         } else {
             std::collections::HashSet::new()
         };
+        snapshot.commit().await?;
         let folder_id = if view_kind == "folder" {
             Some(
                 view_value
@@ -3090,7 +3149,7 @@ impl Db {
         let total = messages.len();
         let mut ordinary = match view_kind {
             "folder" => {
-                self.list_messages(folder_id.unwrap_or_default(), 100)
+                self.list_folder_first_page(folder_id.unwrap_or_default(), 100)
                     .await?
             }
             "label" => {
@@ -3109,7 +3168,7 @@ impl Db {
             _ => {
                 let rows = sqlx::query_as::<_, MessageRow>(SMART_PAGE_FIRST_SQL)
                     .bind(1_000_i64)
-                    .fetch_all(&mut *snapshot)
+                    .fetch_all(&self.pool)
                     .await?;
                 let mut context = self.smart_selection_context(true).await?;
                 rows.into_iter()
@@ -3119,7 +3178,11 @@ impl Db {
             }
         };
         self.attach_labels(&mut ordinary).await?;
-        snapshot.commit().await?;
+        let shown = messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<std::collections::HashSet<_>>();
+        ordinary.retain(|message| !shown.contains(&message.id));
         Ok(PinnedMessageList {
             messages,
             total,
@@ -3128,7 +3191,10 @@ impl Db {
     }
 
     pub async fn save_message_task(&self, input: &MessageTaskInput) -> Result<MessageTask> {
-        validate_task_times(input)?;
+        // Время интерфейса приходит в другом виде, а сравнения сроков идут
+        // строками: без приведения к виду базы просроченных дел не бывает,
+        // а напоминание ждёт полуночи (S-017).
+        let times = validate_task_times(input)?;
         let mut tx = self.begin_write().await?;
         let locator: (i64, i64, String, Option<String>, i64, i64) = sqlx::query_as(
             "SELECT m.account_id, m.uid, f.remote_path, m.remote_id, m.seen, m.flagged
@@ -3147,9 +3213,9 @@ impl Db {
                  completed_at=NULL, reminder_shown_at=NULL, updated_at=datetime('now')",
         )
         .bind(input.message_id)
-        .bind(&input.start_at)
-        .bind(&input.due_at)
-        .bind(&input.reminder_at)
+        .bind(&times.start_at)
+        .bind(&times.due_at)
+        .bind(&times.reminder_at)
         .execute(&mut *tx)
         .await?;
         if locator.5 == 0 {
@@ -3165,6 +3231,7 @@ impl Db {
                 locator.1,
                 locator.3.as_deref(),
                 locator.4 != 0,
+                true,
                 true,
             )
             .await?;
@@ -3259,6 +3326,7 @@ impl Db {
             locator.3.as_deref(),
             locator.4 != 0,
             !completed,
+            true,
         )
         .await?;
         let task = read_message_task(&mut tx, message_id).await?;
@@ -3276,13 +3344,24 @@ impl Db {
     }
 
     pub async fn purge_completed_message_tasks(&self) -> Result<usize> {
-        Ok(sqlx::query(
+        let removed = sqlx::query(
             "DELETE FROM message_tasks WHERE state='done'
               AND completed_at < datetime('now','-30 days')",
         )
         .execute(&self.write_pool)
         .await?
-        .rows_affected() as usize)
+        .rows_affected() as usize;
+        // Тем же проходом уходят приметы писем, которые так и не вернулись:
+        // запись без срока годности лежала бы вечно и однажды досталась бы
+        // письму с тем же заголовком.
+        sqlx::query(AssertSqlSafe(format!(
+            "DELETE FROM storage_meta WHERE key LIKE 'message_traits:%'
+               AND COALESCE(json_extract(value,'$.saved_at'),'9999-12-31 23:59:59')
+                   < datetime('now','-{TRAITS_KEEP_DAYS} days')"
+        )))
+        .execute(&self.write_pool)
+        .await?;
+        Ok(removed)
     }
 
     pub async fn overdue_message_task_count(&self) -> Result<i64> {
@@ -4076,6 +4155,7 @@ impl Db {
             locator.3.as_deref(),
             seen,
             locator.4 != 0,
+            false,
         )
         .await?;
         tx.commit().await?;
@@ -4115,10 +4195,12 @@ impl Db {
             .fetch_one(&mut *tx)
             .await?;
             if reason == FlagChangeReason::Sync {
-                let pending: (i64,) = sqlx::query_as(
-                    "SELECT count(*) FROM outbox_ops WHERE message_id=? AND op_kind='flag'
-                      AND status IN ('pending','processing','retry')",
-                )
+                let pending: (i64,) = sqlx::query_as(concat!(
+                    "SELECT count(*) FROM outbox_ops o WHERE o.message_id=? AND o.op_kind='flag'
+                      AND o.status IN ",
+                    unfinished_flag_op_sql!(),
+                    flag_op_changes_flag_sql!("o.")
+                ))
                 .bind(message_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -4169,6 +4251,7 @@ impl Db {
                     locator.3.as_deref(),
                     locator.4 != 0,
                     flagged,
+                    true,
                 )
                 .await?;
             }
@@ -4182,6 +4265,9 @@ impl Db {
     /// флагов сразу. Пересборка целиком (а не только изменённого поля)
     /// нужна, чтобы более ранняя ещё не отправленная пометка не потерялась,
     /// когда пользователь быстро меняет seen и flagged подряд.
+    /// `sets_flagged` говорит, меняет ли эта постановка важность письма.
+    /// Отметка о прочтении ставит ту же операцию и важности не касается, а
+    /// значение сервера придерживает только настоящее изменение важности.
     async fn queue_flag_sync(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         message_id: i64,
@@ -4191,7 +4277,27 @@ impl Db {
         remote_id: Option<&str>,
         seen: bool,
         flagged: bool,
+        sets_flagged: bool,
     ) -> Result<()> {
+        // Прежняя незавершённая операция пересобирается целиком, и её обещание
+        // об изменении важности наследуется: иначе отметка о прочтении
+        // отменила бы придержку значения сервера для ещё не отправленного
+        // флажка.
+        let previous: Option<(String,)> = sqlx::query_as(
+            "SELECT payload FROM outbox_ops WHERE message_id=? AND op_kind='flag'
+              AND status IN ('pending','retry')",
+        )
+        .bind(message_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let inherited = previous
+            .and_then(|(payload,)| serde_json::from_str::<serde_json::Value>(&payload).ok())
+            .and_then(|payload| {
+                payload
+                    .get("sets_flagged")
+                    .and_then(serde_json::Value::as_bool)
+            })
+            .unwrap_or(false);
         let payload = serde_json::json!({
             "message_id": message_id,
             "folder_path": folder_path,
@@ -4199,6 +4305,7 @@ impl Db {
             "remote_id": remote_id,
             "seen": seen,
             "flagged": flagged,
+            "sets_flagged": sets_flagged || inherited,
         });
         sqlx::query("DELETE FROM outbox_ops WHERE message_id=? AND op_kind='flag' AND status IN ('pending','retry')")
             .bind(message_id)
@@ -4459,71 +4566,19 @@ impl Db {
         if matches!(operation.op_kind.as_str(), "move" | "delete")
             && let Some(message_id) = operation.message_id
         {
-            if operation.op_kind == "move" {
-                let source: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-                    "SELECT account_id,rfc822_message_id,pinned_at FROM messages WHERE id=?",
-                )
-                .bind(message_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-                if let Some((account_id, Some(fixed_id), pinned_at)) = source {
-                    let task = sqlx::query_as::<_, MessageTaskRow>(
-                        "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
-                                reminder_shown_at,created_at,updated_at
-                           FROM message_tasks WHERE message_id=?",
-                    )
-                    .bind(message_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    .map(Into::into);
-                    let candidates: Vec<(i64,)> = sqlx::query_as(
-                        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>?",
-                    )
-                    .bind(account_id)
-                    .bind(&fixed_id)
-                    .bind(message_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                    if candidates.len() == 1 {
-                        let target_id = candidates[0].0;
-                        sqlx::query(
-                            "INSERT INTO message_tasks(message_id,start_at,due_at,reminder_at,state,
-                                                       completed_at,reminder_shown_at,created_at,updated_at)
-                             SELECT ?,start_at,due_at,reminder_at,state,completed_at,
-                                    reminder_shown_at,created_at,updated_at
-                               FROM message_tasks WHERE message_id=?
-                             ON CONFLICT(message_id) DO UPDATE SET
-                                start_at=excluded.start_at,due_at=excluded.due_at,
-                                reminder_at=excluded.reminder_at,state=excluded.state,
-                                completed_at=excluded.completed_at,
-                                reminder_shown_at=excluded.reminder_shown_at,
-                                updated_at=excluded.updated_at",
-                        )
-                        .bind(target_id)
-                        .bind(message_id)
-                        .execute(&mut *tx)
-                        .await?;
-                        if pinned_at.is_some() {
-                            sqlx::query("UPDATE messages SET pinned_at=? WHERE id=?")
-                                .bind(pinned_at)
-                                .bind(target_id)
-                                .execute(&mut *tx)
-                                .await?;
-                        }
-                    } else if candidates.is_empty() && (pinned_at.is_some() || task.is_some()) {
-                        let key = transferred_traits_key(account_id, &fixed_id);
-                        let value =
-                            serde_json::to_string(&TransferredMessageTraits { pinned_at, task })?;
-                        sqlx::query(
-                            "INSERT INTO storage_meta(key,value) VALUES(?,?)
-                             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                        )
-                        .bind(key)
-                        .bind(value)
-                        .execute(&mut *tx)
-                        .await?;
-                    }
-                }
+            // Безвозвратное удаление уносит дело вместе со строкой письма
+            // (flag-due-dates.md, S-088), а перенос обязан его сохранить.
+            // Отказ переноса примет не отменяет завершения операции: письмо на
+            // сервере уже переехало, и откат вернул бы строку письма на старое
+            // место, а операцию оставил бы в состоянии выполнения навсегда.
+            if operation.op_kind == "move"
+                && let Err(error) = preserve_message_traits(&mut tx, message_id).await
+            {
+                tracing::warn!(
+                    message_id,
+                    error = %crate::logging::mask_error_text(&error.to_string()),
+                    "приметы письма не перенесены на новое место"
+                );
             }
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(message_id)
@@ -4629,6 +4684,53 @@ impl Db {
                 ));
             }
         }
+        // Слот пишется здесь же, и без проверки занятости пользователь получал
+        // бы сырую ошибку уникального индекса базы (S-066).
+        if let Some(slot) = input.hotkey_slot {
+            if !(1..=10).contains(&slot) {
+                return Err(crate::Error::Other(
+                    "номер слота должен быть от 1 до 10".into(),
+                ));
+            }
+            let occupied: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM quick_steps WHERE hotkey_slot=? AND id IS NOT ?")
+                    .bind(slot)
+                    .bind(input.id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some((name,)) = occupied {
+                return Err(crate::Error::Other(format!(
+                    "слот занят быстрым действием \"{name}\""
+                )));
+            }
+        }
+        // Цель действия сверяется с настоящими папками и метками: номер, к
+        // которому ничего не ведёт, иначе унёс бы письма неизвестно куда
+        // (S-012, S-043).
+        for action in input.actions.iter() {
+            if let Some(folder_id) = action.folder_id {
+                let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM folders WHERE id=?")
+                    .bind(folder_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if known.is_none() {
+                    return Err(crate::Error::Other(
+                        "папка действия цепочки не найдена".into(),
+                    ));
+                }
+            }
+            if let Some(label_id) = action.label_id {
+                let known: Option<(i64,)> = sqlx::query_as("SELECT id FROM labels WHERE id=?")
+                    .bind(label_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                if known.is_none() {
+                    return Err(crate::Error::Other(
+                        "метка действия цепочки не найдена".into(),
+                    ));
+                }
+            }
+        }
         let id = if let Some(id) = input.id {
             let changed = sqlx::query(
                 "UPDATE quick_steps SET name=?,icon=?,sort_order=?,hotkey_slot=?,state='ok',
@@ -4676,6 +4778,21 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
+        // Состояние считается по фактическим целям той же неделимой операцией:
+        // безусловное "в порядке" обещало бы запуск цепочке, которой некуда
+        // уводить письма (S-047).
+        sqlx::query(
+            "UPDATE quick_steps SET state=CASE WHEN EXISTS(
+                 SELECT 1 FROM quick_step_actions a
+                  WHERE a.quick_step_id=quick_steps.id
+                    AND ((a.kind='move' AND a.folder_id IS NULL AND a.folder_role IS NULL)
+                      OR (a.kind IN ('label_add','label_remove') AND a.label_id IS NULL))
+             ) THEN 'needs_attention' ELSE 'ok' END,
+             updated_at=datetime('now') WHERE id=?",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -5572,6 +5689,8 @@ impl Db {
                     snapshot.remote_id.as_deref(),
                     seen,
                     flagged,
+                    // Правило и быстрое действие меняют именно важность.
+                    true,
                 )
                 .await?;
             }
@@ -7238,7 +7357,19 @@ fn parse_utc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .ok()
 }
 
-fn validate_task_times(input: &MessageTaskInput) -> Result<()> {
+/// Вид, в котором время хранится в базе: тот же, что даёт `datetime('now')`.
+/// Сравнения сроков идут строками, и запись интерфейса в другом виде делала бы
+/// любое сравнение ложным до следующей полуночи.
+const TASK_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Сроки дела, приведённые к виду базы.
+struct NormalizedTaskTimes {
+    start_at: Option<String>,
+    due_at: Option<String>,
+    reminder_at: Option<String>,
+}
+
+fn validate_task_times(input: &MessageTaskInput) -> Result<NormalizedTaskTimes> {
     let start = input.start_at.as_deref().and_then(parse_utc_time);
     let due = input.due_at.as_deref().and_then(parse_utc_time);
     let reminder = input.reminder_at.as_deref().and_then(parse_utc_time);
@@ -7258,7 +7389,14 @@ fn validate_task_times(input: &MessageTaskInput) -> Result<()> {
             "время напоминания не может быть в прошлом".into(),
         ));
     }
-    Ok(())
+    let format = |time: Option<chrono::DateTime<chrono::Utc>>| {
+        time.map(|time| time.format(TASK_TIME_FORMAT).to_string())
+    };
+    Ok(NormalizedTaskTimes {
+        start_at: format(start),
+        due_at: format(due),
+        reminder_at: format(reminder),
+    })
 }
 
 async fn read_message_task(
@@ -7279,7 +7417,15 @@ async fn read_message_task(
 struct TransferredMessageTraits {
     pinned_at: Option<String>,
     task: Option<MessageTask>,
+    /// Время, когда приметы отложены. Письмо может не вернуться вовсе, и без
+    /// срока годности запись лежала бы вечно, а письмо с повторяющимся
+    /// заголовком однажды унаследовало бы чужое закрепление.
+    #[serde(default)]
+    saved_at: Option<String>,
 }
+
+/// Сколько отложенные приметы ждут возвращения письма.
+const TRAITS_KEEP_DAYS: i64 = 30;
 
 fn transferred_traits_key(account_id: i64, fixed_id: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -7324,6 +7470,125 @@ async fn message_traits_at_risk(
     Ok(count.0 != 1)
 }
 
+/// Сохранить приметы письма до удаления его строки.
+///
+/// Общая точка для всех путей, удаляющих строку письма: завершение своей
+/// операции переноса, разбор исчезнувших писем по расширению QRESYNC, сверка
+/// снимка папки, смена признака действительности папки и сверка проекций
+/// провайдера. Без неё перенос письма на другом устройстве и любая
+/// переиндексация ящика молча уносили бы сроки дела и закрепление
+/// (flag-due-dates.md, S-081 и S-091; pin-message.md, S-051 и S-058).
+///
+/// Веток три. Копия письма уже лежит в ящике единственной строкой - приметы
+/// переносятся сразу на неё: этот порядок событий самый частый, потому что
+/// копия в новой папке приходит раньше извещения об исчезновении из старой.
+/// Копии ещё нет - приметы откладываются до её появления. Копий несколько -
+/// выбирать не из чего, и пользователь предупреждён об этом заранее
+/// (flag-due-dates.md, S-082 и S-083).
+async fn preserve_message_traits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+) -> Result<()> {
+    let source: Option<(i64, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT account_id,rfc822_message_id,pinned_at FROM messages WHERE id=?")
+            .bind(message_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((account_id, Some(fixed_id), pinned_at)) = source else {
+        return Ok(());
+    };
+    let task: Option<MessageTask> = sqlx::query_as::<_, MessageTaskRow>(
+        "SELECT message_id,start_at,due_at,reminder_at,state,completed_at,
+                reminder_shown_at,created_at,updated_at
+           FROM message_tasks WHERE message_id=?",
+    )
+    .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(Into::into);
+    if pinned_at.is_none() && task.is_none() {
+        return Ok(());
+    }
+    let candidates: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>?",
+    )
+    .bind(account_id)
+    .bind(&fixed_id)
+    .bind(message_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if candidates.len() == 1 {
+        let target_id = candidates[0].0;
+        if task.is_some() {
+            sqlx::query(
+                "INSERT INTO message_tasks(message_id,start_at,due_at,reminder_at,state,
+                                           completed_at,reminder_shown_at,created_at,updated_at)
+                 SELECT ?,start_at,due_at,reminder_at,state,completed_at,
+                        reminder_shown_at,created_at,updated_at
+                   FROM message_tasks WHERE message_id=?
+                 ON CONFLICT(message_id) DO UPDATE SET
+                    start_at=excluded.start_at,due_at=excluded.due_at,
+                    reminder_at=excluded.reminder_at,state=excluded.state,
+                    completed_at=excluded.completed_at,
+                    reminder_shown_at=excluded.reminder_shown_at,
+                    updated_at=excluded.updated_at",
+            )
+            .bind(target_id)
+            .bind(message_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+        if let Some(pinned_at) = pinned_at.as_deref() {
+            set_pinned_within_limit(tx, target_id, pinned_at).await?;
+        }
+    } else if candidates.is_empty() {
+        let key = transferred_traits_key(account_id, &fixed_id);
+        let value = serde_json::to_string(&TransferredMessageTraits {
+            pinned_at,
+            task,
+            saved_at: Some(chrono::Utc::now().format(TASK_TIME_FORMAT).to_string()),
+        })?;
+        sqlx::query(
+            "INSERT INTO storage_meta(key,value) VALUES(?,?)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Вернуть закрепление письму, не выходя за предел закреплений ящика: перенос
+/// и восстановление примет идут мимо команды закрепления, и без этой проверки
+/// ящик мог набрать больше двадцати закреплённых писем (pin-message.md,
+/// S-007 и S-008).
+async fn set_pinned_within_limit(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+    pinned_at: &str,
+) -> Result<()> {
+    let room: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM messages
+          WHERE account_id=(SELECT account_id FROM messages WHERE id=?)
+            AND pinned_at IS NOT NULL AND id<>?",
+    )
+    .bind(message_id)
+    .bind(message_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if room.0 >= 20 {
+        return Ok(());
+    }
+    sqlx::query("UPDATE messages SET pinned_at=? WHERE id=?")
+        .bind(pinned_at)
+        .bind(message_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn restore_transferred_message_traits(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
@@ -7339,12 +7604,26 @@ async fn restore_transferred_message_traits(
         return Ok(());
     };
     let traits: TransferredMessageTraits = serde_json::from_str(&value)?;
-    if let Some(pinned_at) = traits.pinned_at {
-        sqlx::query("UPDATE messages SET pinned_at=? WHERE id=?")
-            .bind(pinned_at)
-            .bind(message_id)
+    // Письмо, не вернувшееся за месяц, скорее всего не вернётся вовсе, а
+    // заголовок письма может и повториться: наследовать чужое закрепление
+    // такая запись не должна.
+    let expired = traits
+        .saved_at
+        .as_deref()
+        .and_then(parse_utc_time)
+        .is_some_and(|saved| {
+            chrono::Utc::now().signed_duration_since(saved)
+                > chrono::Duration::days(TRAITS_KEEP_DAYS)
+        });
+    if expired {
+        sqlx::query("DELETE FROM storage_meta WHERE key=?")
+            .bind(key)
             .execute(&mut **tx)
             .await?;
+        return Ok(());
+    }
+    if let Some(pinned_at) = traits.pinned_at {
+        set_pinned_within_limit(tx, message_id, &pinned_at).await?;
     }
     if let Some(task) = traits.task {
         sqlx::query(
@@ -7551,6 +7830,8 @@ impl From<MessageRow> for MessageMeta {
             pinned_at: None,
             task_due_at: None,
             task_state: None,
+            task_start_at: None,
+            task_reminder_at: None,
         }
     }
 }
@@ -8714,6 +8995,8 @@ mod smart_condition_legacy_tests {
             pinned_at: None,
             task_due_at: None,
             task_state: None,
+            task_start_at: None,
+            task_reminder_at: None,
         };
         let huge = SmartCondition {
             field: "date".to_owned(),
@@ -8820,6 +9103,8 @@ mod smart_condition_legacy_tests {
             pinned_at: None,
             task_due_at: None,
             task_state: None,
+            task_start_at: None,
+            task_reminder_at: None,
         };
         let labelled = MessageMeta {
             labels: vec!["важное".to_owned()],

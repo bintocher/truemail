@@ -186,7 +186,7 @@ window.restoreHiddenAnchor=restoreHiddenAnchor;
 // Фокус строки списка переживает пересоздание строк (S-006, S-007). Ищем именно
 // ближайшую строку от элемента с фокусом: кликнуть могли по счётчику беседы -
 // вложенной кнопке, которая при перестроении исчезает вместе со строкой.
-function listFocusMessageId(){const row=document.activeElement?.closest?.('.msg');const id=row?Number(row.dataset.messageId):null;return Number.isFinite(id)?id:null;}
+function listFocusMessageId(){const row=document.activeElement?.closest?.('.msg[data-message-id]');const id=row?Number(row.dataset.messageId):null;return Number.isFinite(id)?id:null;}
 // Строки нужного письма в разметке нет (письмо ушло из списка или осталось за
 // окном виртуализации) - фокус отдаём самому списку, чтобы он не потерялся.
 // preventScroll обязателен: окно пересоздаётся на каждый кадр прокрутки, и
@@ -272,9 +272,6 @@ const ACCOUNT_COLORS=[
 ];
 function accountColorById(accountId){const account=coreAccounts.find(item=>item.id===accountId);if(account&&account.color)return account.color;const index=coreAccounts.findIndex(item=>item.id===accountId);return ACCOUNT_COLORS[((index<0?Number(accountId)||0:index)%ACCOUNT_COLORS.length+ACCOUNT_COLORS.length)%ACCOUNT_COLORS.length];}
 // Сортировка писем по реальному времени (учитывает таймзоны), а не по строке даты.
-function messageTime(message){const value=new Date(message?.date||0).getTime();return Number.isFinite(value)?value:0;}
-function byDateDesc(a,b){return messageTime(b)-messageTime(a)||(b.id-a.id);}
-function byDateAsc(a,b){return messageTime(a)-messageTime(b)||(a.id-b.id);}
 let coreContacts=[];
 let coreCalendarData={calendars:[],events:[]};
 let currentFolderId=null;
@@ -317,7 +314,12 @@ const SMART_BACKFILL_FOLDERS=5;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 const ordinaryPageCursors=new Map();
-function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id),date=String(message.date||'');if(!current||date<String(current.date||'')||date===String(current.date||'')&&message.id<current.id)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{if(!ordinaryPageCursors.has(folderId))ordinaryPageCursors.set(folderId,{date:message.date||'',id:message.id});});}
+/* Курсор обычной части ведётся по письмам без закрепления и откатывается к
+   самому старому уцелевшему письму папки: слияние страниц при перезагрузке
+   выбрасывает часть догруженных страниц, а курсор, который двигается только
+   вперёд, оставлял бы между первой страницей и собой дыру навсегда
+   (S-016 - S-018). */
+function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id),date=String(message.date||'');if(!current||date<String(current.date||'')||date===String(current.date||'')&&message.id<current.id)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{const current=ordinaryPageCursors.get(folderId),next={date:message.date||'',id:message.id},currentDate=String(current?.date||'');if(!current||currentDate<next.date||currentDate===next.date&&Number(current.id)<Number(next.id))ordinaryPageCursors.set(folderId,next);});}
 window.seedOrdinaryPageCursors=seedOrdinaryPageCursors;
 let loadingMoreMessages=false;
 let loadingSmartCoverage=false;
@@ -334,7 +336,7 @@ const selectedMessageIds=new Set();
 let selectionAnchorId=null;
 let selectionDragMode=null;
 function updateSelectionUi(){
-  document.querySelectorAll('.msg').forEach(row=>{const picked=selectedMessageIds.has(Number(row.dataset.messageId));row.classList.toggle('selected',picked);row.toggleAttribute('data-bulk-selected',picked);});
+  document.querySelectorAll('.msg[data-message-id]').forEach(row=>{const picked=selectedMessageIds.has(Number(row.dataset.messageId));row.classList.toggle('selected',picked);row.toggleAttribute('data-bulk-selected',picked);});
   const count=selectedMessageIds.size,bar=document.getElementById('selectionBar');bar.classList.toggle('hidden',count===0);document.getElementById('selectionCount').textContent=L(`${count} выбрано`,`${count} selected`);
 }
 function clearMessageSelection(){selectedMessageIds.clear();selectionAnchorId=null;updateSelectionUi();}
@@ -504,5 +506,7 @@ msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
   else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
-  else if(b.dataset.act==='flag-message'&&activeMessage){const flagged=!activeMessage.flags?.flagged;if(!flagged&&activeMessage.task_due_at&&!confirm(L('Снять флажок и удалить сроки дела?','Clear the flag and delete task dates?')))return;try{await window.tm.markFlagged([activeMessage.id],flagged,'user');await window.reloadCoreData();}catch(error){showToast(error);}}
+  /* Шапка письма ведёт флажок тем же путём, что строка списка и контекстное
+     меню: второй путь спрашивал бы про сроки по-своему (S-005, S-006). */
+  else if(b.dataset.act==='flag-message'&&activeMessage){const ids=selectedMessageIds.size?[...selectedMessageIds]:[activeMessage.id];await window.setMessagesFlaggedFromUi?.(ids,!activeMessage.flags?.flagged,activeMessage);}
   else if(b.dataset.act==='task-message'&&activeMessage)window.openMessageTaskEditor?.(activeMessage);});

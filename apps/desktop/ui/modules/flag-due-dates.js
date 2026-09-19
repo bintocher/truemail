@@ -156,7 +156,9 @@
   }
 
   function visibleTasks(items) {
-    return (items || []).filter(item => !taskField(item, 'takeaway_pending'));
+    // Признак уводимого письма ядро называет has_takeaway: по прежнему имени
+    // отбор не отсекал ничего вовсе (S-052).
+    return (items || []).filter(item => !(item?.has_takeaway ?? taskField(item, 'takeaway_pending')));
   }
 
   function reminderCard(item, lang = 'ru') {
@@ -184,6 +186,17 @@
     };
   }
 
+  // Сводка пропущенных напоминаний: из ядра приходит только число, а текст
+  // собирается по языку интерфейса.
+  function missedSummary(count, lang = 'ru') {
+    const total = Number(count) || 0;
+    return {
+      title: lang === 'en' ? 'Missed reminders' : 'Пропущенные напоминания',
+      subject: lang === 'en' ? `Missed reminders: ${total}` : `Пропущено напоминаний: ${total}`,
+      action: lang === 'en' ? 'Open tasks' : 'Открыть дела',
+    };
+  }
+
   function missedReminders(items, now = new Date(), lang = 'ru') {
     const current = asDate(now)?.getTime() || Date.now();
     const week = 7 * 24 * 60 * 60 * 1000;
@@ -198,14 +211,37 @@
     return {shown, marked, text};
   }
 
-  async function toggleFlag(bridge, ids, flagged, options = {}) {
-    if (!flagged && options.task && taskField(options.task, 'due_at')) {
-      const text = options.lang === 'en'
+  // Письма, у которых задан хотя бы один из трёх сроков дела. Снятие флажка
+  // удаляет дело целиком, поэтому спрашивать надо про любой срок, а не только
+  // про срок исполнения.
+  function datedTasks(items) {
+    return (items || []).filter(item => ['start_at', 'due_at', 'reminder_at']
+      .some(key => {
+        const value = taskField(item, key) ?? taskField(item, `task_${key}`);
+        return value != null && value !== '';
+      }));
+  }
+
+  function flagClearWarning(count, lang = 'ru') {
+    if (count <= 1) {
+      return lang === 'en'
         ? 'Clear the flag and delete task dates?'
         : 'Снять флажок и удалить сроки дела?';
+    }
+    return lang === 'en'
+      ? `Clear the flag? Task dates will be deleted for ${count} message(s).`
+      : `Снять флажок? Сроки дела будут удалены у писем: ${count}.`;
+  }
+
+  async function toggleFlag(bridge, ids, flagged, options = {}) {
+    const messageIds = [...new Set(ids || [])];
+    // Сроки собираются по всем выбранным письмам: вопрос по одному письму
+    // молча стирал бы дела всех остальных.
+    const dated = flagged ? [] : datedTasks(options.tasks || (options.task ? [options.task] : []));
+    if (dated.length) {
+      const text = flagClearWarning(dated.length, options.lang);
       if (options.confirm && !await options.confirm(text)) return 0;
     }
-    const messageIds = [...new Set(ids || [])];
     options.onOptimistic?.(messageIds, Boolean(flagged));
     return bridge.markFlagged(messageIds, Boolean(flagged), options.reason || 'user');
   }
@@ -243,7 +279,10 @@
     overdueTaskCount,
     visibleTasks,
     reminderCard,
+    missedSummary,
     missedReminders,
+    datedTasks,
+    flagClearWarning,
     toggleFlag,
     saveTask,
     completeTask,

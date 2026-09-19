@@ -357,12 +357,15 @@ window.corePageSize = 100;
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
     const [contacts, calendarData, smartFolders, storage, pinned, overdueTasks] = await Promise.all([
-      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount(),
+      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount().catch(() => 0),
     ]);
     const taskCount = document.getElementById("tasksOverdueCount");
     if (taskCount) taskCount.textContent = overdueTasks > 0 ? String(overdueTasks) : "";
     window.corePinnedMessages = pinned.messages || [];
     window.renderCoreAccounts?.(accounts, folders, messageGroups.flat().concat(pinned.ordinary || [], window.corePinnedMessages), contacts, calendarData, smartFolders, storage);
+    // Перечень закреплённых читается заново с видом открытого представления:
+    // объединённый перечень выше нужен только стартовому набору писем.
+    await window.refreshPinnedForView?.(true);
   }
   // Перезагрузки выстраиваем в очередь: reloadCoreData зовут и обработчик
   // событий, и модули после действий пользователя. Параллельные проходы

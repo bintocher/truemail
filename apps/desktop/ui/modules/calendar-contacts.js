@@ -221,7 +221,10 @@ function handlePopupMenusEscape(event){
 }
 function posMenu(menu,e){menu.classList.add('open');const w=menu.offsetWidth,h=menu.offsetHeight;menu.style.left=Math.max(8,Math.min(e.clientX,window.innerWidth-w-8))+'px';menu.style.top=Math.max(8,Math.min(e.clientY,window.innerHeight-h-8))+'px';}
 document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,select,[contenteditable="true"]'))return;e.preventDefault();
-  const msg=e.target.closest('.msg'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
+  // Разделитель закреплённой части и заголовок группы дел занимают строку
+  // списка, но письмом не являются: без номера письма меню открывалось бы для
+  // ранее выбранного письма с пунктами удаления и снятия флажка.
+  const msg=e.target.closest('.msg[data-message-id]'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
   if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
 // Меню, которые остаются открытыми при клике внутри них: в фильтре стоят поле
 // ввода и переключатели, в подменю меток за одно открытие отмечают несколько

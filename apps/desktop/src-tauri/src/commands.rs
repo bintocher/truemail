@@ -1723,20 +1723,20 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
             if core.db.mark_task_reminders_shown(&ids).await.is_err() {
                 break;
             }
+            // Из ядра уходят сырые поля и язык интерфейса: текст карточки
+            // собирает окно уведомлений, иначе английский пользователь
+            // получал бы русскую карточку (S-100).
+            let lang = notification_locale(&core).await;
             for reminder in reminders {
-                let sender = reminder
-                    .sender_name
-                    .clone()
-                    .or(reminder.sender_address.clone())
-                    .unwrap_or_else(|| "Отправитель неизвестен".into());
                 push_notification(
                     &app,
                     serde_json::json!({
                         "kind": "task",
-                        "title": "Напоминание о деле",
-                        "subject": if reminder.subject.is_empty() { "Без темы" } else { &reminder.subject },
-                        "preview": sender,
-                        "details": reminder.due_at,
+                        "lang": lang,
+                        "subject": reminder.subject,
+                        "sender_name": reminder.sender_name,
+                        "sender_address": reminder.sender_address,
+                        "due_at": reminder.due_at,
                         "message_id": reminder.message_id,
                     }),
                     "task-reminder",
@@ -1781,12 +1781,28 @@ async fn show_missed_task_reminders(core: &Core, app: &AppHandle) {
             app,
             serde_json::json!({
                 "kind": "task-bundle",
-                "title": "Пропущенные напоминания",
-                "subject": format!("Пропущено напоминаний: {recent}"),
+                "lang": notification_locale(core).await,
                 "count": recent,
             }),
             "task-reminder-bundle",
         );
+    }
+}
+
+/// Язык интерфейса для карточки уведомления: тексты собираются в окне
+/// уведомлений, и язык оно берёт из самого события, а не из своей разметки.
+async fn notification_locale(core: &Core) -> String {
+    let locale = core
+        .db
+        .setting("locale")
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if locale.starts_with("en") {
+        "en".to_owned()
+    } else {
+        "ru".to_owned()
     }
 }
 

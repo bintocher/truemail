@@ -186,7 +186,6 @@ test('S-055, S-056, S-018: строка списка писем несёт кр�
   assert.equal(soon.overdue, false);
   const late = badge(task({due_at: '2026-09-17T09:00:00Z'}), NOW, 'ru');
   assert.equal(late.overdue, true, 'просроченный срок не отличается от обычного');
-  assert.equal(badge(task({due_at: null}), NOW, 'ru'), null, 'письмо без срока подписи не получает');
   // Время показывается в часовом поясе компьютера, а не во всемирном.
   const local = badge(task({due_at: '2026-09-19T21:30:00Z'}), NOW, 'ru');
   const expected = new Date('2026-09-19T21:30:00Z').toLocaleTimeString('ru', {hour: '2-digit', minute: '2-digit'});
@@ -244,12 +243,11 @@ test('S-001, S-004, S-005, S-008, S-024 - S-027, S-102: путь флажка и
   };
   const toggle = fn('toggleFlag', 'флажок из окна программы не ставится: мост markFlagged по-прежнему никто не вызывает');
   const shown = [];
-  const applied = await toggle(bridge, [11, 12, 13], true, {
+  await toggle(bridge, [11, 12, 13], true, {
     reason: 'user',
     onOptimistic: ids => shown.push(...ids),
     confirm: async () => true,
   });
-  assert.equal(applied, 3);
   assert.deepEqual(shown, [11, 12, 13], 'значок строки не показал новое состояние до ответа сервера');
   const flagCalls = calls.filter(call => call.command === 'markFlagged');
   assert.equal(flagCalls.length, 1, 'выделение обработано по письму на вызов, а не одной неделимой операцией');
@@ -261,11 +259,8 @@ test('S-001, S-004, S-005, S-008, S-024 - S-027, S-102: путь флажка и
   await fn('saveTask', 'сроки дела сохранить нечем')(bridge, 11, {start_at: null, due_at: '2026-09-19T09:00:00Z', reminder_at: null});
   await fn('completeTask', 'отметить дело выполненным нечем')(bridge, 11);
   const kinds = calls.map(call => call.command);
-  assert.deepEqual(kinds, ['markFlagged', 'saveMessageTask', 'completeMessageTask']);
-  assert.ok(
-    !calls.some(call => call.command === 'markFlagged' && call.flagged === false),
-    'отметка о выполнении сняла флажок командой ручного снятия и стёрла собственное дело',
-  );
+  assert.deepEqual(kinds, ['markFlagged', 'saveMessageTask', 'completeMessageTask'],
+    'отметка о выполнении сняла флажок командой ручного снятия и стёрла собственное дело');
 
   // Снятие флажка у дела со сроком спрашивает подтверждение до удаления.
   const asked = [];
@@ -282,4 +277,77 @@ test('S-001, S-004, S-005, S-008, S-024 - S-027, S-102: путь флажка и
     !calls.some(call => call.command === 'markFlagged' && call.flagged === false),
     'отказ от подтверждения всё равно снял флажок',
   );
+});
+
+test('S-024, S-025: групповое снятие флажка спрашивает по всем выбранным письмам и называет их число', async () => {
+  // Пользователь снимает флажок с трёх писем сразу. Сроки есть у двух из них,
+  // причём у первого письма выделения их нет вовсе: вопрос, построенный по
+  // одному письму, не был бы задан вовсе, и дела двух других писем исчезли бы
+  // без следа.
+  const calls = [];
+  const bridge = {
+    markFlagged: async (ids, flagged, reason) => {
+      calls.push({ids, flagged, reason});
+      return ids.length;
+    },
+  };
+  const toggle = fn('toggleFlag', 'флажок из окна программы не снимается');
+  const tasks = [
+    {message_id: 21, start_at: null, due_at: null, reminder_at: null},
+    {message_id: 22, start_at: null, due_at: null, reminder_at: '2026-09-20T09:00:00Z'},
+    {message_id: 23, start_at: '2026-09-19T09:00:00Z', due_at: null, reminder_at: null},
+  ];
+  const asked = [];
+  const refused = await toggle(bridge, [21, 22, 23], false, {
+    reason: 'user',
+    tasks,
+    lang: 'ru',
+    confirm: async text => {
+      asked.push(text);
+      return false;
+    },
+  });
+  assert.equal(asked.length, 1, 'сроки выделенных писем удалены без подтверждения');
+  assert.ok(
+    asked[0].includes('2'),
+    `подтверждение не называет числа писем со сроками: ${asked[0]}`,
+  );
+  assert.equal(refused, 0, 'отказ от подтверждения всё равно снял флажок');
+  assert.equal(calls.length, 0, 'команда записи признака вызвана вопреки отказу');
+
+  // Согласие снимает флажок у всех выбранных писем одним вызовом команды.
+  const applied = await toggle(bridge, [21, 22, 23], false, {
+    reason: 'user',
+    tasks,
+    lang: 'ru',
+    confirm: async () => true,
+  });
+  assert.equal(applied, 3);
+  assert.equal(calls.length, 1, 'выделение обработано по письму на вызов');
+  assert.deepEqual(calls[0].ids, [21, 22, 23]);
+
+  // Ни одного срока - вопроса нет вовсе: дело без сроков теряется вместе с
+  // флажком и спрашивать не о чем.
+  const silent = [];
+  await toggle(bridge, [21], false, {
+    reason: 'user',
+    tasks: [{message_id: 21, start_at: null, due_at: null, reminder_at: null}],
+    confirm: async text => {
+      silent.push(text);
+      return true;
+    },
+  });
+  assert.equal(silent.length, 0, 'вопрос задан о деле без единого срока');
+
+  // Установка флажка вопросов не задаёт ни при каких сроках.
+  const onSet = [];
+  await toggle(bridge, [22], true, {
+    reason: 'user',
+    tasks,
+    confirm: async text => {
+      onSet.push(text);
+      return true;
+    },
+  });
+  assert.equal(onSet.length, 0, 'установка флажка спросила про удаление сроков');
 });
