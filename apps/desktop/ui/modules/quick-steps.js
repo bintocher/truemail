@@ -5,9 +5,9 @@
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.quickStepsModel = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this, function(rules) {
-  const MAX_STEPS = 20;
   const MAX_ACTIONS = 10;
   const MAX_MESSAGES = 500;
+  const TOOLBAR_KEY_PREFIX = 'quick_step:';
   const QUICK_STEP_SLOT_ACTIONS = Array.from({length: 10}, (_, index) => `quick_step_${index + 1}`);
 
   const availableActions = () => rules.RULE_ACTIONS
@@ -32,9 +32,10 @@
     if (!step.actions.length) return {ok: false, reason: 'empty'};
     if (step.actions.length > MAX_ACTIONS) return {ok: false, reason: 'actions_limit'};
     let takeaway = -1;
+    const choices = availableActions();
     for (let index = 0; index < step.actions.length; index++) {
       const action = step.actions[index];
-      const definition = availableActions().find(item => item.id === action.kind);
+      const definition = choices.find(item => item.id === action.kind);
       if (!definition) return {ok: false, reason: 'unknown_action'};
       if (definition.needs === 'folder' && !action.folder_id && !action.folder_role) {
         return {ok: false, reason: 'action_folder'};
@@ -86,7 +87,14 @@
   }
 
   function toolbarKey(step) {
-    return `quick_step:${step.id}`;
+    return `${TOOLBAR_KEY_PREFIX}${step.id}`;
+  }
+
+  // Разбор ключа панели обратен его сборке: ключи встроенных кнопок панели
+  // приставки не несут, поэтому за них возвращается пустой номер.
+  function toolbarStepId(key) {
+    const value = String(key || '');
+    return value.startsWith(TOOLBAR_KEY_PREFIX) ? Number(value.slice(TOOLBAR_KEY_PREFIX.length)) : null;
   }
 
   function toolbarSet(builtin, steps, layout) {
@@ -206,7 +214,6 @@
   }
 
   return {
-    MAX_STEPS,
     MAX_ACTIONS,
     MAX_MESSAGES,
     QUICK_STEP_SLOT_ACTIONS,
@@ -217,6 +224,7 @@
     eventCombo,
     proposedSlotCombo,
     toolbarKey,
+    toolbarStepId,
     toolbarSet,
     toolbarMoreMenu,
     quickStepTargets,

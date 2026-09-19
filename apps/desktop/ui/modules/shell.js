@@ -317,7 +317,10 @@ const SMART_BACKFILL_FOLDERS=5;
 const MESSAGE_WINDOW_OVERSCAN=16;
 const folderHasMore=new Map();
 const ordinaryPageCursors=new Map();
-function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id),date=String(message.date||'');if(!current||date<String(current.date||'')||date===String(current.date||'')&&message.id<current.id)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{if(!ordinaryPageCursors.has(folderId))ordinaryPageCursors.set(folderId,{date:message.date||'',id:message.id});});}
+// Стартовый курсор каждой папки - тот же истинный минимум пары дата и номер,
+// что и ordinaryCursor, только по уже загруженным письмам всех папок сразу:
+// закреплённые письма в курсор не попадают (specs/pin-message.md, S-016).
+function seedOrdinaryPageCursors(rows){const grouped=new Map();rows.filter(message=>!message.pinned_at).forEach(message=>{const current=grouped.get(message.folder_id);if(!current||pinMessageModel.compareMessages(message,current,'date-asc')<0)grouped.set(message.folder_id,message);});grouped.forEach((message,folderId)=>{if(!ordinaryPageCursors.has(folderId))ordinaryPageCursors.set(folderId,{date:message.date||'',id:message.id});});}
 window.seedOrdinaryPageCursors=seedOrdinaryPageCursors;
 let loadingMoreMessages=false;
 let loadingSmartCoverage=false;
@@ -428,8 +431,10 @@ async function loadNextMessagePage(serverBackfill=false){
       // Курсор - ИСТИННЫЙ минимум (самая старая дата, затем наименьший id).
       // Сортировка только по дате давала неверный курсор при равных датах, и
       // запрос возвращал уже показанные письма (дубли), из-за чего прокрутка
-      // крутилась вхолостую, а догрузка не запускалась.
-      const cursor=ordinaryPageCursors.get(folderId)||loaded.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
+      // крутилась вхолостую, а догрузка не запускалась. Запасной минимум по
+      // загруженным письмам считает ordinaryCursor - то же правило, что и у
+      // стартового курсора.
+      const cursor=ordinaryPageCursors.get(folderId)||pinMessageModel.ordinaryCursor(loaded);
       if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
       let fresh=page.filter(message=>!known.has(message.id));
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
@@ -504,5 +509,8 @@ msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
   else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
-  else if(b.dataset.act==='flag-message'&&activeMessage){const flagged=!activeMessage.flags?.flagged;if(!flagged&&activeMessage.task_due_at&&!confirm(L('Снять флажок и удалить сроки дела?','Clear the flag and delete task dates?')))return;try{await window.tm.markFlagged([activeMessage.id],flagged,'user');await window.reloadCoreData();}catch(error){showToast(error);}}
+  // Флажок из панели письма идёт тем же путём, что и флажок строки списка:
+  // подтверждение снятия срока и возврат прежнего состояния при ошибке
+  // описаны один раз (specs/flag-due-dates.md, S-025).
+  else if(b.dataset.act==='flag-message'&&activeMessage)await window.setMessagesFlaggedFromUi?.([activeMessage.id],!activeMessage.flags?.flagged,activeMessage);
   else if(b.dataset.act==='task-message'&&activeMessage)window.openMessageTaskEditor?.(activeMessage);});

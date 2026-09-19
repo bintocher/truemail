@@ -429,9 +429,12 @@ pub fn validate_quick_step_input(step: &super::QuickStepInput) -> Result<(), Str
     }
     if step
         .hotkey_slot
-        .is_some_and(|slot| !(1..=10).contains(&slot))
+        .is_some_and(|slot| !(1..=super::QUICK_STEP_SLOTS).contains(&slot))
     {
-        return Err("номер слота горячей клавиши должен быть от 1 до 10".into());
+        return Err(format!(
+            "номер слота горячей клавиши должен быть от 1 до {}",
+            super::QUICK_STEP_SLOTS
+        ));
     }
     let mut takeaway = None;
     for (index, action) in step.actions.iter().enumerate() {

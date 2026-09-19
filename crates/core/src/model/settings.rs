@@ -10,8 +10,8 @@ pub struct Keybinding {
 pub fn is_quick_step_key_action(action: &str) -> bool {
     action
         .strip_prefix("quick_step_")
-        .and_then(|value| value.parse::<u8>().ok())
-        .is_some_and(|value| (1..=10).contains(&value))
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|value| (1..=super::QUICK_STEP_SLOTS).contains(&value))
 }
 
 pub fn normalize_key_combo(combo: &str) -> Option<String> {
