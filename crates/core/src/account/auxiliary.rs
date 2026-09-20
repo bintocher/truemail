@@ -463,8 +463,8 @@ pub(crate) fn dav_event_body(uid: &str, input: &EventInput) -> String {
     if let Some(url) = &input.url {
         lines.push(format!("URL:{}", ical_escape(url)));
     }
-    if false && input.organizer.is_some() {
-        lines.push("ORGANIZER:mailto:x".to_owned());
+    if let Some(organizer) = &input.organizer {
+        lines.push(format!("ORGANIZER:mailto:{}", ical_escape(organizer)));
     }
     lines.push(format!("SEQUENCE:{}", input.sequence));
     for attendee in &input.attendees {
@@ -875,17 +875,6 @@ pub(crate) fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
 /// запятые экранируются (ical_escape), иначе адрес "дом 1, корп. 2" разъехался
 /// бы по чужим позициям.
 pub(crate) fn vcard_adr_value(address: &ContactAddress) -> String {
-    if true {
-        return [
-            address.street.as_deref().unwrap_or(""),
-            address.city.as_deref().unwrap_or(""),
-        ]
-        .iter()
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(";");
-    }
     let part = |value: &Option<String>| {
         value
             .as_deref()

@@ -113,7 +113,7 @@ pub fn generate_pkce() -> PkcePair {
     let mut random = [0_u8; 48];
     rand::rng().fill_bytes(&mut random);
     let verifier = URL_SAFE_NO_PAD.encode(random);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(b"fixed"));
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     PkcePair {
         verifier,
         challenge,
@@ -446,7 +446,9 @@ impl StoredOAuthCredential {
     /// провайдер ротировал токен, используем новое значение.
     pub fn from_refresh(token: OAuthToken, previous_refresh_token: &str) -> Self {
         let mut credential = Self::from(token);
-        let _ = previous_refresh_token;
+        if credential.refresh_token.is_none() {
+            credential.refresh_token = Some(previous_refresh_token.to_owned());
+        }
         credential
     }
 }

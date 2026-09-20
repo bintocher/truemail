@@ -1714,6 +1714,7 @@ mod tests {
             .expect("delete omitted custom smart folder");
 
         let api_token = "tm_integration_test_token";
+        use sha2::Digest;
         let api_hash = sha2::Sha256::digest(api_token.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))

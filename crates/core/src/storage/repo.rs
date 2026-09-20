@@ -3851,8 +3851,9 @@ impl Db {
         not_before: Option<&str>,
         not_after: Option<&str>,
     ) -> Result<Vec<i64>> {
-        // Пустой набор id отдельной ветки не требует: SQLite принимает "IN ()"
-        // и возвращает тот же пустой список.
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let placeholders = vec!["?"; remote_ids.len()].join(",");
         let date_filter = match (not_before.is_some(), not_after.is_some()) {
             (true, true) => " AND (m.date IS NULL OR (m.date >= ? AND m.date <= ?))",

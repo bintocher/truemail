@@ -317,7 +317,7 @@ fn notification_date_borders() -> (String, String) {
     let format =
         |value: chrono::DateTime<chrono::Utc>| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
     (
-        format(now),
+        format(now - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
         format(now + chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
     )
 }
@@ -414,7 +414,7 @@ pub fn skipped_folders_outcome(skipped: &[String], total_folders: usize) -> Skip
         return SkippedFolders::None;
     };
     let count = skipped.len();
-    if count == total_folders {
+    if count >= total_folders {
         return SkippedFolders::Failed(format!(
             "связь обрывалась, ни одна папка не прочитана (пропущено {count}, первая: {first})"
         ));
@@ -444,14 +444,15 @@ fn apply_skipped_folders(
             ));
             Ok(())
         }
-        SkippedFolders::Failed(text) => {
-            warnings.push(SyncWarning::classified(
-                ErrorKind::NetworkUnavailable,
-                text,
-                Some("imap"),
-            ));
-            Ok(())
-        }
+        // Проход, в котором не прочитана ни одна папка, заканчивается отказом,
+        // а не предупреждением: иначе интерфейс показал бы "синхронизировано"
+        // при пустом результате обрыва. Предупреждения при этом не заводим -
+        // причина уже названа самой ошибкой (S-008).
+        SkippedFolders::Failed(text) => Err(crate::Error::classified_backend(
+            "imap-sync",
+            ErrorKind::NetworkUnavailable,
+            text,
+        )),
     }
 }
 
@@ -861,7 +862,7 @@ impl ChangePasswordError {
     pub fn general_error_code(&self) -> Option<&'static str> {
         match self {
             Self::InvalidCredentials(_) => Some("invalid_credentials"),
-            Self::UnsupportedAuthKind | Self::AccountChanged => Some("auth_kind_error"),
+            Self::UnsupportedAuthKind | Self::AccountChanged => Some("account_config"),
             Self::AccountNotFound => Some("unknown"),
             Self::MissingSecretRef => Some("needs_reauth"),
             Self::SecretStoreWriteFailed | Self::SecretStoreStateUnknown => {
@@ -3119,6 +3120,10 @@ impl AccountManager {
         let result = self
             .change_account_password_inner(account_id, &new_password, store)
             .await;
+        // Блокировка снимается при любом исходе: иначе после первой же смены
+        // аккаунт остался бы занятым навсегда и следующая попытка отвечала бы
+        // "смена уже идёт" до перезапуска программы (S-017).
+        self.password_change_locks.unlock(account_id).await;
         result
     }
 

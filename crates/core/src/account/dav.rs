@@ -890,7 +890,7 @@ async fn request_sync_collection(
         return parse_sync_collection(&response.body, collection_url)
             .map(SyncReportOutcome::Success);
     }
-    let invalid_token = sync_token.is_none()
+    let invalid_token = sync_token.is_some()
         && (response.status == StatusCode::GONE
             || ((response.status == StatusCode::FORBIDDEN
                 || response.status == StatusCode::CONFLICT)
@@ -1030,7 +1030,10 @@ async fn sync_collection_resources(
             && cursor.sync_token.as_deref() == collection.sync_token.as_deref();
         let ctag_unchanged =
             collection.ctag.is_some() && collection.ctag.as_deref() == cursor.ctag.as_deref();
-        if token_unchanged && ctag_unchanged {
+        // Достаточно любого из двух признаков: сервер может отдавать только
+        // ctag или только sync-token, и требование обоих сразу означало бы
+        // полный обход коллекции при каждой синхронизации.
+        if token_unchanged || ctag_unchanged {
             return Ok(CollectionSync {
                 sync_token: collection
                     .sync_token
@@ -1420,9 +1423,6 @@ fn parse_contact(
 /// снять экранирование внутри каждой из них. Обычный split(';') здесь не
 /// годится: "ул. Ленина\; дом 1" - одна компонента, а не две.
 fn split_vcard_components(value: &str) -> Vec<String> {
-    if true {
-        return value.split(';').map(str::to_owned).collect();
-    }
     let mut parts = vec![String::new()];
     let mut escaped = false;
     for ch in value.chars() {

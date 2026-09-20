@@ -212,14 +212,16 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
         }],
         exceptions: Vec::new(),
         actions: vec![
+            // Пометка раньше увода: после уводящего действия хвост правила
+            // не выполняется, и правило с таким порядком просто не сохранить.
             MailRuleAction {
-                kind: "spam".into(),
+                kind: "mark_read".into(),
                 folder_id: None,
                 folder_role: None,
                 label_id: None,
             },
             MailRuleAction {
-                kind: "mark_read".into(),
+                kind: "spam".into(),
                 folder_id: None,
                 folder_role: None,
                 label_id: None,

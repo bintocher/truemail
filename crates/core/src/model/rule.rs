@@ -524,6 +524,7 @@ pub fn delete_forever_fingerprint(rule: &MailRuleInput) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Db;
     use crate::storage::repo::test_storage::{TestDb, open_test_db};
 
     /// Ящик проверок: тот же адрес нужен и условию по полю `account`.
@@ -718,6 +719,11 @@ mod tests {
         unit: Option<&'static str>,
         matching: &'static str,
         other: &'static str,
+        /// Действие для несовпадающего случая, если тем же действием подобрать
+        /// его нельзя. У даты так и есть: письмо проверки получено только что,
+        /// и "получено за последние N" совпадает при любом допустимом N, а
+        /// нулём или пустым значением условие просто не сохранится.
+        other_op: Option<&'static str>,
     }
 
     /// Письмо проверки заполнено так, чтобы у каждого поля словаря было и
@@ -729,6 +735,7 @@ mod tests {
             unit: None,
             matching: "Иван Иванов",
             other: "Пётр Петров",
+            other_op: None,
         },
         FieldCase {
             field: "sender_address",
@@ -736,6 +743,7 @@ mod tests {
             unit: None,
             matching: "ivan@example.test",
             other: "petr@example.test",
+            other_op: None,
         },
         FieldCase {
             field: "recipient",
@@ -743,6 +751,7 @@ mod tests {
             unit: None,
             matching: "sales@example.test",
             other: "support@example.test",
+            other_op: None,
         },
         FieldCase {
             field: "subject",
@@ -750,6 +759,7 @@ mod tests {
             unit: None,
             matching: "Счет",
             other: "Договор",
+            other_op: None,
         },
         FieldCase {
             field: "body",
@@ -757,6 +767,7 @@ mod tests {
             unit: None,
             matching: "оплату",
             other: "доставку",
+            other_op: None,
         },
         FieldCase {
             field: "account",
@@ -764,6 +775,7 @@ mod tests {
             unit: None,
             matching: ACCOUNT_EMAIL,
             other: "other@example.test",
+            other_op: None,
         },
         FieldCase {
             field: "folder",
@@ -771,6 +783,7 @@ mod tests {
             unit: None,
             matching: "Входящие",
             other: "Архив",
+            other_op: None,
         },
         FieldCase {
             field: "folder_role",
@@ -778,6 +791,7 @@ mod tests {
             unit: None,
             matching: "inbox",
             other: "archive",
+            other_op: None,
         },
         FieldCase {
             field: "read_state",
@@ -785,6 +799,7 @@ mod tests {
             unit: None,
             matching: "unread",
             other: "read",
+            other_op: None,
         },
         FieldCase {
             field: "importance",
@@ -792,6 +807,7 @@ mod tests {
             unit: None,
             matching: "normal",
             other: "flagged",
+            other_op: None,
         },
         FieldCase {
             field: "reply_state",
@@ -799,6 +815,7 @@ mod tests {
             unit: None,
             matching: "unanswered",
             other: "answered",
+            other_op: None,
         },
         FieldCase {
             field: "draft_state",
@@ -806,6 +823,7 @@ mod tests {
             unit: None,
             matching: "not_draft",
             other: "draft",
+            other_op: None,
         },
         FieldCase {
             field: "attachment",
@@ -813,6 +831,7 @@ mod tests {
             unit: None,
             matching: "none",
             other: "has",
+            other_op: None,
         },
         // Письмо проверки весит 2 кб.
         FieldCase {
@@ -821,6 +840,7 @@ mod tests {
             unit: Some("kb"),
             matching: "1",
             other: "1024",
+            other_op: None,
         },
         FieldCase {
             field: "label",
@@ -828,6 +848,7 @@ mod tests {
             unit: None,
             matching: "важное",
             other: "неважное",
+            other_op: None,
         },
         // Письмо проверки только что получено.
         FieldCase {
@@ -835,7 +856,8 @@ mod tests {
             op: "within_last",
             unit: Some("days"),
             matching: "1",
-            other: "0",
+            other: "1",
+            other_op: Some("older_than"),
         },
     ];
 
@@ -944,7 +966,12 @@ mod tests {
             for (outcome, value) in [("подходит", case.matching), ("чужое", case.other)] {
                 let label_name = format!("{}: {outcome}", case.field);
                 let label = seed_label(&db, &label_name).await;
-                let mut condition = condition(case.field, case.op, value);
+                let op = if outcome == "чужое" {
+                    case.other_op.unwrap_or(case.op)
+                } else {
+                    case.op
+                };
+                let mut condition = condition(case.field, op, value);
                 condition.unit = case.unit.map(str::to_owned);
                 let mut input = rule(
                     vec![group(vec![condition])],

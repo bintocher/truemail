@@ -172,8 +172,13 @@ static_regex!(
 // сервера, и всё оно целиком заменяется одним псевдонимом.
 static_regex!(
     field_content_re,
-    r#"(?i)\b(subject|preview|body|value|rule_value|condition_value|from|from_addr|to|to_addrs|recipient|sender|last_error|policy_value|address|domain|participants|conversation_subject)\s*=\s*("[^"]*"|[^\s,;}]+)"#
+    r#"(?i)\b(subject|preview|body|value|rule_value|condition_value|from|from_addr|to|to_addrs|recipient|sender|last_error|policy_value|address|domain|participants|conversation_subject)\s*=\s*("[^"]*"|[^,;}]+)"#
 );
+// Начало следующего поля записи. Значение без кавычек доходит до разделителя
+// записи, но внутри одной записи полей бывает несколько
+// ("subject=Отчёт за месяц account_id=42"), и без этой границы обезличивание
+// съело бы вместе с темой и чужие поля.
+static_regex!(next_field_re, r#"(?i)\s+[a-z_][a-z0-9_]*\s*="#);
 // Пути: якорь (начало строки или пробел/кавычка/скобка/знак равенства) не
 // входит в замену - иначе разделитель перед путём терялся бы. Без якоря путь
 // внутри URL (`https://host/EWS/...`) ошибочно поглотил бы имя узла.
@@ -229,7 +234,7 @@ static_regex!(ipv4_re, r"\b(?:\d{1,3}\.){3}\d{1,3}\b");
 // журнала - 20:56:39 выглядит как три группы адреса.
 static_regex!(
     ipv6_re,
-    r"(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|(?i)\b[0-9a-f]{0,4}::[0-9a-f:]{2,}\b"
+    r"(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|(?i)(?:[0-9a-f]{1,4})?(?::[0-9a-f]{1,4})*::(?:[0-9a-f]{1,4})?(?::[0-9a-f]{1,4})*"
 );
 
 fn replace_whole_match(
@@ -293,12 +298,22 @@ fn replace_named_field(
         } else {
             raw_value
         };
+        // Значение без кавычек обрывается на начале следующего поля записи:
+        // хвост за ним принадлежит не этому полю и должен остаться как есть.
+        let (inner, tail) = if quoted {
+            (inner, "")
+        } else {
+            match next_field_re().find(inner) {
+                Some(found) => inner.split_at(found.start()),
+                None => (inner, ""),
+            }
+        };
         let replaced = alias(salt, category, inner);
         let field = &caps[1];
         if quoted {
             format!("{field}=\"{replaced}\"")
         } else {
-            format!("{field}={replaced}")
+            format!("{field}={replaced}{tail}")
         }
     })
     .into_owned()
@@ -604,18 +619,20 @@ mod tests {
         // Заменять его надо целиком: половина адреса в архиве - это всё ещё
         // адрес сервера пользователя.
         let salt = salt(21);
+        // Проверяем по самому адресу, а не по его кускам: псевдоним записан
+        // шестнадцатеричными цифрами и может случайно содержать "db8" или
+        // "2001" внутри себя, не раскрывая при этом ничего.
         let cases = [
-            "соединение с 2001:0db8:85a3:0000:0000:8a2e:0370:7334 разорвано",
-            "соединение с 2001:db8::1 разорвано",
-            "соединение с fe80::1 разорвано",
-            "соединение с 2001:db8:0:1::8a2e:370 разорвано",
+            "2001:0db8:85a3:0000:0000:8a2e:0370:7334",
+            "2001:db8::1",
+            "fe80::1",
+            "2001:db8:0:1::8a2e:370",
         ];
-        for case in cases {
+        for address in cases {
             let mut counts = ReplacementCounts::default();
-            let line = anonymize_line(case, &salt, &mut counts);
-            assert!(!line.contains("2001"), "{line}");
-            assert!(!line.contains("db8"), "{line}");
-            assert!(!line.contains("fe80"), "{line}");
+            let case = format!("соединение с {address} разорвано");
+            let line = anonymize_line(&case, &salt, &mut counts);
+            assert!(!line.contains(address), "{line}");
             assert!(!line.contains("::"), "{line}");
             assert!(line.contains("[host-"), "{line}");
             assert!(line.starts_with("соединение с [host-"), "{line}");

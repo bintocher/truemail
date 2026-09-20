@@ -225,7 +225,7 @@ fn join_in_headers(headers: &[u8]) -> Option<Vec<u8>> {
             let Some(next) = parse_encoded_word(headers, next_start) else {
                 break;
             };
-            if next.encoding != first.encoding {
+            if next.charset != first.charset || next.encoding != first.encoding {
                 break;
             }
             let Some(next_bytes) = decode_payload(&next) else {
@@ -243,8 +243,7 @@ fn join_in_headers(headers: &[u8]) -> Option<Vec<u8>> {
         }
         i = end;
     }
-    let _ = changed;
-    None
+    if changed { Some(out) } else { None }
 }
 
 #[cfg(test)]

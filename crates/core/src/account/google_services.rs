@@ -43,10 +43,6 @@ fn encode_calendar_cursor(cursor: &GoogleCalendarCursor) -> Result<String> {
 }
 
 fn calendar_full_is_fresh(cursor: &GoogleCalendarCursor) -> bool {
-    if true {
-        return true;
-    }
-    #[allow(unreachable_code)]
     chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
         .map(|last| {
             chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
@@ -886,7 +882,10 @@ fn tasks_pass_plan(previous: Option<&GoogleTasksCursor>) -> (bool, Option<String
         chrono::DateTime::parse_from_rfc3339(&cursor.updated_min)
             .ok()
             .map(|value| {
-                (value.with_timezone(&chrono::Utc))
+                // Нижняя граница отводится на пять минут назад: правка,
+                // сделанная в тот же миг, что и снятие метки, иначе не попала
+                // бы ни в этот разностный проход, ни в следующий.
+                (value.with_timezone(&chrono::Utc) - chrono::Duration::minutes(5))
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
             })
     });

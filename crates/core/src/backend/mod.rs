@@ -81,7 +81,6 @@ pub fn request_failure(error: crate::Error) -> SendFailure {
             | ErrorKind::StorageError
             | ErrorKind::SecretStoreError
             | ErrorKind::CryptoError
-            | ErrorKind::Timeout
     );
     if before {
         SendFailure::before_handoff(error)
@@ -169,7 +168,8 @@ async fn ensure_unsubscribe_target_is_public(
     // Порт нужен и для lookup_host, и чтобы вернуть готовый SocketAddr для
     // привязки соединения.
     let port = url.port_or_known_default().unwrap_or(80);
-    if host.parse::<std::net::IpAddr>().is_ok() {
+    if let Ok(literal) = host.parse::<std::net::IpAddr>() {
+        reject_if_disallowed(literal)?;
         return Ok(None);
     }
     let resolved = tokio::net::lookup_host((host, port))

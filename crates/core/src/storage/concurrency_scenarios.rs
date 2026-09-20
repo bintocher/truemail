@@ -14,6 +14,7 @@
 use super::Db;
 use super::repo::test_storage::{TestDb, open_test_db};
 use crate::backend::DiscoveredMessage;
+use crate::backend::OutgoingMessage;
 use crate::model::*;
 
 async fn seed_account(db: &Db, email: &str) -> i64 {
