@@ -9,6 +9,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {limits, applyTestLimits} = require('./limits-fixture.js');
+const {createUiWindow} = require('./ui-window.js');
 
 // Модуль закрепления появляется вместе с реализацией. Пока его нет, каждая
 // проверка падает на своём месте и своими словами.
@@ -96,6 +97,44 @@ function message(extra) {
     extra,
   );
 }
+
+// Настоящий путь закрепления проверяется на подставном окне: разметка из
+// index.html, модули окна выполняются целиком, нажатия идут теми же
+// обработчиками, которые вызовет браузер.
+function listMessage(extra) {
+  return Object.assign({
+    id: 1, account_id: 1, folder_id: 2, subject: 'Счёт', preview: 'текст',
+    from: {name: 'Коллега', email: 'mate@example.test'}, to: [], cc: [],
+    flags: {seen: true, flagged: false}, labels: [], date: '2026-09-18T10:00:00Z',
+    pinned_at: null, task_due_at: null,
+  }, extra);
+}
+
+async function openPinList(items, options = {}) {
+  const reloads = [];
+  const ui = createUiWindow({
+    answers: {listPinnedMessages: () => ({messages: [], ordinary: []}), ...(options.answers || {})},
+    globals: {reloadCoreData: async () => { reloads.push(1); }},
+  });
+  ui.reloads = reloads;
+  await ui.clock.drain();
+  ui.evaluate(`
+    coreAccounts=[{id:1,email:'me@example.test',color:'#0058ff'}];
+    setCoreFolders([{id:2,account_id:1,role:'inbox',display_name:'Входящие',remote_path:'INBOX'}]);
+    currentFolderId=2;currentSmartIndex=null;
+    messages=${JSON.stringify(items)};
+    applyListOptions(true,'Входящие');
+  `);
+  return ui;
+}
+
+const rowOf = (ui, id) => ui.query(`#msgs .msg[data-message-id="${id}"]`);
+// Порядок писем в списке без разделителя закреплённой части.
+const rowIds = ui => ui.queryAll('#msgs .msg')
+  .filter(row => !row.classes.has('pinned-separator'))
+  .map(row => Number(row.dataset.messageId));
+// Сообщения смотрим там же, где их видит пользователь: карточкой в углу окна.
+const noticeTexts = ui => ui.queryAll('.app-toast .app-toast-line').map(node => node.textContent.trim());
 
 test('S-023, S-026: закреплённая часть идёт выше обычной и отделена разделителем', () => {
   const rows = listRows(
@@ -237,50 +276,73 @@ test('S-060 - S-062: закреплённое письмо не входит в 
   assert.equal(normal[0].threadCount, 2, 'закреплённое письмо посчитано в свёртке своей беседы');
 });
 
-test('S-003, S-004, S-063, S-064 - S-069: закрепление идёт одной командой моста и снимается без перезагрузки', async () => {
-  // Сквозная проверка настоящего пути: строка, меню и выделение ведут в одну
-  // команду, а отказ чтения закреплённых не прячет обычную часть списка.
-  const calls = [];
-  const bridge = {
-    setMessagesPinned: async (ids, pinned) => {
-      calls.push({ids, pinned});
-      if (pinned && ids.length > 1) return {pinned: 1, rejected: ids.length - 1};
-      return {pinned: ids.length, rejected: 0};
-    },
-  };
-  const toggle = fn('togglePin', 'закрепить письмо нечем: закрепления в программе нет вовсе');
-  await toggle(bridge, [11], true);
-  assert.deepEqual(calls[0], {ids: [11], pinned: true}, 'закрепление обязано идти одной командой с перечнем писем');
+test('S-003, S-004, S-042, S-043, S-063 - S-069: закрепление идёт одной командой, предел назван, отказ ядра откатывает строку', async () => {
+  // Настоящий путь: кнопка закрепления в строке списка - мост - список. Здесь
+  // ловятся три беды, которых не видно по чистым функциям: групповое
+  // закрепление, разбитое на команду по письму, молчаливый отказ предела и
+  // застрявшее закрепление после отказа ядра.
+  const limit = await openPinList([
+    listMessage({id: 71, subject: 'Счёт', date: '2026-09-18T10:00:00Z'}),
+    listMessage({id: 72, subject: 'Отчёт', date: '2026-09-14T10:00:00Z'}),
+    listMessage({id: 73, subject: 'Письмо', date: '2026-09-10T10:00:00Z'}),
+  ], {answers: {setMessagesPinned: (ids, pinned) => (pinned && ids.length > 1
+    ? {pinned: 1, rejected_limit: ids.length - 1}
+    : {pinned: ids.length, rejected_limit: 0})}});
+  rowOf(limit, 71).dispatch('click', {ctrlKey: true});
+  rowOf(limit, 72).dispatch('click', {ctrlKey: true});
+  rowOf(limit, 73).dispatch('click', {ctrlKey: true});
+  await limit.clock.drain();
+  assert.equal(limit.evaluate('selectedMessageIds.size'), 3,
+    'выделить три письма не удалось: проверять групповое закрепление не на чем');
 
-  // Групповое закрепление упирается в предел и честно называет число отказов.
-  const group = await toggle(bridge, [21, 22, 23], true);
-  assert.equal(group.pinned, 1);
-  assert.equal(group.rejected, 2);
-  assert.ok(
-    fn('pinLimitText', 'сообщение о пределе закрепления не собирается')(group, 'ru').includes('2'),
-    'пользователю не сказано, сколько писем закрепить не удалось',
-  );
+  rowOf(limit, 71).querySelector('.row-pin').dispatch('click');
+  await limit.clock.drain();
+  const pinCalls = limit.callsOf('setMessagesPinned');
+  assert.equal(pinCalls.length, 1,
+    'групповое закрепление ушло в ядро не одной командой: при обрыве часть писем осталась бы незакреплённой');
+  assert.deepEqual([[...pinCalls[0].args[0]].sort((a, b) => a - b), pinCalls[0].args[1]], [[71, 72, 73], true],
+    'в ядро ушло закрепление не по всем выделенным письмам');
+  const notices = noticeTexts(limit);
+  assert.equal(notices.length, 1, 'предел закреплений ящика не назван: письма молча остались незакреплёнными');
+  assert.ok(notices[0].includes('2'), `сообщение не называет, сколько писем закрепить не удалось: ${notices[0]}`);
 
-  // Снятие закрепления возвращает письмо в обычную часть на место по
-  // выбранной сортировке, не перезагружая представление.
-  const state = {
-    pinned: [message({id: 5, pinned_at: '2026-09-18T09:00:00Z', date: '2026-09-11T10:00:00Z'})],
-    normal: [message({id: 1, date: '2026-09-18T10:00:00Z'}), message({id: 2, date: '2026-09-10T10:00:00Z'})],
-  };
-  await toggle(bridge, [5], false);
-  const after = fn('unpinInPlace', 'открепление требует перезагрузки представления: список мигает и теряет место')(
-    state, 5, {sort: 'newest'},
-  );
-  assert.deepEqual(after.pinned.map(item => item.id), []);
-  assert.deepEqual(after.normal.map(item => item.id), [1, 5, 2], 'письмо встало не на своё место по дате');
+  // Открепление возвращает письмо в обычную часть на место по сортировке и не
+  // перечитывает данные: перезагрузка списка стирала бы место и прокрутку.
+  const unpin = await openPinList([
+    listMessage({id: 74, subject: 'Закреплённое', date: '2026-09-11T10:00:00Z', pinned_at: '2026-09-18T09:00:00Z'}),
+    listMessage({id: 71, subject: 'Счёт', date: '2026-09-18T10:00:00Z'}),
+    listMessage({id: 72, subject: 'Отчёт', date: '2026-09-14T10:00:00Z'}),
+    listMessage({id: 73, subject: 'Письмо', date: '2026-09-10T10:00:00Z'}),
+  ]);
+  assert.ok(unpin.query('#msgs .pinned-separator'),
+    'закреплённая часть не отделена разделителем: проверять открепление не на чем');
+  rowOf(unpin, 74).querySelector('.row-pin').dispatch('click');
+  await unpin.clock.drain();
+  assert.deepEqual(unpin.callsOf('setMessagesPinned').map(call => [[...call.args[0]], call.args[1]]), [[[74], false]],
+    'открепление не дошло до ядра');
+  assert.deepEqual(rowIds(unpin), [71, 72, 74, 73],
+    'откреплённое письмо встало не на своё место по дате: список пришлось бы перечитывать');
+  assert.equal(unpin.query('#msgs .pinned-separator'), null, 'разделитель остался без единого закреплённого письма');
+  assert.equal(unpin.reloads.length, 0, 'после открепления список перечитан целиком: место и прокрутка потеряны');
 
-  // Отказ чтения закреплённых писем оставляет обычную часть на месте: в модуль
-  // он приходит пустым перечнем закреплённых.
-  const rows = listRows(
-    [],
-    [message({id: 1})],
-    {sort: 'newest', filters: {}, lang: 'ru', pinnedError: 'сеть недоступна'},
-  );
-  assert.deepEqual(rows.filter(row => row.kind !== SEPARATOR).map(row => row.id), [1],
-    'отказ чтения закреплённых писем оставил список пустым');
+  // Отказ ядра возвращает строку в прежний вид: иначе письмо числится
+  // закреплённым до следующей перезагрузки, а в ядре закрепления нет.
+  const failed = await openPinList([
+    listMessage({id: 75, subject: 'Счёт', date: '2026-09-18T10:00:00Z'}),
+  ], {answers: {setMessagesPinned: () => { throw new Error('ядро недоступно'); }}});
+  rowOf(failed, 75).querySelector('.row-pin').dispatch('click');
+  await failed.clock.drain();
+  assert.equal(failed.callsOf('setMessagesPinned').length, 1, 'нажатие на закрепление не дошло до ядра');
+  assert.equal(rowOf(failed, 75).querySelector('.row-pin').classes.has('on'), false,
+    'после отказа ядра строка осталась закреплённой: письмо висит наверху списка без закрепления в ядре');
+  assert.equal(failed.evaluate('messages.find(item=>item.id===75).pinned_at'), null,
+    'письмо в памяти окна осталось закреплённым: следующее нажатие откручивало бы несуществующее закрепление');
+  assert.ok(noticeTexts(failed).length, 'отказ ядра прошёл молча: пользователь считает письмо закреплённым');
+
+  // Отказ чтения закреплённых писем оставляет обычную часть на месте: без
+  // этого одна недоступная команда прячет весь список.
+  unpin.bridge.answer('listPinnedMessages', () => { throw new Error('сеть недоступна'); });
+  unpin.evaluate('refreshPinnedForView(true)');
+  await unpin.clock.drain();
+  assert.deepEqual(rowIds(unpin), [71, 72, 74, 73], 'отказ чтения закреплённых писем оставил список пустым');
 });

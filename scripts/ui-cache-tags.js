@@ -25,21 +25,26 @@ function localesTag(hostText){
   return match?match[1]:null;
 }
 
-// Подключающий файл для изменённого файла интерфейса: путь и функция чтения
-// метки. null - файл по адресу с меткой не подключается (S-005).
-function hostFor(filePath,readHost){
+// Все подключающие файлы изменённого файла интерфейса, а не первый найденный.
+// Один модуль подключают оба окна: flag-due-dates.js стоит и в index.html, и в
+// notify.html, метка у каждого окна своя. Пока смотрели только на первый
+// найденный хост, поднятая метка в index.html закрывала собой неподнятую метку
+// в notify.html, и окно уведомления продолжало выполнять старую копию файла.
+// Пустой массив - файл по адресу с меткой не подключается (S-005).
+function hostsFor(filePath,readHost){
   if(filePath.startsWith(LOCALES_PREFIX)){
-    return {host:LOCALES_HOST,read:localesTag};
+    return [{host:LOCALES_HOST,read:localesTag}];
   }
   const fileName=filePath.slice(filePath.lastIndexOf('/')+1);
+  const found=[];
   for(const host of HTML_HOSTS){
     // Ищем подключение в обоих состояниях: если метку убрали вместе с правкой,
     // в текущем состоянии её уже нет, а нарушение есть.
     if(tagFor(readHost(host,'head'),fileName)!==null||tagFor(readHost(host,'base'),fileName)!==null){
-      return {host,read:text=>tagFor(text,fileName)};
+      found.push({host,read:text=>tagFor(text,fileName)});
     }
   }
-  return null;
+  return found;
 }
 
 // Проверка набора изменений (S-001 - S-006). changes - массив
@@ -54,20 +59,21 @@ function checkCacheTags(changes,readHost){
     if(!filePath.startsWith(UI_PREFIX))continue;          // S-004
     if(change.status==='D')continue;                       // S-006
     if(HTML_HOSTS.includes(filePath))continue;             // сам подключающий файл метки не несёт
-    const host=hostFor(filePath,readHost);
-    if(!host)continue;                                     // S-005
-    const before=host.read(readHost(host.host,'base'));
-    const after=host.read(readHost(host.host,'head'));
-    if(before===null)continue;                             // подключения не было и раньше
-    if(after===null){                                      // метка исчезла - файл перестал версионироваться
-      violations.push({file:filePath,host:host.host,tag:'метка исчезла'});
-      continue;
-    }
-    if(before===after){                                    // S-001, S-002
-      violations.push({file:filePath,host:host.host,tag:after});
+    // Проверяем каждое подключение файла: метку нужно поднять в обоих окнах.
+    for(const host of hostsFor(filePath,readHost)){         // пустой перечень - S-005
+      const before=host.read(readHost(host.host,'base'));
+      const after=host.read(readHost(host.host,'head'));
+      if(before===null)continue;                           // подключения не было и раньше
+      if(after===null){                                    // метка исчезла - файл перестал версионироваться
+        violations.push({file:filePath,host:host.host,tag:'метка исчезла'});
+        continue;
+      }
+      if(before===after){                                  // S-001, S-002
+        violations.push({file:filePath,host:host.host,tag:after});
+      }
     }
   }
   return violations;
 }
 
-module.exports={checkCacheTags,tagFor,localesTag,HTML_HOSTS,LOCALES_HOST};
+module.exports={checkCacheTags,hostsFor,tagFor,localesTag,HTML_HOSTS,LOCALES_HOST};

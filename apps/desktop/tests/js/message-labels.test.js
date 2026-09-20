@@ -1,7 +1,11 @@
-// Проверки показа меток письма в списке.
+// Проверки разбора меток письма: цвет по имени, отбор показываемых меток,
+// значение полосы и модель точек. Здесь проверяется только сам разбор -
+// разметка строки списка, полоса, точки и подсказка проверяются на настоящем
+// окне в message-labels-row.test.js.
 // Спецификация: specs/message-labels-visible.md.
 // Запуск: node --test apps/desktop/tests/js/message-labels.test.js (Node 22+).
 
+'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const labels = require('../../ui/modules/message-labels.js');
@@ -14,85 +18,101 @@ const TAGS = [
   {id: 5, name: 'Без цвета', color: null},
 ];
 
-test('S-009: цвет метки берётся по имени', () => {
-  assert.equal(labels.labelColor('Счета', TAGS), '#3e63dd');
-});
-
-test('S-009: неизвестная метка получает нейтральный цвет, а не пропадает', () => {
-  assert.equal(labels.labelColor('Удалённая', TAGS), labels.LABEL_NEUTRAL);
-  assert.equal(labels.labelColor('Счета', []), labels.LABEL_NEUTRAL);
-});
-
-test('S-009: пустой цвет в перечне заменяется нейтральным', () => {
-  assert.equal(labels.labelColor('Без цвета', TAGS), labels.LABEL_NEUTRAL);
-  assert.equal(labels.labelColor('Пробелы', [{id: 9, name: 'Пробелы', color: '   '}]), labels.LABEL_NEUTRAL);
-});
-
-test('S-010: в списке метки сама метка скрыта, остальные показаны', () => {
-  assert.deepEqual(labels.shownLabels(['Важное', 'Счета'], 'Важное'), ['Счета']);
-});
-
-test('S-010: вне списка метки показываются все метки письма', () => {
-  assert.deepEqual(labels.shownLabels(['Важное', 'Счета'], null), ['Важное', 'Счета']);
-});
-
-test('S-002: письмо без меток не даёт ни полосы, ни точек', () => {
-  assert.deepEqual(labels.shownLabels(null, null), []);
-  assert.equal(labels.stripeValue([], TAGS), '');
-  assert.deepEqual(labels.dotsModel([], TAGS), {dots: [], more: 0});
-});
-
-test('S-002: письмо с единственной меткой в её же списке остаётся без полосы', () => {
-  const shown = labels.shownLabels(['Важное'], 'Важное');
-  assert.deepEqual(shown, []);
-  assert.equal(labels.stripeValue(shown, TAGS), '');
-});
-
-test('S-001: одна метка - сплошной цвет без градиента', () => {
-  assert.equal(labels.stripeValue(['Счета'], TAGS), '#3e63dd');
-});
-
-test('S-003: две метки делят полосу пополам в порядке меток письма', () => {
-  assert.equal(
-    labels.stripeValue(['Важное', 'Счета'], TAGS),
-    'linear-gradient(to bottom,#e5484d 0.000% 50.000%,#3e63dd 50.000% 100.000%)',
-  );
-});
-
-test('S-003: три метки делят полосу на равные трети', () => {
-  const value = labels.stripeValue(['Важное', 'Счета', 'Личное'], TAGS);
-  assert.equal(
-    value,
-    'linear-gradient(to bottom,#e5484d 0.000% 33.333%,#3e63dd 33.333% 66.667%,#30a46c 66.667% 100.000%)',
-  );
-});
-
-test('S-004: от четырёх меток - три сегмента и один нейтральный', () => {
-  const value = labels.stripeValue(['Важное', 'Счета', 'Личное', 'Отпуск', 'Пятая'], TAGS);
-  const stops = value.slice('linear-gradient(to bottom,'.length, -1).split(',');
-  assert.equal(stops.length, 4);
-  assert.ok(stops[3].startsWith(labels.LABEL_NEUTRAL));
-  assert.ok(value.includes('#30a46c'));
-  assert.ok(!value.includes('#f5a524'));
-});
-
-test('S-005: точки повторяют цвета первых трёх меток', () => {
-  assert.deepEqual(labels.dotsModel(['Важное', 'Счета'], TAGS), {
-    dots: ['#e5484d', '#3e63dd'],
-    more: 0,
+// S-009: цвет ищется по имени, а любое отсутствие цвета заменяется нейтральным.
+// Без замены метка, удалённая или пришедшая без цвета, рисовалась бы пустым
+// значением - то есть пропадала бы из строки вместе с полосой и точкой.
+test('S-009: цвет метки по имени, а при его отсутствии - нейтральный', () => {
+  const cases = [
+    {name: 'Счета', tags: TAGS, expect: '#3e63dd', why: 'цвет известной метки взят не из перечня'},
+    {name: 'Удалённая', tags: TAGS, expect: labels.LABEL_NEUTRAL, why: 'метки нет в перечне, а нейтрального цвета не дали: метка пропадёт из строки'},
+    {name: 'Счета', tags: [], expect: labels.LABEL_NEUTRAL, why: 'перечень меток ещё не загружен, а нейтрального цвета не дали'},
+    {name: 'Без цвета', tags: TAGS, expect: labels.LABEL_NEUTRAL, why: 'у метки пустой цвет, а нейтрального не подставили'},
+    {name: 'Пробелы', tags: [{id: 9, name: 'Пробелы', color: '   '}], expect: labels.LABEL_NEUTRAL, why: 'цвет из одних пробелов принят за настоящий'},
+  ];
+  cases.forEach(item => {
+    assert.equal(labels.labelColor(item.name, item.tags), item.expect, `${item.name}: ${item.why}`);
   });
 });
 
-test('S-006: сверх трёх меток показывается счётчик остатка', () => {
-  const model = labels.dotsModel(['Важное', 'Счета', 'Личное', 'Отпуск', 'Пятая'], TAGS);
-  assert.equal(model.dots.length, 3);
-  assert.equal(model.more, 2);
+// S-010: в списке открытой метки её собственный цвет не несёт сведений - он у
+// всех писем списка, поэтому эта метка из строки убирается. Заодно из перечня
+// письма выбрасывается мусор: пустые и нестроковые имена дали бы точку без
+// имени и цвета.
+test('S-010: показываются метки письма без открытой метки и без пустых имён', () => {
+  const cases = [
+    {labels: ['Важное', 'Счета'], open: 'Важное', expect: ['Счета'], why: 'открытая метка осталась в строке: её цвет повторяется у всех писем списка'},
+    {labels: ['Важное', 'Счета'], open: null, expect: ['Важное', 'Счета'], why: 'вне списка метки скрыта часть меток письма'},
+    {labels: ['Важное'], open: 'Важное', expect: [], why: 'единственная метка письма совпадает с открытой, а строка всё равно её показывает'},
+    {labels: ['Важное', '', null, undefined], open: null, expect: ['Важное'], why: 'пустые имена не отброшены: в строке появится точка без имени'},
+    {labels: null, open: null, expect: [], why: 'письмо без меток получило показываемые метки'},
+  ];
+  cases.forEach(item => {
+    assert.deepEqual(labels.shownLabels(item.labels, item.open), item.expect,
+      `${JSON.stringify(item.labels)} при открытой метке "${item.open}": ${item.why}`);
+  });
 });
 
-test('S-006: ровно три метки счётчика не дают', () => {
-  assert.equal(labels.dotsModel(['Важное', 'Счета', 'Личное'], TAGS).more, 0);
+// S-002: показывать нечего - значит ни полосы, ни точек. Без этого письмо без
+// меток получало бы серую полосу у края строки, и метки переставали бы
+// отличать письма друг от друга.
+test('S-002: пустой перечень показываемых меток не даёт ни полосы, ни точек', () => {
+  assert.equal(labels.stripeValue([], TAGS), '', 'письмо без меток получило полосу у края строки');
+  assert.deepEqual(labels.dotsModel([], TAGS), {dots: [], more: 0}, 'письмо без меток получило точки');
+  const single = labels.shownLabels(['Важное'], 'Важное');
+  assert.equal(labels.stripeValue(single, TAGS), '',
+    'у письма с единственной меткой в её же списке осталась полоса: цвет один у всех строк списка');
 });
 
-test('пустые имена в перечне меток письма отбрасываются', () => {
-  assert.deepEqual(labels.shownLabels(['Важное', '', null, undefined], null), ['Важное']);
+// S-001: одна метка - сплошной цвет. Градиент из одного цвета выглядит так же,
+// но значение полосы уходит в стиль строки, и лишняя обёртка тут значит, что
+// сегменты считаются и там, где считать нечего.
+test('S-001: одна метка даёт сплошной цвет без градиента', () => {
+  assert.equal(labels.stripeValue(['Счета'], TAGS), '#3e63dd');
+});
+
+// S-003: полоса делится поровну между метками в порядке меток письма. Дефект,
+// который здесь ловится, - неверный шаг сегмента: цвета съезжают, и по полосе
+// больше нельзя сосчитать метки.
+test('S-003: полоса делится на равные сегменты в порядке меток письма', () => {
+  const cases = [
+    {
+      names: ['Важное', 'Счета'],
+      expect: 'linear-gradient(to bottom,#e5484d 0.000% 50.000%,#3e63dd 50.000% 100.000%)',
+      why: 'две метки не делят полосу пополам',
+    },
+    {
+      names: ['Важное', 'Счета', 'Личное'],
+      expect: 'linear-gradient(to bottom,#e5484d 0.000% 33.333%,#3e63dd 33.333% 66.667%,#30a46c 66.667% 100.000%)',
+      why: 'три метки не делят полосу на равные трети',
+    },
+  ];
+  cases.forEach(item => {
+    assert.equal(labels.stripeValue(item.names, TAGS), item.expect, `${item.names.join(', ')}: ${item.why}`);
+  });
+});
+
+// S-004: от четырёх меток три цвета показываются, остальные сводятся в один
+// нейтральный сегмент - иначе в 57 пикселях строки цвета неразличимы.
+test('S-004: от четырёх меток - три цветных сегмента и один нейтральный', () => {
+  const value = labels.stripeValue(['Важное', 'Счета', 'Личное', 'Отпуск', 'Пятая'], TAGS);
+  const stops = value.slice('linear-gradient(to bottom,'.length, -1).split(',');
+  assert.equal(stops.length, 4, 'полоса не свела остаток меток в один сегмент');
+  assert.ok(stops[3].startsWith(labels.LABEL_NEUTRAL), 'последний сегмент не нейтральный: остаток меток выдан за цветную метку');
+  assert.ok(value.includes('#30a46c'), 'третья метка письма потеряла свой сегмент');
+  assert.ok(!value.includes('#f5a524'), 'четвёртая метка получила собственный цвет вместо нейтрального остатка');
+});
+
+// S-005, S-006: точек не больше трёх, остальные метки считает счётчик. Дефект
+// здесь - потерянный или лишний счётчик: пользователь не узнает, что у письма
+// есть ещё метки, либо увидит "+0".
+test('S-005, S-006: точки повторяют первые три метки, остальные уходят в счётчик', () => {
+  const cases = [
+    {names: ['Важное', 'Счета'], dots: ['#e5484d', '#3e63dd'], more: 0, why: 'две метки дали не те точки или лишний счётчик'},
+    {names: ['Важное', 'Счета', 'Личное'], dots: ['#e5484d', '#3e63dd', '#30a46c'], more: 0, why: 'ровно три метки дали счётчик остатка'},
+    {names: ['Важное', 'Счета', 'Личное', 'Отпуск', 'Пятая'], dots: ['#e5484d', '#3e63dd', '#30a46c'], more: 2, why: 'сверх трёх меток остаток сосчитан неверно'},
+  ];
+  cases.forEach(item => {
+    assert.deepEqual(labels.dotsModel(item.names, TAGS), {dots: item.dots, more: item.more},
+      `${item.names.join(', ')}: ${item.why}`);
+  });
 });

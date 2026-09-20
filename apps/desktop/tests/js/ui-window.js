@@ -109,11 +109,29 @@ function createDocument(html) {
   return documentStub;
 }
 
+// Ответы, без которых окно не доживает до проверяемого действия: эти команды
+// зовутся при загрузке и при перерисовке разделов, а перечень они ждут всегда.
+// Ответ, заданный проверкой, всегда сильнее этого набора.
+const DEFAULT_ANSWERS = {
+  listLabels: () => [],
+  listPinnedMessages: () => ({messages: [], ordinary: []}),
+  messageLabelIds: () => [],
+  pendingMailRuleRuns: () => [],
+  failedMessageOperations: () => [],
+  listMailRules: () => [],
+  pendingSenderPolicyJobs: () => [],
+  pendingSenderSweepJobs: () => [],
+  listOutbox: () => [],
+  listRecipientHistory: () => [],
+  overdueMessageTaskCount: () => 0,
+  allSettings: () => ({}),
+};
+
 // Мост к ядру: команды отвечают заданными значениями, а вызовы запоминаются -
 // именно по ним проверяется итог действия пользователя.
 function createBridge(answers = {}) {
   const calls = [];
-  const handlers = {...answers};
+  const handlers = {...DEFAULT_ANSWERS, ...answers};
   const bridge = new Proxy({}, {
     get(_target, name) {
       if (name === 'calls') return calls;

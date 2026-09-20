@@ -27,6 +27,58 @@ function rules() {
   return found;
 }
 
+// Объявления правила по именам: привязка к точному написанию значения роняла
+// проверку на равнозначной записи, поэтому смотрим на смысл, а не на текст.
+function declarations(body) {
+  const found = new Map();
+  for (const part of body.split(';')) {
+    const colon = part.indexOf(':');
+    if (colon < 0) continue;
+    found.set(part.slice(0, colon).trim().toLowerCase(), part.slice(colon + 1).trim().toLowerCase());
+  }
+  return found;
+}
+
+// Растяжимость и исходный размер поля. Записи "flex:1", "flex:1 1 0",
+// "flex:1 1 0%" и "flex-grow:1;flex-basis:0" означают одно и то же, а "none" -
+// это "0 0 auto".
+function flexOf(decls) {
+  let grow = null;
+  let basis = null;
+  const short = decls.get('flex');
+  if (short === 'none') { grow = 0; basis = 'auto'; }
+  else if (short === 'auto') { grow = 1; basis = 'auto'; }
+  else if (short) {
+    const parts = short.split(/\s+/);
+    grow = Number(parts[0]);
+    if (parts.length === 1) basis = '0%';
+    else if (parts.length === 2) basis = /^[\d.]+$/.test(parts[1]) ? '0%' : parts[1];
+    else basis = parts[2];
+  }
+  if (decls.has('flex-grow')) grow = Number(decls.get('flex-grow'));
+  if (decls.has('flex-basis')) basis = decls.get('flex-basis');
+  return {grow, basis};
+}
+
+// Размер, назначенный самому полю. "100%" - это ширина колонки, а не своя;
+// "auto" и "0" ширины не задают. Всё остальное с единицей измерения или в
+// процентах - собственная ширина, из-за которой поля и разъезжались.
+function ownWidth(value) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text || text === 'auto' || text === '100%' || text === 'inherit' || text === 'initial') return null;
+  if (/^0(\.0+)?(px|em|rem|ch|%)?$/.test(text)) return null;
+  if (text.startsWith('var(')) return null;
+  return /^[\d.]+(px|em|rem|ch|vw|vh|%)$/.test(text) ? text : null;
+}
+
+// Правила, которые целят в само поле внутри колонки настроек, а не в колонку.
+// Ширина колонки задаётся ей самой и законна; своя ширина поля - нет.
+function fieldRules() {
+  return rules().filter(rule => /\.fc\b/.test(rule.selector)
+    && /\.fc[^,]*?[>\s]\s*\.(inp|sel)\b/.test(rule.selector));
+}
+
 // Содержимое правой колонки строки настроек: <div class="fc"> целиком. Ячейки
 // вида "fc-inline" из других окон сюда не попадают - колонка настроек всегда
 // объявлена отдельным классом.
@@ -70,14 +122,23 @@ test('колонка полей настроек одной ширины во в
   );
 });
 
+// S-005: поле не задаёт себе ширину само. Ширину поле получает от колонки,
+// поэтому нарушением считается любой собственный размер: и в пикселях, и в
+// процентах, и исходным размером flex-basis - именно процентами и базисом
+// разнобой и возвращается. Ограничители min-width и max-width ширины не
+// задают: min-width:0 и max-width:100% стоят у правильного правила и
+// нарушением быть не могут.
 test('внутри колонки настроек нет полей со своей шириной', () => {
+  const targeted = fieldRules();
+  assert.ok(targeted.length >= 3,
+    `правила полей колонки перестали разбираться: найдено ${targeted.length}`);
   const offenders = [];
-  // Ширина, назначенная поверх колонки правилом с большей силой: именно так
-  // разнобой и заводился раньше.
-  for (const rule of rules()) {
-    if (!rule.selector.includes('.frow .fc')) continue;
-    if (rule.selector.includes('keybind-cell')) continue;
-    if (/width\s*:\s*\d+(px|em|rem|ch)/.test(rule.body)) offenders.push(`стиль ${rule.selector}`);
+  for (const rule of targeted) {
+    const decls = declarations(rule.body);
+    const width = ownWidth(decls.get('width'));
+    if (width) offenders.push(`стиль ${rule.selector}: width ${width}`);
+    const basis = ownWidth(flexOf(decls).basis);
+    if (basis) offenders.push(`стиль ${rule.selector}: исходный размер flex ${basis}`);
   }
   // Ширина прямо в разметке: атрибут style или size.
   for (const cell of settingsFieldCells()) {
@@ -93,17 +154,32 @@ test('внутри колонки настроек нет полей со сво
   assert.deepEqual(offenders, [], `поля настроек получают разную ширину:\n${offenders.join('\n')}`);
 });
 
+// S-003, S-007: в колонке с парой "поле и кнопка" поле обязано делиться
+// местом. Проверяется смысл записи, а не её текст: "flex:1", "flex:1 1 0" и
+// "flex-grow:1;flex-basis:0" - одно и то же, и равнозначная запись не должна
+// ронять проверку там, где вёрстка исправна.
 test('поле рядом с кнопкой не уводит её на другую строку', () => {
-  const keybind = rules().find(rule => rule.selector.includes('.keybind-cell>.inp'));
+  const bySelector = part => rules().find(rule => rule.selector.includes(part));
+
+  const keybind = bySelector('.keybind-cell>.inp');
   assert.ok(keybind, 'поле сочетания растянется на всю колонку и уведёт кнопку снятия вниз');
-  assert.match(keybind.body, /flex\s*:\s*1 1 0/, 'поле сочетания не делит колонку с кнопкой снятия');
+  const keybindFlex = flexOf(declarations(keybind.body));
+  assert.ok(keybindFlex.grow >= 1,
+    `поле сочетания не забирает остаток колонки (растяжимость ${keybindFlex.grow}), и кнопка снятия уезжает вниз`);
+  assert.ok(keybindFlex.basis !== '100%',
+    'поле сочетания начинается с полной колонки, поэтому кнопке снятия места уже не остаётся');
 
   // Ряд "поле и кнопка" и ряд из двух таких пар (следующее и предыдущее
   // письмо) размечены классом fc-inline. Без своего правила каждое поле
   // занимает колонку целиком, и ряд рассыпается на четыре строки.
-  const inline = rules().find(rule => rule.selector.includes('.fc-inline>.inp'));
+  const inline = bySelector('.fc-inline>.inp');
   assert.ok(inline, 'парный ряд рассыплется: поле займёт всю колонку');
-  assert.match(inline.body, /flex\s*:\s*none/, 'поле парного ряда снова тянется на всю колонку');
+  const inlineDecls = declarations(inline.body);
+  const inlineFlex = flexOf(inlineDecls);
+  assert.equal(inlineFlex.grow, 0,
+    'поле парного ряда снова тянется на всю колонку, и сосед уходит на следующую строку');
+  assert.ok((inlineDecls.get('width') || 'auto') !== '100%',
+    'поле парного ряда занимает колонку целиком шириной, а не растяжимостью - ряд всё равно рассыплется');
 
   // Колонка с двумя и более полями обязана нести один из этих двух классов,
   // иначе исключение её не застанет.

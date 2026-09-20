@@ -163,6 +163,11 @@ class FakeNode {
 
   get lastElementChild() { return this.children[this.children.length - 1] || null; }
 
+  // Пункты списка выбора: окно перебирает select.options, проверяя, есть ли
+  // нужный ящик среди отправителей. Без этого свойства возврат письма в
+  // композер падает на выборе ящика и проверка не доходит до сути.
+  get options() { return this.children.filter(child => child.tag === 'option'); }
+
   get nextElementSibling() {
     const siblings = this.parentElement ? this.parentElement.children : [];
     return siblings[siblings.indexOf(this) + 1] || null;
@@ -189,6 +194,13 @@ class FakeNode {
   set className(value) { this.classes = new Set(String(value || '').split(/\s+/).filter(Boolean)); }
 
   get className() { return [...this.classes].join(' '); }
+
+  // Идентификатор узла свойством, а не только атрибутом: переключение
+  // представлений (showView в shell.js) сравнивает именно node.id, и без этого
+  // свойства ни одно представление окна не становится активным.
+  set id(value) { this.attributes.id = String(value); }
+
+  get id() { return this.attributes.id ?? ''; }
 
   set textContent(value) {
     this.children.forEach(child => { child.parentElement = null; });
@@ -349,6 +361,10 @@ class FakeNode {
   focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
 
   blur() { if (this.ownerDocument && this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = null; }
+
+  // Выделение текста поля: окно зовёт его сразу за focus (кнопка фильтра
+  // списка), и без метода обработчик падал бы на полпути.
+  select() {}
 
   scrollIntoView() {}
 
