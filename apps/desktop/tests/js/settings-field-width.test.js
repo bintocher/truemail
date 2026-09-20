@@ -93,8 +93,26 @@ test('внутри колонки настроек нет полей со сво
   assert.deepEqual(offenders, [], `поля настроек получают разную ширину:\n${offenders.join('\n')}`);
 });
 
-test('поле сочетания клавиш оставляет кнопку снятия в той же строке', () => {
-  const rule = rules().find(rule => rule.selector.includes('.keybind-cell>.inp'));
-  assert.ok(rule, 'поле сочетания растянется на всю колонку и уведёт кнопку снятия вниз');
-  assert.match(rule.body, /flex\s*:\s*1 1 0/, 'поле сочетания не делит колонку с кнопкой снятия');
+test('поле рядом с кнопкой не уводит её на другую строку', () => {
+  const keybind = rules().find(rule => rule.selector.includes('.keybind-cell>.inp'));
+  assert.ok(keybind, 'поле сочетания растянется на всю колонку и уведёт кнопку снятия вниз');
+  assert.match(keybind.body, /flex\s*:\s*1 1 0/, 'поле сочетания не делит колонку с кнопкой снятия');
+
+  // Ряд "поле и кнопка" и ряд из двух таких пар (следующее и предыдущее
+  // письмо) размечены классом fc-inline. Без своего правила каждое поле
+  // занимает колонку целиком, и ряд рассыпается на четыре строки.
+  const inline = rules().find(rule => rule.selector.includes('.fc-inline>.inp'));
+  assert.ok(inline, 'парный ряд рассыплется: поле займёт всю колонку');
+  assert.match(inline.body, /flex\s*:\s*none/, 'поле парного ряда снова тянется на всю колонку');
+
+  // Колонка с двумя и более полями обязана нести один из этих двух классов,
+  // иначе исключение её не застанет.
+  const offenders = [];
+  for (const cell of settingsFieldCells()) {
+    const fields = [...cell.markup.matchAll(/<(input|select)\b/g)].length;
+    if (fields < 2) continue;
+    if (/keybind-cell|fc-inline/.test(cell.extra)) continue;
+    offenders.push(cell.markup.slice(0, 80));
+  }
+  assert.deepEqual(offenders, [], `колонка с несколькими полями без своего правила:\n${offenders.join('\n')}`);
 });

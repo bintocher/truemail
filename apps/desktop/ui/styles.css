@@ -447,6 +447,10 @@
   /* Единица измерения - подпись под полем, во всю ширину колонки: рядом с
      полем она отнимала бы у него разную ширину в зависимости от слова. */
   .frow .fc>.d{flex:1 1 100%;color:var(--text-3);font-size:12.5px;}
+  /* Где в колонке стоит не одно поле, а пара "поле и кнопка" или два таких
+     ряда подряд, ширина остаётся за самим полем: на всю колонку оно уводило бы
+     соседа на следующую строку, и ряд рассыпался бы на четыре строки. */
+  .frow .fc.fc-inline>.inp{flex:none;width:auto;}
   .inp{border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:8px;padding:8px 11px;font:inherit;font-size:13px;width:100%;outline:none;}
   .inp:focus{border-color:var(--accent);} textarea.inp{resize:vertical;min-height:70px;line-height:1.5;}
   .sel{border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;min-width:180px;}
