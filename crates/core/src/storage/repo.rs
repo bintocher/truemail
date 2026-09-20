@@ -1155,6 +1155,9 @@ impl Db {
         changed_remote_ids: &[String],
         remote_snapshot: Option<&[String]>,
     ) -> Result<usize> {
+        // Снимок пределов берётся до цикла: клонировать его на каждое
+        // письмо незачем, значение за один проход не меняется.
+        let limits = self.limit_set();
         use std::collections::{HashMap, HashSet};
 
         let mut desired: HashMap<&str, HashSet<&str>> = HashMap::new();
@@ -1215,7 +1218,7 @@ impl Db {
             }
             // Проекция письма убрана провайдером - строка уходит, а сроки дела
             // и закрепление остаются: письмо то же самое.
-            preserve_message_traits(&mut tx, *id).await?;
+            preserve_message_traits(&mut tx, *id, &limits).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1236,6 +1239,9 @@ impl Db {
         snapshots: &[(String, Vec<u32>)],
         reset_folders: &[String],
     ) -> Result<usize> {
+        // Снимок пределов берётся до цикла: клонировать его на каждое
+        // письмо незачем, значение за один проход не меняется.
+        let limits = self.limit_set();
         use std::collections::HashSet;
         let reset: HashSet<&str> = reset_folders.iter().map(String::as_str).collect();
         let mut tx = self.begin_write().await?;
@@ -1271,7 +1277,7 @@ impl Db {
             // Сверка снимка и смена признака действительности папки удаляют
             // строку письма, которое на сервере осталось: приметы сохраняются
             // ровно как при своём переносе.
-            preserve_message_traits(&mut tx, *id).await?;
+            preserve_message_traits(&mut tx, *id, &limits).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1363,6 +1369,9 @@ impl Db {
         account_id: i64,
         vanished: &[(String, Vec<u32>)],
     ) -> Result<usize> {
+        // Снимок пределов берётся до цикла: клонировать его на каждое
+        // письмо незачем, значение за один проход не меняется.
+        let limits = self.limit_set();
         if vanished.is_empty() {
             return Ok(0);
         }
@@ -1399,7 +1408,7 @@ impl Db {
         for id in &delete_ids {
             // Письмо исчезло из этой папки, но в ящике оно чаще всего уже
             // лежит на новом месте: приметы уходят туда, а не пропадают.
-            preserve_message_traits(&mut tx, *id).await?;
+            preserve_message_traits(&mut tx, *id, &limits).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -2100,6 +2109,9 @@ impl Db {
         messages: &[crate::backend::DiscoveredMessage],
         backfilled: bool,
     ) -> Result<()> {
+        // Снимок пределов берётся до цикла: клонировать его на каждое
+        // письмо незачем, значение за один проход не меняется.
+        let limits = self.limit_set();
         use mail_parser::{MessageParser, MimeHeaders};
         use std::collections::HashSet;
         let mut rows = Vec::new();
@@ -2422,6 +2434,7 @@ impl Db {
                         account_id,
                         fixed_id,
                         message_row_id,
+                        &limits,
                     )
                     .await?;
                 }
@@ -3023,7 +3036,7 @@ impl Db {
                 .bind(account_id)
                 .fetch_one(&mut *tx)
                 .await?;
-                if count.0 >= MAX_PINNED_PER_ACCOUNT {
+                if count.0 >= self.limit(LIMIT_PINNED_PER_ACCOUNT) {
                     result.rejected_limit += 1;
                     continue;
                 }
@@ -3371,10 +3384,13 @@ impl Db {
     }
 
     pub async fn purge_completed_message_tasks(&self) -> Result<usize> {
+        // Срок хранения выполненного дела - настройка, а не число в запросе:
+        // сроки у всех разные, а прежде дело исчезало ровно через месяц.
         let removed = sqlx::query(
             "DELETE FROM message_tasks WHERE state='done'
-              AND completed_at < datetime('now','-30 days')",
+              AND completed_at < datetime('now', ?)",
         )
+        .bind(format!("-{} days", self.limit(LIMIT_DONE_TASK_DAYS)))
         .execute(&self.write_pool)
         .await?
         .rows_affected() as usize;
@@ -3384,7 +3400,8 @@ impl Db {
         sqlx::query(AssertSqlSafe(format!(
             "DELETE FROM storage_meta WHERE key LIKE 'message_traits:%'
                AND COALESCE(json_extract(value,'$.saved_at'),'9999-12-31 23:59:59')
-                   < datetime('now','-{TRAITS_KEEP_DAYS} days')"
+                   < datetime('now','-{} days')",
+            self.limit(LIMIT_MESSAGE_TRAITS_DAYS)
         )))
         .execute(&self.write_pool)
         .await?;
@@ -4572,7 +4589,8 @@ impl Db {
             // сервере уже переехало, и откат вернул бы строку письма на старое
             // место, а операцию оставил бы в состоянии выполнения навсегда.
             if operation.op_kind == "move"
-                && let Err(error) = preserve_message_traits(&mut tx, message_id).await
+                && let Err(error) =
+                    preserve_message_traits(&mut tx, message_id, &self.limit_set()).await
             {
                 tracing::warn!(
                     message_id,
@@ -4602,7 +4620,14 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         let delay = (5_i64.saturating_mul(1_i64 << attempts.0.min(9))).min(3600);
-        let status = if attempts.0 >= 8 { "failed" } else { "retry" };
+        // Сколько раз повторять действие - настройка: на неустойчивой связи
+        // восьми попыток мало, а на устойчивой сбой означает отказ сервера, и
+        // повторять его восемь раз незачем.
+        let status = if attempts.0 >= self.limit(LIMIT_OPERATION_ATTEMPTS) {
+            "failed"
+        } else {
+            "retry"
+        };
         // S-084: поле последней ошибки названо среди маскируемого, а сервер
         // охотно повторяет в ней адрес письма.
         let reason = crate::logging::mask_error_text(error);
@@ -4672,15 +4697,16 @@ impl Db {
     }
 
     pub async fn save_quick_step(&self, input: &QuickStepInput) -> Result<i64> {
-        validate_quick_step_input(input).map_err(crate::Error::Other)?;
+        validate_quick_step_input(input, &self.limit_set()).map_err(crate::Error::Other)?;
         let mut tx = self.begin_write().await?;
         if input.id.is_none() {
             let count: (i64,) = sqlx::query_as("SELECT count(*) FROM quick_steps")
                 .fetch_one(&mut *tx)
                 .await?;
-            if count.0 >= MAX_QUICK_STEPS as i64 {
+            let max_steps = self.limit(LIMIT_QUICK_STEPS);
+            if count.0 >= max_steps {
                 return Err(crate::Error::Other(format!(
-                    "достигнут предел в {MAX_QUICK_STEPS} быстрых действий"
+                    "достигнут предел в {max_steps} быстрых действий"
                 )));
             }
         }
@@ -4863,9 +4889,10 @@ impl Db {
         if message_ids.is_empty() {
             return Err(crate::Error::Other("письмо не выбрано".into()));
         }
-        if message_ids.len() > MAX_QUICK_STEP_MESSAGES {
+        let max_messages = self.limit(LIMIT_QUICK_STEP_MESSAGES);
+        if message_ids.len() as i64 > max_messages {
             return Err(crate::Error::Other(format!(
-                "выберите не больше {MAX_QUICK_STEP_MESSAGES} писем для одного запуска"
+                "выберите не больше {max_messages} писем для одного запуска"
             )));
         }
         let step = self
@@ -4884,7 +4911,7 @@ impl Db {
             &mut tx,
             &format!("m.id IN ({})", id_list(message_ids)),
             Vec::new(),
-            MAX_QUICK_STEP_MESSAGES as i64,
+            max_messages,
         )
         .await?;
         if snapshots.len() != message_ids.len() {
@@ -5145,7 +5172,7 @@ impl Db {
         apply_existing: bool,
         known_rule_ids: Option<&[String]>,
     ) -> Result<MailRule> {
-        validate_rule_input(rule).map_err(crate::Error::AccountConfig)?;
+        validate_rule_input(rule, &self.limit_set()).map_err(crate::Error::AccountConfig)?;
         if rule.actions.iter().any(|action| action.kind == "delete") {
             // S-048: удаление навсегда не имеет отмены, поэтому подтверждение
             // привязано к составу правила и принимается ровно один раз.
@@ -5913,8 +5940,10 @@ impl Db {
         };
         let mut cursor = job.cursor_message_id;
         let mut processed_now = 0_i64;
-        while processed_now < MANUAL_RUN_LIMIT {
-            let batch = MANUAL_RUN_BATCH.min(MANUAL_RUN_LIMIT - processed_now);
+        let run_limit = self.limit(LIMIT_MANUAL_RUN_MESSAGES);
+        let run_batch = self.limit(LIMIT_MANUAL_RUN_BATCH);
+        while processed_now < run_limit {
+            let batch = run_batch.min(run_limit - processed_now);
             let mut tx = self.begin_write().await?;
             // S-065: ручной прогон берёт письма и с признаком backfilled, но
             // только из выбранных папок и только до границы задания.
@@ -7443,8 +7472,8 @@ struct TransferredMessageTraits {
     saved_at: Option<String>,
 }
 
-/// Сколько отложенные приметы ждут возвращения письма.
-const TRAITS_KEEP_DAYS: i64 = 30;
+// Сколько отложенные приметы ждут возвращения письма - настройка
+// LIMIT_MESSAGE_TRAITS_DAYS (crates/core/src/model/limits.rs).
 
 fn transferred_traits_key(account_id: i64, fixed_id: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -7584,6 +7613,7 @@ async fn message_traits_at_risk(
 async fn preserve_message_traits(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: i64,
+    limits: &LimitSet,
 ) -> Result<()> {
     let source: Option<(i64, Option<String>, Option<String>)> =
         sqlx::query_as("SELECT account_id,rfc822_message_id,pinned_at FROM messages WHERE id=?")
@@ -7631,7 +7661,7 @@ async fn preserve_message_traits(
             .await?;
         }
         if let Some(pinned_at) = pinned_at.as_deref() {
-            set_pinned_within_limit(tx, target_id, pinned_at).await?;
+            set_pinned_within_limit(tx, target_id, pinned_at, limits).await?;
         }
     } else if candidates.is_empty() {
         store_transferred_message_traits(tx, account_id, &fixed_id, pinned_at, task).await?;
@@ -7647,6 +7677,7 @@ async fn set_pinned_within_limit(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: i64,
     pinned_at: &str,
+    limits: &LimitSet,
 ) -> Result<()> {
     let room: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM messages
@@ -7657,7 +7688,7 @@ async fn set_pinned_within_limit(
     .bind(message_id)
     .fetch_one(&mut **tx)
     .await?;
-    if room.0 >= MAX_PINNED_PER_ACCOUNT {
+    if room.0 >= limits.get(LIMIT_PINNED_PER_ACCOUNT) {
         return Ok(());
     }
     sqlx::query("UPDATE messages SET pinned_at=? WHERE id=?")
@@ -7673,6 +7704,7 @@ async fn restore_transferred_message_traits(
     account_id: i64,
     fixed_id: &str,
     message_id: i64,
+    limits: &LimitSet,
 ) -> Result<()> {
     let key = transferred_traits_key(account_id, fixed_id);
     let value: Option<(String,)> = sqlx::query_as("SELECT value FROM storage_meta WHERE key=?")
@@ -7692,7 +7724,7 @@ async fn restore_transferred_message_traits(
         .and_then(parse_utc_time)
         .is_some_and(|saved| {
             chrono::Utc::now().signed_duration_since(saved)
-                > chrono::Duration::days(TRAITS_KEEP_DAYS)
+                > chrono::Duration::days(limits.get(LIMIT_MESSAGE_TRAITS_DAYS))
         });
     if expired {
         sqlx::query("DELETE FROM storage_meta WHERE key=?")
@@ -7702,7 +7734,7 @@ async fn restore_transferred_message_traits(
         return Ok(());
     }
     if let Some(pinned_at) = traits.pinned_at {
-        set_pinned_within_limit(tx, message_id, &pinned_at).await?;
+        set_pinned_within_limit(tx, message_id, &pinned_at, limits).await?;
     }
     if let Some(task) = traits.task {
         sqlx::query(
@@ -8279,10 +8311,9 @@ impl From<ContactRow> for Contact {
 
 // ---------- Прогон правил: снимок письма, сопоставление и постановка ----------
 
-/// Размер одной пачки ручного прогона и предел писем за один запуск
-/// (S-068, S-069).
-const MANUAL_RUN_BATCH: i64 = 500;
-const MANUAL_RUN_LIMIT: i64 = 5000;
+// Размер одной пачки ручного прогона и предел писем за один запуск
+// (S-068, S-069) задаются настройками: ключи LIMIT_MANUAL_RUN_BATCH и
+// LIMIT_MANUAL_RUN_MESSAGES (crates/core/src/model/limits.rs).
 
 /// Счётчики отчёта о прогоне (S-073).
 #[derive(Debug, Clone, Copy, Default)]

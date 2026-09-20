@@ -3,7 +3,10 @@
 // Размер страницы писем на папку при полной перезагрузке данных. Список писем
 // сверяется с этим числом, когда решает, исчезло письмо из папки или просто не
 // попало в страницу, - поэтому значение общее, а не локальное.
-window.corePageSize = 100;
+// Размер первой страницы списка - настройка ядра (limit_message_first_page).
+// Число здесь было третьей копией того же размера и молча расходилось с двумя
+// остальными; значение подставляется, как только пределы прочитаны.
+window.corePageSize = null;
 
 (function () {
   const tauri = window.__TAURI__;
@@ -197,6 +200,10 @@ window.corePageSize = 100;
     imageSenderTrusted: (sender) => invoke("image_sender_trusted", { sender }),
     setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
     allSettings: () => invoke("all_settings"),
+    // Пределы приходят из ядра вместе с границами и подписями: в интерфейсе
+    // своих чисел нет, иначе копии расходятся и отказ ядра нечем объяснить.
+    limitSettings: () => invoke("limit_settings"),
+    setLimitSetting: (key, value) => invoke("set_limit_setting", { key, value }),
     setNotifyPosition: (value) => invoke("set_notify_position", { value }),
     openExternal: (url) => invoke("open_external_url", { url }),
     // F7: attemptId - номер попытки подключения (см. wizardAttemptGeneration
@@ -400,6 +407,10 @@ window.corePageSize = 100;
         return;
       }
       const accounts = await window.tm.listAccounts();
+      // Пределы читаются до всего остального: список писем, правила и поля
+      // настроек берут из них свои числа, и до загрузки интерфейсу нечем
+      // решать, сколько писем показывать и что отклонять.
+      await window.reloadLimitSettings?.();
       // Все настройки разом. Перечислять ключи здесь нельзя: забытый ключ -
       // молча не восстановленная настройка (так терялись show_conversations,
       // preview_lines, contacts_view, notify_position).
@@ -459,9 +470,13 @@ window.corePageSize = 100;
         // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE.
         // Gmail проверяет новые ID каждые 25 секунд, а этот проход подхватывает
         // изменения ярлыков/удаления, которые не создали новое входящее письмо.
-        setInterval(() => {
-          window.tm.syncAccounts().catch(console.error);
-        }, 5 * 60 * 1000);
+        // Срок между проходами - настройка ядра, а не число здесь.
+        const syncMinutes = window.limitsModel.limitValue(window.limitsModel.KEYS.backgroundSyncMinutes);
+        if (syncMinutes) {
+          setInterval(() => {
+            window.tm.syncAccounts().catch(console.error);
+          }, syncMinutes * 60 * 1000);
+        }
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
             // Только фоновая синхронизация. Полную перезагрузку списка тут НЕ

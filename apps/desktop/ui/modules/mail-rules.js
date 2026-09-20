@@ -5,11 +5,19 @@
 // как обычный скрипт и отдаёт функции через один глобальный объект.
 // См. specs/mail-rules-conditions-and-actions.md.
 
-// Пределы те же, что проверяет ядро (S-028 - S-030): интерфейс объясняет отказ
-// заранее, но решение всё равно принимает ядро.
-const RULE_MAX_GROUPS = 10;
-const RULE_MAX_CONDITIONS = 10;
-const RULE_MAX_ACTIONS = 10;
+// Пределы приходят из ядра (S-028 - S-030): интерфейс объясняет отказ заранее,
+// но числа берёт у ядра, а не держит свои. Прежде те же три числа стояли и
+// здесь, и в ядре, и расходились при первой же правке.
+const ruleLimits = typeof module === 'object' && module.exports
+  ? require('./limits.js')
+  : globalThis.limitsModel;
+// Пока перечень не загружен, предел не проверяется: выдуманное здесь число и
+// было второй копией.
+const ruleLimit = key => ruleLimits.limitValue(key);
+const overRuleLimit = (count, key) => {
+  const limit = ruleLimit(key);
+  return limit !== null && count > limit;
+};
 
 // Словарь полей условий (S-020). Идентификатор sender означает склейку имени и
 // адреса, точный адрес живёт под собственным sender_address (S-021) и в словарь
@@ -199,15 +207,16 @@ function ruleSizeAmount(value) {
 function validateRule(source) {
   const rule = normalizeRule(source);
   if (!rule.name.trim()) return {ok: false, reason: 'name'};
-  if (rule.groups.length > RULE_MAX_GROUPS || rule.exceptions.length > RULE_MAX_GROUPS) return {ok: false, reason: 'groups_limit'};
+  if (overRuleLimit(rule.groups.length, ruleLimits.KEYS.ruleGroups)
+    || overRuleLimit(rule.exceptions.length, ruleLimits.KEYS.ruleGroups)) return {ok: false, reason: 'groups_limit'};
   if (!rule.groups.length || rule.groups.every(group => !group.conditions.length)) return {ok: false, reason: 'no_conditions'};
   for (const group of rule.groups.concat(rule.exceptions)) {
     if (!group.conditions.length) return {ok: false, reason: 'empty_group'};
-    if (group.conditions.length > RULE_MAX_CONDITIONS) return {ok: false, reason: 'conditions_limit'};
+    if (overRuleLimit(group.conditions.length, ruleLimits.KEYS.groupConditions)) return {ok: false, reason: 'conditions_limit'};
     if (group.conditions.some(condition => !validRuleCondition(condition))) return {ok: false, reason: 'condition_value'};
   }
   if (!rule.actions.length) return {ok: false, reason: 'no_actions'};
-  if (rule.actions.length > RULE_MAX_ACTIONS) return {ok: false, reason: 'actions_limit'};
+  if (overRuleLimit(rule.actions.length, ruleLimits.KEYS.ruleActions)) return {ok: false, reason: 'actions_limit'};
   for (const action of rule.actions) {
     const meta = ruleAction(action.kind);
     if (meta.needs === 'folder' && !action.folder_id && !action.folder_role) return {ok: false, reason: 'action_folder'};
@@ -226,9 +235,9 @@ function validateRule(source) {
 function ruleErrorText(reason, lang) {
   const texts = {
     name: ['Введите название правила', 'Enter a rule name'],
-    groups_limit: [`Групп в правиле не больше ${RULE_MAX_GROUPS}`, `A rule holds at most ${RULE_MAX_GROUPS} groups`],
-    conditions_limit: [`Условий в группе не больше ${RULE_MAX_CONDITIONS}`, `A group holds at most ${RULE_MAX_CONDITIONS} conditions`],
-    actions_limit: [`Действий в правиле не больше ${RULE_MAX_ACTIONS}`, `A rule holds at most ${RULE_MAX_ACTIONS} actions`],
+    groups_limit: [`Групп в правиле не больше ${ruleLimit(ruleLimits.KEYS.ruleGroups)}`, `A rule holds at most ${ruleLimit(ruleLimits.KEYS.ruleGroups)} groups`],
+    conditions_limit: [`Условий в группе не больше ${ruleLimit(ruleLimits.KEYS.groupConditions)}`, `A group holds at most ${ruleLimit(ruleLimits.KEYS.groupConditions)} conditions`],
+    actions_limit: [`Действий в правиле не больше ${ruleLimit(ruleLimits.KEYS.ruleActions)}`, `A rule holds at most ${ruleLimit(ruleLimits.KEYS.ruleActions)} actions`],
     no_conditions: ['Добавьте хотя бы одно условие', 'Add at least one condition'],
     empty_group: ['Группа без условий не сохраняется', 'A group without conditions cannot be saved'],
     condition_value: ['Заполните значения всех условий', 'Fill in every condition value'],
@@ -344,9 +353,7 @@ const mailRulesModel = {
   RULE_ACTIONS,
   RULE_DATE_UNITS,
   RULE_SIZE_UNITS,
-  RULE_MAX_GROUPS,
-  RULE_MAX_CONDITIONS,
-  RULE_MAX_ACTIONS,
+  ruleLimit,
   ruleField,
   ruleAction,
   ruleOperators,

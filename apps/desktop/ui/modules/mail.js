@@ -818,7 +818,7 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
     // Курсор - истинный минимум (старейшая дата, затем наименьший id), иначе при
     // равных датах запрос вернёт уже показанные письма и прокрутка встанет.
     const cursor=existing.reduce((min,message)=>{if(!min)return message;const cmp=String(message.date||'').localeCompare(String(min.date||''));return (cmp<0||(cmp===0&&message.id<min.id))?message:min;},null);
-    let rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);
+    let rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,smartMessagePageSize());
     let fresh=rows.filter(message=>!known.has(message.id));
     // Прогресс - по новым письмам, а не по длине страницы (могут прийти дубли).
     // Нет новых, а на сервере больше - догружаем по папкам-источникам и повторяем.
@@ -875,7 +875,7 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
           backfillFailed=true;visited.delete(source.id);console.error('truemail smart backfill:',error);
         }
       }
-      if(fetchedAny){rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,SMART_MESSAGE_PAGE_SIZE);fresh=rows.filter(message=>!known.has(message.id));}
+      if(fetchedAny){rows=await window.tm.listSmartFolderMessages(folder.id,cursor?(cursor.date||''):null,cursor?.id||null,smartMessagePageSize());fresh=rows.filter(message=>!known.has(message.id));}
       // Круг закрыт - все папки-источники опрошены и ни один запрос не упал.
       circleClosed=!backfillFailed&&candidates.every(source=>visited.has(source.id));
       // Исчерпанной папку считаем, только когда круг закрыт и сервер за весь
@@ -977,7 +977,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
      приходят перечнем любой давности, и по ним край уезжал в прошлое, унося
      почти все догруженные страницы (S-021). Курсор пересевается уже по
      уцелевшему набору. */
-  {const fresh=loadedMessages.map(applyPendingSeen).filter(message=>!message.pinned_at),merged=pinMessageModel.mergeReloadedPages({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},{fresh,pageSize:window.corePageSize||100});messages=trimMessages(merged.pinned.concat(merged.normal),fresh.map(message=>message.id));window.seedOrdinaryPageCursors?.(messages);}
+  {const fresh=loadedMessages.map(applyPendingSeen).filter(message=>!message.pinned_at),merged=pinMessageModel.mergeReloadedPages({pinned:messages.filter(message=>message.pinned_at),normal:messages.filter(message=>!message.pinned_at)},{fresh,pageSize:messageInitialPageSize()});messages=trimMessages(merged.pinned.concat(merged.normal),fresh.map(message=>message.id));window.seedOrdinaryPageCursors?.(messages);}
   coreSmartRows.clear();smartHasMore.clear();if(savedSmartFolders.length){const activeId=smartFolders[previousSmart]?.id;smartFolders.splice(0,smartFolders.length,...normalizedSmartFolders(savedSmartFolders.map(smartFolderFromCore)));if(activeId){const restored=smartFolders.findIndex(folder=>folder.id===activeId);if(restored>=0)previousSmart=restored;}renderSmartManagement();bindSmartNavigation();}
   // Счётчики умных папок пересчитываем после каждой перезагрузки данных: письма
   // могли прийти, уйти или стать прочитанными. Прежние числа возвращаем на
@@ -1004,7 +1004,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   // цикла по папкам давал квадратичный обход (десятки папок на десятки тысяч
   // писем) и заметно грузил процессор на каждой перезагрузке данных.
   {const localCounts=new Map();messages.filter(message=>!message.pinned_at).forEach(message=>localCounts.set(message.folder_id,(localCounts.get(message.folder_id)||0)+1));
-   coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount>=MESSAGE_INITIAL_PAGE_SIZE||(folder.total_count||0)>localCount);});}
+   coreFolders.forEach(folder=>{const localCount=localCounts.get(folder.id)||0;folderHasMore.set(folder.id,localCount>=messageInitialPageSize()||(folder.total_count||0)>localCount);});}
   const labels=[...document.querySelectorAll('.nav .navlabel')];
   const accountsLabel=document.querySelector('.nav [data-navlabel="accounts"]')||labels.find(el=>el.textContent.includes('Аккаунты'))||labels[1];
   let anchor=accountsLabel;

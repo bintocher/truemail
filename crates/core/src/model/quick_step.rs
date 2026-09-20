@@ -3,8 +3,9 @@
 use super::MailRuleAction;
 use serde::{Deserialize, Serialize};
 
-pub const MAX_QUICK_STEPS: usize = 20;
-pub const MAX_QUICK_STEP_MESSAGES: usize = 500;
+// Число быстрых действий и число писем, обрабатываемых одним быстрым
+// действием, задаются настройками: ключи LIMIT_QUICK_STEPS и
+// LIMIT_QUICK_STEP_MESSAGES (crates/core/src/model/limits.rs).
 /// Слотов горячих клавиш ровно столько, сколько цифр на ряду клавиатуры,
 /// поэтому номер слота проверяют и правила, и хранилище, и разбор сочетания.
 pub const QUICK_STEP_SLOTS: i64 = 10;

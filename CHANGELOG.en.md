@@ -7,6 +7,20 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-20
+
+### Added
+
+- Limits and periods are now configurable. Settings have a new "Limits" section: how many messages can be pinned in a mailbox, how many actions a quick step may chain, how long completed tasks are kept, how often the auto reply writes to the same person, how many messages a list page loads, and so on. These numbers used to be built into the program: you hit a limit nobody had written down and could not tell why the program refused. Every field says in plain words what it affects.
+
+### Fixed
+
+- The "what is new" window can be read to the end. It used to disappear the moment the pointer left the update button, so a long list of changes could not be read at all. The window now stays while the pointer is over it, and scrolling or a click inside pins it: it closes on the escape key or a click outside. The release notes are also split into sections and lists instead of raw text with hashes and dashes.
+- A keyboard shortcut can be cleared. An assigned combination could not be removed at all, and pressing Del to erase it produced an error. Every field now has a clear button.
+- The pinned message limit no longer disagrees with what the program shows. The list made room for 50 pinned messages while only 20 could be pinned, and the refusal explained nothing.
+- The quick step count limit never applied: the program compared against a value that did not exist.
+
+
 ## [0.3.1] - 2026-09-19
 
 ### Fixed

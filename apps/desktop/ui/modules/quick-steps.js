@@ -1,12 +1,18 @@
 'use strict';
 (function(root, factory) {
   const rules = typeof module === 'object' && module.exports ? require('./mail-rules.js') : root.mailRulesModel;
-  const api = factory(rules);
+  const limits = typeof module === 'object' && module.exports ? require('./limits.js') : root.limitsModel;
+  const api = factory(rules, limits);
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.quickStepsModel = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function(rules) {
-  const MAX_ACTIONS = 10;
-  const MAX_MESSAGES = 500;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function(rules, limits) {
+  // Число действий в цепочке, число писем за один запуск и число самих
+  // быстрых действий - настройки ядра. Прежде первые два числа стояли здесь
+  // копией, а предел числа быстрых действий интерфейс спрашивал у несу-
+  // ществующего поля и не проверял вовсе.
+  const maxActions = () => limits.limitValue(limits.KEYS.ruleActions);
+  const maxMessages = () => limits.limitValue(limits.KEYS.quickStepMessages);
+  const maxSteps = () => limits.limitValue(limits.KEYS.quickSteps);
   const TOOLBAR_KEY_PREFIX = 'quick_step:';
   const QUICK_STEP_SLOT_ACTIONS = Array.from({length: 10}, (_, index) => `quick_step_${index + 1}`);
   // Закрытый перечень значков. Свободная строка значка подставляется в
@@ -73,7 +79,8 @@
     const step = normalizeQuickStep(source);
     if (!step.name.trim() || [...step.name.trim()].length > 40) return {ok: false, reason: 'name'};
     if (!step.actions.length) return {ok: false, reason: 'empty'};
-    if (step.actions.length > MAX_ACTIONS) return {ok: false, reason: 'actions_limit'};
+    const actionsLimit = maxActions();
+    if (actionsLimit !== null && step.actions.length > actionsLimit) return {ok: false, reason: 'actions_limit'};
     let takeaway = -1;
     const choices = availableActions();
     for (let index = 0; index < step.actions.length; index++) {
@@ -189,10 +196,11 @@
   }
 
   function quickStepLimitError(count, lang = 'ru') {
-    if (Number(count) <= MAX_MESSAGES) return null;
+    const messagesLimit = maxMessages();
+    if (messagesLimit === null || Number(count) <= messagesLimit) return null;
     return lang === 'en'
-      ? `Select no more than ${MAX_MESSAGES} messages`
-      : `Выберите не больше ${MAX_MESSAGES} писем`;
+      ? `Select no more than ${messagesLimit} messages`
+      : `Выберите не больше ${messagesLimit} писем`;
   }
 
   function attentionText(lang) {
@@ -272,8 +280,9 @@
   }
 
   return {
-    MAX_ACTIONS,
-    MAX_MESSAGES,
+    maxActions,
+    maxMessages,
+    maxSteps,
     QUICK_STEP_SLOT_ACTIONS,
     ICONS,
     FOLDER_ROLES,

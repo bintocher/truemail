@@ -17,12 +17,10 @@ pub const MAX_MESSAGE_ID_BYTES: usize = 998;
 pub const MAX_SNAPSHOT_BYTES: usize = 4096;
 /// Из одного заголовка References берётся не более 1000 идентификаторов.
 pub const MAX_REFERENCES: usize = 1000;
-/// Предел набора одной переписки (S-028).
-pub const MAX_CONVERSATION_IDS: usize = 1000;
-/// Предел числа включённых переписок (S-029).
-pub const MAX_IGNORED_CONVERSATIONS: i64 = 1000;
-/// Срок ожидания письма в корзине при возврате (S-042).
-pub const RETURN_WAIT_DAYS: i64 = 7;
+// Предел набора одной переписки (S-028), предел числа включённых переписок
+// (S-029) и срок ожидания письма в корзине при возврате (S-042) задаются
+// настройками: ключи LIMIT_CONVERSATION_IDS, LIMIT_IGNORED_CONVERSATIONS и
+// LIMIT_IGNORE_RETURN_WAIT_DAYS (crates/core/src/model/limits.rs).
 
 /// Состояния записи игнорируемой переписки (S-032).
 pub const IGNORE_STATE_ENABLED: &str = "enabled";

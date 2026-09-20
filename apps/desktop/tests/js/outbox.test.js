@@ -9,6 +9,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const outbox = require('../../ui/modules/outbox.js');
+const {limits, applyTestLimits} = require('./limits-fixture.js');
 
 // Раздел настроек живёт в queue-sections.js и работает с DOM. Чтобы проверять
 // рабочий путь, а не отдельную функцию рядом с ним, модуль выполняется целиком
@@ -147,7 +148,16 @@ test('S-012: пустое поле длительности окна отмен�
   await change({target: field});
   assert.deepEqual(saved, [7], 'допустимое значение сохраняется');
 
-  field.value = '61';
+  // Верхняя граница окна отмены - настройка ядра. Число здесь нарочно не то,
+  // что у ядра по умолчанию: прежде граница была записана тремя копиями - в
+  // ядре, в модуле и в атрибутах min/max самой разметки.
+  applyTestLimits({[limits.KEYS.undoSendMin]: 0, [limits.KEYS.undoSendMax]: 30});
+  field.value = '30';
   await change({target: field});
-  assert.deepEqual(saved, [7], 'значение вне границ в ядро не уходит');
+  assert.deepEqual(saved, [7, 30], 'значение на верхней границе сохраняется');
+
+  field.value = '31';
+  await change({target: field});
+  assert.deepEqual(saved, [7, 30], 'значение вне границ в ядро не уходит');
+  assert.deepEqual(outbox.undoSecondsBounds(), {min: 0, max: 30}, 'границы поля берутся из настроек');
 });

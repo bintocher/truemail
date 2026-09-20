@@ -684,7 +684,7 @@ async fn initial_backfill_walks_past_the_first_batch() {
     let db: TestDb = open_test_db("history-backfill").await;
     let account = seed_account(&db, "me@example.test").await;
     let sent = seed_folder(&db, account, "Sent", Some("sent")).await;
-    let letters = BACKFILL_BATCH + 20;
+    let letters = LimitSet::defaults().get(LIMIT_PURGE_BATCH) + 20;
     let mut tx = db.begin_write().await.expect("открыть запись");
     for uid in 1..=letters {
         sqlx::query(

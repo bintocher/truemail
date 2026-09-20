@@ -1,10 +1,14 @@
 'use strict';
 (function(root, factory) {
-  const api = factory();
+  const limits = typeof module === 'object' && module.exports ? require('./limits.js') : root.limitsModel;
+  const api = factory(limits);
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.pinMessageModel = api;
-})(typeof globalThis !== 'undefined' ? globalThis : this, function() {
-  const PINNED_VISIBLE_LIMIT = 50;
+})(typeof globalThis !== 'undefined' ? globalThis : this, function(limits) {
+  // Сколько закреплённых писем видно вверху списка - настройка ядра, а не
+  // число здесь: пока их было два, список показывал место под пятьдесят
+  // писем, а закрепить ядро давало двадцать.
+  const visibleLimit = () => limits.limitValue(limits.KEYS.pinnedVisible);
 
   function messageValue(message, sort) {
     if (sort === 'sender') return String(message.from?.name || message.from?.email || '');
@@ -87,7 +91,10 @@
       options,
     );
     const ordinaryRows = collapsedRows(filteredOrdinary, options);
-    const shown = filteredPinned.slice(0, PINNED_VISIBLE_LIMIT);
+    // Перечень пределов ещё не загружен - показываем всё, что пришло:
+    // придуманное здесь число и было второй копией предела.
+    const limit = visibleLimit();
+    const shown = limit === null ? filteredPinned : filteredPinned.slice(0, limit);
     const hidden = Math.max(0, filteredPinned.length - shown.length);
     return {
       pinned: shown,
@@ -211,7 +218,7 @@
   }
 
   return {
-    PINNED_VISIBLE_LIMIT,
+    visibleLimit,
     compareMessages,
     conversationKey,
     filterMessages,

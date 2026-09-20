@@ -93,23 +93,82 @@
   const notesHead=document.getElementById('updateNotesHead');
   const notesBody=document.getElementById('updateNotesBody');
   let updateNotes={version:'',text:''};
+  // Описание выпуска приходит из манифеста обновления, то есть снаружи
+  // программы: узлы собираем сами, строку в разметку не подставляем никогда.
+  function fillUpdateNotes(){
+    notesBody.textContent='';
+    const nodes=releaseNotes.parseReleaseNotes(updateNotes.text);
+    if(!nodes.length){
+      notesBody.textContent=L('Описание выпуска не приложено.','The release notes are not attached.');
+      return;
+    }
+    let list=null;
+    for(const node of nodes){
+      if(node.kind==='item'){
+        if(!list){list=document.createElement('ul');list.className='update-notes-list';notesBody.appendChild(list);}
+        const item=document.createElement('li');item.textContent=node.text;list.appendChild(item);
+        continue;
+      }
+      list=null;
+      const block=document.createElement(node.kind==='heading'?'h4':'p');
+      block.className=node.kind==='heading'?'update-notes-section':'update-notes-text';
+      block.textContent=node.text;
+      notesBody.appendChild(block);
+    }
+  }
+  // Окно держится, пока указатель над кнопкой или над самим окном. Между ними
+  // есть зазор, и без задержки окно исчезало раньше, чем мышь успевала его
+  // пересечь - длинное описание было невозможно пролистать (issue #99).
+  const NOTES_HIDE_DELAY=260;
+  let notesHideTimer=null,notesPinned=false;
+  function cancelNotesHide(){if(notesHideTimer){clearTimeout(notesHideTimer);notesHideTimer=null;}}
   function showUpdateNotes(){
     if(!notesBox||!updateNotes.version)return;
+    cancelNotesHide();
     notesHead.textContent=L(`Что нового в truemail ${updateNotes.version}`,`What is new in truemail ${updateNotes.version}`);
-    notesBody.textContent=updateNotes.text||L('Описание выпуска не приложено.','The release notes are not attached.');
+    fillUpdateNotes();
     notesBox.classList.remove('hidden');
     notesBox.setAttribute('aria-hidden','false');
   }
   function hideUpdateNotes(){
+    cancelNotesHide();
     if(!notesBox)return;
+    notesPinned=false;
+    notesBox.classList.remove('pinned');
     notesBox.classList.add('hidden');
     notesBox.setAttribute('aria-hidden','true');
+    notesBox.scrollTop=0;
+  }
+  // Закреплённое окно уводом указателя не закрывается: пользователь читает
+  // длинный список и может увести мышь куда угодно.
+  function scheduleNotesHide(){
+    if(notesPinned)return;
+    cancelNotesHide();
+    notesHideTimer=setTimeout(hideUpdateNotes,NOTES_HIDE_DELAY);
+  }
+  function pinUpdateNotes(){
+    if(!notesBox||notesBox.classList.contains('hidden'))return;
+    cancelNotesHide();
+    notesPinned=true;
+    notesBox.classList.add('pinned');
   }
   updateButton?.addEventListener('mouseenter',showUpdateNotes);
   updateButton?.addEventListener('focus',showUpdateNotes);
-  updateButton?.addEventListener('mouseleave',hideUpdateNotes);
-  updateButton?.addEventListener('blur',hideUpdateNotes);
-  notesBox?.addEventListener('mouseleave',hideUpdateNotes);
+  updateButton?.addEventListener('mouseleave',scheduleNotesHide);
+  updateButton?.addEventListener('blur',scheduleNotesHide);
+  notesBox?.addEventListener('mouseenter',cancelNotesHide);
+  notesBox?.addEventListener('mouseleave',scheduleNotesHide);
+  // Прокрутка колесом и нажатие внутри окна означают, что его читают.
+  notesBox?.addEventListener('wheel',pinUpdateNotes,{passive:true});
+  notesBox?.addEventListener('pointerdown',pinUpdateNotes);
+  document.addEventListener('pointerdown',event=>{
+    if(!notesPinned)return;
+    if(notesBox?.contains(event.target)||updateButton?.contains(event.target))return;
+    hideUpdateNotes();
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&notesPinned)hideUpdateNotes();
+  });
   window.showUpdateButton=function(version,downloaded,notes){
     if(!updateButton||installing)return;
     updateButton.classList.remove('hidden');

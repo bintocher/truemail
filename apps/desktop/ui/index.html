@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260918-4">
+  <link rel="stylesheet" href="styles.css?v=20260920-1">
 </head>
 <body>
 
@@ -168,6 +168,7 @@
       <button type="button" class="sec" data-set="storage"><i data-i="storage"></i><span data-i18n="setStorageNav">Хранилище и кэш</span></button>
       <button type="button" class="sec" data-set="themes"><i data-i="palette"></i><span data-i18n="setThemes">Темы и оформление</span></button>
       <button type="button" class="sec" data-set="api"><i data-i="server"></i><span>API / MCP</span></button>
+      <button type="button" class="sec" data-set="limits"><i data-i="sliders"></i><span data-i18n="setLimits">Пределы</span></button>
       <button type="button" class="sec" data-set="privacy"><i data-i="shield"></i><span data-i18n="setPrivacy">Приватность</span></button>
       <button type="button" class="sec" data-set="keys"><i data-i="keyboard"></i><span data-i18n="setKeys">Горячие клавиши</span></button>
     </nav>
@@ -185,7 +186,7 @@
           <div class="frow hidden" id="sendToRow"><div class="fl"><div class="t" data-i18n="sendToMenu">Пункт truemail в меню "Отправить"</div><div class="d" data-i18n="sendToMenuDesc">В контекстном меню проводника появится "Отправить -> truemail": выбранные файлы сразу лягут вложениями в новое письмо.</div></div><div class="fc"><div class="toggle" id="sendToToggle"></div></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="applicationUpdates">Обновления программы</div><div class="d" id="updateStatus" data-i18n="applicationUpdatesDesc">Новые подписанные версии проверяются автоматически.</div></div><div class="fc"><button class="btn" id="checkUpdates" type="button"><i data-i="sync"></i><span data-i18n="checkUpdates">Проверить</span></button></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="notifyPosition">Где показывать уведомления</div><div class="d" data-i18n="notifyPositionDesc">Угол основного монитора, в котором появляются карточки о новых письмах и напоминания.</div></div><div class="fc"><select class="sel" id="notifyPosition"><option value="top-left" data-i18n="notifyTopLeft">Сверху слева</option><option value="top-center" data-i18n="notifyTopCenter">Сверху по центру</option><option value="top-right" data-i18n="notifyTopRight">Сверху справа</option><option value="bottom-left" data-i18n="notifyBottomLeft">Снизу слева</option><option value="bottom-center" data-i18n="notifyBottomCenter">Снизу по центру</option><option value="bottom-right" data-i18n="notifyBottomRight">Снизу справа</option></select></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="undoSendTitle">Окно отмены отправки</div><div class="d" data-i18n="undoSendDesc">Сколько секунд письмо ждёт перед отправкой на сервер. Всё это время его можно вернуть в композер. Значение 0 отправляет письмо сразу. Одно значение на все ящики.</div></div><div class="fc"><input type="number" class="inp" id="undoSendSeconds" min="0" max="60" step="1" value="5"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="undoSendTitle">Окно отмены отправки</div><div class="d" data-i18n="undoSendDesc">Сколько секунд письмо ждёт перед отправкой на сервер. Всё это время его можно вернуть в композер. Значение 0 отправляет письмо сразу. Одно значение на все ящики.</div></div><div class="fc"><input type="number" class="inp" id="undoSendSeconds" step="1"><!-- границы и значение ставит ядро: min/max в разметке были третьей копией предела --></div></div>
           <div class="frow"><div class="fl"><div class="t" data-i18n="setupWizard">Мастер настройки</div><div class="d" data-i18n="setupWizardDesc">Повторно выбрать язык и подключить аккаунт.</div></div><div class="fc"><button class="btn" id="restartWizard"><i data-i="user"></i><span data-i18n="run">Запустить</span></button></div></div>
         </div></div>
       </div>
@@ -275,7 +276,7 @@
           <div class="btn-row mt-20"><button class="btn primary" id="ruleSave"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="ruleCancel" data-i18n="cancel">Отмена</button><button class="btn danger-btn ml-auto hidden" id="ruleDelete"><i data-i="trash"></i><span data-i18n="deleteRule">Удалить правило</span></button></div>
         </div></div>
         <div class="card mt-20 hidden" id="ruleRunPanel"><div class="ch"><span data-i18n="ruleRunTitle">Ручной прогон правил</span></div><div class="cb">
-          <p class="note-muted" data-i18n="ruleRunHint">Выберите папки: правила пройдут по их письмам, включая поднятые прокруткой. За один запуск разбирается не больше 5000 писем.</p>
+          <p class="note-muted" data-i18n="ruleRunHint">Выберите папки: правила пройдут по их письмам, включая поднятые прокруткой. Сколько писем разбирается за один запуск, задаётся в разделе "Пределы".</p>
           <div id="ruleRunFolders" class="rule-run-folders"></div>
           <div class="btn-row mt-20"><button class="btn primary" id="ruleRunStart"><i data-i="check"></i><span data-i18n="ruleRunStart">Запустить</span></button><button class="btn hidden" id="ruleRunContinue" data-i18n="ruleRunContinue">Продолжить</button><button class="btn" id="ruleRunClose" data-i18n="close">Закрыть</button></div>
           <p class="note-muted" id="ruleRunReport"></p>
@@ -313,7 +314,7 @@
           <div class="t mt-20" data-i18n="absenceExternalText">Текст для внешних отправителей</div>
           <textarea class="inp" id="absenceExternal" rows="3"></textarea>
           <div class="t mt-20" data-i18n="absenceDomains">Внутренние домены</div>
-          <div class="d" data-i18n="absenceDomainsDesc">Отправители этих доменов и их поддоменов получают текст для своих. Не больше 20 значений, через запятую.</div>
+          <div class="d" data-i18n="absenceDomainsDesc">Отправители этих доменов и их поддоменов получают текст для своих. Через запятую, число доменов задаётся в разделе "Пределы".</div>
           <input type="text" class="inp" id="absenceDomains">
           <div class="btn-row mt-20"><button class="btn primary" id="absenceSave" type="button"><i data-i="check"></i><span data-i18n="save">Сохранить</span></button><button class="btn" id="absenceDisable" type="button"><i data-i="close"></i><span data-i18n="absenceDisableAction">Отключить</span></button></div>
           <div class="wz-connect-status" id="absenceStatus" aria-live="polite" data-no-i18n></div>
@@ -405,6 +406,13 @@
         <div class="card"><div class="ch"><span data-i18n="apiRecentCalls">Последние вызовы</span><button class="btn sm ml-auto" id="apiAuditRefresh" data-i18n="refresh">Обновить</button><button class="btn sm" id="apiAuditClear" data-i18n="clear">Очистить</button></div><div class="cb api-audit-list" id="apiAuditList"></div></div>
       </div>
 
+      <div class="setpage" id="set-limits">
+        <h1 data-i18n="limitsTitle">Пределы и сроки</h1><p class="lead" data-i18n="limitsLead">Числа, которые задают поведение программы. У каждого значения есть границы, значение вне границ отклоняется с объяснением.</p>
+        <!-- Поля раздела строятся по перечню ядра (limit_settings): границы,
+             подписи и рабочие значения приходят оттуда, в разметке их нет. -->
+        <div id="limitsBody" data-no-i18n></div>
+      </div>
+
       <div class="setpage" id="set-privacy">
         <h1 data-i18n="privacyTitle">Приватность и безопасность</h1><p class="lead" data-i18n="privacyLead">Безопасные настройки уже действуют. Здесь - только то, где выбор реально за вами.</p>
         <div class="card"><div class="ch"><i data-i="shield"></i><span data-i18n="protectionOn">Защита включена</span></div><div class="cb"><p class="note-muted" data-i18n="protectionDesc">HTML-письма открываются без скриптов в изолированном контейнере. Удалённые изображения блокируются; разрешение можно дать отдельно для конкретного отправителя. База и локальные файлы зашифрованы.</p></div></div>
@@ -413,30 +421,30 @@
       <div class="setpage" id="set-keys">
         <h1 data-i18n="setKeys">Горячие клавиши</h1><p class="lead" data-i18n="keysLead">Текущие рабочие сочетания клавиш.</p>
         <div class="card"><div class="ch"><i data-i="settings"></i><span data-i18n="globalShortcuts">Глобальные (работают даже когда окно свёрнуто)</span> <span class="help" data-i18n-tip="globalShortcutsTip" data-tip="Системные горячие клавиши: срабатывают во всей ОС, даже если truemail свёрнут или вы в другой программе. Например, быстро написать письмо или показать окно, не открывая приложение мышью.">?</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keyToggleApp">Показать / скрыть truemail</div></div><div class="fc"><input class="inp keybind-input" data-key-action="toggle_window" value="Ctrl+Shift+M"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keyComposeGlobal">Написать письмо (из любого места)</div></div><div class="fc"><input class="inp keybind-input" data-key-action="compose_global" value="Ctrl+Shift+C"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keyQuickSearch">Быстрый поиск по почте</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_search" value="Ctrl+Shift+F"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keyToggleApp">Показать / скрыть truemail</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="toggle_window" value="Ctrl+Shift+M"><button type="button" class="keybind-clear" data-key-clear="toggle_window" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keyComposeGlobal">Написать письмо (из любого места)</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="compose_global" value="Ctrl+Shift+C"><button type="button" class="keybind-clear" data-key-clear="compose_global" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keyQuickSearch">Быстрый поиск по почте</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_search" value="Ctrl+Shift+F"><button type="button" class="keybind-clear" data-key-clear="quick_search" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
         </div></div>
         <div class="card"><div class="ch"><i data-i="inbox"></i><span data-i18n="localShortcuts">Локальные (внутри приложения)</span> <span class="help" data-i18n-tip="localShortcutsTip" data-tip="Действуют, когда открыто окно truemail. Классические почтовые сочетания для быстрой работы без мыши.">?</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keySearchCommands">Поиск и команды</div></div><div class="fc"><input class="inp keybind-input" data-key-action="palette" value="Ctrl+K"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keyCompose">Написать письмо</div></div><div class="fc"><input class="inp keybind-input" data-key-action="compose" value="C"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="actionReply">Ответить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="reply" value="R"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="actionReplyAll">Ответить всем</div></div><div class="fc"><input class="inp keybind-input" data-key-action="reply_all" value="A"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="actionForward">Переслать</div></div><div class="fc"><input class="inp keybind-input" data-key-action="forward" value="F"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="actionArchive">В архив</div></div><div class="fc"><input class="inp keybind-input" data-key-action="archive" value="E"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="snooze">Отложить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="snooze" value="H"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="keyNextPrev">Следующее / предыдущее письмо</div></div><div class="fc fc-inline"><input class="inp keybind-input keybind-short" data-key-action="next_message" value="J"><input class="inp keybind-input keybind-short" data-key-action="prev_message" value="K"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="actionDelete">Удалить</div></div><div class="fc"><input class="inp keybind-input" data-key-action="delete" value="Del"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot1">Быстрое действие 1</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_1" placeholder="Ctrl+Shift+1"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot2">Быстрое действие 2</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_2" placeholder="Ctrl+Shift+2"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot3">Быстрое действие 3</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_3" placeholder="Ctrl+Shift+3"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot4">Быстрое действие 4</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_4" placeholder="Ctrl+Shift+4"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot5">Быстрое действие 5</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_5" placeholder="Ctrl+Shift+5"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot6">Быстрое действие 6</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_6" placeholder="Ctrl+Shift+6"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot7">Быстрое действие 7</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_7" placeholder="Ctrl+Shift+7"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot8">Быстрое действие 8</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_8" placeholder="Ctrl+Shift+8"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot9">Быстрое действие 9</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_9" placeholder="Ctrl+Shift+9"></div></div>
-          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot10">Быстрое действие 10</div></div><div class="fc"><input class="inp keybind-input" data-key-action="quick_step_10" placeholder="Ctrl+Shift+0"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keySearchCommands">Поиск и команды</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="palette" value="Ctrl+K"><button type="button" class="keybind-clear" data-key-clear="palette" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keyCompose">Написать письмо</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="compose" value="C"><button type="button" class="keybind-clear" data-key-clear="compose" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="actionReply">Ответить</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="reply" value="R"><button type="button" class="keybind-clear" data-key-clear="reply" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="actionReplyAll">Ответить всем</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="reply_all" value="A"><button type="button" class="keybind-clear" data-key-clear="reply_all" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="actionForward">Переслать</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="forward" value="F"><button type="button" class="keybind-clear" data-key-clear="forward" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="actionArchive">В архив</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="archive" value="E"><button type="button" class="keybind-clear" data-key-clear="archive" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="snooze">Отложить</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="snooze" value="H"><button type="button" class="keybind-clear" data-key-clear="snooze" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="keyNextPrev">Следующее / предыдущее письмо</div></div><div class="fc fc-inline"><input class="inp keybind-input keybind-short" data-key-action="next_message" value="J"><button type="button" class="keybind-clear" data-key-clear="next_message" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button><input class="inp keybind-input keybind-short" data-key-action="prev_message" value="K"><button type="button" class="keybind-clear" data-key-clear="prev_message" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="actionDelete">Удалить</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="delete" value="Del"><button type="button" class="keybind-clear" data-key-clear="delete" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot1">Быстрое действие 1</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_1" placeholder="Ctrl+Shift+1"><button type="button" class="keybind-clear" data-key-clear="quick_step_1" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot2">Быстрое действие 2</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_2" placeholder="Ctrl+Shift+2"><button type="button" class="keybind-clear" data-key-clear="quick_step_2" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot3">Быстрое действие 3</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_3" placeholder="Ctrl+Shift+3"><button type="button" class="keybind-clear" data-key-clear="quick_step_3" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot4">Быстрое действие 4</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_4" placeholder="Ctrl+Shift+4"><button type="button" class="keybind-clear" data-key-clear="quick_step_4" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot5">Быстрое действие 5</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_5" placeholder="Ctrl+Shift+5"><button type="button" class="keybind-clear" data-key-clear="quick_step_5" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot6">Быстрое действие 6</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_6" placeholder="Ctrl+Shift+6"><button type="button" class="keybind-clear" data-key-clear="quick_step_6" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot7">Быстрое действие 7</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_7" placeholder="Ctrl+Shift+7"><button type="button" class="keybind-clear" data-key-clear="quick_step_7" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot8">Быстрое действие 8</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_8" placeholder="Ctrl+Shift+8"><button type="button" class="keybind-clear" data-key-clear="quick_step_8" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot9">Быстрое действие 9</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_9" placeholder="Ctrl+Shift+9"><button type="button" class="keybind-clear" data-key-clear="quick_step_9" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="quickStepSlot10">Быстрое действие 10</div></div><div class="fc keybind-cell"><input class="inp keybind-input" data-key-action="quick_step_10" placeholder="Ctrl+Shift+0"><button type="button" class="keybind-clear" data-key-clear="quick_step_10" data-i18n-title="keyClearTitle" title="Снять сочетание"><i data-i="close"></i></button></div></div>
         </div></div>
       </div>
 
@@ -787,22 +795,23 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.3.1"></script>
+<script src="modules/app-version.js?v=0.3.2"></script>
+<script src="modules/limits.js?v=20260920-1"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
-<script src="modules/shell.js?v=20260919-2"></script>
+<script src="modules/shell.js?v=20260920-1"></script>
 <script src="modules/calendar-contacts.js?v=20260919-1"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
-<script src="modules/commands-accessibility.js?v=20260918-2"></script>
-<script src="modules/mail-rules.js?v=20260918-2"></script>
+<script src="modules/commands-accessibility.js?v=20260920-1"></script>
+<script src="modules/mail-rules.js?v=20260920-1"></script>
 <script src="modules/flag-due-dates.js?v=20260919-1"></script>
-<script src="modules/pin-message.js?v=20260919-2"></script>
-<script src="modules/quick-steps.js?v=20260919-2"></script>
+<script src="modules/pin-message.js?v=20260920-1"></script>
+<script src="modules/quick-steps.js?v=20260920-1"></script>
 <script src="modules/sender-lists.js?v=20260918-2"></script>
-<script src="modules/smart-rules.js?v=20260919-2"></script>
-<script src="modules/i18n-onboarding.js?v=20260918-5"></script>
+<script src="modules/smart-rules.js?v=20260920-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260920-1"></script>
 <script src="modules/error-presentation.js?v=20260918-1"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
@@ -810,18 +819,19 @@
 <script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260916-1"></script>
-<script src="modules/mail.js?v=20260919-2"></script>
+<script src="modules/mail.js?v=20260920-1"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
-<script src="modules/outbox.js?v=20260918-3"></script>
-<script src="modules/out-of-office.js?v=20260918-2"></script>
-<script src="modules/recipient-history.js?v=20260918-1"></script>
+<script src="modules/outbox.js?v=20260920-1"></script>
+<script src="modules/out-of-office.js?v=20260920-1"></script>
+<script src="modules/recipient-history.js?v=20260920-1"></script>
 <script src="modules/composer.js?v=20260918-8"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260919-1"></script>
+<script src="modules/settings.js?v=20260920-1"></script>
 <script src="modules/sender-actions.js?v=20260918-2"></script>
-<script src="modules/queue-sections.js?v=20260918-3"></script>
-<script src="modules/window-chrome.js?v=20260918-1"></script>
-<script src="bridge.js?v=20260919-1"></script>
+<script src="modules/queue-sections.js?v=20260920-1"></script>
+<script src="modules/release-notes.js?v=20260919-1"></script>
+<script src="modules/window-chrome.js?v=20260919-3"></script>
+<script src="bridge.js?v=20260920-1"></script>
 <div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

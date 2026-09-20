@@ -199,7 +199,7 @@ impl Db {
         &self,
         input: SenderSweepInput,
     ) -> Result<SenderSweepPreview> {
-        validate_sweep_input(&input).map_err(crate::Error::AccountConfig)?;
+        validate_sweep_input(&input, &self.limit_set()).map_err(crate::Error::AccountConfig)?;
         // S-046: адрес нормализуется так же, как значение списков отправителей.
         let address =
             normalize_policy_address(&input.address).map_err(crate::Error::AccountConfig)?;
@@ -283,7 +283,7 @@ impl Db {
         input: SenderSweepInput,
         snapshot_key: &str,
     ) -> Result<SenderSweepJobReport> {
-        validate_sweep_input(&input).map_err(crate::Error::AccountConfig)?;
+        validate_sweep_input(&input, &self.limit_set()).map_err(crate::Error::AccountConfig)?;
         let address =
             normalize_policy_address(&input.address).map_err(crate::Error::AccountConfig)?;
         let mut tx = self.begin_write().await?;
@@ -463,13 +463,16 @@ impl Db {
                 "у записи автоочистки бывает только режим \"только последнее\" или \"старше N дней\"".into(),
             ));
         }
-        validate_sweep_input(&SenderSweepInput {
-            address: String::new(),
-            mode: mode.to_owned(),
-            account_id: None,
-            days,
-            sweep_archive,
-        })
+        validate_sweep_input(
+            &SenderSweepInput {
+                address: String::new(),
+                mode: mode.to_owned(),
+                account_id: None,
+                days,
+                sweep_archive,
+            },
+            &self.limit_set(),
+        )
         .map_err(crate::Error::AccountConfig)?;
         let changed = sqlx::query(
             "UPDATE sender_sweep_rules

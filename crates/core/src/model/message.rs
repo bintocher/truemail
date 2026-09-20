@@ -52,9 +52,11 @@ pub struct MessageMeta {
     pub task_state: Option<String>,
 }
 
-/// Предел закреплений на ящик (S-007, S-008). Держим число в ядре: предел
-/// проверяется при закреплении, а интерфейс только показывает отказ.
-pub const MAX_PINNED_PER_ACCOUNT: i64 = 20;
+// Предел закреплений на ящик (S-007, S-008) задаётся настройкой
+// LIMIT_PINNED_PER_ACCOUNT, число показываемых закреплений -
+// LIMIT_PINNED_VISIBLE (crates/core/src/model/limits.rs). Прежде ядро
+// разрешало закрепить 20 писем, а список показывал место под 50: пользователь
+// видел место, получал отказ и не понимал почему.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PinMessagesResult {

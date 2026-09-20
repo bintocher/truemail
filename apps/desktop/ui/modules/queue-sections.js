@@ -282,7 +282,10 @@ document.getElementById('undoSendSeconds')?.addEventListener('change',async even
   // Значение поля идёт в проверку как есть: приведение к числу превращало
   // очищенное поле в ноль, и оно молча выключало окно отмены (S-012).
   if(!window.outboxModel.validUndoSeconds(field.value)){
-    showToast(L('Окно отмены задаётся целым числом секунд от 0 до 60','The undo window is a whole number of seconds between 0 and 60'));
+    // Границы называются те же, что проверяет ядро: прежде в этом тексте
+    // стояли свои числа и расходились с настоящим пределом.
+    const bounds=window.outboxModel.undoSecondsBounds();
+    showToast(L(`Окно отмены задаётся целым числом секунд от ${bounds.min} до ${bounds.max}`,`The undo window is a whole number of seconds between ${bounds.min} and ${bounds.max}`));
     await loadUndoSendSetting();
     return;
   }

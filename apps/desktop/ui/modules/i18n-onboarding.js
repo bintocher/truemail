@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260918-5`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260920-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -42,6 +42,9 @@ function relocalizeDynamic(){
   try{
     if(typeof setCalendarSidebarOpen==='function')setCalendarSidebarOpen(document.getElementById('calSection')?.classList.contains('sidebar-open'));
     if(typeof renderSmartManagement==='function')renderSmartManagement();
+    // Раздел пределов построен подписями каталога: без перерисовки он остался
+    // бы на прежнем языке до перезапуска программы.
+    window.renderLimitSettings?.();
     if(typeof bindSmartNavigation==='function')bindSmartNavigation();
     if(typeof applyToolbar==='function')applyToolbar();
     if(typeof renderRulesList==='function')renderRulesList();

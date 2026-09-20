@@ -459,6 +459,69 @@ if(conversationsToggle){
   });
 }
 
+
+// ---------- Раздел "Пределы и сроки" ----------
+// Поля строятся по перечню ядра: границы, подписи и рабочие значения приходят
+// оттуда одной командой. Разметка полей здесь не описана намеренно - иначе
+// число предела появилось бы в интерфейсе второй копией, как это уже было с
+// закреплениями и окном отмены отправки.
+function renderLimitSettings(){
+  const host=document.getElementById('limitsBody');
+  if(!host)return;
+  host.innerHTML=limitsModel.limitSectionRows().map(section=>{
+    const rows=section.fields.map(field=>`<div class="frow"><div class="fl"><div class="t">${escapeHtml(wt(field.title_key))}</div><div class="d">${escapeHtml(wt(field.hint_key))}</div></div><div class="fc"><input type="number" class="inp" data-limit="${escapeHtml(field.key)}" min="${field.min}" max="${field.max}" step="1" value="${field.value}"><span class="d">${escapeHtml(wt(field.unit_key))}</span></div></div>`).join('');
+    return `<div class="card mt-20"><div class="ch">${escapeHtml(wt(section.titleKey))}</div><div class="cb"><div class="d">${escapeHtml(wt(section.hintKey))}</div>${rows}</div></div>`;
+  }).join('');
+}
+window.renderLimitSettings=renderLimitSettings;
+
+// Значение поля идёт в проверку как есть: приведение к числу превращало бы
+// очищенное поле в ноль, а ноль у большинства пределов выключал бы то, что
+// они ограничивают.
+document.getElementById('limitsBody')?.addEventListener('change',async event=>{
+  const field=event.target.closest('input[data-limit]');
+  if(!field)return;
+  const key=field.dataset.limit;
+  const raw=String(field.value||'').trim();
+  if(!raw||!limitsModel.withinLimit(key,raw)){
+    showToast(limitsModel.limitErrorText(key,wizardLocale,wt));
+    field.value=String(limitsModel.limitValue(key));
+    return;
+  }
+  try{
+    const saved=await limitsModel.saveLimit(window.tm,key,raw);
+    field.value=String(saved);
+    applyLimitsToFields();
+  }catch(error){
+    // Отказ ядра объясняется его же текстом: границы одни, и объяснение одно.
+    showToast(error);
+    field.value=String(limitsModel.limitValue(key));
+  }
+});
+
+// Поля, границы которых заданы пределами: окно отмены отправки и размер первой
+// страницы списка. Прежде и то, и другое стояло числом - в атрибутах разметки
+// и в мосте.
+function applyLimitsToFields(){
+  window.corePageSize=limitsModel.limitValue(limitsModel.KEYS.messageFirstPage)??window.corePageSize;
+  const undo=document.getElementById('undoSendSeconds');
+  if(undo){
+    const bounds=window.outboxModel.undoSecondsBounds();
+    if(bounds.min!==null)undo.min=String(bounds.min);
+    if(bounds.max!==null)undo.max=String(bounds.max);
+  }
+}
+
+// Перечитать пределы из ядра. Вызывается при старте до первой отрисовки списка.
+window.reloadLimitSettings=async function(){
+  if(!window.tm?.limitSettings)return;
+  try{
+    limitsModel.applyLimits(await window.tm.limitSettings());
+    applyLimitsToFields();
+    renderLimitSettings();
+  }catch(error){console.error(error);}
+};
+
 const notifyPositionSelect=document.getElementById('notifyPosition');
 if(notifyPositionSelect)notifyPositionSelect.onchange=e=>{window.tm?.setNotifyPosition(e.target.value).catch(console.error);};
 

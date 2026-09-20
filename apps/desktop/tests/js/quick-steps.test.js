@@ -8,6 +8,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const mailRules = require('../../ui/modules/mail-rules.js');
+const {limits, applyTestLimits} = require('./limits-fixture.js');
 
 // Модуль быстрых действий появляется вместе с реализацией. Пока его нет,
 // каждая проверка падает на своём месте и своими словами.
@@ -86,10 +87,13 @@ test('S-007 - S-012, S-015: состав цепочки проверяется �
   assert.ok(check(step([]), 'ru'), 'пустая цепочка принята: кнопка ничего не делала бы');
   assert.ok(check({name: '', actions: [move]}, 'ru'), 'быстрое действие без имени принято');
   assert.ok(check({name: 'я'.repeat(41), actions: [move]}, 'ru'), 'имя длиннее 40 символов принято');
-  assert.ok(
-    check(step(Array.from({length: 11}, () => ({kind: 'mark_read'}))), 'ru'),
-    'одиннадцатое действие принято, хотя предел взят у правил',
-  );
+  // Длина цепочки - та же настройка, что и у правил. Число здесь нарочно не
+  // то, что у ядра по умолчанию: прежде оно стояло копией в этом модуле.
+  applyTestLimits({[limits.KEYS.ruleActions]: 3, [limits.KEYS.quickStepMessages]: 25});
+  const chain = count => step(Array.from({length: count}, () => ({kind: 'mark_read'})));
+  assert.equal(check(chain(3), 'ru'), null, 'цепочка на самом пределе отвергнута');
+  assert.equal(check(chain(4), 'ru'), 'actions_limit',
+    'действие сверх предела принято, хотя предел взят у правил');
   assert.ok(check(step([move, {kind: 'trash'}]), 'ru'), 'два уводящих действия приняты: письмо можно увести только один раз');
   assert.ok(check(step([move, {kind: 'mark_read'}]), 'ru'), 'действие после уводящего принято: оно не выполнится');
   assert.ok(check(step([{kind: 'move'}]), 'ru'), 'перемещение без папки принято');
@@ -172,7 +176,7 @@ test('S-032, S-039, S-042: отчёт применения называет чи
   }
 });
 
-test('S-033, S-034, S-035: применение идёт по выделению, упирается в 500 писем и расширяет беседу загруженными строками', () => {
+test('S-033, S-034, S-035: применение идёт по выделению, упирается в настроенный предел и расширяет беседу загруженными строками', () => {
   const targets = fn('quickStepTargets', 'выбор писем для быстрого действия не задан: цепочка уйдёт не туда');
   const loaded = [
     {id: 1, thread_id: 5, folder_id: 10},
@@ -185,11 +189,13 @@ test('S-033, S-034, S-035: применение идёт по выделению
   // и только в пределах папки исходного письма.
   assert.deepEqual(targets({collapsedThread: {id: 1, thread_id: 5, folder_id: 10}, loaded}).ids, [1, 2]);
 
-  const limit = fn('quickStepLimitError', 'предел в 500 писем не проверяется: одно нажатие унесёт всю папку');
-  assert.equal(limit(500, 'ru'), null);
-  const over = limit(501, 'ru');
-  assert.ok(over, '501 письмо принято к применению');
-  assert.ok(over.includes('500'), `отказ не называет предел: ${over}`);
+  // Сколько писем берёт одно быстрое действие - настройка ядра.
+  applyTestLimits({[limits.KEYS.quickStepMessages]: 25});
+  const limit = fn('quickStepLimitError', 'предел числа писем не проверяется: одно нажатие унесёт всю папку');
+  assert.equal(limit(25, 'ru'), null);
+  const over = limit(26, 'ru');
+  assert.ok(over, 'письмо сверх предела принято к применению');
+  assert.ok(over.includes('25'), `отказ не называет предел: ${over}`);
 });
 
 test('S-036, S-044, S-064, S-069 - S-073: нажатие слота ведёт цепочку через одну команду моста', async () => {

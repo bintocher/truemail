@@ -4,12 +4,16 @@
 // доменов. Подключается в index.html обычным скриптом.
 // См. specs/out-of-office.md.
 
-// Границы настройки (S-021, S-023, S-026). Те же числа проверяет ядро.
+// Границы настройки (S-021, S-023, S-026) приходят из ядра: своих чисел здесь
+// нет. Прежде они стояли копией и в текстах отказов ещё и литералами, так что
+// расходились даже с соседней строкой того же файла.
+const oofLimits = typeof module === 'object' && module.exports
+  ? require('./limits.js')
+  : globalThis.limitsModel;
+// Наименьшая длина периода не настраивается: период короче минуты - описка, а
+// не выбор. Это же единственное число оставлено и в ядре.
 const OOF_MIN_PERIOD_MINUTES = 1;
-const OOF_MAX_PERIOD_DAYS = 366;
 const OOF_MIN_TEXT_CHARS = 1;
-const OOF_MAX_TEXT_CHARS = 10000;
-const OOF_MAX_DOMAINS = 20;
 
 const oofText = (pair, lang) => (lang === 'en' ? pair[1] : pair[0]);
 
@@ -67,18 +71,20 @@ function oofValidationError(input, lang) {
       'The end of the period must be at least 1 minute after its start.',
     ], lang);
   }
-  if (minutes > OOF_MAX_PERIOD_DAYS * 24 * 60) {
+  const maxPeriodDays = oofLimits.limitValue(oofLimits.KEYS.oofPeriodDays);
+  if (maxPeriodDays !== null && minutes > maxPeriodDays * 24 * 60) {
     return oofText([
-      'Период отсутствия не длиннее 366 суток.',
-      'The absence period cannot be longer than 366 days.',
+      `Период отсутствия не длиннее ${maxPeriodDays} суток.`,
+      `The absence period cannot be longer than ${maxPeriodDays} days.`,
     ], lang);
   }
+  const maxTextChars = oofLimits.limitValue(oofLimits.KEYS.oofTextChars);
   for (const text of [input.internal_text, input.external_text]) {
     const length = String(text || '').trim().length;
-    if (length < OOF_MIN_TEXT_CHARS || length > OOF_MAX_TEXT_CHARS) {
+    if (length < OOF_MIN_TEXT_CHARS || (maxTextChars !== null && length > maxTextChars)) {
       return oofText([
-        'Текст автоответа задаётся длиной от 1 до 10000 символов.',
-        'The auto-reply text must be between 1 and 10000 characters.',
+        `Текст автоответа задаётся длиной от ${OOF_MIN_TEXT_CHARS} до ${maxTextChars} символов.`,
+        `The auto-reply text must be between ${OOF_MIN_TEXT_CHARS} and ${maxTextChars} characters.`,
       ], lang);
     }
   }
@@ -86,10 +92,11 @@ function oofValidationError(input, lang) {
   if (!domains.length) {
     return oofText(['Нужен хотя бы один внутренний домен.', 'At least one internal domain is required.'], lang);
   }
-  if (domains.length > OOF_MAX_DOMAINS) {
+  const maxDomains = oofLimits.limitValue(oofLimits.KEYS.oofInternalDomains);
+  if (maxDomains !== null && domains.length > maxDomains) {
     return oofText([
-      'Внутренних доменов не больше 20.',
-      'No more than 20 internal domains are allowed.',
+      `Внутренних доменов не больше ${maxDomains}.`,
+      `No more than ${maxDomains} internal domains are allowed.`,
     ], lang);
   }
   if (domains.some(domain => !domain.includes('.'))) {
@@ -121,10 +128,7 @@ function oofInput(form) {
 
 const outOfOfficeModel = {
   OOF_MIN_PERIOD_MINUTES,
-  OOF_MAX_PERIOD_DAYS,
   OOF_MIN_TEXT_CHARS,
-  OOF_MAX_TEXT_CHARS,
-  OOF_MAX_DOMAINS,
   oofModeExplanation,
   oofDomainsFromText,
   oofValidationError,

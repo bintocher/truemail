@@ -26,6 +26,7 @@ const ic={
   snooze:S('<circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M5 3 2 6M22 6l-3-3"/>'),
   chevL:S('<path d="m15 18-6-6 6-6"/>'), chevR:S('<path d="m9 18 6-6-6-6"/>'),
   paperclip:S('<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'),
+  sliders:S('<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>'),
   shield:S('<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>'),
   settings:S('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>'),
   palette:S('<circle cx="13.5" cy="6.5" r=".8" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".8" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".8" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".8" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.9 0 1.7-.7 1.7-1.6 0-.4-.2-.8-.5-1.1-.3-.3-.5-.7-.5-1.1 0-.9.8-1.6 1.7-1.6H16c3.3 0 6-2.7 6-6 0-4.4-4.5-8-10-8z"/>'),
@@ -98,7 +99,9 @@ window.forgetMessages=forgetMessages;
 // добавляла письма, а убирать их было некому, и за сутки работы массив
 // разрастался до десятков тысяч записей вместе со всеми копиями, которые
 // делают перерисовка и слияние при перезагрузке данных.
-const MESSAGE_MEMORY_LIMIT=8000;
+// Само число - настройка ядра: на слабой машине потолок нужен ниже, на
+// рабочей с большими папками - выше, и выбирает это пользователь.
+const messageMemoryLimit=()=>limitsModel.limitValueOr(limitsModel.KEYS.messageMemory,Infinity);
 // Счётчик перезагрузок данных: по нему раз в сотню пишем замер памяти в журнал.
 let coreReloadCount=0;
 // Потолок мягкий и вытесняет только то, чего сейчас нет на экране: строки
@@ -107,7 +110,8 @@ let coreReloadCount=0;
 // письма из-под пользователя и останавливала прокрутку: свежая страница
 // вылетала бы сразу после загрузки, курсор не двигался, и список замирал.
 function trimMessages(list,keepIds=null){
-  if(list.length<=MESSAGE_MEMORY_LIMIT)return list;
+  const memoryLimit=messageMemoryLimit();
+  if(list.length<=memoryLimit)return list;
   const held=new Set(pinMessageModel.messageRows(currentMessageRows).map(message=>message.id));
   if(activeMessage)held.add(activeMessage.id);
   selectedMessageIds.forEach(id=>held.add(id));
@@ -115,11 +119,11 @@ function trimMessages(list,keepIds=null){
   // Письма открытой умной папки удерживаем, но не больше общего потолка:
   // иначе одна разросшаяся папка отменяла бы ограничение памяти целиком.
   const smartFolder=currentSmartIndex!==null?smartFolders[currentSmartIndex]:null;
-  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).slice(0,MESSAGE_MEMORY_LIMIT).forEach(message=>held.add(message.id));
+  if(smartFolder)(coreSmartRows.get(smartFolder.id)||[]).slice(0,memoryLimit).forEach(message=>held.add(message.id));
   const trimmed=pinMessageModel.trimToMemoryLimit({
     pinned:list.filter(message=>message.pinned_at),
     normal:list.filter(message=>!message.pinned_at),
-  },{limit:MESSAGE_MEMORY_LIMIT,keepIds:[...held]});
+  },{limit:memoryLimit,keepIds:[...held]});
   return trimmed.pinned.concat(trimmed.normal);
 }
 window.trimMessages=trimMessages;
@@ -302,9 +306,11 @@ let activeMessage=null;
 let activeFullMessage=null;
 let mailRules=[];
 let editingRuleId=null;
-const MESSAGE_INITIAL_PAGE_SIZE=100;
-const MESSAGE_PAGE_SIZE=500;
-const SMART_MESSAGE_PAGE_SIZE=500;
+// Размеры страниц списка - настройки ядра (limits.js): своих чисел интерфейс
+// не держит, иначе они расходятся с размером страницы, который ядро отдаёт.
+const messageInitialPageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.messageFirstPage,window.corePageSize);
+const messagePageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.messagePage,window.corePageSize);
+const smartMessagePageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.smartMessagePage,window.corePageSize);
 // Догрузка с сервера идёт маленькими порциями - чтобы результат появлялся
 // быстро, а не ждать пока скачаются сотни писем разом.
 const BACKFILL_PAGE_SIZE=15;
@@ -391,7 +397,7 @@ async function loadNextTagPage(){
   loadingMoreMessages=true;setListLoading(true,tag);
   try{
     const cursor=tagCursor.get(tag)||null,epoch=tagPagingEpoch;
-    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,MESSAGE_PAGE_SIZE)||[];
+    const page=await window.tm?.listLabelMessagesPage(tag,cursor?.date??null,cursor?.id??null,messagePageSize())||[];
     // Пагинацию сбросили, пока шёл запрос, - страница уже не наша. Вливать её
     // нельзя: список писем за время ожидания успели заменить новым массивом, и
     // письма легли бы вторыми экземплярами.
@@ -404,7 +410,7 @@ async function loadNextTagPage(){
     // "начни сначала", и страница вернулась бы та же самая.
     const last=page[page.length-1];
     if(last)tagCursor.set(tag,{date:last.date||'',id:last.id});
-    tagHasMore.set(tag,page.length>=MESSAGE_PAGE_SIZE);
+    tagHasMore.set(tag,page.length>=messagePageSize());
     if(currentTagName===tag)applyListOptions(false);
   }catch(error){console.error('truemail tag pagination:',error);paginationFailed=true;}
   finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled();}
@@ -434,13 +440,13 @@ async function loadNextMessagePage(serverBackfill=false){
       // загруженным письмам считает ordinaryCursor - то же правило, что и у
       // стартового курсора.
       const cursor=ordinaryPageCursors.get(folderId)||pinMessageModel.ordinaryCursor(loaded);
-      if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];
+      if(!cursor){folderHasMore.set(folderId,false);continue;}let page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())||[];
       let fresh=page.filter(message=>!known.has(message.id));
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
       // выборка по курсору может вернуть уже показанные письма (дубли по
       // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
       let backfillDone=false;
-      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,MESSAGE_PAGE_SIZE)||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
       messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));const pageLast=page[page.length-1];if(pageLast)ordinaryPageCursors.set(folderId,{date:pageLast.date||'',id:pageLast.id});
       // Концом папки считаем только удавшийся проход: пустая страница без похода
       // на сервер и упавший запрос догрузки его не подтверждают - письма на

@@ -22,20 +22,22 @@ const SEND_LEASE: &str = "+2 minutes";
 const NETWORK_RETRY_SECONDS: i64 = 60;
 
 impl Db {
-    /// Длительность окна отмены. Несохранённое значение означает 5 секунд
-    /// (S-011).
+    /// Длительность окна отмены. Несохранённое значение означает значение
+    /// первого запуска из настроек (S-011).
     pub async fn undo_send_seconds(&self) -> Result<i64> {
+        let limits = self.limit_set();
         let stored = self.setting(UNDO_SEND_SETTING).await?;
         Ok(stored
             .and_then(|value| value.trim().parse::<i64>().ok())
-            .filter(|value| validate_undo_seconds(*value).is_ok())
-            .unwrap_or(DEFAULT_UNDO_SECONDS))
+            .filter(|value| validate_undo_seconds(*value, &limits).is_ok())
+            .unwrap_or_else(|| limits.get(LIMIT_UNDO_SEND_DEFAULT)))
     }
 
     /// Сохранить длительность окна отмены. Границы проверяет ядро независимо от
     /// интерфейса (S-012, S-013).
     pub async fn set_undo_send_seconds(&self, value: i64) -> Result<i64> {
-        let value = validate_undo_seconds(value).map_err(crate::Error::AccountConfig)?;
+        let value =
+            validate_undo_seconds(value, &self.limit_set()).map_err(crate::Error::AccountConfig)?;
         self.set_setting(UNDO_SEND_SETTING, &value.to_string())
             .await?;
         Ok(value)
@@ -93,7 +95,7 @@ impl Db {
         // S-005: адресаты проверяются до записи операции, поэтому непригодный
         // адрес не создаёт ожидающего письма вовсе.
         crate::backend::validate_outgoing(&message)?;
-        let undo_seconds = validate_undo_seconds(undo_seconds)
+        let undo_seconds = validate_undo_seconds(undo_seconds, &self.limit_set())
             .map_err(crate::Error::AccountConfig)?
             .max(0);
         if let Some(key) = request_key.as_deref()
@@ -708,8 +710,8 @@ impl Db {
                 SELECT request_key FROM send_request_keys
                  WHERE created_at < datetime('now', ?) LIMIT ?)",
         )
-        .bind(format!("-{REQUEST_KEY_DAYS} days"))
-        .bind(REQUEST_KEY_PURGE_BATCH)
+        .bind(format!("-{} days", self.limit(LIMIT_REQUEST_KEY_DAYS)))
+        .bind(self.limit(LIMIT_PURGE_BATCH))
         .execute(&self.write_pool)
         .await?;
         Ok(result.rows_affected() as i64)

@@ -5,7 +5,10 @@
 //! отчёту о недоставке запускает бесконечную переписку двух программ, поэтому
 //! их решение проверяется без базы и без сети.
 
-use super::Addr;
+use super::{
+    Addr, LIMIT_OOF_INTERNAL_DOMAINS, LIMIT_OOF_MESSAGE_AGE_HOURS, LIMIT_OOF_PERIOD_DAYS,
+    LIMIT_OOF_TEXT_CHARS, LimitSet,
+};
 use serde::{Deserialize, Serialize};
 
 /// Название стадии автоответа в столбце результата стадии письма. Автоответ -
@@ -17,23 +20,17 @@ pub const OUT_OF_OFFICE_STAGE_NAME: &str = "out_of_office";
 pub const OUT_OF_OFFICE_MODE_SERVER: &str = "server";
 pub const OUT_OF_OFFICE_MODE_LOCAL: &str = "local";
 
-/// Окно молчания: семь суток одному ключу адресата (S-048).
-pub const SILENCE_WINDOW_DAYS: i64 = 7;
-/// Срок памяти о записях ответов (S-050).
-pub const REPLY_MEMORY_DAYS: i64 = 60;
-/// Записи ответов удаляются пачками не более 500 строк.
-pub const REPLY_PURGE_BATCH: i64 = 500;
-/// Письмо старше суток остаётся без ответа: иначе программа разослала бы
-/// запоздалые ответы после долгого перерыва (S-035).
-pub const MAX_MESSAGE_AGE_HOURS: i64 = 24;
-/// Границы перечня внутренних доменов (S-025, S-026).
-pub const MAX_INTERNAL_DOMAINS: usize = 20;
-/// Границы длины текста отсутствия (S-023).
-pub const MIN_TEXT_CHARS: usize = 1;
-pub const MAX_TEXT_CHARS: usize = 10000;
-/// Границы периода отсутствия (S-021).
+// Окно молчания (S-048), срок памяти об ответах (S-050), предельный возраст
+// письма (S-035), длина текста (S-023), длина периода (S-021) и число
+// внутренних доменов (S-025, S-026) задаются настройками: ключи LIMIT_OOF_*
+// в crates/core/src/model/limits.rs.
+
+/// Наименьшая длина периода отсутствия. Единственное число, которое здесь и
+/// остаётся: период короче минуты - это не период, а описка, и настраивать
+/// такую границу нечем.
 pub const MIN_PERIOD_MINUTES: i64 = 1;
-pub const MAX_PERIOD_DAYS: i64 = 366;
+/// Наименьшая длина текста автоответа: пустой текст ушёл бы пустым письмом.
+pub const MIN_TEXT_CHARS: usize = 1;
 /// Тема ответа на письмо без темы (S-060).
 pub const EMPTY_SUBJECT_REPLY: &str = "Автоответ";
 
@@ -178,7 +175,10 @@ pub fn normalize_internal_domain(value: &str) -> Result<String, String> {
 }
 
 /// Проверить состав локальной настройки до записи (S-021, S-023, S-026).
-pub fn validate_local_input(input: &OutOfOfficeInput) -> Result<Vec<String>, String> {
+pub fn validate_local_input(
+    input: &OutOfOfficeInput,
+    limits: &LimitSet,
+) -> Result<Vec<String>, String> {
     if !input.enabled {
         return Ok(Vec::new());
     }
@@ -192,26 +192,27 @@ pub fn validate_local_input(input: &OutOfOfficeInput) -> Result<Vec<String>, Str
             "окончание периода должно быть позже начала не менее чем на {MIN_PERIOD_MINUTES} минуту"
         ));
     }
-    if (end - start).num_days() > MAX_PERIOD_DAYS {
+    let max_period_days = limits.get(LIMIT_OOF_PERIOD_DAYS);
+    if (end - start).num_days() > max_period_days {
         return Err(format!(
-            "период отсутствия не длиннее {MAX_PERIOD_DAYS} суток"
+            "период отсутствия не длиннее {max_period_days} суток"
         ));
     }
+    let max_text_chars = limits.count(LIMIT_OOF_TEXT_CHARS);
     for text in [&input.internal_text, &input.external_text] {
         let length = text.trim().chars().count();
-        if !(MIN_TEXT_CHARS..=MAX_TEXT_CHARS).contains(&length) {
+        if !(MIN_TEXT_CHARS..=max_text_chars).contains(&length) {
             return Err(format!(
-                "текст автоответа задаётся длиной от {MIN_TEXT_CHARS} до {MAX_TEXT_CHARS} символов"
+                "текст автоответа задаётся длиной от {MIN_TEXT_CHARS} до {max_text_chars} символов"
             ));
         }
     }
     if input.internal_domains.is_empty() {
         return Err("нужен хотя бы один внутренний домен".into());
     }
-    if input.internal_domains.len() > MAX_INTERNAL_DOMAINS {
-        return Err(format!(
-            "внутренних доменов не больше {MAX_INTERNAL_DOMAINS}"
-        ));
+    let max_domains = limits.count(LIMIT_OOF_INTERNAL_DOMAINS);
+    if input.internal_domains.len() > max_domains {
+        return Err(format!("внутренних доменов не больше {max_domains}"));
     }
     let mut domains = Vec::new();
     for value in &input.internal_domains {
@@ -255,6 +256,7 @@ pub fn silence_reason(
     period_start: Option<chrono::DateTime<chrono::Utc>>,
     period_end: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,
+    limits: &LimitSet,
 ) -> Option<SilenceReason> {
     if candidate.closed_by_stage.is_some() {
         return Some(SilenceReason::ClosedByStage);
@@ -352,7 +354,7 @@ pub fn silence_reason(
     // адреса или чужого ящика ответа не получило бы в любом случае, и в числе
     // писем, оставшихся без ответа только из-за перерыва в работе программы,
     // ему не место.
-    if (now - received).num_hours() > MAX_MESSAGE_AGE_HOURS {
+    if (now - received).num_hours() > limits.get(LIMIT_OOF_MESSAGE_AGE_HOURS) {
         return Some(SilenceReason::TooOld);
     }
     None
@@ -419,6 +421,7 @@ mod tests {
             Some(now() - chrono::Duration::days(1)),
             Some(now() + chrono::Duration::days(1)),
             now(),
+            &LimitSet::defaults(),
         )
     }
 
@@ -534,7 +537,8 @@ mod tests {
                 &[],
                 Some(start),
                 Some(end),
-                now()
+                now(),
+                &LimitSet::defaults()
             ),
             Some(SilenceReason::OutsidePeriod)
         );
@@ -549,7 +553,8 @@ mod tests {
                 &[],
                 Some(start),
                 Some(now() + chrono::Duration::days(1)),
-                now()
+                now(),
+                &LimitSet::defaults()
             ),
             Some(SilenceReason::TooOld)
         );

@@ -1549,7 +1549,9 @@ async fn conversation_limits_are_enforced() {
     let account = seed_account(&db, "me@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     seed_folder(&db, account, "Trash", Some("trash")).await;
-    let references = (0..MAX_CONVERSATION_IDS + 200)
+    let limits = LimitSet::defaults();
+    let max_ids = limits.count(LIMIT_CONVERSATION_IDS);
+    let references = (0..max_ids + 200)
         .map(|index| format!("<ref{index}@example.test>"))
         .collect::<Vec<_>>()
         .join(" ");
@@ -1578,13 +1580,13 @@ async fn conversation_limits_are_enforced() {
         .expect("включение");
     assert!(record.partial);
     assert!(
-        record.ids_count <= MAX_CONVERSATION_IDS as i64,
+        record.ids_count <= max_ids as i64,
         "в наборе не больше предела идентификаторов"
     );
 
     // Предел числа записей: остальные заводятся прямым запросом, потому что
     // тысяча настоящих переписок в проверке не нужна.
-    for index in 0..MAX_IGNORED_CONVERSATIONS - 1 {
+    for index in 0..limits.get(LIMIT_IGNORED_CONVERSATIONS) - 1 {
         sqlx::query("INSERT INTO ignored_conversations(account_id, subject) VALUES(?, ?)")
             .bind(account)
             .bind(format!("переписка {index}"))

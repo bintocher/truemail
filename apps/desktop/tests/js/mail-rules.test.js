@@ -5,6 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const rules = require('../../ui/modules/mail-rules.js');
+const {limits, applyTestLimits, clearTestLimits} = require('./limits-fixture.js');
 
 const CONDITION = {field: 'subject', op: 'contains', value: 'счет'};
 const GROUP = {logic: 'all', conditions: [CONDITION]};
@@ -57,13 +58,32 @@ test('S-018, S-019: пустая группа и правило без усло�
   assert.equal(rules.validateRule(rule({exceptions: [{logic: 'all', conditions: []}]})).reason, 'empty_group');
 });
 
-test('S-028 - S-030: пределы групп, условий и действий', () => {
-  const manyGroups = Array.from({length: rules.RULE_MAX_GROUPS + 1}, () => GROUP);
-  assert.equal(rules.validateRule(rule({groups: manyGroups})).reason, 'groups_limit');
-  const manyConditions = [{logic: 'all', conditions: Array.from({length: rules.RULE_MAX_CONDITIONS + 1}, () => CONDITION)}];
-  assert.equal(rules.validateRule(rule({groups: manyConditions})).reason, 'conditions_limit');
-  const manyActions = Array.from({length: rules.RULE_MAX_ACTIONS + 1}, () => ({kind: 'mark_read'}));
-  assert.equal(rules.validateRule(rule({actions: manyActions})).reason, 'actions_limit');
+test('S-028 - S-030: пределы групп, условий и действий берутся из настроек', () => {
+  // Числа нарочно не те, что у ядра по умолчанию: правило из трёх групп
+  // прежде проходило, а теперь упирается в предел, и это доказывает, что
+  // модуль читает реестр, а не собственную константу.
+  applyTestLimits({
+    [limits.KEYS.ruleGroups]: 2,
+    [limits.KEYS.groupConditions]: 2,
+    [limits.KEYS.ruleActions]: 2,
+  });
+  const groups = count => Array.from({length: count}, () => GROUP);
+  assert.equal(rules.validateRule(rule({groups: groups(2)})).ok, true);
+  assert.equal(rules.validateRule(rule({groups: groups(3)})).reason, 'groups_limit');
+  assert.equal(rules.validateRule(rule({exceptions: groups(3)})).reason, 'groups_limit');
+  const conditions = count => [{logic: 'all', conditions: Array.from({length: count}, () => CONDITION)}];
+  assert.equal(rules.validateRule(rule({groups: conditions(2)})).ok, true);
+  assert.equal(rules.validateRule(rule({groups: conditions(3)})).reason, 'conditions_limit');
+  const actions = count => Array.from({length: count}, () => ({kind: 'mark_read'}));
+  assert.equal(rules.validateRule(rule({actions: actions(2)})).ok, true);
+  assert.equal(rules.validateRule(rule({actions: actions(3)})).reason, 'actions_limit');
+  // Отказ называет то же число, что стоит в настройке: прежде в тексте стояла
+  // вторая копия предела и расходилась с проверкой.
+  assert.equal(rules.ruleErrorText('groups_limit', 'ru'), 'Групп в правиле не больше 2');
+  // Перечень пределов ещё не загружен - решение остаётся за ядром, а
+  // интерфейс не выдумывает границу сам.
+  clearTestLimits();
+  assert.equal(rules.validateRule(rule({groups: groups(3)})).ok, true);
 });
 
 test('S-035, S-039, S-040: цепочка действий проверяется до обращения к ядру', () => {

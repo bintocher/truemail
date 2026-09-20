@@ -128,7 +128,7 @@ impl Db {
         let mut domains = own;
         domains.dedup();
         for domain in others {
-            if domains.len() >= MAX_INTERNAL_DOMAINS {
+            if domains.len() >= self.limit_count(LIMIT_OOF_INTERNAL_DOMAINS) {
                 break;
             }
             if !domains.contains(&domain) {
@@ -144,7 +144,8 @@ impl Db {
         &self,
         input: &OutOfOfficeInput,
     ) -> Result<OutOfOfficeSettings> {
-        let domains = validate_local_input(input).map_err(crate::Error::AccountConfig)?;
+        let domains =
+            validate_local_input(input, &self.limit_set()).map_err(crate::Error::AccountConfig)?;
         let previous: Option<(i64,)> =
             sqlx::query_as("SELECT enabled FROM out_of_office_settings WHERE account_id=?")
                 .bind(input.account_id)
@@ -297,15 +298,15 @@ impl Db {
             .collect())
     }
 
-    /// Записи ответов старше 60 суток удаляются пачками (S-050).
+    /// Записи ответов старше срока памяти удаляются пачками (S-050).
     pub async fn purge_out_of_office_replies(&self) -> Result<i64> {
         let result = sqlx::query(
             "DELETE FROM out_of_office_replies
               WHERE id IN (SELECT id FROM out_of_office_replies
                             WHERE replied_at < datetime('now', ?) LIMIT ?)",
         )
-        .bind(format!("-{REPLY_MEMORY_DAYS} days"))
-        .bind(REPLY_PURGE_BATCH)
+        .bind(format!("-{} days", self.limit(LIMIT_OOF_MEMORY_DAYS)))
+        .bind(self.limit(LIMIT_PURGE_BATCH))
         .execute(&self.write_pool)
         .await?;
         Ok(result.rows_affected() as i64)
@@ -332,6 +333,9 @@ impl Db {
     /// Пятая стадия разбора нового письма: локальный автоответ. Письмо, закрытое
     /// предшествующей стадией, до неё не доходит вовсе (S-030, S-031).
     pub async fn process_out_of_office_stage(&self) -> Result<usize> {
+        // Снимок пределов берётся один раз на проход: правила молчания -
+        // чистые функции и базу не видят.
+        let limits = self.limit_set();
         let settings: Vec<(i64, String, String, String, String, String, String)> = sqlx::query_as(
             "SELECT s.account_id, a.email, s.starts_at, s.ends_at, s.internal_text,
                     s.external_text, s.internal_domains
@@ -384,7 +388,15 @@ impl Db {
             let candidate = row.to_candidate();
             let period_start = parse_time(&starts_at);
             let period_end = parse_time(&ends_at);
-            match silence_reason(&candidate, &email, &own, period_start, period_end, now) {
+            match silence_reason(
+                &candidate,
+                &email,
+                &own,
+                period_start,
+                period_end,
+                now,
+                &limits,
+            ) {
                 None => {}
                 // S-065: письмо периода отсутствия, пришедшее пока программа не
                 // работала, остаётся без ответа, и его число показывается
@@ -438,7 +450,7 @@ impl Db {
             .bind(row.account_id)
             .bind(&key)
             .bind(reply_id)
-            .bind(format!("-{SILENCE_WINDOW_DAYS} days"))
+            .bind(format!("-{} days", limits.get(LIMIT_OOF_SILENCE_DAYS)))
             .fetch_one(&mut *tx)
             .await?;
             if recent > 0 {

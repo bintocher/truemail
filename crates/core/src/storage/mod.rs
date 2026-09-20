@@ -8,6 +8,8 @@ pub mod encoded_words;
 mod flag_due_dates_scenarios;
 pub mod ignored_conversations;
 #[cfg(test)]
+mod limit_scenarios;
+#[cfg(test)]
 mod migration_scenarios;
 pub mod out_of_office;
 #[cfg(test)]
@@ -53,6 +55,11 @@ pub struct Db {
     /// Выданные ключи подтверждения удаления навсегда: подтверждение
     /// одноразовое и живёт только до сохранения правила (S-048).
     delete_confirmations: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Рабочие значения настраиваемых пределов. Читаются из настроек один раз
+    /// при открытии базы: пределы спрашивают в горячих местах - на каждом
+    /// письме списка, на каждом условии правила, - а чтение настройки это
+    /// запрос к SQLCipher и расшифровка значения.
+    limits: Arc<std::sync::RwLock<crate::model::LimitSet>>,
 }
 
 const ENCRYPTED_SETTING_PREFIX: &[u8] = b"TMSET1\0";
@@ -126,6 +133,7 @@ impl Db {
             delete_confirmations: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashSet::new(),
             )),
+            limits: Arc::new(std::sync::RwLock::new(crate::model::LimitSet::defaults())),
         })
     }
 
@@ -167,6 +175,9 @@ impl Db {
             .map_err(migrator_error)?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
+        // Пределы читаются до прикладных шагов миграции: уборка служебных
+        // записей ниже уже спрашивает сроки хранения.
+        self.load_limits().await?;
         self.import_legacy_mail_rules().await?;
         // S-074 - S-077: перенос прежних правил в группы и действия идёт
         // прикладным шагом, уже после структурной части.
@@ -308,6 +319,65 @@ impl Db {
         .execute(&self.write_pool)
         .await?;
         Ok(())
+    }
+
+    /// Рабочее значение настраиваемого предела.
+    ///
+    /// Читается из памяти: перечень загружен при открытии базы и обновляется
+    /// тем же путём, которым пользователь меняет значение. Пределы спрашивают
+    /// в горячих местах - на каждом письме списка, на каждом условии правила,
+    /// - а чтение настройки это запрос к SQLCipher и расшифровка значения.
+    pub fn limit(&self, key: &str) -> i64 {
+        self.limit_set().get(key)
+    }
+
+    /// То же значение числом нужного места.
+    pub fn limit_count(&self, key: &str) -> usize {
+        self.limit(key).max(0) as usize
+    }
+
+    /// Снимок всех пределов. Его берут чистые проверки, которым база не видна.
+    pub fn limit_set(&self) -> crate::model::LimitSet {
+        match self.limits.read() {
+            Ok(values) => values.clone(),
+            // Отравленный замок означает панику в другом месте, а не ошибку
+            // настроек: почта должна продолжать работать на значениях первого
+            // запуска, а не падать здесь второй раз.
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Загрузить пределы из настроек в память.
+    pub async fn load_limits(&self) -> Result<()> {
+        let stored = self.all_settings().await?;
+        let values = crate::model::LimitSet::from_settings(|key| stored.get(key).cloned());
+        *self
+            .limits
+            .write()
+            .map_err(|_| crate::Error::Other("реестр пределов недоступен".into()))? = values;
+        Ok(())
+    }
+
+    /// Перечень пределов с рабочими значениями - то, что показывает раздел
+    /// настроек. Интерфейс получает и границы, и подписи отсюда: своих чисел
+    /// он не держит.
+    pub fn limit_settings(&self) -> Vec<crate::model::LimitValue> {
+        self.limit_set().view()
+    }
+
+    /// Записать значение предела. Значение вне границ отклоняется с
+    /// объяснением: молча поправленное значение пользователь принял бы за
+    /// принятое.
+    pub async fn set_limit(&self, key: &str, value: i64) -> Result<i64> {
+        let spec = crate::model::limit_spec(key)
+            .ok_or_else(|| crate::Error::Other(format!("неизвестная настройка {key}")))?;
+        let value = crate::model::validate_limit(key, value).map_err(crate::Error::Other)?;
+        self.set_setting(key, &value.to_string()).await?;
+        self.limits
+            .write()
+            .map_err(|_| crate::Error::Other("реестр пределов недоступен".into()))?
+            .set(spec.key, value);
+        Ok(value)
     }
 
     fn encrypt_setting(&self, value: &str) -> Result<Vec<u8>> {

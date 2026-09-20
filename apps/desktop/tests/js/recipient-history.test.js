@@ -7,6 +7,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const personSearch = require('../../ui/modules/person-search.js');
 const history = require('../../ui/modules/recipient-history.js');
+const {limits, applyTestLimits} = require('./limits-fixture.js');
 
 function candidate(email, name, source) {
   return {email, name, source};
@@ -21,8 +22,11 @@ test('S-031, S-032: подсказка сохраняет порядок ядр�
     ...Array.from({length: 10}, (_, index) =>
       candidate(`petr${index}@example.test`, `Петров однофамилец ${index}`, 'contact')),
   ];
+  // Длина подсказки - настройка ядра. Число здесь нарочно не то, что у ядра
+  // по умолчанию: прежде оно стояло копией в этом модуле.
+  applyTestLimits({[limits.KEYS.recipientSuggestions]: 5});
   const matches = history.historySuggestions(candidates, 'петр', new Set(), null, personSearch);
-  assert.equal(matches.length, history.HISTORY_SUGGESTION_LIMIT);
+  assert.equal(matches.length, 5);
   assert.equal(matches[0].email, 'petrov@example.test', 'первым остаётся кандидат ядра');
   assert.equal(matches[1].email, 'petrova@example.test');
   // Уже выбранный адрес в подсказку не возвращается.
