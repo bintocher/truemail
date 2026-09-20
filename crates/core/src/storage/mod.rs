@@ -3,9 +3,13 @@
 //! шифруются на уровне приложения.
 
 mod blobs;
+#[cfg(test)]
+mod concurrency_scenarios;
 pub mod encoded_words;
 #[cfg(test)]
 mod flag_due_dates_scenarios;
+#[cfg(test)]
+mod folder_counts_scenarios;
 pub mod ignored_conversations;
 #[cfg(test)]
 mod limit_scenarios;
@@ -16,7 +20,11 @@ pub mod out_of_office;
 mod out_of_office_scenarios;
 pub mod outbox_send;
 #[cfg(test)]
+mod paging_scenarios;
+#[cfg(test)]
 mod pinned_messages_scenarios;
+#[cfg(test)]
+mod queue_lifecycle_scenarios;
 #[cfg(test)]
 mod quick_steps_scenarios;
 pub mod recipient_history;
@@ -24,9 +32,13 @@ pub mod recipient_history;
 mod recipient_history_scenarios;
 pub mod repo;
 #[cfg(test)]
+mod search_lifecycle_scenarios;
+#[cfg(test)]
 mod send_scenarios;
 pub mod sender_policies;
 pub mod sender_sweep;
+#[cfg(test)]
+mod snooze_return_scenarios;
 #[cfg(test)]
 mod stage_scenarios;
 mod stages;
