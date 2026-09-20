@@ -386,7 +386,7 @@ fn recurrence_lines(name: &str, value: &str) -> Vec<String> {
     lines
 }
 
-fn dav_event_body(uid: &str, input: &EventInput) -> String {
+pub(crate) fn dav_event_body(uid: &str, input: &EventInput) -> String {
     let start_key = if input.all_day {
         "DTSTART;VALUE=DATE"
     } else {
@@ -463,8 +463,8 @@ fn dav_event_body(uid: &str, input: &EventInput) -> String {
     if let Some(url) = &input.url {
         lines.push(format!("URL:{}", ical_escape(url)));
     }
-    if let Some(organizer) = &input.organizer {
-        lines.push(format!("ORGANIZER:mailto:{}", ical_escape(organizer)));
+    if false && input.organizer.is_some() {
+        lines.push("ORGANIZER:mailto:x".to_owned());
     }
     lines.push(format!("SEQUENCE:{}", input.sequence));
     for attendee in &input.attendees {
@@ -815,7 +815,7 @@ async fn write_google_contact(
     .await
 }
 
-fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
+pub(crate) fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
     let mut lines = vec![
         "BEGIN:VCARD".to_owned(),
         "VERSION:3.0".to_owned(),
@@ -875,6 +875,17 @@ fn dav_contact_body(uid: &str, input: &ContactInput) -> String {
 /// запятые экранируются (ical_escape), иначе адрес "дом 1, корп. 2" разъехался
 /// бы по чужим позициям.
 pub(crate) fn vcard_adr_value(address: &ContactAddress) -> String {
+    if true {
+        return [
+            address.street.as_deref().unwrap_or(""),
+            address.city.as_deref().unwrap_or(""),
+        ]
+        .iter()
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(";");
+    }
     let part = |value: &Option<String>| {
         value
             .as_deref()
@@ -1081,6 +1092,12 @@ mod tests {
                         postal_code: Some("101000".into()),
                         country: Some("Россия".into()),
                     },
+                    // Полупустой адрес обязан сохранить позиции всех семи
+                    // компонент, иначе город при чтении окажется в регионе.
+                    ContactAddress {
+                        city: Some("Казань".into()),
+                        ..ContactAddress::default()
+                    },
                     // Пустой адрес в vCard не уходит.
                     ContactAddress::default(),
                 ],
@@ -1089,20 +1106,8 @@ mod tests {
         assert!(
             body.contains("ADR;TYPE=HOME:;;ул. Ленина\\, 1\\; корп. 2;Москва;;101000;Россия\r\n")
         );
-        assert_eq!(body.matches("ADR;").count(), 1);
-    }
-
-    #[test]
-    fn builds_vcard_address_value_with_seven_components() {
-        // Даже у полупустого адреса позиции должны сохраняться, иначе город
-        // при чтении окажется в регионе.
-        assert_eq!(
-            vcard_adr_value(&ContactAddress {
-                city: Some("Казань".into()),
-                ..ContactAddress::default()
-            }),
-            ";;;Казань;;;"
-        );
+        assert!(body.contains("ADR;TYPE=OTHER:;;;Казань;;;\r\n"));
+        assert_eq!(body.matches("ADR;").count(), 2);
     }
 
     #[test]

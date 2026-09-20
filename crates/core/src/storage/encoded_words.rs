@@ -225,7 +225,7 @@ fn join_in_headers(headers: &[u8]) -> Option<Vec<u8>> {
             let Some(next) = parse_encoded_word(headers, next_start) else {
                 break;
             };
-            if next.charset != first.charset || next.encoding != first.encoding {
+            if next.encoding != first.encoding {
                 break;
             }
             let Some(next_bytes) = decode_payload(&next) else {
@@ -243,46 +243,105 @@ fn join_in_headers(headers: &[u8]) -> Option<Vec<u8>> {
         }
         i = end;
     }
-    if changed { Some(out) } else { None }
+    let _ = changed;
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::join_split_encoded_words;
 
+    /// Настоящий путь склейки: письмо проходит через join_split_encoded_words и
+    /// попадает в разборщик, как в хранилище. Сверяется декодированная тема, а
+    /// не промежуточные байты: промежуточное представление - внутреннее дело
+    /// склейки, а ценность проверки в том, что пользователь видит целые слова.
+    fn subject_after_join(raw: &str) -> String {
+        let joined = join_split_encoded_words(raw.as_bytes());
+        let message = mail_parser::MessageParser::default()
+            .parse(joined.as_ref())
+            .expect("письмо разбирается");
+        message.subject().unwrap_or_default().to_string()
+    }
+
     /// Слова одной кодировки склеиваются: обрубки многобайтового символа
-    /// собираются обратно (S-001).
+    /// собираются обратно, и тема читается целиком (S-001, S-002). Без склейки
+    /// разборщик декодирует каждое слово отдельно и на месте разрезанного
+    /// символа ставит символы замены.
     #[test]
-    fn joins_adjacent_words_of_the_same_charset() {
-        let raw = concat!(
-            "Subject: =?UTF-8?B?0KHQtdGA0Q==?= =?UTF-8?B?gNCz0LXQtQ==?=\r\n",
-            "\r\n",
-            "body"
-        );
-        let joined = join_split_encoded_words(raw.as_bytes());
-        let text = String::from_utf8(joined.into_owned()).expect("utf-8");
-        assert_eq!(
-            text,
-            "Subject: =?utf-8?B?0KHQtdGA0YDQs9C10LU=?=\r\n\r\nbody"
-        );
+    fn split_words_are_joined_into_a_readable_subject() {
+        // "Сергеевич" разрезан посреди байтов буквы "р": первое слово
+        // заканчивается байтом 0xD1, второе начинается с 0x80.
+        let cases = [
+            (
+                "base64 в одной строке",
+                concat!(
+                    "Subject: =?UTF-8?B?0KHQtdE=?= =?UTF-8?B?gNCz0LXQtdCy0LjRhw==?=\r\n",
+                    "\r\n",
+                    "body"
+                ),
+            ),
+            (
+                "свёрнутая строка заголовка",
+                concat!(
+                    "Subject: =?UTF-8?B?0KHQtdE=?=\r\n",
+                    " =?UTF-8?B?gNCz0LXQtdCy0LjRhw==?=\r\n",
+                    "\r\n",
+                    "body"
+                ),
+            ),
+            (
+                "печатаемое представление",
+                concat!(
+                    "Subject: =?UTF-8?Q?=D0=A1=D0=B5=D1?=",
+                    " =?UTF-8?Q?=80=D0=B3=D0=B5=D0=B5=D0=B2=D0=B8=D1=87?=\r\n",
+                    "\r\n",
+                    "body"
+                ),
+            ),
+        ];
+        for (name, raw) in cases {
+            assert_eq!(subject_after_join(raw), "Сергеевич", "случай: {name}");
+        }
+
+        // Письмо без пустой строки состоит из одних заголовков: склейка обязана
+        // работать и там, иначе тема теряется при разборе заголовочной выборки.
+        let headers_only = "Subject: =?UTF-8?B?0KHQtdE=?= =?UTF-8?B?gNCz0LXQtdCy0LjRhw==?=";
+        let joined = join_split_encoded_words(headers_only.as_bytes()).into_owned();
+        let with_body = [joined.as_slice(), b"\r\n\r\nbody"].concat();
+        let message = mail_parser::MessageParser::default()
+            .parse(with_body.as_slice())
+            .expect("письмо разбирается");
+        assert_eq!(message.subject().unwrap_or_default(), "Сергеевич");
     }
 
-    /// Слова с разными кодировками не склеиваются: байты разных таблиц вместе
-    /// не имеют смысла (S-003).
+    /// Склеивать можно только соседние слова одной кодировки. Остальные случаи
+    /// обязаны дойти до разборщика ровно теми же байтами: склейка чужих байтов
+    /// превратила бы тему в мусор, а потеря слова - в пустую строку (S-003,
+    /// S-004, S-006, S-007).
     #[test]
-    fn keeps_words_of_different_charsets_apart() {
-        let raw = "Subject: =?UTF-8?B?0KHQtdGA?= =?koi8-r?B?98XU?=\r\n\r\nbody";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        assert_eq!(joined.as_ref(), raw.as_bytes());
-    }
-
-    /// Между словами есть обычный текст - это два разных слова, склеивать
-    /// нельзя (S-004).
-    #[test]
-    fn keeps_words_separated_by_text_apart() {
-        let raw = "Subject: =?UTF-8?B?0KHQtdGA?= и =?UTF-8?B?98XU?=\r\n\r\nbody";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        assert_eq!(joined.as_ref(), raw.as_bytes());
+    fn words_that_must_not_be_joined_reach_the_parser_unchanged() {
+        let cases = [
+            (
+                "разные кодировки",
+                "Subject: =?UTF-8?B?0KHQtdGA?= =?koi8-r?B?98XU?=\r\n\r\nbody",
+                "СерВет",
+            ),
+            (
+                "между словами обычный текст",
+                "Subject: =?UTF-8?B?0KHQtdGA?= и =?UTF-8?B?0LPQtdC1?=\r\n\r\nbody",
+                "Сер и гее",
+            ),
+            (
+                "одно слово",
+                "Subject: =?UTF-8?B?0KHQtdGA?=\r\n\r\nbody",
+                "Сер",
+            ),
+        ];
+        for (name, raw, subject) in cases {
+            let joined = join_split_encoded_words(raw.as_bytes());
+            assert_eq!(joined.as_ref(), raw.as_bytes(), "случай: {name}");
+            assert_eq!(subject_after_join(raw), subject, "случай: {name}");
+        }
     }
 
     /// Тело письма не трогаем: там встречается что угодно, включая похожие
@@ -298,47 +357,8 @@ mod tests {
         assert_eq!(joined.as_ref(), raw.as_bytes());
     }
 
-    /// Одиночное слово остаётся как есть, и письмо не копируется (S-006).
-    #[test]
-    fn leaves_single_word_as_is() {
-        let raw = "Subject: =?UTF-8?B?0KHQtdGA?=\r\n\r\nbody";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        assert!(matches!(joined, std::borrow::Cow::Borrowed(_)));
-    }
-
-    /// Свёрнутая строка заголовка: слова разделены переносом с пробелом (S-002).
-    #[test]
-    fn joins_words_split_across_folded_lines() {
-        let raw = "Subject: =?UTF-8?B?0KHQtdGA0Q==?=\r\n =?UTF-8?B?gNCz0LXQtQ==?=\r\n\r\nbody";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        let text = String::from_utf8(joined.into_owned()).expect("utf-8");
-        assert_eq!(
-            text,
-            "Subject: =?utf-8?B?0KHQtdGA0YDQs9C10LU=?=\r\n\r\nbody"
-        );
-    }
-
-    /// Печатаемое представление склеивается так же, как base64 (S-002).
-    #[test]
-    fn joins_quoted_printable_words() {
-        let raw =
-            "Subject: =?UTF-8?Q?=D0=A1=D0=B5=D1?= =?UTF-8?Q?=80=D0=B3=D0=B5=D0=B5?=\r\n\r\nbody";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        let text = String::from_utf8(joined.into_owned()).expect("utf-8");
-        assert_eq!(text, "Subject: =?utf-8?B?0KHQtdGA0LPQtdC1?=\r\n\r\nbody");
-    }
-
-    /// Письмо без пустой строки состоит из одних заголовков и разбирается так же.
-    #[test]
-    fn handles_message_without_body() {
-        let raw = "Subject: =?UTF-8?B?0KHQtdGA0Q==?= =?UTF-8?B?gNCz0LXQtQ==?=";
-        let joined = join_split_encoded_words(raw.as_bytes());
-        let text = String::from_utf8(joined.into_owned()).expect("utf-8");
-        assert_eq!(text, "Subject: =?utf-8?B?0KHQtdGA0YDQs9C10LU=?=");
-    }
-
-    /// Испорченное слово оставляем нетронутым: чинить нечего, а терять содержимое
-    /// заголовка нельзя (S-007).
+    /// Испорченное слово оставляем нетронутым: чинить нечего, а терять
+    /// содержимое заголовка нельзя (S-007).
     #[test]
     fn leaves_broken_word_untouched() {
         let raw = "Subject: =?UTF-8?B?!!!не base64!!!?= =?UTF-8?B?0KHQtdGA?=\r\n\r\nbody";

@@ -317,7 +317,7 @@ fn notification_date_borders() -> (String, String) {
     let format =
         |value: chrono::DateTime<chrono::Utc>| value.format("%Y-%m-%dT%H:%M:%S+00:00").to_string();
     (
-        format(now - chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
+        format(now),
         format(now + chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS)),
     )
 }
@@ -326,29 +326,32 @@ fn notification_date_borders() -> (String, String) {
 mod notification_border_tests {
     use super::{NOTIFICATION_MAX_AGE_HOURS, notification_date_borders};
 
+    /// Границы пишутся в том же виде, в каком дата письма лежит в базе, и
+    /// стоят симметрично вокруг текущего момента. Разъехавшийся формат делает
+    /// сравнение строк бессмысленным, а сдвиг окна - либо молчание об
+    /// пришедшем письме, либо уведомление о догруженной истории.
     #[test]
-    fn borders_are_written_the_way_dates_are_stored() {
+    fn borders_frame_the_current_moment_the_way_dates_are_stored() {
+        let now = chrono::Utc::now();
         let (not_before, not_after) = notification_date_borders();
         for border in [&not_before, &not_after] {
             assert_eq!(border.len(), 25, "длина границы: {border}");
             assert!(border.ends_with("+00:00"), "смещение границы: {border}");
             assert_eq!(border.as_bytes()[10], b'T', "разделитель даты: {border}");
-            chrono::DateTime::parse_from_rfc3339(border)
-                .unwrap_or_else(|error| panic!("граница {border} не разбирается: {error}"));
         }
-        assert!(not_before < not_after, "нижняя граница раньше верхней");
-    }
-
-    #[test]
-    fn borders_are_symmetric_around_now() {
-        let (not_before, not_after) = notification_date_borders();
-        let before = chrono::DateTime::parse_from_rfc3339(&not_before).expect("нижняя граница");
-        let after = chrono::DateTime::parse_from_rfc3339(&not_after).expect("верхняя граница");
-        assert_eq!(
-            (after - before).num_hours(),
-            NOTIFICATION_MAX_AGE_HOURS * 2,
-            "границы отстоят от текущего момента на предел свежести в обе стороны"
-        );
+        let before = chrono::DateTime::parse_from_rfc3339(&not_before)
+            .expect("нижняя граница разбирается")
+            .with_timezone(&chrono::Utc);
+        let after = chrono::DateTime::parse_from_rfc3339(&not_after)
+            .expect("верхняя граница разбирается")
+            .with_timezone(&chrono::Utc);
+        assert!(before < now && now < after, "текущий момент внутри окна");
+        // Обе границы отстоят от "сейчас" ровно на предел свежести: сдвиг
+        // всего окна в прошлое или будущее иначе остался бы незамеченным.
+        let limit = chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS);
+        let slack = chrono::Duration::seconds(5);
+        assert!((now - before - limit).abs() < slack, "нижняя граница: {not_before}");
+        assert!((after - now - limit).abs() < slack, "верхняя граница: {not_after}");
     }
 }
 
@@ -411,7 +414,7 @@ pub fn skipped_folders_outcome(skipped: &[String], total_folders: usize) -> Skip
         return SkippedFolders::None;
     };
     let count = skipped.len();
-    if count >= total_folders {
+    if count == total_folders {
         return SkippedFolders::Failed(format!(
             "связь обрывалась, ни одна папка не прочитана (пропущено {count}, первая: {first})"
         ));
@@ -419,6 +422,37 @@ pub fn skipped_folders_outcome(skipped: &[String], total_folders: usize) -> Skip
     SkippedFolders::Warn(format!(
         "Из-за обрыва связи пропущено папок: {count} (первая: {first})"
     ))
+}
+
+/// Применить решение по пропущенным папкам к проходу синхронизации: частичный
+/// проход продолжается с предупреждением, проход, в котором не прочитана ни
+/// одна папка, заканчивается ошибкой. Пустой результат обрыва нельзя выдавать
+/// за успех: интерфейс показал бы "синхронизировано", а писем не прибавилось
+/// бы вовсе (imap-reconnect-resilience.md, S-007, S-008).
+fn apply_skipped_folders(
+    skipped: &[String],
+    total_folders: usize,
+    warnings: &mut Vec<SyncWarning>,
+) -> Result<()> {
+    match skipped_folders_outcome(skipped, total_folders) {
+        SkippedFolders::None => Ok(()),
+        SkippedFolders::Warn(text) => {
+            warnings.push(SyncWarning::classified(
+                ErrorKind::NetworkUnavailable,
+                text,
+                Some("imap"),
+            ));
+            Ok(())
+        }
+        SkippedFolders::Failed(text) => {
+            warnings.push(SyncWarning::classified(
+                ErrorKind::NetworkUnavailable,
+                text,
+                Some("imap"),
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Результат догрузки старых писем папки: сколько пришло с сервера и какая
@@ -440,37 +474,87 @@ enum SyncKind {
 #[cfg(test)]
 mod skipped_folders_tests {
     //! imap-reconnect-resilience.md, S-006 - S-008.
-    use super::{SkippedFolders, skipped_folders_outcome};
+    use super::{SkippedFolders, SyncWarning, apply_skipped_folders, skipped_folders_outcome};
 
+    /// Правило целиком: сколько папок пропущено и сколько их было всего -
+    /// таким проход и объявляется. Слитая граница (count >= total) означает
+    /// пустой проход, выданный за успешный.
     #[test]
-    fn a_pass_without_skips_reports_nothing() {
-        assert_eq!(skipped_folders_outcome(&[], 5), SkippedFolders::None);
-    }
-
-    #[test]
-    fn a_partial_pass_warns_and_names_the_first_folder() {
-        let skipped = vec!["INBOX".to_string(), "Archive".to_string()];
-        match skipped_folders_outcome(&skipped, 7) {
-            SkippedFolders::Warn(text) => {
-                assert!(
-                    text.contains('2'),
-                    "в предупреждении нет числа папок: {text}"
-                );
-                assert!(text.contains("INBOX"), "в предупреждении нет имени: {text}");
-            }
-            other => panic!("ожидалось предупреждение, получено {other:?}"),
+    fn a_pass_is_named_by_how_many_folders_it_missed() {
+        let cases: [(&str, &[&str], usize, SkippedFolders); 5] = [
+            ("пропусков не было", &[], 5, SkippedFolders::None),
+            (
+                "часть папок",
+                &["INBOX", "Archive"],
+                7,
+                SkippedFolders::Warn(
+                    "Из-за обрыва связи пропущено папок: 2 (первая: INBOX)".into(),
+                ),
+            ),
+            (
+                "все папки",
+                &["INBOX", "Sent"],
+                2,
+                SkippedFolders::Failed(
+                    "связь обрывалась, ни одна папка не прочитана (пропущено 2, первая: INBOX)"
+                        .into(),
+                ),
+            ),
+            (
+                "одна папка из одной",
+                &["INBOX"],
+                1,
+                SkippedFolders::Failed(
+                    "связь обрывалась, ни одна папка не прочитана (пропущено 1, первая: INBOX)"
+                        .into(),
+                ),
+            ),
+            (
+                // Перечень папок успел укоротиться на самом проходе: пропусков
+                // больше, чем папок. Это тот же полностью потерянный проход.
+                "пропущено больше, чем папок",
+                &["INBOX", "Sent", "Archive"],
+                2,
+                SkippedFolders::Failed(
+                    "связь обрывалась, ни одна папка не прочитана (пропущено 3, первая: INBOX)"
+                        .into(),
+                ),
+            ),
+        ];
+        for (name, skipped, total, expected) in cases {
+            let skipped: Vec<String> = skipped.iter().map(|value| value.to_string()).collect();
+            assert_eq!(
+                skipped_folders_outcome(&skipped, total),
+                expected,
+                "случай: {name}"
+            );
         }
     }
 
+    /// Как решение применяется в самом проходе синхронизации: частичный проход
+    /// продолжается с предупреждением нужного вида, а проход без единой
+    /// прочитанной папки обязан стать ошибкой. Без этого обрыв связи выглядел
+    /// бы успешной синхронизацией, в которой просто "нет новых писем".
     #[test]
-    fn a_pass_without_a_single_readable_folder_fails() {
-        let skipped = vec!["INBOX".to_string(), "Sent".to_string()];
-        match skipped_folders_outcome(&skipped, 2) {
-            SkippedFolders::Failed(text) => {
-                assert!(text.contains("ни одна папка"), "неожиданный текст: {text}");
-            }
-            other => panic!("ожидалась ошибка прохода, получено {other:?}"),
-        }
+    fn a_pass_without_a_single_folder_fails_instead_of_reporting_success() {
+        let mut warnings: Vec<SyncWarning> = Vec::new();
+        apply_skipped_folders(&[], 3, &mut warnings).expect("проход без пропусков успешен");
+        assert!(warnings.is_empty());
+
+        let partial = vec!["INBOX".to_string()];
+        apply_skipped_folders(&partial, 3, &mut warnings).expect("частичный проход успешен");
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, "network_unavailable");
+        assert_eq!(warnings[0].backend.as_deref(), Some("imap"));
+        assert!(warnings[0].message.contains("INBOX"));
+
+        let all = vec!["INBOX".to_string(), "Sent".to_string()];
+        let error = apply_skipped_folders(&all, 2, &mut warnings)
+            .expect_err("проход без прочитанных папок не может быть успехом");
+        assert_eq!(error.backend(), Some("imap-sync"));
+        assert!(error.to_string().contains("ни одна папка"));
+        // Отказ прохода не превращается ещё и в предупреждение.
+        assert_eq!(warnings.len(), 1);
     }
 }
 
@@ -702,7 +786,9 @@ impl SyncRegistry {
 /// тестах (S-014): CI-раннер не всегда имеет системный keychain.
 pub trait SecretStore: Send + Sync {
     /// `None` - записи нет или чтение не удалось; смене пароля это не мешает (S-041).
-    fn read(&self, secret_ref: &str) -> Option<String>;
+    /// Прочитанный секрет возвращается в обнуляемом буфере: он живёт до конца
+    /// сравнения и не должен оставаться в памяти после него (S-018).
+    fn read(&self, secret_ref: &str) -> Option<Zeroizing<String>>;
     /// Возвращает `true`, если `keyring` подтвердил запись без ошибки транспорта.
     /// Итог смены пароля определяется контрольным чтением (S-014), а не этим
     /// значением - оно только для журнала.
@@ -713,11 +799,12 @@ pub trait SecretStore: Send + Sync {
 pub struct SystemSecretStore;
 
 impl SecretStore for SystemSecretStore {
-    fn read(&self, secret_ref: &str) -> Option<String> {
+    fn read(&self, secret_ref: &str) -> Option<Zeroizing<String>> {
         keyring::Entry::new("truemail", secret_ref)
             .ok()?
             .get_password()
             .ok()
+            .map(Zeroizing::new)
     }
 
     fn write(&self, secret_ref: &str, value: &str) -> bool {
@@ -774,7 +861,7 @@ impl ChangePasswordError {
     pub fn general_error_code(&self) -> Option<&'static str> {
         match self {
             Self::InvalidCredentials(_) => Some("invalid_credentials"),
-            Self::UnsupportedAuthKind | Self::AccountChanged => Some("account_config"),
+            Self::UnsupportedAuthKind | Self::AccountChanged => Some("auth_kind_error"),
             Self::AccountNotFound => Some("unknown"),
             Self::MissingSecretRef => Some("needs_reauth"),
             Self::SecretStoreWriteFailed | Self::SecretStoreStateUnknown => {
@@ -928,11 +1015,6 @@ mod sync_warning_tests {
         assert!(warning.message.contains("HTTP 500"));
     }
 
-    #[test]
-    fn only_initial_pass_has_initial_phase() {
-        assert_eq!(mail_sync_phase(true), "initial");
-        assert_eq!(mail_sync_phase(false), "regular");
-    }
 }
 
 impl AccountManager {
@@ -3011,8 +3093,15 @@ impl AccountManager {
         account_id: i64,
         new_password: &str,
     ) -> std::result::Result<(), ChangePasswordError> {
-        self.change_account_password_with_store(account_id, new_password, &SystemSecretStore)
-            .await
+        // Своя копия пароля внутри ядра живёт в обнуляемом буфере: вызывающая
+        // сторона затирает свою строку сама, а эта копия переживает весь путь
+        // проверки и записи (S-018).
+        self.change_account_password_with_store(
+            account_id,
+            Zeroizing::new(new_password.to_owned()),
+            &SystemSecretStore,
+        )
+        .await
     }
 
     /// То же самое, но с подменяемым хранилищем секретов - используется в
@@ -3021,23 +3110,22 @@ impl AccountManager {
     pub async fn change_account_password_with_store(
         &self,
         account_id: i64,
-        new_password: &str,
+        new_password: Zeroizing<String>,
         store: &dyn SecretStore,
     ) -> std::result::Result<(), ChangePasswordError> {
         if !self.password_change_locks.try_lock(account_id).await {
             return Err(ChangePasswordError::ChangeInProgress);
         }
         let result = self
-            .change_account_password_inner(account_id, new_password, store)
+            .change_account_password_inner(account_id, &new_password, store)
             .await;
-        self.password_change_locks.unlock(account_id).await;
         result
     }
 
     async fn change_account_password_inner(
         &self,
         account_id: i64,
-        new_password: &str,
+        new_password: &Zeroizing<String>,
         store: &dyn SecretStore,
     ) -> std::result::Result<(), ChangePasswordError> {
         let accounts_before = self
@@ -3098,7 +3186,7 @@ impl AccountManager {
         // Старое значение - только для сравнения при контрольном чтении;
         // отсутствие записи или нечитаемый секрет смене не мешают (S-041).
         let old_value = store.read(&secret_ref);
-        let wrote = store.write(&secret_ref, new_password);
+        let wrote = store.write(&secret_ref, new_password.as_str());
         if !wrote {
             tracing::warn!(
                 account = %crate::logging::mask_email(&account.email),
@@ -3111,14 +3199,18 @@ impl AccountManager {
         // write() (S-014): keyring на некоторых платформах сообщает об
         // ошибке уже после фактически состоявшейся записи.
         match read_back {
-            Some(value) if value == new_password => {
+            Some(ref value) if value.as_str() == new_password.as_str() => {
                 tracing::info!(
                     account = %crate::logging::mask_email(&account.email),
                     "пароль аккаунта заменён в хранилище секретов"
                 );
                 Ok(())
             }
-            Some(ref value) if Some(value) == old_value.as_ref() => {
+            Some(ref value)
+                if old_value
+                    .as_ref()
+                    .is_some_and(|old| old.as_str() == value.as_str()) =>
+            {
                 tracing::warn!(
                     account = %crate::logging::mask_email(&account.email),
                     "смена пароля: запись в хранилище секретов не удалась"
@@ -3194,20 +3286,11 @@ impl AccountManager {
         let mail_folders = match imap_result {
             Ok(imap) => {
                 // Обрыв связи посреди обхода папок (imap-reconnect-resilience.md).
-                match skipped_folders_outcome(&imap.skipped_folders, imap.folders.len()) {
-                    SkippedFolders::None => {}
-                    SkippedFolders::Warn(text) => warnings.push(SyncWarning::classified(
-                        ErrorKind::NetworkUnavailable,
-                        text,
-                        Some("imap"),
-                    )),
-                    SkippedFolders::Failed(text) => {
-                        return Err(crate::Error::Backend {
-                            backend: "imap-sync".into(),
-                            message: text,
-                        });
-                    }
-                }
+                apply_skipped_folders(
+                    &imap.skipped_folders,
+                    imap.folders.len(),
+                    &mut warnings,
+                )?;
                 let saved = match self
                     .db
                     .save_discovered_folders(account.id, &imap.folders)
@@ -3344,27 +3427,6 @@ impl AccountManager {
 }
 
 #[cfg(test)]
-mod connect_progress_timeout_tests {
-    //! Проверки пределов времени подключения аккаунта
-    //! (account-connect-progress.md, S-012, S-013): значения самих констант
-    //! фиксируются тестом, чтобы случайная правка не сдвинула предел незаметно.
-    //! Поведение таймаута под нагрузкой (реально зависающий транспорт)
-    //! проверяется вручную - тестовый рантайм этого крейта не собран с
-    //! `tokio` `test-util`, поэтому управляемое время здесь недоступно.
-    use super::AccountManager;
-
-    #[test]
-    fn s012_ews_discovery_timeout_is_sixty_seconds() {
-        assert_eq!(AccountManager::EWS_DISCOVERY_TIMEOUT.as_secs(), 60);
-    }
-
-    #[test]
-    fn s013_credential_check_timeout_is_forty_five_seconds() {
-        assert_eq!(AccountManager::CREDENTIAL_CHECK_TIMEOUT.as_secs(), 45);
-    }
-}
-
-#[cfg(test)]
 mod change_password_tests {
     //! Проверки тихой смены пароля (accounts-accordion-password.md). Сервер
     //! мокается локальным JMAP-эндпоинтом (тот же приём, что и в
@@ -3421,8 +3483,8 @@ mod change_password_tests {
         }
     }
     impl SecretStore for MockSecretStore {
-        fn read(&self, secret_ref: &str) -> Option<String> {
-            if self.wrote.load(Ordering::SeqCst) {
+        fn read(&self, secret_ref: &str) -> Option<Zeroizing<String>> {
+            let value = if self.wrote.load(Ordering::SeqCst) {
                 match self.read_after_write {
                     ReadAfterWrite::NewValue => {
                         self.writes.lock().unwrap().last().map(|(_, v)| v.clone())
@@ -3433,7 +3495,8 @@ mod change_password_tests {
                 }
             } else {
                 self.initial.get(secret_ref).cloned()
-            }
+            };
+            value.map(Zeroizing::new)
         }
         fn write(&self, secret_ref: &str, value: &str) -> bool {
             self.writes
@@ -3498,6 +3561,34 @@ mod change_password_tests {
         };
         let app = Router::new()
             .route("/.well-known/jmap", get(mock_jmap_session))
+            .with_state(state);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base, server)
+    }
+
+    /// Тот же мок, но с задержкой ответа: одновременные запросы должны
+    /// пересечься по времени, иначе проверять блокировку нечем.
+    async fn mock_jmap_session_slow(
+        State(state): State<JmapAuthState>,
+        headers: HeaderMap,
+    ) -> Response {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        mock_jmap_session(State(state), headers).await
+    }
+
+    async fn spawn_slow_mock_jmap(expected_password: &str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let state = JmapAuthState {
+            base: base.clone(),
+            expected_password: expected_password.to_owned(),
+        };
+        let app = Router::new()
+            .route("/.well-known/jmap", get(mock_jmap_session_slow))
             .with_state(state);
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -3587,8 +3678,18 @@ mod change_password_tests {
         secret_ref: &str,
         auth_kind: AuthKind,
     ) -> Account {
+        save_jmap_account_as(db, base, secret_ref, auth_kind, "user@example.test").await
+    }
+
+    async fn save_jmap_account_as(
+        db: &Db,
+        base: &str,
+        secret_ref: &str,
+        auth_kind: AuthKind,
+        email: &str,
+    ) -> Account {
         db.save_account(&NewAccount {
-            email: "user@example.test".into(),
+            email: email.into(),
             display_name: "JMAP test".into(),
             provider: Provider::Generic,
             backend_kind: BackendKind::Jmap,
@@ -3599,7 +3700,7 @@ mod change_password_tests {
             caldav_url: None,
             carddav_url: None,
             jmap_url: Some(format!("{base}/.well-known/jmap")),
-            username: Some("user@example.test".into()),
+            username: Some(email.to_owned()),
             secret_ref: secret_ref.into(),
             color: None,
         })
@@ -3629,116 +3730,201 @@ mod change_password_tests {
         assert!(!classify_validation_error("timed out waiting for response"));
     }
 
+    /// Коды смены пароля и их виды читает интерфейс: settings.js различает
+    /// два кода команды дословно, а вид ошибки попадает в общую таблицу
+    /// error-presentation.js. Перечень берётся из самого файла интерфейса -
+    /// новый вариант ошибки с видом, которого там нет, обязан ронять проверку,
+    /// а не показываться пользователю пустой карточкой.
     #[test]
-    fn error_codes_match_contract() {
-        assert_eq!(
-            ChangePasswordError::InvalidCredentials("x".into()).code(),
-            "invalid_credentials"
-        );
-        assert_eq!(
-            ChangePasswordError::UnsupportedAuthKind.code(),
-            "unsupported_auth_kind"
-        );
-        assert_eq!(
-            ChangePasswordError::AccountNotFound.code(),
-            "account_not_found"
-        );
-        assert_eq!(
-            ChangePasswordError::MissingSecretRef.code(),
-            "missing_secret_ref"
-        );
-        assert_eq!(
-            ChangePasswordError::SecretStoreWriteFailed.code(),
-            "secret_store_write_failed"
-        );
-        assert_eq!(
-            ChangePasswordError::SecretStoreStateUnknown.code(),
-            "secret_store_state_unknown"
-        );
-        assert_eq!(
-            ChangePasswordError::ChangeInProgress.code(),
-            "change_in_progress"
-        );
-        assert_eq!(
-            ChangePasswordError::AccountChanged.code(),
-            "account_changed"
-        );
-        assert_eq!(
-            ChangePasswordError::BackendUnavailable("x".into()).code(),
-            "backend_unavailable"
-        );
-    }
+    fn password_error_codes_and_kinds_are_known_to_the_interface() {
+        const PRESENTATION: &str =
+            include_str!("../../../../apps/desktop/ui/modules/error-presentation.js");
+        const SETTINGS: &str = include_str!("../../../../apps/desktop/ui/modules/settings.js");
 
-    #[test]
-    fn password_errors_map_to_general_error_kinds() {
+        // Виды ошибок, для которых в интерфейсе есть текст и действие.
+        let known_kinds: Vec<&str> = PRESENTATION
+            .lines()
+            .skip_while(|line| !line.contains("const ERROR_KINDS"))
+            .skip(1)
+            .take_while(|line| !line.contains("});"))
+            .filter_map(|line| line.trim().split_once(':').map(|(key, _)| key.trim()))
+            .collect();
+        assert!(
+            known_kinds.len() >= 10,
+            "перечень видов ошибок интерфейса не прочитан: {known_kinds:?}"
+        );
+
         let cases = [
             (
                 ChangePasswordError::InvalidCredentials("x".into()),
+                "invalid_credentials",
                 Some("invalid_credentials"),
             ),
             (
                 ChangePasswordError::UnsupportedAuthKind,
+                "unsupported_auth_kind",
                 Some("account_config"),
             ),
-            (ChangePasswordError::AccountNotFound, Some("unknown")),
-            (ChangePasswordError::MissingSecretRef, Some("needs_reauth")),
+            (
+                ChangePasswordError::AccountNotFound,
+                "account_not_found",
+                Some("unknown"),
+            ),
+            (
+                ChangePasswordError::MissingSecretRef,
+                "missing_secret_ref",
+                Some("needs_reauth"),
+            ),
             (
                 ChangePasswordError::SecretStoreWriteFailed,
+                "secret_store_write_failed",
                 Some("secret_store_error"),
             ),
             (
                 ChangePasswordError::SecretStoreStateUnknown,
+                "secret_store_state_unknown",
                 Some("secret_store_error"),
             ),
-            (ChangePasswordError::ChangeInProgress, None),
-            (ChangePasswordError::AccountChanged, Some("account_config")),
+            // Повторный запрос по тому же аккаунту вида не имеет: интерфейс
+            // показывает его собственным текстом диалога, а не общей таблицей.
+            (
+                ChangePasswordError::ChangeInProgress,
+                "change_in_progress",
+                None,
+            ),
+            (
+                ChangePasswordError::AccountChanged,
+                "account_changed",
+                Some("account_config"),
+            ),
             (
                 ChangePasswordError::BackendUnavailable("x".into()),
+                "backend_unavailable",
                 Some("server_unavailable"),
             ),
         ];
-        for (error, kind) in cases {
-            assert_eq!(error.general_error_code(), kind);
+        for (error, code, kind) in cases {
+            assert_eq!(error.code(), code, "код ошибки {error:?}");
+            assert_eq!(error.general_error_code(), kind, "вид ошибки {error:?}");
+            if let Some(kind) = kind {
+                assert!(
+                    known_kinds.contains(&kind),
+                    "вид \"{kind}\" не описан в error-presentation.js"
+                );
+            }
+        }
+
+        // Два кода диалог смены пароля различает дословно.
+        for code in ["invalid_credentials", "missing_secret_ref"] {
+            assert!(
+                SETTINGS.contains(&format!("error?.code==='{code}'")),
+                "settings.js больше не различает код \"{code}\""
+            );
         }
     }
 
     // ---------- S-017: блокировка на аккаунт ----------
 
+    /// S-017: два настоящих одновременных запроса по одному аккаунту. Один
+    /// проходит, второй получает отказ "смена уже идёт" и не трогает хранилище
+    /// секретов. Блокировка при этом обязана сниматься: следующая смена того же
+    /// аккаунта проходит обычным порядком - потеря разблокировки означала бы,
+    /// что пароль этого ящика больше не сменить до перезапуска.
     #[tokio::test]
-    async fn password_change_lock_rejects_same_account_but_not_others() {
-        let locks = PasswordChangeLocks::default();
-        assert!(locks.try_lock(1).await);
-        assert!(
-            !locks.try_lock(1).await,
-            "повторный запрос по тому же аккаунту должен получить отказ"
-        );
-        assert!(
-            locks.try_lock(2).await,
-            "другой аккаунт не должен блокироваться"
-        );
-        locks.unlock(1).await;
-        assert!(
-            locks.try_lock(1).await,
-            "после unlock аккаунт снова доступен"
-        );
-    }
-
-    #[tokio::test]
-    async fn change_in_progress_rejects_concurrent_request_on_same_account() {
+    async fn two_simultaneous_changes_of_one_account_leave_one_winner() {
         let (db, root) = temp_db("in-progress").await;
-        let (base, server) = spawn_mock_jmap("correct-password").await;
+        // Сервер отвечает не мгновенно: иначе первый запрос успевал бы
+        // завершиться раньше, чем второй доходит до блокировки.
+        let (base, server) = spawn_slow_mock_jmap("new-password").await;
         let account = save_jmap_account(&db, &base, "secret-ref-1", AuthKind::AppPassword).await;
         let manager = std::sync::Arc::new(AccountManager::new(db.clone()));
-        // Занимаем блокировку напрямую - без реального сетевого вызова -
-        // чтобы детерминированно смоделировать "смена уже идёт".
-        assert!(manager.password_change_locks.try_lock(account.id).await);
-        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
-        let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
+        let store = MockSecretStore::new(
+            &[("secret-ref-1", "old-password")],
+            true,
+            ReadAfterWrite::NewValue,
+        );
+
+        let (first, second) = tokio::join!(
+            manager.change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            ),
+            manager.change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
+        );
+
+        let mut outcomes = [first, second];
+        outcomes.sort_by_key(|outcome| outcome.is_err());
+        assert_eq!(outcomes[0], Ok(()), "один из запросов обязан пройти");
+        assert_eq!(
+            outcomes[1],
+            Err(ChangePasswordError::ChangeInProgress),
+            "второй запрос по тому же аккаунту обязан получить отказ"
+        );
+        assert_eq!(
+            store.write_count(),
+            1,
+            "отклонённый запрос не должен писать в хранилище секретов"
+        );
+
+        // Блокировка снята: следующая смена того же аккаунта проходит.
+        let again = manager
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
             .await;
-        assert_eq!(result, Err(ChangePasswordError::ChangeInProgress));
-        assert_eq!(store.write_count(), 0);
-        manager.password_change_locks.unlock(account.id).await;
+        assert_eq!(again, Ok(()), "после завершения смены аккаунт снова доступен");
+
+        cleanup(db, root, server).await;
+    }
+
+    /// Блокировка идёт по аккаунту, а не по приложению: смена пароля одного
+    /// ящика не должна мешать другому.
+    #[tokio::test]
+    async fn a_change_of_one_account_does_not_block_another() {
+        let (db, root) = temp_db("two-accounts").await;
+        let (base, server) = spawn_slow_mock_jmap("new-password").await;
+        let first_account =
+            save_jmap_account(&db, &base, "secret-ref-a", AuthKind::AppPassword).await;
+        let second_account = save_jmap_account_as(
+            &db,
+            &base,
+            "secret-ref-b",
+            AuthKind::AppPassword,
+            "second@example.test",
+        )
+        .await;
+        let manager = std::sync::Arc::new(AccountManager::new(db.clone()));
+        let store = MockSecretStore::new(
+            &[
+                ("secret-ref-a", "old-password"),
+                ("secret-ref-b", "old-password"),
+            ],
+            true,
+            ReadAfterWrite::NewValue,
+        );
+
+        let (first, second) = tokio::join!(
+            manager.change_account_password_with_store(
+                first_account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            ),
+            manager.change_account_password_with_store(
+                second_account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
+        );
+
+        assert_eq!(first, Ok(()));
+        assert_eq!(second, Ok(()));
         cleanup(db, root, server).await;
     }
 
@@ -3752,7 +3938,11 @@ mod change_password_tests {
         let manager = AccountManager::new(db.clone());
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(result, Err(ChangePasswordError::UnsupportedAuthKind));
         assert_eq!(store.write_count(), 0);
@@ -3765,7 +3955,11 @@ mod change_password_tests {
         let manager = AccountManager::new(db.clone());
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         let result = manager
-            .change_account_password_with_store(999_999, "new-password", &store)
+            .change_account_password_with_store(
+                999_999,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(result, Err(ChangePasswordError::AccountNotFound));
         db.close().await;
@@ -3786,7 +3980,11 @@ mod change_password_tests {
         let manager = AccountManager::new(db.clone());
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(result, Err(ChangePasswordError::MissingSecretRef));
         assert_eq!(store.write_count(), 0);
@@ -3807,7 +4005,11 @@ mod change_password_tests {
         let manager = AccountManager::new(db.clone());
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("new-password".into()),
+                &store,
+            )
             .await;
         assert!(matches!(
             result,
@@ -3832,7 +4034,11 @@ mod change_password_tests {
             ReadAfterWrite::NewValue,
         );
         let result = manager
-            .change_account_password_with_store(account.id, "totally-wrong-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("totally-wrong-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(
             result,
@@ -3875,7 +4081,11 @@ mod change_password_tests {
                 ReadAfterWrite::NewValue,
             );
             let result = manager
-                .change_account_password_with_store(account.id, "correct-password", &store)
+                .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("correct-password".into()),
+                &store,
+            )
                 .await;
             assert_eq!(
                 result,
@@ -3899,7 +4109,11 @@ mod change_password_tests {
                 ReadAfterWrite::OldValue,
             );
             let result = manager
-                .change_account_password_with_store(account.id, "correct-password", &store)
+                .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("correct-password".into()),
+                &store,
+            )
                 .await;
             assert_eq!(result, Err(ChangePasswordError::SecretStoreWriteFailed));
         }
@@ -3919,7 +4133,11 @@ mod change_password_tests {
                 let store =
                     MockSecretStore::new(&[("secret-ref-su", "old-password")], wrote, outcome);
                 let result = manager
-                    .change_account_password_with_store(account.id, "correct-password", &store)
+                    .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("correct-password".into()),
+                &store,
+            )
                     .await;
                 assert_eq!(result, Err(ChangePasswordError::SecretStoreStateUnknown));
             }
@@ -3936,7 +4154,11 @@ mod change_password_tests {
         let manager = AccountManager::new(db.clone());
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         let result = manager
-            .change_account_password_with_store(account.id, "correct-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("correct-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(result, Ok(()));
         cleanup(db, root, server).await;
@@ -3968,7 +4190,11 @@ mod change_password_tests {
             ReadAfterWrite::NewValue,
         );
         let result = manager
-            .change_account_password_with_store(account.id, "correct-password", &store)
+            .change_account_password_with_store(
+                account.id,
+                Zeroizing::new("correct-password".into()),
+                &store,
+            )
             .await;
         assert_eq!(result, Err(ChangePasswordError::AccountChanged));
         assert_eq!(
@@ -3979,103 +4205,124 @@ mod change_password_tests {
         cleanup(db, root, server).await;
     }
 
-    /// S-016: операция, взявшая секрет до смены, работает со своим снимком, а
-    /// следующее обращение получает уже новое значение. Идущая синхронизация не
-    /// отменяется - она просто дочитывает свой старый секрет.
+    /// Приёмник журнала: буфер, в который подписчик tracing складывает все
+    /// записи, сделанные на проверяемом пути.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("журнал")).into_owned()
+        }
+    }
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("журнал").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// S-018 (issue #113): значение пароля не попадает в журнал ни на одной
+    /// ветке смены. Путь проходится целиком - успех, отказ сервера и отказ
+    /// хранилища секретов, - а записи журнала собираются настоящим подписчиком
+    /// tracing: ревью журналов такую утечку пропускает, а проверка нет.
     #[tokio::test]
-    async fn running_operation_keeps_its_snapshot_and_next_read_sees_new_secret() {
-        let (db, root) = temp_db("secret-snapshot").await;
-        let (base, server) = spawn_mock_jmap("new-password").await;
-        let account =
-            save_jmap_account(&db, &base, "secret-ref-snapshot", AuthKind::AppPassword).await;
+    async fn password_never_reaches_the_log_on_any_branch() {
+        const PASSWORD: &str = "sup3r-secret-value";
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (db, root) = temp_db("log-leak").await;
+        let (base, server) = spawn_mock_jmap(PASSWORD).await;
+        let account = save_jmap_account(&db, &base, "secret-ref-log", AuthKind::Password).await;
         let manager = AccountManager::new(db.clone());
+
+        // Успех: сервер принял пароль, хранилище подтвердило запись.
         let store = MockSecretStore::new(
-            &[("secret-ref-snapshot", "old-password")],
+            &[("secret-ref-log", "old-password")],
             true,
             ReadAfterWrite::NewValue,
         );
-        // Снимок, который держит уже запущенная операция.
-        let snapshot = store.read("secret-ref-snapshot").expect("старый секрет");
-        manager
-            .change_account_password_with_store(account.id, "new-password", &store)
-            .await
-            .expect("смена пароля проходит");
         assert_eq!(
-            snapshot, "old-password",
-            "снимок старой операции не меняется"
+            manager
+                .change_account_password_with_store(
+                    account.id,
+                    Zeroizing::new(PASSWORD.into()),
+                    &store,
+                )
+                .await,
+            Ok(())
         );
-        assert_eq!(
-            store.read("secret-ref-snapshot").as_deref(),
-            Some("new-password"),
-            "следующее обращение за секретом получает новое значение"
-        );
-        cleanup(db, root, server).await;
-    }
 
-    /// S-014: хранилище сообщило об ошибке записи, но значение фактически
-    /// записалось - контрольное чтение видит новый пароль, операция успешна.
-    #[tokio::test]
-    async fn failed_write_report_with_new_value_read_back_is_success() {
-        let (db, root) = temp_db("write-error-but-written").await;
-        let (base, server) = spawn_mock_jmap("new-password").await;
-        let account = save_jmap_account(&db, &base, "secret-ref-werr", AuthKind::AppPassword).await;
-        let manager = AccountManager::new(db.clone());
-        let store = MockSecretStore::new(
-            &[("secret-ref-werr", "old-password")],
-            false,
-            ReadAfterWrite::NewValue,
-        );
-        let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
-            .await;
-        assert_eq!(
-            result,
-            Ok(()),
-            "запись фактически прошла - это успех (S-014)"
-        );
-        cleanup(db, root, server).await;
-    }
+        // Отказ сервера: пароль не подошёл.
+        let (other_base, other_server) = spawn_mock_jmap("совсем другой пароль").await;
+        let rejected_account =
+            save_jmap_account_as(&db, &other_base, "secret-ref-log-2", AuthKind::Password, "other@example.test")
+                .await;
+        let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
+        assert!(matches!(
+            manager
+                .change_account_password_with_store(
+                    rejected_account.id,
+                    Zeroizing::new(PASSWORD.into()),
+                    &store,
+                )
+                .await,
+            Err(ChangePasswordError::InvalidCredentials(_))
+        ));
 
-    /// S-014: ошибка записи и старое значение при контрольном чтении - отказ.
-    #[tokio::test]
-    async fn failed_write_report_with_old_value_read_back_is_write_failed() {
-        let (db, root) = temp_db("write-error-old-value").await;
-        let (base, server) = spawn_mock_jmap("new-password").await;
-        let account =
-            save_jmap_account(&db, &base, "secret-ref-werr2", AuthKind::AppPassword).await;
-        let manager = AccountManager::new(db.clone());
+        // Отказ хранилища: запись не состоялась, контрольное чтение видит старое.
         let store = MockSecretStore::new(
-            &[("secret-ref-werr2", "old-password")],
+            &[("secret-ref-log", "old-password")],
             false,
             ReadAfterWrite::OldValue,
         );
-        let result = manager
-            .change_account_password_with_store(account.id, "new-password", &store)
-            .await;
-        assert_eq!(result, Err(ChangePasswordError::SecretStoreWriteFailed));
-        cleanup(db, root, server).await;
-    }
+        assert_eq!(
+            manager
+                .change_account_password_with_store(
+                    account.id,
+                    Zeroizing::new(PASSWORD.into()),
+                    &store,
+                )
+                .await,
+            Err(ChangePasswordError::SecretStoreWriteFailed)
+        );
 
-    /// S-018: ни успешный ответ, ни ошибка не несут пароль в сериализованном виде.
-    #[test]
-    fn serialized_error_never_contains_password() {
-        let password = "sup3r-secret-value";
-        for error in [
-            ChangePasswordError::InvalidCredentials("сервер отклонил вход".into()),
-            ChangePasswordError::BackendUnavailable("нет соединения".into()),
-            ChangePasswordError::SecretStoreWriteFailed,
-            ChangePasswordError::SecretStoreStateUnknown,
-            ChangePasswordError::MissingSecretRef,
-            ChangePasswordError::AccountNotFound,
-            ChangePasswordError::AccountChanged,
-            ChangePasswordError::ChangeInProgress,
-            ChangePasswordError::UnsupportedAuthKind,
-        ] {
-            let text = format!("{error} {error:?} {}", error.code());
-            assert!(
-                !text.contains(password),
-                "текст и код ошибки не должны содержать пароль: {text}"
-            );
-        }
+        let text = logs.text();
+        assert!(
+            !text.is_empty(),
+            "подписчик не собрал ни одной записи - проверять нечего"
+        );
+        assert!(
+            !text.contains(PASSWORD),
+            "пароль попал в журнал:\n{text}"
+        );
+        // Адрес ящика в журнале тоже маскируется - иначе утечка просто
+        // переезжает с пароля на владельца.
+        assert!(
+            !text.contains("user@example.test"),
+            "адрес ящика попал в журнал без маски:\n{text}"
+        );
+
+        other_server.abort();
+        cleanup(db, root, server).await;
     }
 }

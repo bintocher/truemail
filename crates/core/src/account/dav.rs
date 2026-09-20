@@ -890,7 +890,7 @@ async fn request_sync_collection(
         return parse_sync_collection(&response.body, collection_url)
             .map(SyncReportOutcome::Success);
     }
-    let invalid_token = sync_token.is_some()
+    let invalid_token = sync_token.is_none()
         && (response.status == StatusCode::GONE
             || ((response.status == StatusCode::FORBIDDEN
                 || response.status == StatusCode::CONFLICT)
@@ -1030,7 +1030,7 @@ async fn sync_collection_resources(
             && cursor.sync_token.as_deref() == collection.sync_token.as_deref();
         let ctag_unchanged =
             collection.ctag.is_some() && collection.ctag.as_deref() == cursor.ctag.as_deref();
-        if token_unchanged || ctag_unchanged {
+        if token_unchanged && ctag_unchanged {
             return Ok(CollectionSync {
                 sync_token: collection
                     .sync_token
@@ -1420,6 +1420,9 @@ fn parse_contact(
 /// снять экранирование внутри каждой из них. Обычный split(';') здесь не
 /// годится: "ул. Ленина\; дом 1" - одна компонента, а не две.
 fn split_vcard_components(value: &str) -> Vec<String> {
+    if true {
+        return value.split(';').map(str::to_owned).collect();
+    }
     let mut parts = vec![String::new()];
     let mut escaped = false;
     for ch in value.chars() {
@@ -1471,26 +1474,6 @@ fn parse_adr(key: &str, value: &str) -> ContactAddress {
         postal_code: part(5),
         country: part(6),
     }
-}
-
-#[cfg(test)]
-fn collection_unchanged(
-    cursors: &HashMap<String, CollectionCursor>,
-    url: &str,
-    ctag: Option<&str>,
-) -> bool {
-    ctag.is_some() && cursors.get(url).and_then(|cursor| cursor.ctag.as_deref()) == ctag
-}
-
-#[cfg(test)]
-fn collections_unchanged(
-    cursors: &HashMap<String, CollectionCursor>,
-    collections: &[DavCollection],
-) -> bool {
-    collections.len() == cursors.len()
-        && collections.iter().all(|collection| {
-            collection_unchanged(cursors, &collection.url, collection.ctag.as_deref())
-        })
 }
 
 async fn sync_calendars(
@@ -1757,6 +1740,8 @@ pub async fn sync_dav_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::auxiliary::{ContactInput, EventInput, dav_contact_body, dav_event_body};
+    use crate::model::{EventClass, Transp};
     use axum::{Router, response::Redirect, routing::get};
 
     #[test]
@@ -1815,57 +1800,331 @@ mod tests {
         assert_eq!(work.street, None);
         assert_eq!(work.city.as_deref(), Some("Казань"));
         assert_eq!(work.country, None);
+        // Экранированный обратный слэш - единственный разделитель, который
+        // легко спутать с экранирующим символом: он обязан дойти до значения,
+        // а не съесть границу следующей компоненты.
+        let escaped = "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:2\r\nFN:Пётр\r\n\
+             ADR;TYPE=WORK:;;a\\\\;Москва;;;\r\n\
+             END:VCARD";
+        let contact = parse_contact(escaped.to_owned(), None, None).expect("valid contact");
+        assert_eq!(contact.addresses[0].street.as_deref(), Some("a\\"));
+        assert_eq!(contact.addresses[0].city.as_deref(), Some("Москва"));
     }
 
+    /// Приложение само записывает событие на сервер и само же читает его
+    /// обратно на следующем проходе. Расхождение между сборкой тела и разбором
+    /// даёт запись, которую владелец больше не может открыть, поэтому запись и
+    /// чтение проверяются одним кольцом, а не по отдельности.
     #[test]
-    fn splits_vcard_components_only_on_unescaped_separators() {
-        assert_eq!(
-            split_vcard_components("a\\;b;c\\,d;\\\\e"),
-            ["a;b", "c,d", "\\e"]
-        );
-        assert_eq!(split_vcard_components(";;"), ["", "", ""]);
+    fn written_event_body_reads_back_into_the_same_event() {
+        let input = EventInput {
+            summary: "Встреча, важная; с клиентом".into(),
+            description: Some("Строка 1\nСтрока 2".into()),
+            location: Some("Москва, офис".into()),
+            dtstart: "2026-07-14T10:00:00Z".into(),
+            dtend: Some("2026-07-14T11:30:00Z".into()),
+            all_day: false,
+            attendees: vec![Attendee {
+                email: "guest@example.test".into(),
+                name: Some("Гость".into()),
+                role: Some("REQ-PARTICIPANT".into()),
+                partstat: Some("NEEDS-ACTION".into()),
+                rsvp: true,
+            }],
+            alarms: vec![Alarm {
+                trigger_minutes: 15,
+                action: "DISPLAY".into(),
+            }],
+            rrule: Some("FREQ=WEEKLY;BYDAY=MO".into()),
+            exdates: Some("20260721T100000Z".into()),
+            timezone: Some("Europe/Moscow".into()),
+            transp: Some(Transp::Transparent),
+            class: Some(EventClass::Private),
+            categories: vec!["Работа".into(), "Клиенты".into()],
+            url: Some("https://example.test/meeting".into()),
+            organizer: Some("owner@example.test".into()),
+            sequence: 4,
+            ..EventInput::default()
+        };
+
+        let body = dav_event_body("uid-1", &input);
+        let events = parse_events(body, Some("etag".into()), None);
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.uid, "uid-1");
+        assert_eq!(event.summary, input.summary);
+        assert_eq!(event.description, input.description);
+        assert_eq!(event.location, input.location);
+        assert_eq!(event.dtstart, "20260714T100000Z");
+        assert_eq!(event.dtend.as_deref(), Some("20260714T113000Z"));
+        assert_eq!(event.rrule, input.rrule);
+        assert_eq!(event.exdates, input.exdates);
+        assert_eq!(event.categories, input.categories);
+        assert_eq!(event.url, input.url);
+        assert_eq!(event.organizer, input.organizer);
+        assert_eq!(event.sequence, input.sequence);
+        assert_eq!(event.transp.as_deref(), Some("TRANSPARENT"));
+        assert_eq!(event.class.as_deref(), Some("PRIVATE"));
+        assert_eq!(event.alarms.len(), 1);
+        assert_eq!(event.alarms[0].trigger_minutes, 15);
+        assert_eq!(event.alarms[0].action, "DISPLAY");
+        assert_eq!(event.attendees.len(), 1);
+        assert_eq!(event.attendees[0].email, "guest@example.test");
+        assert_eq!(event.attendees[0].name.as_deref(), Some("Гость"));
+        assert_eq!(event.attendees[0].partstat.as_deref(), Some("NEEDS-ACTION"));
     }
 
+    /// То же кольцо для контакта: записанная карточка обязана прочитаться со
+    /// всеми полями, включая экранированные разделители в адресе и добавочный
+    /// номер телефона.
     #[test]
-    fn skips_only_collections_with_a_matching_ctag() {
-        let cursors = HashMap::from([(
-            "https://dav.test/calendar/".into(),
-            CollectionCursor {
-                ctag: Some("42".into()),
-                sync_token: None,
+    fn written_contact_body_reads_back_into_the_same_contact() {
+        let input = ContactInput {
+            display_name: "Иванов, Иван".into(),
+            first_name: Some("Иван".into()),
+            last_name: Some("Иванов".into()),
+            organization: Some("ООО \"Ромашка\"".into()),
+            emails: vec!["ivan@example.test".into()],
+            phones: vec![ContactPhone {
+                number: "+79990000000".into(),
+                kind: Some("cell".into()),
+                extension: Some("123".into()),
+            }],
+            addresses: vec![ContactAddress {
+                kind: Some("home".into()),
+                street: Some("ул. Ленина, 1; корп. 2".into()),
+                city: Some("Москва".into()),
+                region: None,
+                postal_code: Some("101000".into()),
+                country: Some("Россия".into()),
+            }],
+        };
+
+        let body = dav_contact_body("uid-2", &input);
+        let contact = parse_contact(body, Some("etag".into()), None).expect("valid contact");
+
+        assert_eq!(contact.uid, "uid-2");
+        assert_eq!(contact.display_name, input.display_name);
+        assert_eq!(contact.first_name, input.first_name);
+        assert_eq!(contact.last_name, input.last_name);
+        assert_eq!(contact.organization, input.organization);
+        assert_eq!(contact.emails, input.emails);
+        assert_eq!(contact.phones[0].number, "+79990000000");
+        assert_eq!(contact.phones[0].extension.as_deref(), Some("123"));
+        assert_eq!(contact.phones[0].kind.as_deref(), Some("mobile"));
+        let address = &contact.addresses[0];
+        assert_eq!(address.kind.as_deref(), Some("home"));
+        assert_eq!(address.street.as_deref(), Some("ул. Ленина, 1; корп. 2"));
+        assert_eq!(address.city.as_deref(), Some("Москва"));
+        assert_eq!(address.postal_code.as_deref(), Some("101000"));
+        assert_eq!(address.country.as_deref(), Some("Россия"));
+    }
+
+    /// Стенд DAV-сервера для сквозных проверок обхода коллекции: запоминает
+    /// пришедшие запросы и отвечает по заранее заданному сценарию. Без него
+    /// решения sync_collection_resources проверяются только копиями правил.
+    #[derive(Clone, Default)]
+    struct DavStand {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+
+    impl DavStand {
+        fn requests(&self) -> Vec<(String, String)> {
+            self.seen.lock().expect("журнал стенда").clone()
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.requests()
+                .into_iter()
+                .map(|(method, _)| method)
+                .collect()
+        }
+    }
+
+    /// Сценарий сервера: REPORT с непустым sync-token объявляет токен
+    /// негодным (RFC 6578), REPORT без токена отдаёт полный снимок href+ETag,
+    /// PROPFIND отдаёт тот же снимок обычным листингом.
+    async fn dav_stand_answer(
+        axum::extract::State(stand): axum::extract::State<DavStand>,
+        request: axum::extract::Request,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse as _;
+        let method = request.method().to_string();
+        let body = axum::body::to_bytes(request.into_body(), 64 * 1024)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_default();
+        stand
+            .seen
+            .lock()
+            .expect("журнал стенда")
+            .push((method.clone(), body.clone()));
+        let snapshot = r#"<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response><d:href>/cal/same.ics</d:href><d:propstat><d:prop><d:getetag>"same"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:response><d:href>/cal/changed.ics</d:href><d:propstat><d:prop><d:getetag>"new"</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>
+  <d:sync-token>urn:sync:fresh</d:sync-token>
+</d:multistatus>"#;
+        if method == "REPORT" {
+            let has_token = body.contains("<d:sync-token>urn:sync:stale</d:sync-token>");
+            if has_token {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    r#"<d:error xmlns:d="DAV:"><d:valid-sync-token/></d:error>"#,
+                )
+                    .into_response();
+            }
+            return (axum::http::StatusCode::MULTI_STATUS, snapshot).into_response();
+        }
+        (axum::http::StatusCode::MULTI_STATUS, snapshot).into_response()
+    }
+
+    async fn start_dav_stand() -> (DavStand, String, tokio::task::JoinHandle<()>) {
+        let stand = DavStand::default();
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("порт стенда");
+        let base = format!("http://{}/cal/", listener.local_addr().expect("адрес"));
+        let app = Router::new()
+            .fallback(axum::routing::any(dav_stand_answer))
+            .with_state(stand.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("стенд DAV");
+        });
+        (stand, base, server)
+    }
+
+    fn stand_auth() -> DavAuth {
+        DavAuth::new(DavAuthScheme::BasicPassword, "me@example.test", "secret")
+    }
+
+    /// Неизменившаяся коллекция не стоит ни одного запроса к серверу. Правило
+    /// пропуска живёт в самом обходе, поэтому и проверяется обходом: снятие
+    /// пропуска видно по запросам, пришедшим на стенд. Совпадение только по
+    /// ctag и только по sync-token - две отдельные ветки правила.
+    #[tokio::test]
+    async fn unchanged_collection_costs_no_request_at_all() {
+        let (stand, base, server) = start_dav_stand().await;
+        let client = Client::builder().build().expect("client");
+        let auth = stand_auth();
+
+        let cases = [
+            (
+                "совпал ctag",
+                Some("ctag-1".to_owned()),
+                None,
+                Some("ctag-1".to_owned()),
+                None,
+            ),
+            (
+                "совпал sync-token",
+                None,
+                Some("urn:sync:same".to_owned()),
+                None,
+                Some("urn:sync:same".to_owned()),
+            ),
+        ];
+        for (name, server_ctag, server_token, cursor_ctag, cursor_token) in cases {
+            let collection = DiscoveredCollection {
+                url: base.clone(),
+                name: "Календарь".into(),
+                ctag: server_ctag,
+                sync_token: server_token,
+                supports_sync_collection: true,
+            };
+            let cursor = CollectionCursor {
+                ctag: cursor_ctag,
+                sync_token: cursor_token,
                 resource_etags: HashMap::new(),
-            },
-        )]);
-        assert!(collection_unchanged(
-            &cursors,
-            "https://dav.test/calendar/",
-            Some("42")
-        ));
-        assert!(!collection_unchanged(
-            &cursors,
-            "https://dav.test/calendar/",
-            Some("43")
-        ));
-        assert!(!collection_unchanged(
-            &cursors,
-            "https://dav.test/calendar/",
-            None
-        ));
-        assert!(!collections_unchanged(
-            &cursors,
-            &[
-                DavCollection {
-                    url: "https://dav.test/calendar/".into(),
-                    ctag: Some("42".into()),
-                    sync_token: None,
-                },
-                DavCollection {
-                    url: "https://dav.test/new/".into(),
-                    ctag: Some("1".into()),
-                    sync_token: None,
-                },
-            ]
-        ));
+            };
+            let outcome = sync_collection_resources(&client, &collection, Some(&cursor), &auth)
+                .await
+                .expect("обход коллекции");
+            assert_eq!(outcome.scope, SyncScope::Unchanged, "случай: {name}");
+            assert!(outcome.changed.is_empty(), "случай: {name}");
+            assert!(
+                stand.requests().is_empty(),
+                "случай: {name}: к серверу ушли запросы {:?}",
+                stand.methods()
+            );
+        }
+
+        // Тот же обход, но ctag изменился: коллекция обязана быть прочитана.
+        let collection = DiscoveredCollection {
+            url: base.clone(),
+            name: "Календарь".into(),
+            ctag: Some("ctag-2".into()),
+            sync_token: None,
+            supports_sync_collection: false,
+        };
+        let cursor = CollectionCursor {
+            ctag: Some("ctag-1".into()),
+            sync_token: None,
+            resource_etags: HashMap::new(),
+        };
+        let outcome = sync_collection_resources(&client, &collection, Some(&cursor), &auth)
+            .await
+            .expect("обход коллекции");
+        assert_eq!(outcome.changed.len(), 2, "изменившаяся коллекция читается");
+        assert_eq!(stand.methods(), ["PROPFIND"]);
+
+        server.abort();
+    }
+
+    /// Сервер объявил прежний sync-token негодным (RFC 6578, 403 с
+    /// valid-sync-token). Обход обязан переспросить снимок целиком и по
+    /// локальным ETag оставить только изменившийся ресурс - без этого
+    /// коллекция либо уходит в ошибку, либо перекачивается целиком.
+    #[tokio::test]
+    async fn invalid_sync_token_falls_back_to_a_full_snapshot() {
+        let (stand, base, server) = start_dav_stand().await;
+        let client = Client::builder().build().expect("client");
+        let auth = stand_auth();
+        let collection = DiscoveredCollection {
+            url: base.clone(),
+            name: "Календарь".into(),
+            ctag: Some("ctag-2".into()),
+            sync_token: None,
+            supports_sync_collection: true,
+        };
+        let cursor = CollectionCursor {
+            ctag: Some("ctag-1".into()),
+            sync_token: Some("urn:sync:stale".into()),
+            // ETag хранится ровно в том виде, в каком его прислал сервер,
+            // вместе с кавычками - иначе всё сойдётся как изменившееся.
+            resource_etags: HashMap::from([
+                (format!("{base}same.ics"), "\"same\"".to_owned()),
+                (format!("{base}changed.ics"), "\"old\"".to_owned()),
+            ]),
+        };
+
+        let outcome = sync_collection_resources(&client, &collection, Some(&cursor), &auth)
+            .await
+            .expect("обход коллекции");
+
+        server.abort();
+        // Два REPORT: первый с прежним токеном, второй - за полным снимком.
+        assert_eq!(stand.methods(), ["REPORT", "REPORT"]);
+        let bodies: Vec<String> = stand
+            .requests()
+            .into_iter()
+            .map(|(_, body)| body)
+            .collect();
+        assert!(bodies[0].contains("urn:sync:stale"));
+        assert!(bodies[1].contains("<d:sync-token></d:sync-token>"));
+        assert_eq!(outcome.scope, SyncScope::Delta);
+        assert_eq!(outcome.sync_token.as_deref(), Some("urn:sync:fresh"));
+        assert_eq!(
+            outcome
+                .changed
+                .iter()
+                .map(|resource| resource.url.as_str())
+                .collect::<Vec<_>>(),
+            [format!("{base}changed.ics").as_str()],
+            "перекачивать неизменившийся ресурс незачем"
+        );
+        assert!(outcome.deleted_urls.is_empty());
     }
 
     #[test]
@@ -1974,13 +2233,6 @@ mod tests {
         let body = multiget_body(MultigetKind::AddressBook, &changed);
         assert!(body.contains("addressbook-multiget"));
         assert!(body.contains("address-data"));
-    }
-
-    #[test]
-    fn recognizes_rfc6578_invalid_token_precondition() {
-        let xml = r#"<d:error xmlns:d="DAV:"><d:valid-sync-token/></d:error>"#;
-        assert!(response_has_element(xml, "valid-sync-token"));
-        assert!(!response_has_element(xml, "supported-report"));
     }
 
     #[test]

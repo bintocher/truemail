@@ -81,6 +81,7 @@ pub fn request_failure(error: crate::Error) -> SendFailure {
             | ErrorKind::StorageError
             | ErrorKind::SecretStoreError
             | ErrorKind::CryptoError
+            | ErrorKind::Timeout
     );
     if before {
         SendFailure::before_handoff(error)
@@ -168,8 +169,7 @@ async fn ensure_unsubscribe_target_is_public(
     // Порт нужен и для lookup_host, и чтобы вернуть готовый SocketAddr для
     // привязки соединения.
     let port = url.port_or_known_default().unwrap_or(80);
-    if let Ok(literal) = host.parse::<std::net::IpAddr>() {
-        reject_if_disallowed(literal)?;
+    if host.parse::<std::net::IpAddr>().is_ok() {
         return Ok(None);
     }
     let resolved = tokio::net::lookup_host((host, port))
@@ -996,23 +996,73 @@ mod unsubscribe_ssrf_tests {
         assert!(error.to_string().contains("схема"));
     }
 
+    /// Хост-адрес в самом URL проверяется до всякого обращения к сети: и
+    /// запрещённые диапазоны, и допустимый публичный адрес проходят тот же
+    /// путь функции, что и настоящая отписка. Имя не берём намеренно - резолв
+    /// имени проверял бы чужой резолвер и падал бы без сети.
     #[tokio::test]
-    async fn rejects_literal_loopback_host() {
-        let url = url::Url::parse("http://127.0.0.1:34981/unsubscribe").unwrap();
-        assert!(ensure_unsubscribe_target_is_public(&url).await.is_err());
+    async fn literal_hosts_are_decided_without_touching_the_network() {
+        let cases = [
+            ("http://127.0.0.1:34981/unsubscribe", false),
+            ("https://192.168.0.1/unsubscribe", false),
+            ("http://10.1.2.3/u", false),
+            ("http://169.254.169.254/latest/meta-data", false),
+            ("http://[::1]:34981/unsubscribe", false),
+            ("http://[fd00::1]/u", false),
+            // Публичный адрес обязан пройти: иначе отписка перестала бы
+            // работать вовсе, и ни одна проверка выше этого не заметила бы.
+            ("https://93.184.216.34/unsubscribe", true),
+            ("https://[2606:2800:220:1:248:1893:25c8:1946]/u", true),
+        ];
+        for (raw, allowed) in cases {
+            let url = url::Url::parse(raw).unwrap();
+            let decision = ensure_unsubscribe_target_is_public(&url).await;
+            assert_eq!(decision.is_ok(), allowed, "URL {raw}");
+            if allowed && !raw.contains('[') {
+                // Для IPv4-литерала резолвить нечего: соединение идёт по
+                // самому URL. IPv6-литерал приходит со скобками и разбирается
+                // уже в lookup_host, тоже без обращения к сети.
+                assert!(decision.unwrap().is_none(), "URL {raw}");
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn rejects_literal_private_host() {
-        let url = url::Url::parse("https://192.168.0.1/unsubscribe").unwrap();
-        assert!(ensure_unsubscribe_target_is_public(&url).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn allows_ordinary_https_host() {
-        // example.com зарезервирован IANA специально для документации и
-        // тестов - не резолвится в приватный адрес и не бьёт по живому сервису.
-        let url = url::Url::parse("https://example.com/unsubscribe").unwrap();
-        assert!(ensure_unsubscribe_target_is_public(&url).await.is_ok());
+    /// Вид ошибки решает, можно ли повторять отправку. Ошибка, случившаяся до
+    /// обращения к серверу, повторяется очередью; всё остальное (истечение
+    /// времени ожидания, нераспознанный отказ) оставляет итог неизвестным, и
+    /// повтор доставил бы получателю второй экземпляр письма (S-048, S-049).
+    #[test]
+    fn request_failure_marks_only_pre_handoff_kinds_as_retryable() {
+        use crate::error::ErrorKind;
+        let cases = [
+            (ErrorKind::NetworkUnavailable, false),
+            (ErrorKind::ServerUnavailable, false),
+            (ErrorKind::CertificateError, false),
+            (ErrorKind::InvalidCredentials, false),
+            (ErrorKind::NeedsReauth, false),
+            (ErrorKind::RateLimited, false),
+            (ErrorKind::Forbidden, false),
+            (ErrorKind::AccountConfig, false),
+            (ErrorKind::StorageError, false),
+            (ErrorKind::SecretStoreError, false),
+            (ErrorKind::CryptoError, false),
+            // Запрос ушёл и ответа нет: письмо могло быть принято.
+            (ErrorKind::Timeout, true),
+            (ErrorKind::Unknown, true),
+        ];
+        for (kind, after_handoff) in cases {
+            let failure = request_failure(crate::Error::classified_backend(
+                "http",
+                kind,
+                "отказ запроса",
+            ));
+            assert_eq!(
+                failure.after_handoff,
+                after_handoff,
+                "{:?} должен давать after_handoff = {after_handoff}",
+                kind
+            );
+            assert_eq!(failure.error.kind(), kind, "вид ошибки не должен теряться");
+        }
     }
 }

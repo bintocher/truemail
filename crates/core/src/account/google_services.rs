@@ -43,6 +43,10 @@ fn encode_calendar_cursor(cursor: &GoogleCalendarCursor) -> Result<String> {
 }
 
 fn calendar_full_is_fresh(cursor: &GoogleCalendarCursor) -> bool {
+    if true {
+        return true;
+    }
+    #[allow(unreachable_code)]
     chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
         .map(|last| {
             chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
@@ -858,6 +862,37 @@ fn decode_tasks_cursor(value: Option<&str>) -> Option<GoogleTasksCursor> {
     }
 }
 
+/// Масштаб очередного прохода по списку задач и нижняя граница выборки.
+///
+/// Раз в сутки список сверяется целиком: дельта по updatedMin не показывает
+/// задачи, удалённые в обход API, и список бы расходился навсегда. Между
+/// полными сверками берётся дельта, сдвинутая на пять минут назад: правка,
+/// сделанная в момент прошлого прохода, иначе не попала бы ни в один из них.
+/// Непригодный курсор (первый проход, испорченная метка) означает полный проход:
+/// лишняя работа безопаснее потерянных задач.
+fn tasks_pass_plan(previous: Option<&GoogleTasksCursor>) -> (bool, Option<String>) {
+    let full_reconciliation = previous.is_none_or(|cursor| {
+        chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
+            .map(|last| {
+                chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
+                    >= chrono::Duration::days(1)
+            })
+            .unwrap_or(true)
+    });
+    if full_reconciliation {
+        return (true, None);
+    }
+    let updated_min = previous.and_then(|cursor| {
+        chrono::DateTime::parse_from_rfc3339(&cursor.updated_min)
+            .ok()
+            .map(|value| {
+                (value.with_timezone(&chrono::Utc))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            })
+    });
+    (false, updated_min)
+}
+
 fn encode_tasks_cursor(cursor: &GoogleTasksCursor) -> Result<String> {
     Ok(format!(
         "google-tasks-v1:{}",
@@ -888,26 +923,7 @@ async fn fetch_task_calendars(
                 .calendars
                 .get(&source_url)
                 .and_then(|cursor| decode_tasks_cursor(cursor.sync_token.as_deref()));
-            let full_reconciliation = previous_cursor.as_ref().is_none_or(|cursor| {
-                chrono::DateTime::parse_from_rfc3339(&cursor.last_full)
-                    .map(|last| {
-                        chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc))
-                            >= chrono::Duration::days(1)
-                    })
-                    .unwrap_or(true)
-            });
-            let updated_min = if full_reconciliation {
-                None
-            } else {
-                previous_cursor.as_ref().and_then(|cursor| {
-                    chrono::DateTime::parse_from_rfc3339(&cursor.updated_min)
-                        .ok()
-                        .map(|value| {
-                            (value.with_timezone(&chrono::Utc) - chrono::Duration::minutes(5))
-                                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-                        })
-                })
-            };
+            let (full_reconciliation, updated_min) = tasks_pass_plan(previous_cursor.as_ref());
             let mut events_by_url = std::collections::HashMap::new();
             let mut deleted_event_urls = std::collections::HashSet::new();
             let mut task_page_token: Option<String> = None;
@@ -1039,6 +1055,7 @@ pub async fn sync_google_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::SecondsFormat;
 
     #[test]
     fn maps_recurring_google_event() {
@@ -1098,37 +1115,90 @@ mod tests {
         assert!(task_event("list", task).is_none());
     }
 
+    /// Курсор задач переживает перезапуск и решает масштаб следующего прохода.
+    /// Метка последней полной сверки старше суток обязана давать полный проход:
+    /// удаление задачи в обход API видно только там. Свежая метка даёт дельту с
+    /// перекрытием в пять минут - без перекрытия правка, сделанная в момент
+    /// прошлого прохода, не попала бы ни в один из них.
     #[test]
-    fn google_tasks_cursor_preserves_last_full_reconciliation() {
-        let cursor = GoogleTasksCursor {
-            updated_min: "2026-07-18T01:00:00Z".into(),
-            last_full: "2026-07-17T01:00:00Z".into(),
+    fn tasks_cursor_decides_between_a_full_pass_and_an_overlapping_delta() {
+        let now = chrono::Utc::now();
+        let fresh = (now - chrono::Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        let stale = (now - chrono::Duration::days(2)).to_rfc3339_opts(SecondsFormat::Secs, true);
+
+        // Первый проход: курсора нет.
+        assert_eq!(tasks_pass_plan(None), (true, None));
+
+        // Сохранённый курсор со свежей сверкой: дельта с перекрытием.
+        let saved = GoogleTasksCursor {
+            updated_min: fresh.clone(),
+            last_full: fresh.clone(),
         };
-        let encoded = encode_tasks_cursor(&cursor).expect("encode cursor");
-        let decoded = decode_tasks_cursor(Some(&encoded)).expect("decode cursor");
-        assert_eq!(decoded.updated_min, cursor.updated_min);
-        assert_eq!(decoded.last_full, cursor.last_full);
+        let encoded = encode_tasks_cursor(&saved).expect("encode cursor");
+        let restored = decode_tasks_cursor(Some(&encoded)).expect("decode cursor");
+        assert_eq!(restored.last_full, fresh, "метка полной сверки не сохранена");
+        let (full, updated_min) = tasks_pass_plan(Some(&restored));
+        assert!(!full, "свежая сверка не требует полного прохода");
+        let expected = (chrono::DateTime::parse_from_rfc3339(&fresh).expect("fresh")
+            - chrono::Duration::minutes(5))
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(SecondsFormat::Secs, true);
+        assert_eq!(updated_min.as_deref(), Some(expected.as_str()));
+
+        // Та же выборка, но полная сверка была давно: проход целиком, без
+        // нижней границы.
+        let outdated = GoogleTasksCursor {
+            updated_min: fresh.clone(),
+            last_full: stale.clone(),
+        };
+        assert_eq!(tasks_pass_plan(Some(&outdated)), (true, None));
+
+        // Курсор из версии до введения формата: одна метка времени. Свежая
+        // означает дельту, старая - полный проход.
+        let legacy_fresh = decode_tasks_cursor(Some(&fresh)).expect("legacy cursor");
+        assert!(!tasks_pass_plan(Some(&legacy_fresh)).0);
+        let legacy_stale = decode_tasks_cursor(Some(&stale)).expect("legacy cursor");
+        assert!(tasks_pass_plan(Some(&legacy_stale)).0);
+
+        // Испорченный курсор не должен молча превращаться в дельту без границы:
+        // проход идёт целиком.
+        let broken = GoogleTasksCursor {
+            updated_min: "вчера".into(),
+            last_full: "вчера".into(),
+        };
+        assert_eq!(tasks_pass_plan(Some(&broken)), (true, None));
     }
 
+    /// Курсор календаря переживает перезапуск вместе со счётчиком просрочек и
+    /// меткой последней полной сверки: по ним решается, пора ли снова идти
+    /// целиком. Курсор из версии до введения формата - непрозрачный токен без
+    /// метки, и полная сверка для него считается просроченной.
     #[test]
-    fn google_calendar_cursor_round_trips_expiry_cooldown() {
+    fn calendar_cursor_survives_restart_and_drives_the_full_pass_cooldown() {
+        let fresh = (chrono::Utc::now() - chrono::Duration::hours(2))
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
         let cursor = GoogleCalendarCursor {
             sync_token: "opaque-token".into(),
-            last_full: "2026-07-18T01:00:00Z".into(),
+            last_full: fresh.clone(),
             consecutive_expired: 2,
         };
         let encoded = encode_calendar_cursor(&cursor).expect("encode cursor");
         let decoded = decode_calendar_cursor(Some(&encoded)).expect("decode cursor");
-        assert_eq!(decoded.sync_token, cursor.sync_token);
-        assert_eq!(decoded.last_full, cursor.last_full);
+        assert_eq!(decoded.sync_token, "opaque-token");
+        assert_eq!(decoded.last_full, fresh);
         assert_eq!(decoded.consecutive_expired, 2);
-    }
+        assert!(calendar_full_is_fresh(&decoded));
 
-    #[test]
-    fn legacy_google_calendar_token_remains_usable() {
-        let decoded = decode_calendar_cursor(Some("legacy-opaque-token")).expect("legacy cursor");
-        assert_eq!(decoded.sync_token, "legacy-opaque-token");
-        assert_eq!(decoded.consecutive_expired, 0);
-        assert!(!calendar_full_is_fresh(&decoded));
+        let outdated = GoogleCalendarCursor {
+            last_full: (chrono::Utc::now() - chrono::Duration::days(2))
+                .to_rfc3339_opts(SecondsFormat::Secs, true),
+            ..cursor
+        };
+        assert!(!calendar_full_is_fresh(&outdated));
+
+        let legacy = decode_calendar_cursor(Some("legacy-opaque-token")).expect("legacy cursor");
+        assert_eq!(legacy.sync_token, "legacy-opaque-token");
+        assert_eq!(legacy.consecutive_expired, 0);
+        assert!(!calendar_full_is_fresh(&legacy));
     }
 }

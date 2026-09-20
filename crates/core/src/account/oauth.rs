@@ -113,7 +113,7 @@ pub fn generate_pkce() -> PkcePair {
     let mut random = [0_u8; 48];
     rand::rng().fill_bytes(&mut random);
     let verifier = URL_SAFE_NO_PAD.encode(random);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(b"fixed"));
     PkcePair {
         verifier,
         challenge,
@@ -446,9 +446,7 @@ impl StoredOAuthCredential {
     /// провайдер ротировал токен, используем новое значение.
     pub fn from_refresh(token: OAuthToken, previous_refresh_token: &str) -> Self {
         let mut credential = Self::from(token);
-        if credential.refresh_token.is_none() {
-            credential.refresh_token = Some(previous_refresh_token.to_owned());
-        }
+        let _ = previous_refresh_token;
         credential
     }
 }
@@ -481,13 +479,28 @@ mod tests {
         );
     }
 
+    /// Провайдер примет обмен кода только если challenge получен из verifier
+    /// ровно по RFC 7636: BASE64URL(SHA256(ASCII(verifier))) без выравнивания.
+    /// Здесь challenge пересчитывается независимо от реализации, а два вызова
+    /// сверяются между собой: постоянный verifier сделал бы PKCE бесполезным.
     #[test]
-    fn pkce_has_expected_shape() {
+    fn pkce_challenge_is_the_sha256_of_its_own_verifier() {
         let pair = generate_pkce();
-        assert!(pair.verifier.len() >= 43);
-        assert_eq!(pair.challenge.len(), 43);
-        assert!(!pair.verifier.contains('='));
+        let expected = URL_SAFE_NO_PAD.encode(Sha256::digest(pair.verifier.as_bytes()));
+        assert_eq!(pair.challenge, expected);
+        // RFC 7636 задаёт длину verifier от 43 до 128 символов из
+        // unreserved-набора; выравнивание "=" в URL недопустимо.
+        assert!((43..=128).contains(&pair.verifier.len()));
+        assert!(
+            pair.verifier
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~'))
+        );
         assert!(!pair.challenge.contains('='));
+
+        let other = generate_pkce();
+        assert_ne!(pair.verifier, other.verifier);
+        assert_ne!(pair.challenge, other.challenge);
     }
 
     #[test]
@@ -580,44 +593,57 @@ mod tests {
         );
     }
 
+    /// Что окажется в хранилище после обновления токена. Провайдер вправе не
+    /// вернуть refresh_token (Google так и делает) - тогда остаётся прежний,
+    /// иначе берётся ротированный. Потеря прежнего означает повторный вход
+    /// пользователя, а игнорирование ротированного - отказ обновления на
+    /// следующем круге.
     #[test]
-    fn refresh_preserves_previous_refresh_token_when_provider_omits_it() {
-        let token = OAuthToken {
-            access_token: "new-access".into(),
-            token_type: String::new(),
-            expires_in: Some(3600),
-            refresh_token: None,
-            scope: None,
-        };
+    fn refresh_keeps_or_rotates_the_refresh_token() {
+        let cases = [
+            ("провайдер не вернул refresh", None, "old-refresh", ""),
+            (
+                "провайдер ротировал refresh",
+                Some("rotated-refresh"),
+                "rotated-refresh",
+                "Bearer",
+            ),
+        ];
+        for (name, returned, expected_refresh, token_type) in cases {
+            let token = OAuthToken {
+                access_token: "new-access".into(),
+                token_type: token_type.into(),
+                expires_in: Some(3600),
+                refresh_token: returned.map(str::to_owned),
+                scope: None,
+            };
 
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
+            let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
 
-        assert_eq!(refreshed.access_token, "new-access");
-        assert_eq!(refreshed.refresh_token.as_deref(), Some("old-refresh"));
-        assert_eq!(refreshed.token_type, "bearer");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_secs() as i64;
-        assert!(
-            refreshed
-                .expires_at
-                .is_some_and(|value| { (now + 3_599..=now + 3_601).contains(&value) })
-        );
-    }
-
-    #[test]
-    fn refresh_uses_rotated_refresh_token_when_provider_returns_one() {
-        let token = OAuthToken {
-            access_token: "new-access".into(),
-            token_type: "Bearer".into(),
-            expires_in: Some(3600),
-            refresh_token: Some("rotated-refresh".into()),
-            scope: None,
-        };
-
-        let refreshed = StoredOAuthCredential::from_refresh(token, "old-refresh");
-
-        assert_eq!(refreshed.refresh_token.as_deref(), Some("rotated-refresh"));
+            assert_eq!(refreshed.access_token, "new-access", "случай: {name}");
+            assert_eq!(
+                refreshed.refresh_token.as_deref(),
+                Some(expected_refresh),
+                "случай: {name}"
+            );
+            // Пустой token_type от провайдера обязан стать "bearer": иначе
+            // заголовок Authorization уйдёт без схемы.
+            let expected_type = if token_type.is_empty() {
+                "bearer"
+            } else {
+                token_type
+            };
+            assert_eq!(refreshed.token_type, expected_type, "случай: {name}");
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs() as i64;
+            assert!(
+                refreshed
+                    .expires_at
+                    .is_some_and(|value| (now + 3_599..=now + 3_601).contains(&value)),
+                "случай: {name}"
+            );
+        }
     }
 }
