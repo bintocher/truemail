@@ -266,6 +266,85 @@ async fn a_value_outside_its_bounds_is_rejected_with_an_explanation() {
     db.close().await;
 }
 
+/// Границы окна отмены и его значение первого запуска - три отдельные
+/// настройки, и порознь каждая остаётся в своих границах. Вместе они
+/// расходятся: наименьшее окно, поднятое выше значения первого запуска,
+/// оставляет обычную отправку без пригодного значения вовсе - выбранное по
+/// умолчанию окно отклоняется при приёме письма, и отправка перестаёт работать.
+/// Проверка идёт по настоящему пути: настоящая запись настройки и настоящий
+/// приём письма в очередь.
+#[tokio::test]
+async fn the_undo_window_bounds_stay_consistent_with_their_default() {
+    use crate::backend::OutgoingMessage;
+
+    let db: TestDb = open_test_db("limits-undo-chain").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let letter = || OutgoingMessage {
+        from: "me@example.test".into(),
+        to: vec!["boss@partner.test".into()],
+        subject: "Договор".into(),
+        body_text: "Текст письма".into(),
+        ..Default::default()
+    };
+    let queue_ordinary = async |db: &Db| {
+        let undo = db.undo_send_seconds().await.expect("длительность окна");
+        db.queue_outgoing_send(account, letter(), SEND_ORIGIN_ORDINARY, None, undo)
+            .await
+    };
+    let text = crate::i18n::I18n::new("ru");
+    let before = db.limit(LIMIT_UNDO_SEND_MIN);
+
+    let error = db
+        .set_limit(LIMIT_UNDO_SEND_MIN, 10)
+        .await
+        .expect_err("наименьшее окно принято выше значения первого запуска");
+    let message = error.to_string();
+    assert!(
+        message.contains(&text.t("limitUndoSendDefault")),
+        "отказ не называет зависимое поле: {message}"
+    );
+    assert_eq!(
+        db.limit(LIMIT_UNDO_SEND_MIN),
+        before,
+        "отклонённое значение всё-таки изменило рабочий предел"
+    );
+    queue_ordinary(&db)
+        .await
+        .expect("обычная отправка после отклонённого изменения");
+
+    // Согласованный порядок принимается: сначала значение первого запуска, за
+    // ним граница.
+    db.set_limit(LIMIT_UNDO_SEND_DEFAULT, 10)
+        .await
+        .expect("записать значение первого запуска");
+    db.set_limit(LIMIT_UNDO_SEND_MIN, 10)
+        .await
+        .expect("записать наименьшее окно");
+    assert_eq!(
+        db.undo_send_seconds().await.expect("длительность окна"),
+        10,
+        "длительность окна разошлась с новым значением первого запуска"
+    );
+    queue_ordinary(&db)
+        .await
+        .expect("обычная отправка на согласованных пределах");
+    assert!(
+        db.set_limit(LIMIT_UNDO_SEND_MAX, 5).await.is_err(),
+        "наибольшее окно принято ниже значения первого запуска"
+    );
+
+    // Испорченная база: несогласованные значения могли попасть в настройки
+    // мимо проверки. Почта должна работать и на них.
+    db.set_setting(LIMIT_UNDO_SEND_MIN, "30")
+        .await
+        .expect("записать настройку мимо проверки");
+    db.load_limits().await.expect("перечитать пределы");
+    queue_ordinary(&db)
+        .await
+        .expect("обычная отправка на испорченных пределах");
+    db.close().await;
+}
+
 /// Обновление непустой базы не меняет поведения: у того, кто обновился,
 /// пределы остаются прежними зашитыми числами, а значение, уже выбранное
 /// пользователем, миграция не перетирает.

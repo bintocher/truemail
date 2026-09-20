@@ -687,6 +687,30 @@ pub const LIMITS: &[LimitSpec] = &[
     },
 ];
 
+/// Связанные пределы: значения перечисленных ключей идут по неубыванию.
+///
+/// Поодиночке каждый из них остаётся в своих границах, а вместе расходятся:
+/// наименьшее окно отмены, поднятое выше значения первого запуска, оставляет
+/// обычную отправку без пригодной длительности - выбранное по умолчанию окно
+/// отклоняется при приёме письма, и отправка перестаёт работать целиком.
+pub const LIMIT_ORDERS: &[&[&str]] = &[&[
+    LIMIT_UNDO_SEND_MIN,
+    LIMIT_UNDO_SEND_DEFAULT,
+    LIMIT_UNDO_SEND_MAX,
+]];
+
+/// Цепочки пределов, идущих строго по возрастанию. Пороги свежести обращения
+/// образуют шкалу "свежее - недавнее - давнее", и сравнение идёт по порядку:
+/// порог, догнавший предыдущий, недостижим - вес за ним не выдаётся никогда, а
+/// подсказка получателей молча перестаёт различать свежие и недавние
+/// обращения. От неубывающих цепочек это отделено намеренно: там равные
+/// значения осмысленны, здесь равенство ломает шкалу.
+pub const LIMIT_STRICT_ORDERS: &[&[&str]] = &[&[
+    LIMIT_RANK_FRESH_DAYS,
+    LIMIT_RANK_RECENT_DAYS,
+    LIMIT_RANK_OLD_DAYS,
+]];
+
 /// Снимок рабочих значений пределов.
 ///
 /// Чистые функции проверки (правила, автоответ, автоочистка) базы не видят и
@@ -714,7 +738,7 @@ impl LimitSet {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self {
+        let mut set = Self {
             values: LIMITS
                 .iter()
                 .map(|spec| {
@@ -725,7 +749,27 @@ impl LimitSet {
                     (spec.key, value)
                 })
                 .collect(),
+        };
+        // Собственные границы не видят связей между пределами, а в настройки
+        // несогласованный набор попадает и мимо записи - перенесённой базой или
+        // правкой руками. Расходящаяся цепочка целиком возвращается к значениям
+        // первого запуска: они согласованы по построению, а починить одно звено
+        // означало бы угадывать, какое из значений пользователь считал верным.
+        for (chains, strict) in [(LIMIT_ORDERS, false), (LIMIT_STRICT_ORDERS, true)] {
+            for chain in chains {
+                if chain.windows(2).any(|pair| {
+                    let (lower, upper) = (set.get(pair[0]), set.get(pair[1]));
+                    lower > upper || (strict && lower == upper)
+                }) {
+                    for key in *chain {
+                        if let Some(spec) = limit_spec(key) {
+                            set.set(spec.key, spec.default);
+                        }
+                    }
+                }
+            }
         }
+        set
     }
 
     pub fn get(&self, key: &str) -> i64 {
@@ -805,6 +849,51 @@ pub fn validate_limit(key: &str, value: i64) -> Result<i64, String> {
     Ok(value)
 }
 
+/// Проверить значение вместе с соседями по цепочке. Каждое из связанных
+/// значений остаётся в собственных границах, а вместе они расходятся, и
+/// поведение, которое задаёт соседнее поле, становится недостижимым.
+pub fn validate_limit_in_set(key: &str, value: i64, limits: &LimitSet) -> Result<i64, String> {
+    let value = validate_limit(key, value)?;
+    for (chains, strict) in [(LIMIT_ORDERS, false), (LIMIT_STRICT_ORDERS, true)] {
+        for chain in chains {
+            let Some(place) = chain.iter().position(|item| *item == key) else {
+                continue;
+            };
+            if let Some(lower) = place.checked_sub(1).map(|index| chain[index]) {
+                let bound = limits.get(lower);
+                if value < bound || (strict && value == bound) {
+                    return Err(order_refusal(key, value, lower, bound, "больше"));
+                }
+            }
+            if let Some(upper) = chain.get(place + 1) {
+                let bound = limits.get(upper);
+                if value > bound || (strict && value == bound) {
+                    return Err(order_refusal(key, value, upper, bound, "меньше"));
+                }
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Отказ по цепочке. Называет зависимое поле и его рабочее значение: "должно
+/// быть больше" без имени соседа не говорит пользователю, что именно менять.
+fn order_refusal(key: &str, value: i64, neighbour: &str, bound: i64, order: &str) -> String {
+    let text = crate::i18n::I18n::new("ru");
+    let title =
+        |key: &str| limit_spec(key).map_or_else(|| key.to_owned(), |spec| text.t(spec.title_key));
+    let unit = limit_spec(neighbour).map_or(String::new(), |spec| text.t(spec.unit_key));
+    format!(
+        "\"{}\": значение должно быть {} значения настройки \"{}\" ({} {}), получено {}",
+        title(key),
+        order,
+        title(neighbour),
+        bound,
+        unit,
+        value
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,6 +924,32 @@ mod tests {
             let text = crate::i18n::I18n::new("ru");
             for key in [spec.title_key, spec.hint_key, spec.unit_key] {
                 assert_ne!(text.t(key), key, "нет русской подписи для ключа {key}");
+            }
+        }
+        // Значения первого запуска связанных пределов обязаны идти по
+        // неубыванию: на них возвращается расходящаяся цепочка из настроек, и
+        // несогласованный реестр чинить было бы нечем.
+        for chain in LIMIT_ORDERS {
+            for pair in chain.windows(2) {
+                assert!(
+                    limit_default(pair[0]) <= limit_default(pair[1]),
+                    "значения первого запуска пределов {} и {} идут не по порядку",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+        // У строгой цепочки равенство тоже запрещено: порог, догнавший
+        // предыдущий, недостижим, и пользователь не смог бы записать ни одно
+        // значение, которое сосед не отклонит.
+        for chain in LIMIT_STRICT_ORDERS {
+            for pair in chain.windows(2) {
+                assert!(
+                    limit_default(pair[0]) < limit_default(pair[1]),
+                    "значения первого запуска пределов {} и {} не образуют шкалу",
+                    pair[0],
+                    pair[1]
+                );
             }
         }
     }

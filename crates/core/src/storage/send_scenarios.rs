@@ -837,6 +837,61 @@ async fn quitting_releases_undo_windows_and_leaves_the_scheduled_message_alone()
     db.close().await;
 }
 
+/// Наименьшее окно отмены ограничивает выбор пользователя, а не письма, у
+/// которых окна нет вовсе: отложенная отправка по времени, служебное письмо
+/// программы и письмо локального интерфейса приложений уходят с нулём
+/// техническим (S-055, S-057, S-059). Пока этот ноль проверялся теми же
+/// границами, что и выбор пользователя, поднятое наименьшее окно отклоняло и
+/// автоответ, и отправку по времени.
+#[tokio::test]
+async fn messages_without_an_undo_window_pass_whatever_the_minimum_is() {
+    let db: TestDb = open_test_db("send-no-window").await;
+    let account = seed_account(&db, "me@example.test").await;
+    db.set_limit(LIMIT_UNDO_SEND_DEFAULT, 30)
+        .await
+        .expect("значение первого запуска");
+    db.set_limit(LIMIT_UNDO_SEND_MIN, 10)
+        .await
+        .expect("наименьшее окно отмены");
+
+    for origin in [SEND_ORIGIN_AUTOMATIC, SEND_ORIGIN_EXTERNAL] {
+        db.queue_outgoing_send(account, letter("me@example.test"), origin, None, 0)
+            .await
+            .unwrap_or_else(|error| panic!("письмо происхождения {origin} отклонено: {error}"));
+    }
+    db.queue_scheduled_send(account, letter("me@example.test"), "2099-01-01 00:00:00")
+        .await
+        .expect("отправка по времени отклонена наименьшим окном");
+
+    // Выбор пользователя наименьшее окно по-прежнему ограничивает, а обычная
+    // отправка идёт на действующей длительности.
+    assert!(
+        db.queue_outgoing_send(
+            account,
+            letter("me@example.test"),
+            SEND_ORIGIN_ORDINARY,
+            None,
+            5,
+        )
+        .await
+        .is_err(),
+        "окно короче наименьшего принято у письма пользователя"
+    );
+    let undo = db.undo_send_seconds().await.expect("длительность окна");
+    let queued = db
+        .queue_outgoing_send(
+            account,
+            letter("me@example.test"),
+            SEND_ORIGIN_ORDINARY,
+            None,
+            undo,
+        )
+        .await
+        .expect("обычная отправка на действующей длительности");
+    assert_eq!(queued.undo_seconds, 30);
+    db.close().await;
+}
+
 /// Отложенная отправка получает своё время одной записью и до этого времени
 /// работнику недоступна вовсе (S-008, S-055, S-056). Новые состояния очереди
 /// при этом остаются только у отправки: операции увода их не принимают, иначе

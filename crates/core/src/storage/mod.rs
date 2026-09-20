@@ -368,11 +368,14 @@ impl Db {
 
     /// Записать значение предела. Значение вне границ отклоняется с
     /// объяснением: молча поправленное значение пользователь принял бы за
-    /// принятое.
+    /// принятое. Значение сверяется и с соседями по шкале: порог, догнавший
+    /// соседний, сам по себе в границах, но делает недостижимым чужое
+    /// поведение, и такой отказ объясняется именем зависимого поля.
     pub async fn set_limit(&self, key: &str, value: i64) -> Result<i64> {
         let spec = crate::model::limit_spec(key)
             .ok_or_else(|| crate::Error::Other(format!("неизвестная настройка {key}")))?;
-        let value = crate::model::validate_limit(key, value).map_err(crate::Error::Other)?;
+        let value = crate::model::validate_limit_in_set(key, value, &self.limit_set())
+            .map_err(crate::Error::Other)?;
         self.set_setting(key, &value.to_string()).await?;
         self.limits
             .write()
