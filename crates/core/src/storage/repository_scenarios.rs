@@ -457,7 +457,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             flagged: false,
             answered: false,
             draft: false,
-            raw: b"Subject: Meeting\r\n\r\nобрывок".to_vec(),
+            raw: "Subject: Meeting\r\n\r\nобрывок".as_bytes().to_vec(),
             body_fetched: false,
             has_attachments: None,
         }],
@@ -504,7 +504,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             flagged: false,
             answered: false,
             draft: false,
-            raw: b"Subject: Large\r\n\r\nобрывок".to_vec(),
+            raw: "Subject: Large\r\n\r\nобрывок".as_bytes().to_vec(),
             body_fetched: false,
             has_attachments: None,
         }],
@@ -526,7 +526,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             .4,
         "проекция помечена неполной"
     );
-    db.store_fetched_raw(projection, b"Subject: Large\r\n\r\nполное тело")
+    db.store_fetched_raw(projection, "Subject: Large\r\n\r\nполное тело".as_bytes())
         .await
         .expect("догрузить тело");
     assert!(

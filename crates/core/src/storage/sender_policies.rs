@@ -772,20 +772,43 @@ impl Db {
         .collect();
         // S-022, S-025: догруженные прокруткой письма стадия списков не берёт,
         // как и письма служебных папок и архива.
-        let sql = format!(
+        //
+        // Пачка набирается двумя запросами, а не одним общим: номера отложенных
+        // писем меньше курсора и в общем порядке всегда идут первыми, поэтому
+        // полная пачка застрявших повторов (чужая незавершённая операция на
+        // каждом) вытесняла бы новые письма из выборки бесконечно - ни одно
+        // новое письмо заблокированного отправителя не получило бы увода.
+        // Половина предела отводится повторам, остаток - новым письмам, и
+        // недобор одной половины достаётся другой.
+        let limit = self.limit(LIMIT_STAGE_BATCH);
+        let deferred_budget = (limit / 2).max(1);
+        let deferred_sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE (m.id>? OR {DEFERRED_MESSAGES})
+              WHERE m.id<=? AND {DEFERRED_MESSAGES}
                 AND m.backfilled=0 AND m.closed_by_stage IS NULL AND {WORKING_FOLDERS}
               ORDER BY m.id LIMIT ?"
         );
-        let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
+        let mut batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(deferred_sql))
             .bind(cursor)
             .bind(STAGE_DEFERRAL_KIND)
             .bind(STAGE_DEFERRAL_JOB)
-            .bind(self.limit(LIMIT_STAGE_BATCH))
+            .bind(deferred_budget)
             .fetch_all(&mut *tx)
             .await?;
+        let fresh_sql = format!(
+            "SELECT {STAGE_MESSAGE_COLUMNS}
+               FROM messages m JOIN folders f ON f.id=m.folder_id
+              WHERE m.id>?
+                AND m.backfilled=0 AND m.closed_by_stage IS NULL AND {WORKING_FOLDERS}
+              ORDER BY m.id LIMIT ?"
+        );
+        let fresh = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(fresh_sql))
+            .bind(cursor)
+            .bind(limit - batch.len() as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+        batch.extend(fresh);
         let mut queued = 0usize;
         let mut last_id = cursor;
         for message in &batch {
@@ -1159,5 +1182,122 @@ mod tests {
         assert_eq!(set.decide(Some("news@notspam.test")), SenderDecision::Pass);
         assert_eq!(set.decide(None), SenderDecision::Pass);
         assert_eq!(set.decide(Some("   ")), SenderDecision::Pass);
+    }
+}
+
+#[cfg(test)]
+mod stage_batch_tests {
+    use super::*;
+    use crate::storage::repo::test_storage::{TestDb, open_test_db};
+
+    /// Отложенные письма набираются на свою долю пачки, а не на всю.
+    ///
+    /// Номера отложенных писем меньше курсора, поэтому в общем порядке они
+    /// идут первыми. Пока пачка набиралась одним запросом, полный предел
+    /// повторов вытеснял новые письма из каждого прохода: заблокированный
+    /// отправитель продолжал бы класть письма во входящие, и ни одно из них
+    /// не получило бы увода, пока держится очередь повторов.
+    #[tokio::test]
+    async fn a_queue_of_deferred_messages_does_not_starve_new_ones() {
+        let db: TestDb = open_test_db("stage-batch-share").await;
+        db.set_limit(LIMIT_STAGE_BATCH, 10)
+            .await
+            .expect("предел пачки");
+        let account = sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
+             VALUES('acc-batch', 'me@example.test', 'generic', 'imap', 'password') RETURNING id",
+        )
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("ящик")
+        .0;
+        let folder = |path: &'static str, role: &'static str| {
+            let pool = db.write_pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64,)>(
+                    "INSERT INTO folders(account_id, remote_path, display_name, role)
+                     VALUES(?, ?, ?, ?) RETURNING id",
+                )
+                .bind(account)
+                .bind(path)
+                .bind(path)
+                .bind(role)
+                .fetch_one(&pool)
+                .await
+                .expect("папка")
+                .0
+            }
+        };
+        let inbox = folder("INBOX", "inbox").await;
+        folder("Trash", "trash").await;
+        let message = |uid: i64| {
+            let pool = db.write_pool.clone();
+            async move {
+                sqlx::query_as::<_, (i64,)>(
+                    "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject, date,
+                                          backfilled, remote_id, size)
+                     VALUES(?, ?, ?, 'spam@example.test', 'тема', '2026-09-01T10:00:00Z', 0, ?, 512)
+                     RETURNING id",
+                )
+                .bind(account)
+                .bind(inbox)
+                .bind(uid)
+                .bind(format!("remote-{uid}"))
+                .fetch_one(&pool)
+                .await
+                .expect("письмо")
+                .0
+            }
+        };
+
+        // Повторов ровно столько, сколько вмещает пачка целиком.
+        let mut deferred_ids = Vec::new();
+        for uid in 1..=10 {
+            deferred_ids.push(message(uid).await);
+        }
+        let fresh = message(11).await;
+        let mut tx = db.begin_write().await.expect("запись");
+        for id in &deferred_ids {
+            sqlx::query("INSERT INTO stage_job_deferrals(kind, job_id, message_id) VALUES(?, ?, ?)")
+                .bind(STAGE_DEFERRAL_KIND)
+                .bind(STAGE_DEFERRAL_JOB)
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .expect("отложить письмо");
+        }
+        Db::set_stage_cursor(
+            &mut tx,
+            SENDER_POLICY_STAGE_NAME,
+            *deferred_ids.last().expect("номер"),
+        )
+        .await
+        .expect("курсор");
+        tx.commit().await.expect("фиксация");
+
+        db.save_sender_policy(
+            POLICY_KIND_ADDRESS,
+            "spam@example.test",
+            POLICY_DECISION_BLOCKED,
+            false,
+        )
+        .await
+        .expect("запись списка");
+        db.process_sender_policy_stage()
+            .await
+            .expect("проход стадии");
+
+        let queued: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM outbox_ops WHERE message_id=? AND op_kind IN ('move','delete')",
+        )
+        .bind(fresh)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("операции нового письма")
+        .0;
+        assert!(
+            queued > 0,
+            "новое письмо не уведено: пачка прохода занята повторами целиком"
+        );
     }
 }

@@ -229,12 +229,16 @@ static_regex!(
 // Сервер могут задать голым адресом IP - для читателя архива это такой же
 // узел, как и имя: без этого шаблона адрес остался бы в архиве открытым.
 static_regex!(ipv4_re, r"\b(?:\d{1,3}\.){3}\d{1,3}\b");
-// Только полная форма из восьми групп и сжатая форма с двойным
-// двоеточием: более свободный шаблон съедал бы время в самой записи
-// журнала - 20:56:39 выглядит как три группы адреса.
+// Полная форма из восьми групп и сжатая форма с двойным двоеточием, причём
+// хотя бы одна группа цифр обязательна с одной из сторон, а сам адрес
+// ограничен символами, которые не могут быть его частью. Без этих границ
+// шаблон резал бы обычные имена исходников: в "truemail_core::account"
+// кусок "e::acc" состоит из тех же шестнадцатеричных букв и выглядел бы
+// адресом. Время в самой записи (20:56:39) двойного двоеточия не содержит и
+// сюда не попадает.
 static_regex!(
     ipv6_re,
-    r"(?i)\b(?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}\b|(?i)(?:[0-9a-f]{1,4})?(?::[0-9a-f]{1,4})*::(?:[0-9a-f]{1,4})?(?::[0-9a-f]{1,4})*"
+    r"(?i)(?:^|[^0-9a-z_.:])((?:[0-9a-f]{1,4}:){7}[0-9a-f]{1,4}|(?:[0-9a-f]{1,4}:)*[0-9a-f]{1,4}::(?:[0-9a-f]{1,4}:)*[0-9a-f]{1,4}|[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*::|::[0-9a-f]{1,4}(?::[0-9a-f]{1,4})*)(?:$|[^0-9a-z_.:])"
 );
 
 fn replace_whole_match(
@@ -263,6 +267,28 @@ fn replace_encoded_email(salt: &[u8; 16], text: &str, counts: &mut ReplacementCo
         .into_owned()
 }
 
+/// Заменить значение, обрамлённое с обеих сторон: сами границы в замену не
+/// входят и возвращаются на место. Нужно там, где значение нельзя опознать
+/// без соседей - адрес IPv6 иначе совпадает внутри обычного имени исходника.
+fn replace_bounded_value(
+    re: &Regex,
+    category: Category,
+    salt: &[u8; 16],
+    text: &str,
+    counts: &mut ReplacementCounts,
+) -> String {
+    re.replace_all(text, |caps: &Captures<'_>| {
+        counts.increment(category);
+        let whole = &caps[0];
+        let value = caps.get(1).expect("значение внутри границ");
+        let start = value.start() - caps.get(0).expect("совпадение").start();
+        let left = &whole[..start];
+        let right = &whole[start + value.as_str().len()..];
+        format!("{left}{}{right}", alias(salt, category, value.as_str()))
+    })
+    .into_owned()
+}
+
 fn replace_anchored_value(
     re: &Regex,
     category: Category,
@@ -280,43 +306,65 @@ fn replace_anchored_value(
     .into_owned()
 }
 
+/// Заменить значения именованных полей записи журнала псевдонимами.
+///
+/// Проход ручной, а не `replace_all`: значение без кавычек доходит до
+/// разделителя записи, поэтому совпадение захватывает и хвост строки, а
+/// `replace_all` продолжил бы поиск уже за ним. Второе содержательное поле той
+/// же записи ("subject=Тема last_error=текст") осталось бы тогда в архиве
+/// открытым текстом. Здесь поиск продолжается ровно с конца значения.
 fn replace_named_field(
     re: &Regex,
     salt: &[u8; 16],
     text: &str,
     counts: &mut ReplacementCounts,
 ) -> String {
-    re.replace_all(text, |caps: &Captures<'_>| {
-        let Some(category) = Category::from_field_name(&caps[1]) else {
-            return caps[0].to_owned();
-        };
-        counts.increment(category);
-        let raw_value = &caps[2];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(caps) = re.captures(rest) {
+        let whole = caps.get(0).expect("совпадение целиком");
+        let value = caps.get(2).expect("значение поля");
+        let raw_value = value.as_str();
         let quoted = raw_value.len() >= 2 && raw_value.starts_with('"') && raw_value.ends_with('"');
         let inner = if quoted {
             &raw_value[1..raw_value.len() - 1]
         } else {
             raw_value
         };
-        // Значение без кавычек обрывается на начале следующего поля записи:
-        // хвост за ним принадлежит не этому полю и должен остаться как есть.
-        let (inner, tail) = if quoted {
-            (inner, "")
+        // Начало следующего поля обрывает значение без кавычек: хвост за ним
+        // принадлежит не этому полю и просматривается следующим витком.
+        let inner = if quoted {
+            inner
         } else {
             match next_field_re().find(inner) {
-                Some(found) => inner.split_at(found.start()),
-                None => (inner, ""),
+                Some(found) => &inner[..found.start()],
+                None => inner,
             }
         };
-        let replaced = alias(salt, category, inner);
-        let field = &caps[1];
-        if quoted {
-            format!("{field}=\"{replaced}\"")
+        let value_end = if quoted {
+            value.end()
         } else {
-            format!("{field}={replaced}{tail}")
+            value.start() + inner.len()
+        };
+        out.push_str(&rest[..whole.start()]);
+        match Category::from_field_name(&caps[1]) {
+            Some(category) => {
+                counts.increment(category);
+                let replaced = alias(salt, category, inner);
+                let field = &caps[1];
+                if quoted {
+                    out.push_str(&format!("{field}=\"{replaced}\""));
+                } else {
+                    out.push_str(&format!("{field}={replaced}"));
+                }
+            }
+            // Поле не из словаря категорий: оставляем запись как есть.
+            None => out.push_str(&rest[whole.start()..value_end]),
         }
-    })
-    .into_owned()
+        rest = &rest[value_end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Обезличивает одну целиком прочитанную строку журнала (S-003): заменяет
@@ -347,7 +395,7 @@ pub fn anonymize_line(line: &str, salt: &[u8; 16], counts: &mut ReplacementCount
     text = replace_whole_match(email_re(), Category::Email, salt, &text, counts);
     text = replace_whole_match(host_re(), Category::Host, salt, &text, counts);
     text = replace_whole_match(ipv4_re(), Category::Host, salt, &text, counts);
-    text = replace_whole_match(ipv6_re(), Category::Host, salt, &text, counts);
+    text = replace_bounded_value(ipv6_re(), Category::Host, salt, &text, counts);
     text
 }
 
@@ -638,6 +686,52 @@ mod tests {
             assert!(line.starts_with("соединение с [host-"), "{line}");
             assert!(line.ends_with(" разорвано"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_source_module_name_is_not_mistaken_for_an_address() {
+        // Имя исходника в записи журнала содержит двойное двоеточие, а вокруг
+        // него - те же шестнадцатеричные буквы ("truemail_core::account"):
+        // шаблон адреса без границ вырезал бы из имени кусок "e::acc" и
+        // читатель архива не нашёл бы источник записи.
+        let salt = salt(24);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "truemail_core::account: синхронизация завершена",
+            &salt,
+            &mut counts,
+        );
+        assert_eq!(line, "truemail_core::account: синхронизация завершена");
+
+        // Настоящий адрес рядом с именем исходника всё равно заменяется.
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "truemail_core::backend: отказ узла fe80::1 при обращении",
+            &salt,
+            &mut counts,
+        );
+        assert!(line.starts_with("truemail_core::backend: "), "{line}");
+        assert!(!line.contains("fe80::1"), "{line}");
+        assert!(line.contains("[host-"), "{line}");
+    }
+
+    #[test]
+    fn every_content_field_of_one_record_is_replaced() {
+        // Значение без кавычек доходит до разделителя записи, поэтому
+        // совпадение захватывает и хвост строки. Пока замена шла обходом всех
+        // совпадений сразу, поиск продолжался уже за этим хвостом, и второе
+        // содержательное поле той же записи оставалось в архиве открытым.
+        let salt = salt(23);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "subject=Отчёт за месяц last_error=NO mailbox is full preview=первые строки",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("Отчёт"), "{line}");
+        assert!(!line.contains("mailbox"), "{line}");
+        assert!(!line.contains("первые строки"), "{line}");
+        assert_eq!(line.matches("[content-").count(), 3, "{line}");
     }
 
     #[test]

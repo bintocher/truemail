@@ -32,6 +32,8 @@ pub mod recipient_history;
 mod recipient_history_scenarios;
 pub mod repo;
 #[cfg(test)]
+mod repository_scenarios;
+#[cfg(test)]
 mod search_lifecycle_scenarios;
 #[cfg(test)]
 mod send_scenarios;
