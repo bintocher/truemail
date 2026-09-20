@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260920-2">
+  <link rel="stylesheet" href="styles.css?v=20260920-3">
 </head>
 <body>
 
@@ -206,9 +206,9 @@
       <div class="setpage" id="set-addacct">
         <h1 data-i18n="accountWizardTitle">Мастер подключения аккаунта</h1><p class="lead" data-i18n="connectSub">Введите любой адрес — truemail определит провайдера и выберет способ входа.</p>
         <div class="card"><div class="ch"><i data-i="lock"></i><span data-i18n="secureAccountConnection">Безопасное подключение аккаунта</span></div><div class="cb">
-          <div class="frow"><div class="fl"><div class="t" data-i18n="emailAddress">Адрес почты</div></div><div class="fc"><input class="inp inp-w280" id="accountEmail" type="email" placeholder="you@example.com"></div></div>
+          <div class="frow"><div class="fl"><div class="t" data-i18n="emailAddress">Адрес почты</div></div><div class="fc"><input class="inp" id="accountEmail" type="email" placeholder="you@example.com"></div></div>
           <div class="frow" id="accountConnectionDetectRow"><div class="fl"><div class="t" data-i18n="connection">Подключение</div><div class="d" data-i18n="connectionDesc">Провайдер и доступные сервисы определятся автоматически.</div></div><div class="fc"><button class="btn primary" id="accountOauthStart"><i data-i="lock"></i><span data-i18n="connect">Подключить</span></button></div></div>
-          <div class="frow hidden" id="accountCodeRow"><div class="fl"><div class="t" data-i18n="confirmationCode">Код подтверждения</div><div class="d" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</div></div><div class="fc"><input class="inp inp-w280 mb-10" id="accountOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codeShort" placeholder="Код"><button class="btn primary" id="accountOauthConfirm"><i data-i="check"></i><span data-i18n="confirmShort">Подтвердить</span></button></div></div>
+          <div class="frow hidden" id="accountCodeRow"><div class="fl"><div class="t" data-i18n="confirmationCode">Код подтверждения</div><div class="d" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</div></div><div class="fc"><input class="inp mb-10" id="accountOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codeShort" placeholder="Код"><button class="btn primary" id="accountOauthConfirm"><i data-i="check"></i><span data-i18n="confirmShort">Подтвердить</span></button></div></div>
           <div class="account-connection-panel hidden" id="accountPasswordRow">
             <div class="account-connection-head">
               <div class="t" id="accountPasswordTitle" data-i18n="mailPasswordTitle">Пароль приложения / почты</div>

@@ -99,6 +99,10 @@
   /* Кнопка снятия сочетания стоит вплотную к полю: без неё назначенную
      клавишу нельзя было убрать вовсе (issue #100). */
   .keybind-cell{display:flex;align-items:center;gap:6px;}
+  /* Поле сочетания делит колонку с кнопкой снятия: на всю ширину оно уводило
+     бы кнопку на вторую строку, поэтому берёт остаток колонки. Ширина у всех
+     строк одна, потому что одна колонка (issue #105). */
+  .frow .fc.keybind-cell>.inp{flex:1 1 0;width:auto;min-width:0;}
   .keybind-clear{flex:none;width:26px;height:26px;padding:0;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text-3);cursor:pointer;}
   .keybind-clear svg{display:block;width:13px;height:13px;margin:0 auto;}
   .keybind-clear:hover{color:var(--danger);border-color:var(--danger);}
@@ -427,13 +431,22 @@
   .setnav .sec:hover{background:var(--hover);} .setnav .sec.active{background:var(--active);color:var(--accent-text);font-weight:560;}
   .setnav .sec i svg{width:17px;height:17px;}
   .setbody{min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:26px 34px;} .setpage{display:none;width:min(100%,720px);max-width:720px;} .setpage.active{display:block;}
+  .setpage{--field-col:280px;}
   .setpage h1{margin:0 0 4px;font-size:22px;letter-spacing:-.02em;} .setpage .lead{color:var(--text-3);margin:0 0 22px;}
   .card{border:1px solid var(--border);border-radius:12px;margin-bottom:16px;overflow:hidden;}
   .card .ch{padding:13px 16px;border-bottom:1px solid var(--border);font-weight:600;display:flex;align-items:center;gap:10px;background:var(--panel2);}
   .card .cb{padding:16px;}
   .frow{display:flex;align-items:center;gap:14px;padding:11px 0;border-bottom:1px solid var(--border);}
   .frow:last-child{border-bottom:0;} .frow .fl{min-width:0;flex:1;} .frow .fl .t{font-weight:550;} .frow .fl .d{color:var(--text-3);font-size:12.5px;margin-top:2px;}
-  .frow .fc{flex:none;}
+  /* Правая колонка строки настроек одной ширины во всех разделах. Раньше она
+     подбиралась по содержимому: поле под "24" выходило вдвое уже поля под
+     "3650", единица измерения вставала то рядом, то под полем, и раздел
+     пределов рассыпался на разную ширину и разные отступы (issue #105). */
+  .frow .fc{flex:none;width:var(--field-col);display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;}
+  .frow .fc>.inp,.frow .fc>.sel{flex:1 1 100%;width:100%;min-width:0;max-width:100%;}
+  /* Единица измерения - подпись под полем, во всю ширину колонки: рядом с
+     полем она отнимала бы у него разную ширину в зависимости от слова. */
+  .frow .fc>.d{flex:1 1 100%;color:var(--text-3);font-size:12.5px;}
   .inp{border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:8px;padding:8px 11px;font:inherit;font-size:13px;width:100%;outline:none;}
   .inp:focus{border-color:var(--accent);} textarea.inp{resize:vertical;min-height:70px;line-height:1.5;}
   .sel{border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;min-width:180px;}
@@ -693,7 +706,7 @@
   .att-info{flex:1;min-width:0;} .att-acts{display:flex;gap:2px;} .att .att-acts .iconbtn{width:28px;height:28px;} .att .att-acts .iconbtn svg{width:16px;height:16px;} .ext-good{background:var(--good);}
   .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12px;}
   .wz-skip-btn{background:transparent;border:0;color:var(--text-3);cursor:pointer;font:inherit;font-size:13px;} .wz-skip-btn:hover{color:var(--text);}
-  .acc2col{display:grid;grid-template-columns:1fr 1fr;gap:12px;} .inp-w280{width:560px;max-width:100%;} .btn-row{display:flex;gap:8px;margin-top:4px;}
+  .acc2col{display:grid;grid-template-columns:1fr 1fr;gap:12px;} .btn-row{display:flex;gap:8px;margin-top:4px;}
   .map-2{grid-template-columns:120px 1fr!important;} .cb-muted{color:var(--text-2);} .last-flush{border-bottom:0!important;} .note-muted{color:var(--text-3);font-size:12.5px;} .ava-22{width:22px;height:22px;border-radius:6px;font-size:10px;} .adot-12{width:12px;height:12px;}
   .mt-6{margin-top:6px;} .mt-20{margin-top:20px;} .mt-26{margin-top:26px;} .h-18{font-size:18px;} .fw-600{font-weight:600;} .d-inline{display:inline;} .flex-g4{display:flex;gap:4px;} .flex-g8{display:flex;gap:8px;}
   .expert-only{display:none!important;}
