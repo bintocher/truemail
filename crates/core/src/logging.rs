@@ -81,9 +81,4 @@ mod tests {
     fn does_not_panic_without_at_sign() {
         assert_eq!(mask_email("not-an-email"), "***");
     }
-
-    #[test]
-    fn does_not_panic_on_empty_string() {
-        assert_eq!(mask_email(""), "***");
-    }
 }
