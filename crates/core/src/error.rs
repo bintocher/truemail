@@ -656,46 +656,44 @@ mod tests {
         }
     }
 
+    // G2: response_code() берётся из поля, заполненного на месте создания
+    // ошибки. В тексте сообщения никакого кода ответа нет - только порт в
+    // адресе, поэтому подмена поля запасным разбором текста сразу видна:
+    // разбор вернул бы None, и интерфейс остался бы без кода ответа.
     #[test]
-    fn response_code_is_returned_only_when_http_code_is_known() {
-        let http = Error::Backend {
-            backend: "ews-http".into(),
-            message: "HTTP 500 Internal Server Error".into(),
-        };
-        let network = Error::Backend {
-            backend: "imap-idle".into(),
-            message: "os error 10054".into(),
-        };
-        assert_eq!(http.response_code(), Some(500));
-        assert_eq!(network.response_code(), None);
-        assert_eq!(http.backend(), Some("ews-http"));
-    }
-
-    // G2: response_code() берётся из поля, а не разбором текста. Раньше
-    // запасной разбор искал любую подстроку "http" и находил её внутри
-    // адреса из https://..., откуда брал порт (443) вместо настоящего кода
-    // ответа (503) чуть дальше в том же сообщении.
-    #[test]
-    fn from_http_status_carries_the_real_code_even_with_a_port_in_the_message() {
+    fn from_http_status_carries_the_real_code_when_the_message_has_none() {
         let error = Error::from_http_status(
             "dav",
             503,
-            "GET https://caldav.example.com:443/dav/calendars/: HTTP 503: Service Unavailable",
+            "PROPFIND https://caldav.example.com:443/dav/calendars/: соединение закрыто сервером",
         );
         assert_eq!(error.response_code(), Some(503));
     }
 
-    // Тот же случай для запасного разбора текста (ошибки без поля кода) -
-    // он должен опираться на "HTTP <код>", а не на любое вхождение "http".
     #[test]
-    fn fallback_text_parsing_ignores_a_port_that_looks_like_a_response_code() {
-        let error = Error::Backend {
-            backend: "dav".into(),
-            message:
-                "GET https://caldav.example.com:443/dav/calendars/: HTTP 503: Service Unavailable"
-                    .into(),
-        };
-        assert_eq!(error.response_code(), Some(503));
+    fn fallback_text_parsing_takes_the_code_only_from_the_http_marker() {
+        // Запасной разбор текста работает только для ошибок без поля кода
+        // (старый Backend) и опирается на токен "HTTP <код>", а не на любое
+        // вхождение "http": иначе порт из "https://host:443/" уезжал бы в
+        // интерфейс вместо настоящего кода ответа, а сетевой обрыв без кода
+        // выглядел бы как ответ сервера.
+        let cases: [(&str, Option<u16>); 4] = [
+            ("HTTP 500 Internal Server Error", Some(500)),
+            (
+                "GET https://caldav.example.com:443/dav/calendars/: HTTP 503: Service Unavailable",
+                Some(503),
+            ),
+            ("GET https://caldav.example.com:443/dav/calendars/", None),
+            ("os error 10054", None),
+        ];
+        for (message, expected) in cases {
+            let error = Error::Backend {
+                backend: "ews-http".into(),
+                message: message.into(),
+            };
+            assert_eq!(error.response_code(), expected, "текст: {message}");
+            assert_eq!(error.backend(), Some("ews-http"), "текст: {message}");
+        }
     }
 
     #[test]

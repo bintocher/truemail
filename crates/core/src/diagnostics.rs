@@ -57,40 +57,51 @@ impl Category {
     /// Категория по имени поля структурированной записи журнала
     /// (`tracing`-события пишут `key=value`); None - поле не из перечня.
     fn from_field_name(name: &str) -> Option<Self> {
-        match name.to_ascii_lowercase().as_str() {
-            "account_id" => Some(Self::AccountId),
-            "folder_id" => Some(Self::FolderId),
-            "message_id" => Some(Self::MessageId),
-            "uid" => Some(Self::Uid),
-            "collection" | "folder" | "mailbox" | "remote_path" => Some(Self::Folder),
-            // S-084: тема, предпросмотр, адреса, значение условия правила и
-            // текст ошибки очереди в архив открытым текстом не попадают.
-            // Значения списков отправителей, адрес записи автоочистки, тема и
-            // участники игнорируемой переписки попадают сюда же
-            // (blocked-senders.md S-052, ignore-conversation.md S-053,
-            // sweep-by-sender.md S-049).
-            "subject"
-            | "preview"
-            | "body"
-            | "value"
-            | "rule_value"
-            | "condition_value"
-            | "from"
-            | "from_addr"
-            | "to"
-            | "to_addrs"
-            | "recipient"
-            | "sender"
-            | "last_error"
-            | "policy_value"
-            | "address"
-            | "domain"
-            | "participants"
-            | "conversation_subject" => Some(Self::Content),
-            _ => None,
-        }
+        let lowered = name.to_ascii_lowercase();
+        FIELD_CATEGORIES
+            .iter()
+            .find(|(field, _)| *field == lowered)
+            .map(|(_, category)| *category)
     }
 }
+
+/// Имена полей записи журнала и их категории - одним перечнем, а не
+/// ветвями `match`: тот же список нужен проверке полноты обезличивания, а
+/// список, переписанный в проверке руками, молча разошёлся бы с разбором.
+///
+/// S-084: тема, предпросмотр, адреса, значение условия правила и текст
+/// ошибки очереди в архив открытым текстом не попадают. Туда же идут
+/// значения списков отправителей, адрес записи автоочистки, тема и
+/// участники игнорируемой переписки (blocked-senders.md S-052,
+/// ignore-conversation.md S-053, sweep-by-sender.md S-049).
+const FIELD_CATEGORIES: &[(&str, Category)] = &[
+    ("account_id", Category::AccountId),
+    ("folder_id", Category::FolderId),
+    ("message_id", Category::MessageId),
+    ("uid", Category::Uid),
+    ("collection", Category::Folder),
+    ("folder", Category::Folder),
+    ("mailbox", Category::Folder),
+    ("remote_path", Category::Folder),
+    ("subject", Category::Content),
+    ("preview", Category::Content),
+    ("body", Category::Content),
+    ("value", Category::Content),
+    ("rule_value", Category::Content),
+    ("condition_value", Category::Content),
+    ("from", Category::Content),
+    ("from_addr", Category::Content),
+    ("to", Category::Content),
+    ("to_addrs", Category::Content),
+    ("recipient", Category::Content),
+    ("sender", Category::Content),
+    ("last_error", Category::Content),
+    ("policy_value", Category::Content),
+    ("address", Category::Content),
+    ("domain", Category::Content),
+    ("participants", Category::Content),
+    ("conversation_subject", Category::Content),
+];
 
 /// Счётчики замен по категориям для `manifest.json` (S-007). Сериализуется
 /// как обычный объект `{"email": 3, ...}` - без имени пользователя, пути или
@@ -429,6 +440,22 @@ mod tests {
         [byte; 16]
     }
 
+    /// Отпечаток из псевдонима "[<категория>-<отпечаток>]": сравнивать
+    /// надо именно его, а не всю строку - разный префикс категории сам по себе
+    /// делает строки разными даже при совпавшем отпечатке.
+    fn alias_fingerprint(line: &str) -> String {
+        let inside = line
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(inside, _)| inside)
+            .unwrap_or_else(|| panic!("в строке нет псевдонима: {line}"));
+        inside
+            .rsplit_once('-')
+            .unwrap_or_else(|| panic!("псевдоним без отпечатка: {line}"))
+            .1
+            .to_owned()
+    }
+
     #[test]
     fn replaces_every_listed_category() {
         let salt = salt(1);
@@ -511,101 +538,125 @@ mod tests {
     }
 
     #[test]
-    fn message_content_and_rule_values_are_masked() {
-        // mail-rules-conditions-and-actions.md, S-084: тема письма, значение
-        // условия правила и текст ошибки очереди в архив открытым текстом не
-        // попадают.
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
-            "rule_id=r1 value=\"Счет от ООО\" subject=\"Отчёт за месяц\" last_error=\"NO [OVERQUOTA] boss@example.test\"",
-            &salt(9),
-            &mut counts,
-        );
-        assert!(!line.contains("Счет от ООО"), "{line}");
-        assert!(!line.contains("Отчёт за месяц"), "{line}");
-        assert!(!line.contains("OVERQUOTA"), "{line}");
-        assert!(line.contains("rule_id=r1"), "{line}");
+    fn every_known_log_field_value_is_replaced_by_an_alias() {
+        // Перечень полей берётся из самого разбора (FIELD_CATEGORIES): поле,
+        // которое разбор знает, а шаблон строки нет, ушло бы в архив открытым
+        // текстом и об этом никто бы не узнал. В поле попадает и тема с
+        // адресом внутри, и путь папки ящика, и текст ошибки сервера
+        // (S-084, blocked-senders.md S-052, ignore-conversation.md S-053,
+        // sweep-by-sender.md S-049).
+        let salt = salt(9);
+        let values = [
+            "Счет от ООО boss@example.test",
+            "INBOX/Клиенты/Договоры",
+            "NO [OVERQUOTA] Иван Петров",
+        ];
+        for (field, category) in FIELD_CATEGORIES {
+            for value in values {
+                let mut counts = ReplacementCounts::default();
+                let line = anonymize_line(
+                    &format!("rule_id=r1 {field}=\"{value}\" правило применено"),
+                    &salt,
+                    &mut counts,
+                );
+                assert!(!line.contains(value), "{field}: {line}");
+                assert!(
+                    line.contains(&format!("{field}=\"[{}-", category.tag())),
+                    "{field}: {line}"
+                );
+                assert_eq!(
+                    counts.0.get(category.tag()),
+                    Some(&1),
+                    "{field}: счётчик категории для manifest.json, {line}"
+                );
+                // Служебное поле и текст записи остаются: без них архив
+                // перестал бы годиться для разбора отказа.
+                assert!(line.contains("rule_id=r1"), "{field}: {line}");
+                assert!(line.contains("правило применено"), "{field}: {line}");
+            }
+        }
     }
 
     #[test]
-    fn sender_lists_and_conversation_metadata_are_masked() {
-        // blocked-senders.md S-052, ignore-conversation.md S-053,
-        // sweep-by-sender.md S-049: значения списков отправителей, адрес
-        // записи автоочистки, тема и участники переписки и идентификатор
-        // письма открытым текстом в архив не попадают.
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
-            "policy_id=7 policy_value=\"boss@example.test\" domain=\"spam.test\" participants=\"Иван Петров\" conversation_subject=\"Договор на поставку\" header=<abc123@example.test>",
-            &salt(11),
-            &mut counts,
-        );
-        assert!(!line.contains("boss@example.test"), "{line}");
-        assert!(!line.contains("spam.test"), "{line}");
-        assert!(!line.contains("Иван Петров"), "{line}");
-        assert!(!line.contains("Договор на поставку"), "{line}");
-        assert!(!line.contains("abc123"), "{line}");
-        assert!(line.contains("policy_id=7"), "{line}");
-    }
-
-    #[test]
-    fn mailbox_folder_field_is_replaced() {
-        // Путь папки ящика приходит в журнал отдельным полем remote_path
-        // (догрузка старых писем, удаление папки): без него структура ящика
-        // читалась бы из архива как есть.
-        let salt = salt(7);
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
-            "remote_path=\"INBOX/Клиенты/Договоры\" folder_id=3",
-            &salt,
-            &mut counts,
-        );
-        assert!(!line.contains("Клиенты"), "{line}");
-        assert!(!line.contains("Договоры"), "{line}");
-        assert!(line.contains("[folder-"), "{line}");
-    }
-
-    #[test]
-    fn home_directory_with_space_in_username_is_fully_hidden() {
+    fn home_directory_with_a_space_in_the_user_name_is_fully_hidden() {
         // F1: имя пользователя "Ivan Petrov" содержит пробел - общий шаблон
-        // пути обрывался бы на первом пробеле, оставляя фамилию в архиве.
+        // пути обрывается на первом пробеле и оставил бы фамилию в архиве.
+        // У каждой системы своя форма домашнего каталога и свой шаблон.
         let salt = salt(11);
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
+        let cases = [
             r"путь C:\Users\Ivan Petrov\AppData\Local\truemail\logs\truemail.log открыт",
-            &salt,
-            &mut counts,
-        );
-        assert!(!line.contains("Ivan"), "{line}");
-        assert!(!line.contains("Petrov"), "{line}");
-        assert!(line.contains("[path-"), "{line}");
-    }
-
-    #[test]
-    fn unix_home_directory_with_space_in_username_is_fully_hidden() {
-        let salt = salt(12);
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
             "путь /home/Ivan Petrov/.config/truemail открыт",
-            &salt,
-            &mut counts,
-        );
-        assert!(!line.contains("Ivan"), "{line}");
-        assert!(!line.contains("Petrov"), "{line}");
-        assert!(line.contains("[path-"), "{line}");
+            "путь /Users/Ivan Petrov/Library/Application Support/truemail открыт",
+        ];
+        for case in cases {
+            let mut counts = ReplacementCounts::default();
+            let line = anonymize_line(case, &salt, &mut counts);
+            assert!(!line.contains("Ivan"), "{line}");
+            assert!(!line.contains("Petrov"), "{line}");
+            assert!(line.contains("[path-"), "{line}");
+            assert!(line.starts_with("путь ["), "{line}");
+        }
     }
 
     #[test]
-    fn macos_home_directory_with_space_in_username_is_fully_hidden() {
-        let salt = salt(13);
-        let mut counts = ReplacementCounts::default();
-        let line = anonymize_line(
-            "путь /Users/Ivan Petrov/Library/Application Support/truemail открыт",
-            &salt,
-            &mut counts,
-        );
-        assert!(!line.contains("Ivan"), "{line}");
-        assert!(!line.contains("Petrov"), "{line}");
-        assert!(line.contains("[path-"), "{line}");
+    fn ipv6_server_address_is_replaced_whole() {
+        // Сервер могут задать адресом IPv6, в том числе в сжатой форме с "::".
+        // Заменять его надо целиком: половина адреса в архиве - это всё ещё
+        // адрес сервера пользователя.
+        let salt = salt(21);
+        let cases = [
+            "соединение с 2001:0db8:85a3:0000:0000:8a2e:0370:7334 разорвано",
+            "соединение с 2001:db8::1 разорвано",
+            "соединение с fe80::1 разорвано",
+            "соединение с 2001:db8:0:1::8a2e:370 разорвано",
+        ];
+        for case in cases {
+            let mut counts = ReplacementCounts::default();
+            let line = anonymize_line(case, &salt, &mut counts);
+            assert!(!line.contains("2001"), "{line}");
+            assert!(!line.contains("db8"), "{line}");
+            assert!(!line.contains("fe80"), "{line}");
+            assert!(!line.contains("::"), "{line}");
+            assert!(line.contains("[host-"), "{line}");
+            assert!(line.starts_with("соединение с [host-"), "{line}");
+            assert!(line.ends_with(" разорвано"), "{line}");
+        }
+    }
+
+    #[test]
+    fn field_value_with_spaces_is_replaced_to_the_end_of_the_value() {
+        // Значение поля записи журнала не всегда берётся в кавычки, а тема или
+        // текст ошибки почти всегда с пробелами: шаблон, обрывающийся на
+        // первом пробеле, оставил бы хвост темы в архиве открытым текстом
+        // (S-084). Граница значения - разделитель записи или начало
+        // следующего поля "имя=", а не любой пробел.
+        let salt = salt(22);
+        let cases = [
+            (
+                "subject=Отчёт за месяц account_id=42",
+                "Отчёт за месяц",
+                "account_id=",
+            ),
+            (
+                "last_error=NO [OVERQUOTA] mailbox is full, op=move",
+                "NO [OVERQUOTA] mailbox is full",
+                "op=move",
+            ),
+            ("value=Счет от ООО", "Счет от ООО", ""),
+        ];
+        for (source, secret, tail) in cases {
+            let mut counts = ReplacementCounts::default();
+            let line = anonymize_line(source, &salt, &mut counts);
+            assert!(!line.contains(secret), "{line}");
+            assert!(!line.contains("месяц"), "{line}");
+            assert!(!line.contains("mailbox"), "{line}");
+            assert!(!line.contains("ООО"), "{line}");
+            if !tail.is_empty() {
+                // Следующее поле записи не должно попасть внутрь значения:
+                // иначе обезличивание съело бы всю оставшуюся строку.
+                assert!(line.contains(tail), "{line}");
+            }
+        }
     }
 
     #[test]
@@ -639,16 +690,22 @@ mod tests {
     }
 
     #[test]
-    fn categories_are_salted_independently() {
-        // Отпечаток категорий независим: тот же текст в роли email и в роли
-        // произвольного узла не обязан давать одинаковый отпечаток, потому
-        // что соль применяется вместе с именем категории.
+    fn one_value_in_two_categories_gets_two_different_fingerprints() {
+        // S-004: отпечаток считается вместе с именем категории. Без этого
+        // одно и то же значение, встретившееся в двух разных категориях, получило бы
+        // одинаковый отпечаток, и читатель архива связал бы тему письма с именем
+        // папки, а адрес в поле записи - с адресом в свободном тексте строки.
         let salt = salt(3);
-        let mut counts = ReplacementCounts::default();
-        let email_alias = anonymize_line("x@example.com", &salt, &mut counts);
-        let mut counts2 = ReplacementCounts::default();
-        let host_alias = anonymize_line("example.com", &salt, &mut counts2);
-        assert_ne!(email_alias, host_alias);
+        let cases = [
+            ("folder=\"INBOX\"", "subject=\"INBOX\""),
+            ("письмо от x@example.com", "from=\"x@example.com\""),
+        ];
+        for (first_line, second_line) in cases {
+            let mut counts = ReplacementCounts::default();
+            let first = alias_fingerprint(&anonymize_line(first_line, &salt, &mut counts));
+            let second = alias_fingerprint(&anonymize_line(second_line, &salt, &mut counts));
+            assert_ne!(first, second, "{first_line} и {second_line}");
+        }
     }
 
     #[test]
