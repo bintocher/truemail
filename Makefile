@@ -3,19 +3,26 @@
 
 .PHONY: dev dev-check build migrate-new lint fmt test check-ui-tags check-ui-scope clean sweep sweep-preview setup
 
+# Пределы для js-тестов. Без лимита кучи текущий тест выбирает весь предел
+# коммита системы и роняет чужие процессы, без таймаута зависший тест не
+# прерывается. Переопределяются из окружения:
+# make test JS_TEST_HEAP_MB=512 JS_TEST_TIMEOUT_MS=10000
+JS_TEST_HEAP_MB ?= 2048
+JS_TEST_TIMEOUT_MS ?= 30000
+
 ifeq ($(OS),Windows_NT)
 DEV_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1
 DEV_CHECK_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/dev.ps1 -Check
 BUILD_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-perl.ps1 -WorkingDirectory apps/desktop/src-tauri cargo tauri build
 TEST_CMD = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/with-perl.ps1 cargo test --workspace --all-targets
-JS_TEST_CMD = node --test "apps/desktop/tests/js/*.test.js"
+JS_TEST_CMD = node --max-old-space-size=$(JS_TEST_HEAP_MB) --test --test-timeout=$(JS_TEST_TIMEOUT_MS) "apps/desktop/tests/js/*.test.js"
 SETUP_PERL = pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/ensure-perl.ps1
 else
 DEV_CMD = sh scripts/dev.sh
 DEV_CHECK_CMD = sh scripts/dev.sh --check
 BUILD_CMD = cd apps/desktop/src-tauri && cargo tauri build
 TEST_CMD = cargo test --workspace --all-targets
-JS_TEST_CMD = node --test "apps/desktop/tests/js/*.test.js"
+JS_TEST_CMD = node --max-old-space-size=$(JS_TEST_HEAP_MB) --test --test-timeout=$(JS_TEST_TIMEOUT_MS) "apps/desktop/tests/js/*.test.js"
 SETUP_PERL = perl -v >/dev/null
 endif
 
