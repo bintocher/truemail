@@ -8,7 +8,7 @@
 
 use super::Db;
 use super::stages::{
-    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, needs_retry,
+    DEFERRED_MESSAGES, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -213,6 +213,7 @@ impl Db {
             &payload,
             max_message_id,
             &candidates,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
         )
         .await?;
         tx.commit().await?;
@@ -751,7 +752,7 @@ impl Db {
             .bind(cursor)
             .bind(DEFERRAL_KIND)
             .bind(job_id)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut counters = StageCounters::default();
@@ -959,7 +960,7 @@ impl Db {
               ORDER BY id LIMIT ?",
         )
         .bind(conversation_id)
-        .bind(STAGE_BATCH)
+        .bind(self.limit(LIMIT_STAGE_BATCH))
         .fetch_all(&mut *tx)
         .await?;
         for row in pending {
@@ -1252,7 +1253,7 @@ impl Db {
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
             .bind(cursor)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut queued = 0usize;

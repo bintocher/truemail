@@ -116,6 +116,24 @@ pub const LIMIT_RECIPIENT_OWN_SEND_DAYS: &str = "limit_recipient_own_send_days";
 pub const LIMIT_MESSAGE_TRAITS_DAYS: &str = "limit_message_traits_days";
 pub const LIMIT_OPERATION_ATTEMPTS: &str = "limit_operation_attempts";
 pub const LIMIT_BACKGROUND_SYNC_MINUTES: &str = "limit_background_sync_minutes";
+pub const LIMIT_GMAIL_POLL_SECONDS: &str = "limit_gmail_poll_seconds";
+pub const LIMIT_SNOOZE_RELEASE_SECONDS: &str = "limit_snooze_release_seconds";
+pub const LIMIT_BACKFILL_PAGE: &str = "limit_backfill_page";
+pub const LIMIT_BODY_PREFETCH_MESSAGES: &str = "limit_body_prefetch_messages";
+pub const LIMIT_BODY_PREFETCH_SIZE_MB: &str = "limit_body_prefetch_size_mb";
+
+pub const LIMIT_HISTORY_PAGE: &str = "limit_history_page";
+pub const LIMIT_RANK_FRESH_DAYS: &str = "limit_rank_fresh_days";
+pub const LIMIT_RANK_RECENT_DAYS: &str = "limit_rank_recent_days";
+pub const LIMIT_RANK_OLD_DAYS: &str = "limit_rank_old_days";
+
+pub const LIMIT_STAGE_BATCH: &str = "limit_stage_batch";
+pub const LIMIT_STAGE_SNAPSHOT_HOURS: &str = "limit_stage_snapshot_hours";
+pub const LIMIT_SWEEP_WAIT_SECONDS: &str = "limit_sweep_wait_seconds";
+pub const LIMIT_SWEEP_MAX_WAITS: &str = "limit_sweep_max_waits";
+pub const LIMIT_SWEEP_FULL_PASS_HOURS: &str = "limit_sweep_full_pass_hours";
+pub const LIMIT_REMINDER_CHECK_SECONDS: &str = "limit_reminder_check_seconds";
+pub const LIMIT_UPDATE_CHECK_HOURS: &str = "limit_update_check_hours";
 
 /// Перечень настраиваемых пределов. Порядок - порядок показа внутри раздела.
 pub const LIMITS: &[LimitSpec] = &[
@@ -197,6 +215,56 @@ pub const LIMITS: &[LimitSpec] = &[
         hint_key: "limitSyncFailuresBeforeToastDesc",
         unit_key: "limitUnitChecks",
         default: 3,
+        min: 1,
+        max: 100,
+    },
+    LimitSpec {
+        key: LIMIT_GMAIL_POLL_SECONDS,
+        section: "messages",
+        title_key: "limitGmailPollSeconds",
+        hint_key: "limitGmailPollSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 25,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_SNOOZE_RELEASE_SECONDS,
+        section: "messages",
+        title_key: "limitSnoozeReleaseSeconds",
+        hint_key: "limitSnoozeReleaseSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 30,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_BACKFILL_PAGE,
+        section: "messages",
+        title_key: "limitBackfillPage",
+        hint_key: "limitBackfillPageDesc",
+        unit_key: "limitUnitMessages",
+        default: 15,
+        min: 1,
+        max: 500,
+    },
+    LimitSpec {
+        key: LIMIT_BODY_PREFETCH_MESSAGES,
+        section: "messages",
+        title_key: "limitBodyPrefetchMessages",
+        hint_key: "limitBodyPrefetchMessagesDesc",
+        unit_key: "limitUnitMessages",
+        default: 50,
+        min: 1,
+        max: 1000,
+    },
+    LimitSpec {
+        key: LIMIT_BODY_PREFETCH_SIZE_MB,
+        section: "messages",
+        title_key: "limitBodyPrefetchSizeMb",
+        hint_key: "limitBodyPrefetchSizeMbDesc",
+        unit_key: "limitUnitMegabytes",
+        default: 5,
         min: 1,
         max: 100,
     },
@@ -331,6 +399,49 @@ pub const LIMITS: &[LimitSpec] = &[
         default: 8,
         min: 1,
         max: 50,
+    },
+    LimitSpec {
+        key: LIMIT_HISTORY_PAGE,
+        section: "sending",
+        title_key: "limitHistoryPage",
+        hint_key: "limitHistoryPageDesc",
+        unit_key: "limitUnitEntries",
+        default: 100,
+        min: 10,
+        max: 1000,
+    },
+    // Пороги свежести идут от свежего к давнему: обращение, попавшее в первый
+    // порог, весит больше, чем попавшее во второй. Сами веса настройкой не
+    // стали - они задают не предел, а само правило сравнения.
+    LimitSpec {
+        key: LIMIT_RANK_FRESH_DAYS,
+        section: "sending",
+        title_key: "limitRankFreshDays",
+        hint_key: "limitRankFreshDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 30,
+        min: 1,
+        max: 3650,
+    },
+    LimitSpec {
+        key: LIMIT_RANK_RECENT_DAYS,
+        section: "sending",
+        title_key: "limitRankRecentDays",
+        hint_key: "limitRankRecentDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 90,
+        min: 1,
+        max: 3650,
+    },
+    LimitSpec {
+        key: LIMIT_RANK_OLD_DAYS,
+        section: "sending",
+        title_key: "limitRankOldDays",
+        hint_key: "limitRankOldDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 365,
+        min: 1,
+        max: 3650,
     },
     // --- Автоответ ---
     LimitSpec {
@@ -503,6 +614,76 @@ pub const LIMITS: &[LimitSpec] = &[
         default: 30,
         min: 1,
         max: 3650,
+    },
+    LimitSpec {
+        key: LIMIT_STAGE_BATCH,
+        section: "maintenance",
+        title_key: "limitStageBatch",
+        hint_key: "limitStageBatchDesc",
+        unit_key: "limitUnitMessages",
+        default: 500,
+        min: 10,
+        max: 10_000,
+    },
+    LimitSpec {
+        key: LIMIT_STAGE_SNAPSHOT_HOURS,
+        section: "maintenance",
+        title_key: "limitStageSnapshotHours",
+        hint_key: "limitStageSnapshotHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 24,
+        min: 1,
+        max: 8760,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_WAIT_SECONDS,
+        section: "maintenance",
+        title_key: "limitSweepWaitSeconds",
+        hint_key: "limitSweepWaitSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 60,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_MAX_WAITS,
+        section: "maintenance",
+        title_key: "limitSweepMaxWaits",
+        hint_key: "limitSweepMaxWaitsDesc",
+        unit_key: "limitUnitWaits",
+        default: 8,
+        min: 1,
+        max: 100,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_FULL_PASS_HOURS,
+        section: "maintenance",
+        title_key: "limitSweepFullPassHours",
+        hint_key: "limitSweepFullPassHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 24,
+        min: 1,
+        max: 8760,
+    },
+    LimitSpec {
+        key: LIMIT_REMINDER_CHECK_SECONDS,
+        section: "maintenance",
+        title_key: "limitReminderCheckSeconds",
+        hint_key: "limitReminderCheckSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 60,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_UPDATE_CHECK_HOURS,
+        section: "maintenance",
+        title_key: "limitUpdateCheckHours",
+        hint_key: "limitUpdateCheckHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 6,
+        min: 1,
+        max: 8760,
     },
 ];
 

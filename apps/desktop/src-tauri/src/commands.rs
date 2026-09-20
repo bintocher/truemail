@@ -111,6 +111,28 @@ pub fn mail_failure_threshold(core: &Core) -> u32 {
         .max(1) as u32
 }
 
+/// Размер порции серверной догрузки. Число приходит от интерфейса, но своего
+/// числа тот не держит: пока перечень пределов не загружен, он присылает
+/// пустое значение, и порцию называет настройка ядра.
+fn backfill_page(core: &Core, requested: Option<i64>) -> usize {
+    requested
+        .unwrap_or_else(|| core.db.limit(truemail_core::model::LIMIT_BACKFILL_PAGE))
+        .max(1) as usize
+}
+
+/// Значение предела для фонового цикла, которому ядро доступно только через
+/// состояние приложения. До создания хранилища и на занятом замке остаётся
+/// значение первого запуска: цикл проверки обновлений не должен ни ждать базу,
+/// ни останавливаться из-за неё.
+pub fn limit_or_default(app: &AppHandle, key: &str) -> i64 {
+    app.state::<AppState>()
+        .core
+        .try_read()
+        .ok()
+        .and_then(|core| core.as_ref().map(|core| core.db.limit(key)))
+        .unwrap_or_else(|| truemail_core::model::limit_default(key))
+}
+
 /// Реестр счётчиков сбоев почты по аккаунту (см. `AppState::mail_failures`).
 /// Функции ниже принимают саму ссылку на реестр, а не всё `AppState` - все
 /// пути синхронизации почты работают внутри `tokio::spawn`-задач или
@@ -1579,7 +1601,14 @@ async fn gmail_realtime_loop(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+        // Срок читается на каждом обороте: выбранное пользователем значение
+        // действует со следующего прохода, без перезапуска программы.
+        tokio::time::sleep(std::time::Duration::from_secs(
+            core.db
+                .limit(truemail_core::model::LIMIT_GMAIL_POLL_SECONDS)
+                .max(1) as u64,
+        ))
+        .await;
     }
 }
 
@@ -1662,7 +1691,14 @@ async fn reminders_loop(core: Arc<Core>, app: AppHandle) {
     let mut notified: HashSet<String> = HashSet::new();
     let mut last_task_cleanup = None;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // Срок читается на каждом обороте: выбранное пользователем значение
+        // действует со следующего прохода, без перезапуска программы.
+        tokio::time::sleep(std::time::Duration::from_secs(
+            core.db
+                .limit(truemail_core::model::LIMIT_REMINDER_CHECK_SECONDS)
+                .max(1) as u64,
+        ))
+        .await;
         let events = match core.db.list_calendars_and_events().await {
             Ok((_, events)) => events,
             Err(_) => continue,
@@ -2338,10 +2374,10 @@ pub async fn fetch_older_messages(
     before: String,
     limit: Option<i64>,
 ) -> CmdResult<truemail_core::account::BackfillPage> {
-    Ok(core(&state)
-        .await?
+    let core = core(&state).await?;
+    Ok(core
         .accounts
-        .fetch_older_folder_messages(folder_id, &before, limit.unwrap_or(500).max(1) as usize)
+        .fetch_older_folder_messages(folder_id, &before, backfill_page(&core, limit))
         .await?)
 }
 
@@ -4892,10 +4928,14 @@ pub async fn list_recipient_history(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> CmdResult<Vec<truemail_core::model::RecipientHistoryEntry>> {
-    Ok(core(&state)
-        .await?
+    let core = core(&state).await?;
+    Ok(core
         .db
-        .list_recipient_history(account_id, limit.unwrap_or(100), offset.unwrap_or(0))
+        .list_recipient_history(
+            account_id,
+            limit.unwrap_or_else(|| core.db.limit(truemail_core::model::LIMIT_HISTORY_PAGE)),
+            offset.unwrap_or(0),
+        )
         .await?)
 }
 

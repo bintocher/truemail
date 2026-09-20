@@ -220,7 +220,7 @@ async function reloadQueueSections(){
   }else{absenceSettings=null;absenceReplies=[];}
   const historyAccount=Number(document.getElementById('historyAccount')?.value)||0;
   if(historyAccount){
-    try{historyEntries=await window.tm.listRecipientHistory(historyAccount,100,0);}catch(_){historyEntries=[];}
+    try{historyEntries=await window.tm.listRecipientHistory(historyAccount,window.limitsModel.limitValue(window.limitsModel.KEYS.historyPage),0);}catch(_){historyEntries=[];}
   }else historyEntries=[];
   window.setOutboxEntriesForCard?.(outboxEntries);
   renderOutboxList();renderAbsenceSection();renderHistoryList();

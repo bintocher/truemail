@@ -371,12 +371,14 @@ pub struct InboxSyncResult {
     pub changed: bool,
 }
 
-/// Сколько тел писем догружаем за один проход синхронизации
-/// (gmail-local-body-prefetch.md, S-005).
-const BODY_PREFETCH_PER_PASS: i64 = 50;
-/// Письма крупнее этого размера в фоне не качаем: они тянут вложения целиком,
-/// а нужны редко. Их тело скачивается при открытии письма (S-006).
-const BODY_PREFETCH_MAX_SIZE: i64 = 5 * 1024 * 1024;
+// Сколько тел писем догружаем за один проход синхронизации (S-005) и с какого
+// размера письмо в фоне не качаем (S-006) - настройки: ключи
+// LIMIT_BODY_PREFETCH_MESSAGES и LIMIT_BODY_PREFETCH_SIZE_MB
+// (crates/core/src/model/limits.rs, gmail-local-body-prefetch.md).
+
+/// Мегабайт числом: порог размера письма пользователь задаёт в мегабайтах, а
+/// запрос сравнивает с полем `size` в байтах.
+const BYTES_IN_MEGABYTE: i64 = 1024 * 1024;
 
 /// Итог фоновой догрузки тел писем за один проход.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1527,8 +1529,8 @@ impl AccountManager {
             .messages_missing_body(
                 account.id,
                 account.retention_days,
-                BODY_PREFETCH_MAX_SIZE,
-                BODY_PREFETCH_PER_PASS,
+                self.db.limit(crate::model::LIMIT_BODY_PREFETCH_SIZE_MB) * BYTES_IN_MEGABYTE,
+                self.db.limit(crate::model::LIMIT_BODY_PREFETCH_MESSAGES),
             )
             .await?;
         if pending.is_empty() {

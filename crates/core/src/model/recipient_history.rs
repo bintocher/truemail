@@ -7,14 +7,13 @@
 use serde::{Deserialize, Serialize};
 
 // Число отметок на запись (S-027), число видимых записей на ящик (S-051),
-// длина подсказки (S-032), срок памяти о собственных отправках (S-010) и
-// размер пачки первичного заполнения задаются настройками: ключи
-// LIMIT_RECIPIENT_TOUCHES, LIMIT_RECIPIENT_ENTRIES, LIMIT_RECIPIENT_SUGGESTIONS,
-// LIMIT_RECIPIENT_OWN_SEND_DAYS и LIMIT_PURGE_BATCH
-// (crates/core/src/model/limits.rs).
+// длина подсказки (S-032), срок памяти о собственных отправках (S-010),
+// размер пачки первичного заполнения, страница раздела управления историей и
+// пороги свежести ранга задаются настройками: ключи LIMIT_RECIPIENT_TOUCHES,
+// LIMIT_RECIPIENT_ENTRIES, LIMIT_RECIPIENT_SUGGESTIONS,
+// LIMIT_RECIPIENT_OWN_SEND_DAYS, LIMIT_PURGE_BATCH, LIMIT_HISTORY_PAGE и
+// LIMIT_RANK_* (crates/core/src/model/limits.rs).
 
-/// Раздел управления историей загружает записи страницами.
-pub const HISTORY_PAGE: i64 = 100;
 /// Предел длины адреса истории (S-023). Тот же предел, что и у записей списков
 /// отправителей: имя взято другое, чтобы общая область имён модели не
 /// сталкивалась.

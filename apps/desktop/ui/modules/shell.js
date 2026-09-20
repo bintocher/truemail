@@ -312,8 +312,9 @@ const messageInitialPageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.messa
 const messagePageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.messagePage,window.corePageSize);
 const smartMessagePageSize=()=>limitsModel.limitValueOr(limitsModel.KEYS.smartMessagePage,window.corePageSize);
 // Догрузка с сервера идёт маленькими порциями - чтобы результат появлялся
-// быстро, а не ждать пока скачаются сотни писем разом.
-const BACKFILL_PAGE_SIZE=15;
+// быстро, а не ждать пока скачаются сотни писем разом. Размер порции -
+// настройка ядра; пока перечень не загружен, порцию называет само ядро.
+const backfillPageSize=()=>limitsModel.limitValue(limitsModel.KEYS.backfillPage);
 // Сколько папок-источников умная папка догружает за один проход: каждая - это
 // отдельное подключение к серверу, остальные подхватит следующий проход.
 const SMART_BACKFILL_FOLDERS=5;
@@ -446,7 +447,7 @@ async function loadNextMessagePage(serverBackfill=false){
       // выборка по курсору может вернуть уже показанные письма (дубли по
       // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
       let backfillDone=false;
-      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,BACKFILL_PAGE_SIZE);const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
+      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,backfillPageSize());const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
       messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));const pageLast=page[page.length-1];if(pageLast)ordinaryPageCursors.set(folderId,{date:pageLast.date||'',id:pageLast.id});
       // Концом папки считаем только удавшийся проход: пустая страница без похода
       // на сервер и упавший запрос догрузки его не подтверждают - письма на

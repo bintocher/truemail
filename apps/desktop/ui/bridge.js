@@ -54,7 +54,9 @@ window.corePageSize = null;
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     listLabelMessagesPage: (label, beforeDate, beforeId, limit = 100) => invoke("list_label_messages_page", { label, beforeDate, beforeId, limit }),
     labelMessageCounts: () => invoke("label_message_counts"),
-    fetchOlderMessages: (folderId, before, limit = 500) => invoke("fetch_older_messages", { folderId, before, limit }),
+    // Пустой предел означает "спроси настройку": размер порции догрузки
+    // называет ядро, а не запасное число моста.
+    fetchOlderMessages: (folderId, before, limit = null) => invoke("fetch_older_messages", { folderId, before, limit }),
     uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
@@ -460,7 +462,10 @@ window.corePageSize = null;
           if (released) scheduleReload(0);
         };
         releaseSnoozed().catch(console.error);
-        setInterval(() => releaseSnoozed().catch(console.error), 30000);
+        // Срок между проверками отложенных писем - настройка ядра, а не число
+        // здесь.
+        const snoozeSeconds = window.limitsModel.limitValue(window.limitsModel.KEYS.snoozeReleaseSeconds);
+        if (snoozeSeconds) setInterval(() => releaseSnoozed().catch(console.error), snoozeSeconds * 1000);
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере

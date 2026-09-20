@@ -866,7 +866,7 @@ async function loadSmartCoveragePage(index,reset=false,serverBackfill=false){
         // попадают, курсор стоял бы на месте и сервер отдавал бы ту же страницу.
         const folderCursor=smartBackfillCursor.get(source.id)||folderCursors.get(source.id)?.date||cursor.date;
         try{
-          const page=await window.tm?.fetchOlderMessages(source.id,folderCursor,BACKFILL_PAGE_SIZE);
+          const page=await window.tm?.fetchOlderMessages(source.id,folderCursor,backfillPageSize());
           if(page?.oldest)smartBackfillCursor.set(source.id,page.oldest);
           if((page?.fetched||0)>0){fetchedAny=true;smartCircleFetched.set(folder.id,true);}
         }catch(error){

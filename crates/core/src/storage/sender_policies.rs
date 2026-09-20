@@ -7,8 +7,8 @@
 
 use super::Db;
 use super::stages::{
-    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage,
-    WORKING_FOLDERS, needs_retry,
+    DEFERRED_MESSAGES, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, WORKING_FOLDERS,
+    needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -273,9 +273,15 @@ impl Db {
         let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
         let max_message_id = Self::max_message_id(&mut tx).await?;
         let payload = format!("{kind}\n{canonical}");
-        let snapshot_key =
-            Self::save_stage_snapshot(&mut tx, SNAPSHOT_KIND, &payload, max_message_id, &ids)
-                .await?;
+        let snapshot_key = Self::save_stage_snapshot(
+            &mut tx,
+            SNAPSHOT_KIND,
+            &payload,
+            max_message_id,
+            &ids,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         tx.commit().await?;
         Ok(SenderPolicyPreview {
             kind: kind.to_owned(),
@@ -529,7 +535,7 @@ impl Db {
             .bind(cursor)
             .bind(DEFERRAL_KIND)
             .bind(job_id)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut counters = StageCounters::default();
@@ -744,7 +750,7 @@ impl Db {
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
             .bind(cursor)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut queued = 0usize;

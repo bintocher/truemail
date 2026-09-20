@@ -24,9 +24,6 @@ pub(crate) const WORKING_FOLDERS: &str =
 pub(crate) const WORKING_FOLDERS_WITH_ARCHIVE: &str =
     "(f.role IS NULL OR f.role NOT IN ('sent','drafts','spam','trash'))";
 
-/// Размер пачки стадии: то же число, что уже выбирает один проход правил.
-pub(crate) const STAGE_BATCH: i64 = 500;
-
 /// Условие отбора писем, отложенных этим заданием: они повторяются наравне с
 /// письмами после курсора, поэтому проход к ним возвращается.
 pub(crate) const DEFERRED_MESSAGES: &str =
@@ -189,8 +186,9 @@ impl Db {
         payload: &str,
         max_message_id: i64,
         candidates: &[i64],
+        snapshot_hours: i64,
     ) -> Result<String> {
-        Self::purge_stale_snapshots_in_tx(tx, Some(kind)).await?;
+        Self::purge_stale_snapshots_in_tx(tx, Some(kind), snapshot_hours).await?;
         let key = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO stage_snapshots(key, kind, payload, max_message_id, total)
@@ -245,30 +243,38 @@ impl Db {
     /// строки копились бы навсегда.
     pub(crate) async fn purge_stale_stage_snapshots(&self) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        Self::purge_stale_snapshots_in_tx(&mut tx, None).await?;
+        Self::purge_stale_snapshots_in_tx(&mut tx, None, self.limit(LIMIT_STAGE_SNAPSHOT_HOURS))
+            .await?;
         tx.commit().await?;
         Ok(())
     }
 
+    /// Срок жизни снимка приходит значением, а не читается здесь: обе ветки
+    /// уборки работают внутри чужой транзакции, а база настроек за ней не
+    /// видна.
     async fn purge_stale_snapshots_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         kind: Option<&str>,
+        snapshot_hours: i64,
     ) -> Result<()> {
+        let border = format!("-{snapshot_hours} hours");
         match kind {
             Some(kind) => {
                 sqlx::query(
                     "DELETE FROM stage_snapshots
-                      WHERE kind=? AND datetime(created_at) <= datetime('now', '-1 day')",
+                      WHERE kind=? AND datetime(created_at) <= datetime('now', ?)",
                 )
                 .bind(kind)
+                .bind(&border)
                 .execute(&mut **tx)
                 .await?;
             }
             None => {
                 sqlx::query(
                     "DELETE FROM stage_snapshots
-                      WHERE datetime(created_at) <= datetime('now', '-1 day')",
+                      WHERE datetime(created_at) <= datetime('now', ?)",
                 )
+                .bind(&border)
                 .execute(&mut **tx)
                 .await?;
             }

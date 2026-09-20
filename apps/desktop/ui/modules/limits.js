@@ -52,6 +52,22 @@
     recipientOwnSendDays: 'limit_recipient_own_send_days',
     messageTraitsDays: 'limit_message_traits_days',
     operationAttempts: 'limit_operation_attempts',
+    gmailPollSeconds: 'limit_gmail_poll_seconds',
+    snoozeReleaseSeconds: 'limit_snooze_release_seconds',
+    backfillPage: 'limit_backfill_page',
+    bodyPrefetchMessages: 'limit_body_prefetch_messages',
+    bodyPrefetchSizeMb: 'limit_body_prefetch_size_mb',
+    historyPage: 'limit_history_page',
+    rankFreshDays: 'limit_rank_fresh_days',
+    rankRecentDays: 'limit_rank_recent_days',
+    rankOldDays: 'limit_rank_old_days',
+    stageBatch: 'limit_stage_batch',
+    stageSnapshotHours: 'limit_stage_snapshot_hours',
+    sweepWaitSeconds: 'limit_sweep_wait_seconds',
+    sweepMaxWaits: 'limit_sweep_max_waits',
+    sweepFullPassHours: 'limit_sweep_full_pass_hours',
+    reminderCheckSeconds: 'limit_reminder_check_seconds',
+    updateCheckHours: 'limit_update_check_hours',
   };
 
   let sections = [];
