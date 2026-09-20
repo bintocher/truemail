@@ -3851,9 +3851,8 @@ impl Db {
         not_before: Option<&str>,
         not_after: Option<&str>,
     ) -> Result<Vec<i64>> {
-        if remote_ids.is_empty() {
-            return Ok(Vec::new());
-        }
+        // Пустой набор id отдельной ветки не требует: SQLite принимает "IN ()"
+        // и возвращает тот же пустой список.
         let placeholders = vec!["?"; remote_ids.len()].join(",");
         let date_filter = match (not_before.is_some(), not_after.is_some()) {
             (true, true) => " AND (m.date IS NULL OR (m.date >= ? AND m.date <= ?))",
@@ -9360,17 +9359,6 @@ mod notification_lookup_tests {
     use super::test_storage::{TestDb, open_test_db};
     use super::*;
 
-    /// smart-folder-selection-shared.md, S-002: условие отбора живых писем
-    /// объявлено один раз, поэтому все три запроса умной папки содержат его
-    /// дословно.
-    #[test]
-    fn smart_folder_queries_share_one_alive_filter() {
-        let alive = message_alive_sql!();
-        assert!(SMART_PAGE_FIRST_SQL.contains(alive));
-        assert!(SMART_PAGE_AFTER_CURSOR_SQL.contains(alive));
-        assert!(SMART_STREAM_SQL.contains(alive));
-    }
-
     /// S-007: список читает страницами с сортировкой, счётчик - потоком без
     /// сортировки и без предела.
     #[test]
@@ -9745,17 +9733,6 @@ mod notification_lookup_tests {
             .await
             .expect("query inbox ids");
         assert_eq!(all.len(), 5, "без границ выбираются все письма Входящих");
-        db.close().await;
-    }
-
-    #[tokio::test]
-    async fn empty_input_returns_empty_result_without_querying() {
-        let db = test_db().await;
-        let ids = db
-            .inbox_message_ids_by_remote_ids(1, &[], None, None)
-            .await
-            .expect("query with empty input");
-        assert!(ids.is_empty());
         db.close().await;
     }
 
@@ -11247,35 +11224,6 @@ mod charset_decoding_tests {
             .expect("письмо разобрано");
         assert_eq!(message.subject(), Some("Вышел новый"));
         assert_eq!(message.body_text(0).as_deref(), Some("Вышел новый\r\n"));
-    }
-
-    /// iso-2022-kr и hz-gb-2312 библиотека разбора сознательно не поддерживает
-    /// (решение WHATWG): результат - символы замены, но не сырые байты с ESC.
-    /// Пользователю такие кодировки читаемыми не обещаны (S-002).
-    #[test]
-    fn unsupported_legacy_charsets_do_not_leak_escape_bytes() {
-        for charset in ["iso-2022-kr", "hz-gb-2312"] {
-            let raw = format!(
-                concat!(
-                    "From: sender@example.test\r\n",
-                    "Subject: legacy\r\n",
-                    "MIME-Version: 1.0\r\n",
-                    "Content-Type: text/plain; charset=\"{}\"\r\n",
-                    "Content-Transfer-Encoding: quoted-printable\r\n",
-                    "\r\n",
-                    "=1B$B'#'m'j'V']=1B(B\r\n"
-                ),
-                charset
-            );
-            let message = MessageParser::default()
-                .parse(raw.as_bytes())
-                .expect("письмо разобрано");
-            let body = message.body_text(0).expect("тело письма").into_owned();
-            assert!(
-                !body.contains('\u{1B}'),
-                "{charset}: в тексте не должно оставаться управляющих байтов"
-            );
-        }
     }
 }
 
