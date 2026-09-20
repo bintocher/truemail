@@ -1,6 +1,8 @@
 // Проверки чистой логики apps/desktop/ui/modules/message-view.js.
 // Запуск: node --test apps/desktop/tests/js/message-view.test.js (Node 20+).
 // Каталог вне apps/desktop/ui, поэтому в дистрибутив Tauri не попадает.
+// Проверки табличные: каждый случай назван тем дефектом, который он ловит,
+// и при поломке сообщение показывает, какой именно случай перестал работать.
 'use strict';
 const {test}=require('node:test');
 const assert=require('node:assert/strict');
@@ -8,95 +10,96 @@ const {isCurrentView,listAnchorAt,listAnchorOffset,selectionAnchorIndex}=require
 
 const rowsOf=(...ids)=>ids.map(id=>({id}));
 
-// S-001: результат ожидания применяется, только пока поколение показа то же.
-test('S-001: поколение не менялось - результат применяется',()=>{
-  assert.equal(isCurrentView(3,3),true);
-  assert.equal(isCurrentView(0,0),true);
-});
-test('S-001: поколение выросло - результат первого запроса отбрасывается',()=>{
-  assert.equal(isCurrentView(1,2),false);
-  assert.equal(isCurrentView(1,5),false); // подряд несколько кликов
-});
-// Поколение только растёт, но меньшее текущего тоже не своё: применять чужой
-// результат нельзя ни в какую сторону.
-test('S-001: поколение меньше запрошенного - тоже не свое',()=>{
-  assert.equal(isCurrentView(4,2),false);
-});
-test('S-001: неизвестное поколение считается чужим',()=>{
-  assert.equal(isCurrentView(undefined,1),false);
-  assert.equal(isCurrentView(1,undefined),false);
-  assert.equal(isCurrentView(null,0),false);
-  assert.equal(isCurrentView(Number.NaN,Number.NaN),false);
-});
-// S-004: ветка ошибки пользуется той же проверкой - сообщение об ошибке
-// устаревшего запроса на экран не идет.
-test('S-004: ошибка устаревшего запроса не проходит проверку, ошибка актуального проходит',()=>{
-  assert.equal(isCurrentView(7,8),false);
-  assert.equal(isCurrentView(8,8),true);
+// S-001..S-004: ответ ядра применяется, только пока поколение показа то же.
+// Дефект здесь означает письмо, нарисованное поверх другого: пользователь
+// кликнул по второму письму, а на экране появилось тело первого. Ветка ошибки
+// пользуется этой же проверкой, отдельного пути у неё нет.
+test('S-001: результат применяется только своему поколению показа',()=>{
+  const cases=[
+    ['поколение то же',3,3,true],
+    ['нулевое поколение то же',0,0,true],
+    ['поколение выросло на один - ответ первого запроса чужой',1,2,false],
+    ['несколько кликов подряд - ответ давнего запроса чужой',1,5,false],
+    ['поколение меньше запрошенного - тоже не своё',4,2,false],
+    ['поколения нет вовсе',undefined,1,false],
+    ['текущего поколения нет',1,undefined,false],
+    ['пустое поколение не равно нулевому',null,0,false],
+    ['нечисловое поколение не совпадает само с собой',Number.NaN,Number.NaN,false],
+  ];
+  cases.forEach(([name,generation,current,expected])=>{
+    assert.equal(isCurrentView(generation,current),expected,`случай "${name}": ответ ядра применён не по правилу поколения`);
+  });
 });
 
-// S-009: снятие якоря - верхнее видимое письмо и смещение внутри его строки.
-test('S-009: якорь - верхняя видимая строка, смещение внутри нее',()=>{
+// S-009: якорь списка - верхнее видимое письмо и смещение внутри его строки.
+// Ошибка на границе строки уводит список на строку вверх или вниз при каждой
+// перерисовке.
+test('S-009: якорь списка - верхняя видимая строка и смещение внутри неё',()=>{
   const rows=rowsOf(10,11,12,13);
-  assert.deepEqual(listAnchorAt(rows,0,76),{id:10,offset:0});
-  assert.deepEqual(listAnchorAt(rows,76,76),{id:11,offset:0});
-  assert.deepEqual(listAnchorAt(rows,90,76),{id:11,offset:14});
-});
-test('S-009: положение ниже последней строки дает последнее письмо',()=>{
-  assert.deepEqual(listAnchorAt(rowsOf(10,11),100000,76).id,11);
-});
-test('S-009: пустой список и нулевая высота строки якоря не дают',()=>{
-  assert.deepEqual(listAnchorAt([],120,76),{id:null,offset:0});
-  assert.deepEqual(listAnchorAt(undefined,120,76),{id:null,offset:0});
-  assert.deepEqual(listAnchorAt(rowsOf(10),120,0),{id:null,offset:0});
-});
-test('S-009: отрицательное положение прокрутки дает первое письмо',()=>{
-  assert.deepEqual(listAnchorAt(rowsOf(10,11),-40,76),{id:10,offset:0});
-});
-
-// S-009: восстановление - строка якоря встает на прежнее место, даже если
-// сверху вставились новые письма.
-test('S-009: два письма сверху не сдвигают строку под курсором',()=>{
-  const before=rowsOf(10,11,12),after=rowsOf(8,9,10,11,12);
-  const anchor=listAnchorAt(before,76,76); // верхнее видимое - письмо 11
-  assert.equal(anchor.id,11);
-  assert.equal(listAnchorOffset(after,anchor.id,76,76),3*76); // 11 стало четвертым
-});
-test('S-009: смещение внутри строки сохраняется',()=>{
-  const after=rowsOf(8,9,10,11);
-  assert.equal(listAnchorOffset(after,11,90,76),3*76+14);
-});
-test('S-009: якоря нет или письмо ушло из списка - прежнее положение по пикселям',()=>{
-  assert.equal(listAnchorOffset(rowsOf(10,11),null,120,76),120);
-  assert.equal(listAnchorOffset(rowsOf(10,11),99,120,76),120);
-  assert.equal(listAnchorOffset([],11,120,76),120);
-  assert.equal(listAnchorOffset(rowsOf(10,11),11,120,0),120);
-});
-test('S-009: якорь на первой строке возвращает то же положение',()=>{
-  assert.equal(listAnchorOffset(rowsOf(10,11,12),10,0,76),0);
-});
-test('S-009: испорченное прежнее положение не дает отрицательного результата',()=>{
-  assert.equal(listAnchorOffset(rowsOf(10,11),10,-500,76),0);
-  assert.equal(listAnchorOffset(rowsOf(10,11),10,undefined,76),0);
+  const cases=[
+    ['список в самом верху',rows,0,76,{id:10,offset:0}],
+    ['ровно граница второй строки',rows,76,76,{id:11,offset:0}],
+    ['середина второй строки - смещение внутри неё',rows,90,76,{id:11,offset:14}],
+    // Смещение при уходе ниже списка не задано - проверяем только письмо.
+    ['прокрутка ниже последней строки',rowsOf(10,11),100000,76,{id:11}],
+    ['отрицательное положение - первое письмо',rowsOf(10,11),-40,76,{id:10,offset:0}],
+    ['пустой список',[],120,76,{id:null,offset:0}],
+    ['списка нет вовсе',undefined,120,76,{id:null,offset:0}],
+    ['высота строки не измерена',rowsOf(10),120,0,{id:null,offset:0}],
+  ];
+  cases.forEach(([name,list,scrollTop,rowHeight,expected])=>{
+    const anchor=listAnchorAt(list,scrollTop,rowHeight);
+    assert.equal(anchor.id,expected.id,`случай "${name}": якорь снят не с того письма`);
+    if(expected.offset!==undefined)assert.equal(anchor.offset,expected.offset,`случай "${name}": смещение внутри строки якоря посчитано неверно`);
+  });
 });
 
-// S-010: опорная позиция выделения с Shift пересчитывается из id в номер строки.
-test('S-010: опорное письмо на месте - его номер в текущем списке',()=>{
-  assert.equal(selectionAnchorIndex(rowsOf(10,11,12),12,-1),2);
+// S-009: восстановление положения. Дефект здесь виден пользователю как прыжок
+// списка при доставке новых писем: строка под курсором уезжает из-под него.
+test('S-009: строка якоря встаёт на прежнее место после перестройки списка',()=>{
+  const cases=[
+    ['два письма вставились сверху - строка якоря остаётся под курсором',rowsOf(8,9,10,11,12),11,76,76,3*76],
+    ['смещение внутри строки сохраняется',rowsOf(8,9,10,11),11,90,76,3*76+14],
+    ['якоря не было - прежнее положение по пикселям',rowsOf(10,11),null,120,76,120],
+    ['письмо ушло из выборки - прежнее положение',rowsOf(10,11),99,120,76,120],
+    ['список опустел - прежнее положение',[],11,120,76,120],
+    ['высота строки не измерена - прежнее положение',rowsOf(10,11),11,120,0,120],
+    ['испорченное прежнее положение не даёт отрицательного',rowsOf(10,11),10,-500,76,0],
+    ['прежнего положения нет вовсе',rowsOf(10,11),10,undefined,76,0],
+  ];
+  cases.forEach(([name,rows,anchorId,previousOffset,rowHeight,expected])=>{
+    assert.equal(listAnchorOffset(rows,anchorId,previousOffset,rowHeight),expected,`случай "${name}": список встал не на своё место`);
+  });
+  // Якорь снимается и восстанавливается одной парой функций - проверяем их
+  // вместе: раздельно они могут разойтись в трактовке смещения.
+  const anchor=listAnchorAt(rowsOf(10,11,12),76,76);
+  assert.equal(anchor.id,11,'якорь снят не с верхней видимой строки: восстанавливать нечего');
+  assert.equal(listAnchorOffset(rowsOf(8,9,10,11,12),anchor.id,76,76),3*76,'снятый якорь не восстановил положение списка');
 });
-test('S-010: перестройка списка сдвинула строки - номер пересчитан',()=>{
-  assert.equal(selectionAnchorIndex(rowsOf(8,9,10,11,12),11,-1),3);
+
+// S-010: опорная позиция выделения с Shift хранится по id письма, а номер
+// строки берётся из того списка, который пользователь видит сейчас.
+test('S-010: опорное письмо на месте - номер строки берётся из текущего списка',()=>{
+  const cases=[
+    ['список не менялся',rowsOf(10,11,12),12,-1,2],
+    ['перестройка списка сдвинула строки',rowsOf(8,9,10,11,12),11,-1,3],
+    ['развёрнутая беседа - опорное письмо видно',rowsOf(10,11,12),12,0,2],
+  ];
+  cases.forEach(([name,rows,anchorId,fallback,expected])=>{
+    assert.equal(selectionAnchorIndex(rows,anchorId,fallback),expected,`случай "${name}": опорная строка выделения посчитана неверно`);
+  });
 });
-test('S-010: опорного письма в списке нет - берется запасная позиция',()=>{
-  assert.equal(selectionAnchorIndex(rowsOf(10,11),99,4),4); // письмо ушло из выборки
-  assert.equal(selectionAnchorIndex(rowsOf(10,11),null,4),4); // якоря не было вовсе
-  assert.equal(selectionAnchorIndex([],10,4),4);
-  assert.equal(selectionAnchorIndex(undefined,10,4),4);
-});
-// Свернутая беседа: письма-дети из строк списка исчезают, и опорным должно
-// стать то письмо, по которому кликнули, а не невидимая строка.
-test('S-010: опорное письмо скрыто в свернутой беседе - запасная позиция',()=>{
-  const expanded=rowsOf(10,11,12),collapsed=rowsOf(10);
-  assert.equal(selectionAnchorIndex(expanded,12,0),2);
-  assert.equal(selectionAnchorIndex(collapsed,12,0),0);
+// Запасная позиция - строка, по которой кликнули. Без неё выделение с Shift
+// уходит от -1 и захватывает весь список.
+test('S-010: опорного письма в списке нет - берётся строка под курсором',()=>{
+  const cases=[
+    ['письмо ушло из выборки',rowsOf(10,11),99,4,4],
+    ['якоря не было вовсе',rowsOf(10,11),null,4,4],
+    ['список опустел',[],10,4,4],
+    ['списка нет вовсе',undefined,10,4,4],
+    ['беседа свернулась и письмо-ребёнок пропало из строк',rowsOf(10),12,0,0],
+  ];
+  cases.forEach(([name,rows,anchorId,fallback,expected])=>{
+    assert.equal(selectionAnchorIndex(rows,anchorId,fallback),expected,`случай "${name}": вместо строки под курсором взята чужая позиция`);
+  });
 });

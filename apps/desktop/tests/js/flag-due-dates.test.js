@@ -1,14 +1,18 @@
-// Проверки сроков у флажка письма и списка дел: быстрые значения срока,
-// согласованность сроков, группы и порядок списка дел, подписи строк, карточка
-// напоминания, сводка пропущенных и настоящий путь установки флажка через мост
-// команд. Разметка здесь не участвует: проверяются чистые модули и обращения к
-// мосту.
+// Проверки сроков у флажка письма и раздела "Дела": готовые сроки,
+// согласованность сроков, группы и порядок списка дел, карточка напоминания,
+// а также настоящие пути окна - раздел "Дела", подпись срока в строке списка
+// писем и снятие флажка с писем, у которых заданы сроки.
+// Пути окна проверяются на настоящей разметке из index.html: модули окна
+// выполняются целиком, нажатия идут теми же обработчиками, которые вызовет
+// браузер, а итог смотрится по тому, что уходит в мост к ядру. Чистыми
+// остались только те проверки, где счёт времени не зависит от разметки.
 // Спецификация: specs/flag-due-dates.md.
 // Запуск: node --test apps/desktop/tests/js/flag-due-dates.test.js (Node 22+).
 
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const {createUiWindow} = require('./ui-window.js');
 
 // Модуль сроков флажка появляется вместе с реализацией. Пока его нет, каждая
 // проверка падает на своём месте и своими словами, а не одной общей ошибкой
@@ -40,16 +44,6 @@ function taskTimesError(times, now, lang) {
   return fn('taskErrorText', 'причина отказа не называется: сроки пропадают молча')(check.reason, lang);
 }
 
-// Подпись срока в строке списка писем собирается из текста срока и признака
-// просрочки: их модуль отдаёт двумя своими функциями.
-function dueBadge(item, now, lang) {
-  const due = (item.task || item).due_at;
-  if (!due) return null;
-  const text = fn('formatDue', 'подписи срока в строке списка писем нет: срок виден только в списке дел')(due, lang, now);
-  const group = fn('taskGroup', 'просроченный срок не отличается от обычного')(item, now);
-  return {text, overdue: group === 'overdue'};
-}
-
 const NOW = Date.parse('2026-09-18T12:00:00Z');
 
 function task(extra) {
@@ -73,29 +67,64 @@ function task(extra) {
   );
 }
 
-test('S-016, S-100: готовые сроки покрывают частые случаи и переводятся', () => {
-  // Набор из пяти значений заставлял открывать выбор даты и времени ради
-  // "через час" и "через месяц" - самых частых сроков напоминания.
-  const choices = fn('dueQuickChoices', 'выбрать срок исполнения нечем: окно сроков пустое')('ru');
-  const titles = choices.map(choice => choice.title);
-  for (const wanted of ['Через час', 'Сегодня', 'Сегодня вечером', 'Завтра в 09:00',
-    'В понедельник в 09:00', 'Через неделю', 'Через месяц', 'Без срока']) {
-    assert.ok(titles.includes(wanted), `в наборе нет значения "${wanted}": ${titles.join(', ')}`);
-  }
-  assert.equal(
-    choices.filter(choice => choice.id !== 'custom').length, 8,
-    'готовых сроков должно быть ровно восемь: окно раскладывает их сеткой по четыре в ряд',
-  );
-  assert.ok(
-    choices.some(choice => choice.id === 'custom'),
-    'произвольные дата и время обязаны остаться: иначе срок можно поставить только из готового набора',
-  );
-  const english = fn('dueQuickChoices', 'выбрать срок исполнения нечем')('en');
-  assert.ok(
-    english.every(choice => !/[А-Яа-я]/.test(choice.title)),
-    'при английском языке подписи сроков остались русскими',
-  );
-});
+// Окно считает сроки настоящим Date, поэтому проверкам путей момент задаётся
+// подставным Date: иначе "сегодня в 21:30" зависело бы от часа запуска.
+const WINDOW_NOW = new Date(2026, 8, 20, 10, 0, 0, 0);
+
+function fixedDate() {
+  return class FixedDate extends Date {
+    constructor(...args) {
+      if (args.length === 0) super(WINDOW_NOW.getTime());
+      else super(...args);
+    }
+
+    static now() { return WINDOW_NOW.getTime(); }
+  };
+}
+
+// Время задаётся календарными сутками компьютера: сроки дел живут в местном
+// часовом поясе, а не во всемирном времени.
+function localIso(day, hours, minutes) {
+  return new Date(2026, 8, day, hours, minutes, 0, 0).toISOString();
+}
+
+function createWindow(options = {}) {
+  const reloads = [];
+  const ui = createUiWindow({
+    answers: options.answers || {},
+    globals: {Date: fixedDate(), reloadCoreData: async () => { reloads.push(1); }, ...(options.globals || {})},
+  });
+  ui.reloads = reloads;
+  return ui;
+}
+
+// Список писем строится тем же путём, что и в окне: открыта папка входящих,
+// письма лежат в общем перечне, а разметку собирает applyListOptions.
+async function openList(messages, options = {}) {
+  const ui = createWindow(options);
+  await ui.clock.drain();
+  ui.evaluate(`
+    coreAccounts=[{id:1,email:'me@example.test',color:'#0058ff'}];
+    setCoreFolders([{id:2,account_id:1,role:'inbox',display_name:'Входящие',remote_path:'INBOX'}]);
+    currentFolderId=2;currentSmartIndex=null;
+    messages=${JSON.stringify(messages)};
+    applyListOptions(true,'Входящие');
+  `);
+  return ui;
+}
+
+function listMessage(extra) {
+  return Object.assign({
+    id: 1, account_id: 1, folder_id: 2, subject: 'Отчёт', preview: 'текст',
+    from: {name: 'Коллега', email: 'mate@example.test'}, to: [], cc: [],
+    flags: {seen: true, flagged: false}, labels: [], date: '2026-09-18T10:00:00Z',
+    pinned_at: null, task_due_at: null, task_start_at: null, task_reminder_at: null,
+  }, extra);
+}
+
+const rowOf = (ui, id) => ui.query(`#msgs .msg[data-message-id="${id}"]`);
+// Сообщения смотрим там же, где их видит пользователь: карточкой в углу окна.
+const noticeTexts = ui => ui.queryAll('.app-toast .app-toast-line').map(node => node.textContent.trim());
 
 test('S-016: готовые сроки отсчитываются от текущего момента', () => {
   // Неверно посчитанный готовый срок молча ставит напоминание не на то время:
@@ -185,24 +214,55 @@ test('S-047: список дел выстроен полным порядком'
   assert.deepEqual(sorted.map(item => item.message_id), [1, 5, 4, 3]);
 });
 
-test('S-048, S-049, S-054: строка списка дел называет письмо и ящик, пустые значения подписаны, счётчик считает просроченные', () => {
-  const rowText = fn('taskRowText', 'строка списка дел пуста: письмо в ней не опознать');
-  const full = rowText(task({due_at: '2026-09-19T09:00:00Z'}), 'ru');
-  for (const piece of ['Договор', 'Начальник', 'me@example.test']) {
-    assert.ok(full.includes(piece), `в строке нет "${piece}": ${full}`);
-  }
-  const empty = rowText(task({subject: '', from_name: '', from_addr: ''}), 'ru');
-  assert.ok(empty.includes('Без темы'), `пустая тема не подписана: ${empty}`);
-  assert.ok(empty.includes('Отправитель неизвестен'), `неизвестный отправитель не подписан: ${empty}`);
+test('S-046, S-048, S-049, S-052: раздел "Дела" строит строки по ответу ядра и не показывает уводимое письмо', async () => {
+  // Настоящий путь раздела: нажатие на пункт "Дела" - чтение страниц у ядра -
+  // строки списка. Здесь ловится и потеря подписи письма в строке, и
+  // перепутанные группы, и уводимое письмо, которое в списках писем уже
+  // исчезло, а в делах осталось бы висеть (признак ядра зовётся has_takeaway).
+  const ui = createWindow({
+    answers: {
+      listMessageTasks: () => ({
+        items: [
+          {task: {message_id: 32, start_at: null, due_at: localIso(20, 18, 0), reminder_at: null, state: 'active'},
+            account_id: 1, account_email: 'me@example.test', folder_id: 2, subject: '',
+            sender_name: null, sender_address: null, message_date: '2026-09-19T10:00:00Z',
+            snoozed_until: null, has_takeaway: false},
+          {task: {message_id: 31, start_at: null, due_at: localIso(19, 9, 0), reminder_at: null, state: 'active'},
+            account_id: 1, account_email: 'me@example.test', folder_id: 2, subject: 'Договор',
+            sender_name: 'Начальник', sender_address: 'boss@example.test', message_date: '2026-09-18T10:00:00Z',
+            snoozed_until: null, has_takeaway: false},
+          {task: {message_id: 33, start_at: null, due_at: localIso(20, 19, 0), reminder_at: null, state: 'active'},
+            account_id: 1, account_email: 'me@example.test', folder_id: 2, subject: 'Уводится',
+            sender_name: 'Никто', sender_address: 'nobody@example.test', message_date: '2026-09-17T10:00:00Z',
+            snoozed_until: null, has_takeaway: true},
+        ],
+        next_cursor: null,
+      }),
+    },
+  });
+  await ui.clock.drain();
+  ui.evaluate(`coreAccounts=[{id:1,email:'me@example.test',color:'#0058ff'}];
+    setCoreFolders([{id:2,account_id:1,role:'inbox',display_name:'Входящие',remote_path:'INBOX'}]);`);
+  ui.byId('tasksNav').dispatch('click');
+  await ui.clock.drain();
 
-  // Счётчик рядом с разделом "Дела" считает только просроченные дела в работе.
-  const overdue = fn('overdueTaskCount', 'счётчика просроченных дел нет: пользователь не увидит, что сроки горят');
-  assert.equal(overdue([
-    task({due_at: '2026-09-17T09:00:00Z'}),
-    task({message_id: 2, due_at: '2026-09-19T09:00:00Z'}),
-    task({message_id: 3, due_at: '2026-09-17T09:00:00Z', state: 'done', completed_at: '2026-09-18T08:00:00Z'}),
-    task({message_id: 4, due_at: '2026-09-17T09:00:00Z', state: 'detached'}),
-  ], NOW), 1);
+  assert.equal(ui.callsOf('listMessageTasks').length, 1, 'раздел "Дела" не запросил список у ядра');
+  // Порядок строк с разделителями: просроченное выше сегодняшнего, каждая
+  // группа подписана. Названия групп записаны здесь словами, а не собраны тем
+  // же кодом, который их строит.
+  const rows = ui.queryAll('#msgs .msg').map(row => (row.classes.has('task-separator')
+    ? row.textContent.trim()
+    : Number(row.dataset.messageId)));
+  assert.deepEqual(rows, ['Просрочено', 31, 'Сегодня', 32],
+    'раздел "Дела" собран неверно: либо пропала группировка, либо уводимое письмо осталось в списке');
+
+  const overdue = rowOf(ui, 31).querySelector('.prev').textContent;
+  for (const piece of ['Договор', 'Начальник', 'me@example.test']) {
+    assert.ok(overdue.includes(piece), `в строке дела нет "${piece}": письмо в списке не опознать - ${overdue}`);
+  }
+  const empty = rowOf(ui, 32).querySelector('.prev').textContent;
+  assert.ok(empty.includes('Без темы'), `пустая тема в строке дела не подписана: ${empty}`);
+  assert.ok(empty.includes('Отправитель неизвестен'), `неизвестный отправитель не подписан: ${empty}`);
 });
 
 test('S-052, S-053: уводимое письмо в списке дел не показывается, отложенное показывается с временем возврата', () => {
@@ -219,17 +279,28 @@ test('S-052, S-053: уводимое письмо в списке дел не п
   assert.ok(/отложено|возврат/i.test(text), `отложенное письмо не подписано временем возврата: ${text}`);
 });
 
-test('S-055, S-056, S-018: строка списка писем несёт краткую подпись срока, просроченный срок выделен', () => {
-  const badge = dueBadge;
-  const soon = badge(task({due_at: '2026-09-19T09:00:00Z'}), NOW, 'ru');
-  assert.ok(soon && soon.text, 'у письма со сроком нет подписи');
-  assert.equal(soon.overdue, false);
-  const late = badge(task({due_at: '2026-09-17T09:00:00Z'}), NOW, 'ru');
-  assert.equal(late.overdue, true, 'просроченный срок не отличается от обычного');
-  // Время показывается в часовом поясе компьютера, а не во всемирном.
-  const local = badge(task({due_at: '2026-09-19T21:30:00Z'}), NOW, 'ru');
-  const expected = new Date('2026-09-19T21:30:00Z').toLocaleTimeString('ru', {hour: '2-digit', minute: '2-digit'});
-  assert.ok(local.text.includes(expected), `срок показан не в часовом поясе компьютера: ${local.text}`);
+test('S-018, S-055, S-056: подпись срока в строке письма называет время, завтрашний день и дату', async () => {
+  // Ожидания записаны здесь словами и цифрами, а не собраны тем же
+  // форматированием, что и код: иначе проверка повторяла бы код и молчала бы
+  // при любой его ошибке. Сегодняшний срок - только время, завтрашний -
+  // подписан словом, дальний - с числом и месяцем: без этого подпись "09:00" у
+  // письма со сроком через неделю читалась бы как "сегодня".
+  const ui = await openList([
+    listMessage({id: 41, subject: 'Сегодня', task_due_at: localIso(20, 21, 30)}),
+    listMessage({id: 42, subject: 'Завтра', task_due_at: localIso(21, 9, 5)}),
+    listMessage({id: 43, subject: 'Позже', task_due_at: localIso(30, 9, 0)}),
+  ]);
+  const dueText = id => rowOf(ui, id).querySelector('.task-due').textContent.trim();
+
+  assert.equal(dueText(41), '21:30',
+    'срок сегодняшнего дня показан не одним временем: в узкой строке списка лишняя дата съедает подпись');
+  const tomorrow = dueText(42);
+  assert.ok(tomorrow.includes('Завтра'), `завтрашний срок не подписан словом "Завтра": ${tomorrow}`);
+  assert.ok(tomorrow.includes('09:05'), `завтрашний срок потерял время: ${tomorrow}`);
+  const later = dueText(43);
+  assert.ok(!later.includes('Завтра'), `дальний срок подписан как завтрашний: ${later}`);
+  assert.ok(later.includes('30') && /[а-я]/i.test(later), `дальний срок показан без числа и месяца: ${later}`);
+  assert.ok(later.includes('09:00'), `дальний срок потерял время: ${later}`);
 });
 
 test('S-063, S-064: карточка напоминания называет письмо и предлагает три действия', () => {
@@ -244,150 +315,71 @@ test('S-063, S-064: карточка напоминания называет п�
   assert.ok(`${empty.title} ${empty.body}`.includes('Без темы'), 'пустая тема в карточке не подписана');
 });
 
-test('S-071, S-073 - S-076: пропущенные напоминания сводятся в одно сообщение, старше 7 суток только отмечаются', () => {
-  const summary = fn('missedReminders', 'сводки пропущенных напоминаний нет: неделя отсутствия даст поток карточек')([
-    task({message_id: 1, reminder_at: '2026-09-17T09:00:00Z'}),
-    task({message_id: 2, reminder_at: '2026-09-16T09:00:00Z'}),
-    task({message_id: 3, reminder_at: '2026-09-01T09:00:00Z'}),
-  ], NOW, 'ru');
-  assert.equal(summary.shown.length, 2, 'в сводку вошли не только свежие пропущенные напоминания');
-  assert.ok(summary.text.includes('2'), `сводка не называет число напоминаний: ${summary.text}`);
-  assert.deepEqual(summary.marked.sort((a, b) => a - b), [1, 2, 3],
-    'отметку о показе получают все разобранные напоминания, иначе та же сводка появится при следующем запуске');
-  assert.ok(
-    !summary.shown.some(item => item.message_id === 3),
-    'напоминание старше 7 суток попало в сводку',
-  );
+test('S-001, S-024, S-025, S-102: снятие флажка с писем со сроками спрашивает по всему выделению, отказ ничего не меняет', async () => {
+  // Настоящий путь: кнопка флажка в строке списка - подтверждение - мост.
+  // Сроки есть у обоих выделенных писем, причём у второго задано только
+  // напоминание: вопрос, построенный по одному письму или только по сроку
+  // исполнения, стёр бы чужие напоминания молча.
+  const ui = await openList([
+    listMessage({id: 51, subject: 'Счёт', flags: {seen: true, flagged: true}, task_due_at: localIso(21, 9, 0)}),
+    listMessage({id: 52, subject: 'Отчёт', flags: {seen: true, flagged: true}, task_reminder_at: localIso(22, 9, 0)}),
+    listMessage({id: 53, subject: 'Письмо', flags: {seen: true, flagged: false}, task_due_at: localIso(23, 9, 0)}),
+  ]);
+  rowOf(ui, 51).dispatch('click', {ctrlKey: true});
+  rowOf(ui, 52).dispatch('click', {ctrlKey: true});
+  await ui.clock.drain();
+  assert.equal(ui.evaluate('selectedMessageIds.size'), 2, 'выделить два письма не удалось: проверять групповое снятие не на чем');
+
+  rowOf(ui, 51).querySelector('.row-flag').dispatch('click');
+  await ui.clock.drain();
+  const cancel = ui.query('.overlay.open .confirm-cancel');
+  assert.ok(cancel, 'снятие флажка у писем со сроками прошло без вопроса: напоминания удалены незаметно');
+  const question = cancel.closest('.modal').querySelector('.mb').textContent;
+  assert.ok(question.includes('2'), `вопрос не называет числа писем со сроками: ${question}`);
+  assert.equal(rowOf(ui, 51).querySelector('.row-flag').classes.has('on'), true,
+    'флажок снят с виду ещё до ответа на вопрос: отказ оставит строку с неверным значком');
+
+  cancel.dispatch('click');
+  await ui.clock.drain();
+  assert.equal(ui.callsOf('markFlagged').length, 0, 'отказ от подтверждения всё равно снял флажок');
+  assert.equal(rowOf(ui, 51).querySelector('.row-flag').classes.has('on'), true, 'после отказа флажок пропал из строки');
+  assert.equal(ui.reloads.length, 0, 'после отказа список перечитан: строка мигает без причины');
+
+  // Согласие снимает флажок у всех выделенных писем одной командой: команда на
+  // письмо оставила бы половину выделения с флажком при обрыве связи.
+  rowOf(ui, 51).querySelector('.row-flag').dispatch('click');
+  await ui.clock.drain();
+  ui.query('.overlay.open .mf .btn.primary').dispatch('click');
+  await ui.clock.drain();
+  const call = ui.callsOf('markFlagged');
+  assert.equal(call.length, 1, 'снятие флажка ушло в ядро не одной командой на всё выделение');
+  assert.deepEqual([[...call[0].args[0]].sort((a, b) => a - b), call[0].args[1], call[0].args[2]], [[51, 52], false, 'user'],
+    'в ядро ушло не снятие флажка по обоим выделенным письмам');
+  assert.equal(rowOf(ui, 51).querySelector('.row-flag').classes.has('on'), false, 'после согласия флажок остался в строке');
+
+  // Установка флажка вопросов не задаёт ни при каких сроках: ничего не
+  // удаляется.
+  ui.evaluate('clearMessageSelection()');
+  rowOf(ui, 53).querySelector('.row-flag').dispatch('click');
+  await ui.clock.drain();
+  assert.equal(ui.query('.overlay.open .confirm-cancel'), null, 'установка флажка спросила про удаление сроков');
+  assert.deepEqual([...ui.callsOf('markFlagged').at(-1).args[0]], [53], 'установка флажка не дошла до ядра');
 });
 
-test('S-001, S-004, S-005, S-008, S-024 - S-027, S-102: путь флажка и дела идёт одной командой на пачку писем', async () => {
-  // Сквозная проверка настоящего пути: поверхности разные, а команда одна.
-  const calls = [];
-  const bridge = {
-    markFlagged: async (ids, flagged, reason) => {
-      calls.push({command: 'markFlagged', ids, flagged, reason});
-      return ids.length;
-    },
-    saveMessageTask: async (messageId, times) => {
-      calls.push({command: 'saveMessageTask', messageId, times});
-      return task({message_id: messageId, due_at: times.due_at});
-    },
-    completeMessageTask: async messageId => {
-      calls.push({command: 'completeMessageTask', messageId});
-      return task({message_id: messageId, state: 'done', completed_at: '2026-09-18T12:00:00Z'});
-    },
-    deleteMessageTask: async messageId => {
-      calls.push({command: 'deleteMessageTask', messageId});
-      return true;
-    },
-  };
-  const toggle = fn('toggleFlag', 'флажок из окна программы не ставится: мост markFlagged по-прежнему никто не вызывает');
-  const shown = [];
-  await toggle(bridge, [11, 12, 13], true, {
-    reason: 'user',
-    onOptimistic: ids => shown.push(...ids),
-    confirm: async () => true,
-  });
-  assert.deepEqual(shown, [11, 12, 13], 'значок строки не показал новое состояние до ответа сервера');
-  const flagCalls = calls.filter(call => call.command === 'markFlagged');
-  assert.equal(flagCalls.length, 1, 'выделение обработано по письму на вызов, а не одной неделимой операцией');
-  assert.deepEqual(flagCalls[0].ids, [11, 12, 13]);
-  assert.equal(flagCalls[0].reason, 'user', 'причина изменения признака в ядро не передана');
+test('S-001, S-005: отказ ядра возвращает флажок строке и называет причину', async () => {
+  // Значок строки меняется до ответа ядра, иначе нажатие выглядит
+  // непроизошедшим. Без отката неудача ядра оставляет в списке флажок,
+  // которого у письма нет: письмо числится помеченным до перезагрузки.
+  const ui = await openList([
+    listMessage({id: 61, subject: 'Счёт', flags: {seen: true, flagged: false}}),
+  ], {answers: {markFlagged: () => { throw new Error('ядро недоступно'); }}});
 
-  // Сроки сохраняются отдельной командой, а отметка о выполнении - своей:
-  // ручное снятие флажка удалило бы только что созданное дело.
-  await fn('saveTask', 'сроки дела сохранить нечем')(bridge, 11, {start_at: null, due_at: '2026-09-19T09:00:00Z', reminder_at: null});
-  await fn('completeTask', 'отметить дело выполненным нечем')(bridge, 11);
-  const kinds = calls.map(call => call.command);
-  assert.deepEqual(kinds, ['markFlagged', 'saveMessageTask', 'completeMessageTask'],
-    'отметка о выполнении сняла флажок командой ручного снятия и стёрла собственное дело');
-
-  // Снятие флажка у дела со сроком спрашивает подтверждение до удаления.
-  const asked = [];
-  await toggle(bridge, [11], false, {
-    reason: 'user',
-    task: task({message_id: 11, due_at: '2026-09-19T09:00:00Z'}),
-    confirm: async text => {
-      asked.push(text);
-      return false;
-    },
-  });
-  assert.equal(asked.length, 1, 'сроки удалены без подтверждения');
-  assert.ok(
-    !calls.some(call => call.command === 'markFlagged' && call.flagged === false),
-    'отказ от подтверждения всё равно снял флажок',
-  );
-});
-
-test('S-024, S-025: групповое снятие флажка спрашивает по всем выбранным письмам и называет их число', async () => {
-  // Пользователь снимает флажок с трёх писем сразу. Сроки есть у двух из них,
-  // причём у первого письма выделения их нет вовсе: вопрос, построенный по
-  // одному письму, не был бы задан вовсе, и дела двух других писем исчезли бы
-  // без следа.
-  const calls = [];
-  const bridge = {
-    markFlagged: async (ids, flagged, reason) => {
-      calls.push({ids, flagged, reason});
-      return ids.length;
-    },
-  };
-  const toggle = fn('toggleFlag', 'флажок из окна программы не снимается');
-  const tasks = [
-    {message_id: 21, start_at: null, due_at: null, reminder_at: null},
-    {message_id: 22, start_at: null, due_at: null, reminder_at: '2026-09-20T09:00:00Z'},
-    {message_id: 23, start_at: '2026-09-19T09:00:00Z', due_at: null, reminder_at: null},
-  ];
-  const asked = [];
-  const refused = await toggle(bridge, [21, 22, 23], false, {
-    reason: 'user',
-    tasks,
-    lang: 'ru',
-    confirm: async text => {
-      asked.push(text);
-      return false;
-    },
-  });
-  assert.equal(asked.length, 1, 'сроки выделенных писем удалены без подтверждения');
-  assert.ok(
-    asked[0].includes('2'),
-    `подтверждение не называет числа писем со сроками: ${asked[0]}`,
-  );
-  assert.equal(refused, 0, 'отказ от подтверждения всё равно снял флажок');
-  assert.equal(calls.length, 0, 'команда записи признака вызвана вопреки отказу');
-
-  // Согласие снимает флажок у всех выбранных писем одним вызовом команды.
-  const applied = await toggle(bridge, [21, 22, 23], false, {
-    reason: 'user',
-    tasks,
-    lang: 'ru',
-    confirm: async () => true,
-  });
-  assert.equal(applied, 3);
-  assert.equal(calls.length, 1, 'выделение обработано по письму на вызов');
-  assert.deepEqual(calls[0].ids, [21, 22, 23]);
-
-  // Ни одного срока - вопроса нет вовсе: дело без сроков теряется вместе с
-  // флажком и спрашивать не о чем.
-  const silent = [];
-  await toggle(bridge, [21], false, {
-    reason: 'user',
-    tasks: [{message_id: 21, start_at: null, due_at: null, reminder_at: null}],
-    confirm: async text => {
-      silent.push(text);
-      return true;
-    },
-  });
-  assert.equal(silent.length, 0, 'вопрос задан о деле без единого срока');
-
-  // Установка флажка вопросов не задаёт ни при каких сроках.
-  const onSet = [];
-  await toggle(bridge, [22], true, {
-    reason: 'user',
-    tasks,
-    confirm: async text => {
-      onSet.push(text);
-      return true;
-    },
-  });
-  assert.equal(onSet.length, 0, 'установка флажка спросила про удаление сроков');
+  rowOf(ui, 61).querySelector('.row-flag').dispatch('click');
+  await ui.clock.drain();
+  assert.equal(ui.callsOf('markFlagged').length, 1, 'нажатие на флажок не дошло до ядра');
+  assert.equal(rowOf(ui, 61).querySelector('.row-flag').classes.has('on'), false,
+    'после отказа ядра флажок остался поднятым: письмо числится помеченным, а метки у него нет');
+  assert.equal(ui.evaluate('messages.find(item=>item.id===61).flags.flagged'), false,
+    'письмо в памяти окна осталось с флажком: следующее нажатие снимет несуществующий флажок');
+  assert.ok(noticeTexts(ui).length, 'отказ ядра прошёл молча: пользователь считает флажок поставленным');
 });

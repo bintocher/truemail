@@ -345,19 +345,30 @@ async fn the_undo_window_bounds_stay_consistent_with_their_default() {
     db.close().await;
 }
 
-/// Обновление непустой базы не меняет поведения: у того, кто обновился,
-/// пределы остаются прежними зашитыми числами, а значение, уже выбранное
-/// пользователем, миграция не перетирает.
+/// Обновление непустой базы не меняет поведения: значение, уже выбранное
+/// пользователем, миграция не перетирает, и после обновления оно продолжает
+/// действовать на настоящем пути. Письма при этом целы - раздел пределов
+/// трогает только таблицу настроек.
 #[tokio::test]
 async fn migrating_a_filled_database_keeps_the_previous_behaviour() {
     let db: TestDb = open_test_db_upto("limits-migrate", BEFORE_LIMITS).await;
+    let spec = limit_spec(LIMIT_PINNED_PER_ACCOUNT).expect("описание предела");
+    // Значение берётся из реестра, а не числом в проверке. Важно одно: оно
+    // отличается от значения первого запуска, иначе перетёртая настройка
+    // осталась бы незамеченной.
+    let chosen = spec.min + 1;
+    assert!(
+        chosen != spec.default && chosen <= spec.max,
+        "выбранное до обновления значение совпало со значением первого запуска"
+    );
     let account = seed_account(&db, "me@example.test").await;
     let folder = seed_folder(&db, account).await;
-    seed_messages(&db, account, folder, 3).await;
+    let ids = seed_messages(&db, account, folder, chosen + 1).await;
     // Настройка, выбранная пользователем до обновления. Значения в базе
     // прежней версии лежат открытым текстом - их шифрует шаг миграции.
-    sqlx::query("INSERT INTO settings(key, value) VALUES(?, '7')")
+    sqlx::query("INSERT INTO settings(key, value) VALUES(?, ?)")
         .bind(LIMIT_PINNED_PER_ACCOUNT)
+        .bind(chosen.to_string())
         .execute(&db.write_pool)
         .await
         .expect("записать выбранное пользователем значение");
@@ -366,34 +377,29 @@ async fn migrating_a_filled_database_keeps_the_previous_behaviour() {
 
     assert_eq!(
         db.limit(LIMIT_PINNED_PER_ACCOUNT),
-        7,
+        chosen,
         "миграция перетёрла значение, выбранное пользователем"
     );
-    // Все остальные пределы равны прежним зашитым числам: поведение у того,
-    // кто обновился, не меняется.
-    for spec in LIMITS {
-        if spec.key == LIMIT_PINNED_PER_ACCOUNT {
-            continue;
-        }
-        assert_eq!(
-            db.limit(spec.key),
-            spec.default,
-            "предел {} после обновления отличается от прежнего зашитого",
-            spec.key
-        );
-        let stored = db
-            .setting(spec.key)
-            .await
-            .expect("прочитать настройку")
-            .expect("миграция не завела настройку");
-        assert_eq!(stored, spec.default.to_string());
-    }
-    // Письма на месте: миграция трогает только таблицу настроек.
+    // Значение не просто прочитано - оно действует: закрепление идёт той же
+    // командой, которой пользуется список писем.
+    let result = db
+        .set_messages_pinned(&ids, true)
+        .await
+        .expect("закрепить письма после обновления");
+    assert_eq!(
+        result.changed as i64, chosen,
+        "после обновления действует не выбранное пользователем значение"
+    );
+    assert_eq!(
+        result.rejected_limit, 1,
+        "письмо сверх выбранного пользователем предела принято молча"
+    );
+    // Письма на месте: обновление не уносит почту.
     let (messages,): (i64,) = sqlx::query_as("SELECT count(*) FROM messages")
         .fetch_one(&db.pool)
         .await
         .expect("посчитать письма");
-    assert_eq!(messages, 3);
+    assert_eq!(messages, ids.len() as i64, "обновление потеряло письма");
     db.close().await;
 }
 
@@ -797,38 +803,82 @@ async fn the_history_section_page_comes_from_the_settings() {
     db.close().await;
 }
 
-/// Перечень для интерфейса несёт всё, чем интерфейс рисует поле: рабочее
-/// значение, обе границы, раздел и ключи подписей. Недостающее поле заставило
-/// бы интерфейс подставить своё число - ровно ту копию, из-за которой пределы
-/// и разошлись.
+/// Перечень для интерфейса несёт всё, чем интерфейс рисует поле, и несёт это
+/// пригодным к показу.
+///
+/// Интерфейс раскладывает поля по разделам (limits.js, `limitSectionRows`),
+/// подписывает их каталогом локализации и сверяет ввод с границами
+/// (`withinLimit`). Поэтому проверяется не наличие полей, а их пригодность:
+/// поле без своего раздела не рисуется нигде, перепутанные границы не дают
+/// ввести ни одного значения, а подпись без перевода показывает пользователю
+/// имя ключа. Наличие само по себе ловило слишком мало: перечень с
+/// перепутанными границами проходил насквозь.
 #[tokio::test]
 async fn the_limit_list_carries_everything_the_interface_draws() {
     let db: TestDb = open_test_db("limits-view").await;
-    db.set_limit(LIMIT_PINNED_PER_ACCOUNT, 9)
+    let spec = limit_spec(LIMIT_PINNED_PER_ACCOUNT).expect("описание предела");
+    let chosen = spec.min + 1;
+    db.set_limit(LIMIT_PINNED_PER_ACCOUNT, chosen)
         .await
         .expect("записать предел");
     let view = serde_json::to_value(db.limit_settings()).expect("собрать перечень");
     let rows = view.as_array().expect("перечень не массив");
     assert_eq!(rows.len(), LIMITS.len());
+
+    let ru = crate::i18n::I18n::new("ru");
+    let en = crate::i18n::I18n::new("en");
+    let untranslated = |key: &str| ru.t(key) == key || en.t(key) == key;
+    let mut drawn = 0;
+    for section in LIMIT_SECTIONS {
+        for key in [section.title_key, section.hint_key] {
+            assert!(!untranslated(key), "у раздела {key} нет подписи в каталоге");
+        }
+        for field in rows.iter().filter(|row| row["section"] == section.id) {
+            let key = field["key"].as_str().expect("в перечне нет имени настройки");
+            let min = field["min"].as_i64().expect("в перечне нет нижней границы");
+            let max = field["max"].as_i64().expect("в перечне нет верхней границы");
+            let default = field["default"]
+                .as_i64()
+                .expect("в перечне нет значения первого запуска");
+            let value = field["value"].as_i64().expect("в перечне нет значения");
+            assert!(
+                min < max,
+                "границы предела {key} перепутаны или не дают выбора: от {min} до {max}"
+            );
+            assert!(
+                (min..=max).contains(&value) && (min..=max).contains(&default),
+                "предел {key}: поле ввода откажет и собственному значению ({value}) \
+                 или значению первого запуска ({default})"
+            );
+            for label in ["title_key", "hint_key", "unit_key"] {
+                let label_key = field[label]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("в перечне нет поля {label} предела {key}"));
+                assert!(
+                    !untranslated(label_key),
+                    "подпись {label_key} предела {key} не переведена: пользователь увидит ключ"
+                );
+            }
+            drawn += 1;
+        }
+    }
+    assert_eq!(
+        drawn,
+        LIMITS.len(),
+        "поле не попало ни в один раздел: интерфейс его не нарисует"
+    );
+
+    // Перечень отдаёт рабочее значение, а не описание: иначе поле показывало
+    // бы одно, а ядро считало другое.
     let pinned = rows
         .iter()
         .find(|row| row["key"] == LIMIT_PINNED_PER_ACCOUNT)
         .expect("предела закреплений нет в перечне");
-    assert_eq!(pinned["value"], 9, "перечень отдаёт не рабочее значение");
-    for field in [
-        "section",
-        "title_key",
-        "hint_key",
-        "unit_key",
-        "default",
-        "min",
-        "max",
-    ] {
-        assert!(
-            !pinned[field].is_null(),
-            "в перечне нет поля {field}: интерфейс подставит своё"
-        );
-    }
+    assert_eq!(
+        pinned["value"].as_i64(),
+        Some(chosen),
+        "перечень отдаёт не рабочее значение"
+    );
     db.close().await;
 }
 
@@ -883,64 +933,85 @@ fn the_user_interface_takes_every_limit_from_the_core() {
     }
 }
 
-/// Пределы, у которых сценария нет: они действуют только на настоящем сервере
-/// (сколько писем тянет фоновая догрузка тел) или в фоновом цикле, живущем вне
-/// хранилища (ритм опроса, напоминаний и проверки обновлений).
+/// Исходники каталога одним куском, без комментариев и без сценарных проверок.
 ///
-/// Проверка читает сами исходники: прежние числа были именованными
-/// константами, и вернуться незамеченными они могут только так.
-#[test]
-fn the_places_without_a_scenario_keep_no_number_of_their_own() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for (file, gone, key) in [
-        (
-            "crates/core/src/account/mod.rs",
-            "BODY_PREFETCH_PER_PASS",
-            LIMIT_BODY_PREFETCH_MESSAGES,
-        ),
-        (
-            "crates/core/src/account/mod.rs",
-            "BODY_PREFETCH_MAX_SIZE",
-            LIMIT_BODY_PREFETCH_SIZE_MB,
-        ),
-        (
-            "crates/core/src/storage/stages.rs",
-            "STAGE_BATCH",
-            LIMIT_STAGE_BATCH,
-        ),
-        (
-            "crates/core/src/model/sender_sweep.rs",
-            "SWEEP_WAIT_SECONDS: i64",
-            LIMIT_SWEEP_WAIT_SECONDS,
-        ),
-        (
-            "crates/core/src/model/recipient_history.rs",
-            "HISTORY_PAGE: i64",
-            LIMIT_HISTORY_PAGE,
-        ),
-    ] {
-        let source = std::fs::read_to_string(root.join(file)).expect("прочитать исходник ядра");
-        assert!(
-            !source.contains(gone),
-            "в {file} вернулась собственная копия предела {gone} (настройка {key})"
-        );
+/// Пояснение, называющее настройку по имени, местом применения не является:
+/// иначе число, вернувшееся в код рядом с упоминанием ключа в комментарии,
+/// проходило бы насквозь. Сценарные проверки исключены по той же причине - имя
+/// ключа там называется, а число не читается.
+fn sources_without_comments(dir: &std::path::Path, extension: &str, skip: &[&str]) -> String {
+    let mut text = String::new();
+    for entry in std::fs::read_dir(dir).expect("прочитать каталог исходников") {
+        let path = entry.expect("запись каталога").path();
+        if path.is_dir() {
+            text.push_str(&sources_without_comments(&path, extension, skip));
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if path.extension().and_then(|value| value.to_str()) != Some(extension)
+            || skip.contains(&name.as_str())
+            || name.ends_with("_scenarios.rs")
+        {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path)
+            .expect("прочитать исходник")
+            .lines()
+        {
+            text.push_str(line.split("//").next().unwrap_or_default());
+            text.push('\n');
+        }
     }
+    text
+}
 
-    // Фоновые циклы спрашивают настройку на каждом обороте: иначе выбранный
-    // пользователем срок ждал бы перезапуска программы.
-    let loops = std::fs::read_to_string(root.join("apps/desktop/src-tauri/src/commands.rs"))
-        .expect("команды");
-    for key in [LIMIT_GMAIL_POLL_SECONDS, LIMIT_REMINDER_CHECK_SECONDS] {
-        let name = key.to_uppercase();
+/// Короткое имя предела в реестре ключей интерфейса (limits.js): обращаются к
+/// пределу только через него, и строка ключа руками во втором месте не
+/// набирается.
+fn ui_alias(registry: &str, key: &str) -> Option<String> {
+    registry.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        (value.trim().trim_end_matches(',').trim_matches('\'') == key)
+            .then(|| name.trim().to_owned())
+    })
+}
+
+/// Место, у которого нет своего сценария, всё равно спрашивает число у реестра
+/// настроек, а не держит собственное.
+///
+/// Такие места есть: догрузка тел писем работает только на настоящем сервере,
+/// а ритм опроса, напоминаний и проверки обновлений живёт в фоновом цикле вне
+/// хранилища. Настройка, которую не спрашивает никто, означает ровно одно -
+/// место применения осталось со своим числом, и выбранное пользователем
+/// значение никуда не доходит.
+///
+/// Прежняя проверка искала в исходниках имена прежних констант, и то же число
+/// под новым именем проходило насквозь. Здесь проверяется обратное: у каждого
+/// предела есть спрашивающий - ядро по имени константы или интерфейс по
+/// короткому имени из своего реестра ключей.
+#[test]
+fn every_limit_is_asked_for_by_the_place_that_applies_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Сам реестр не в счёт: там предел описан, а не применён.
+    let core = sources_without_comments(&root.join("crates/core/src"), "rs", &["limits.rs"])
+        + &sources_without_comments(&root.join("apps/desktop/src-tauri/src"), "rs", &[]);
+    let interface = sources_without_comments(&root.join("apps/desktop/ui"), "js", &["limits.js"]);
+    let registry = std::fs::read_to_string(root.join("apps/desktop/ui/modules/limits.js"))
+        .expect("прочитать реестр ключей интерфейса");
+
+    for spec in LIMITS {
+        let constant = spec.key.to_uppercase();
+        let alias = ui_alias(&registry, spec.key).unwrap_or_else(|| {
+            panic!("в реестре ключей интерфейса нет предела {}", spec.key)
+        });
         assert!(
-            loops.contains(&name),
-            "фоновый цикл не спрашивает настройку {key}"
+            core.contains(&constant) || interface.contains(&format!("KEYS.{alias}")),
+            "предел {} не спрашивает никто: место применения осталось со своим числом",
+            spec.key
         );
     }
-    let start =
-        std::fs::read_to_string(root.join("apps/desktop/src-tauri/src/main.rs")).expect("запуск");
-    assert!(
-        start.contains(&LIMIT_UPDATE_CHECK_HOURS.to_uppercase()),
-        "проверка обновлений идёт по числу в коде, а не по настройке"
-    );
 }

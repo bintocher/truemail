@@ -131,36 +131,25 @@ async fn message_id_by_uid(db: &Db, folder_id: i64, uid: i64) -> i64 {
         .0
 }
 
-/// S-039, S-040: пока по письму лежит незавершённая операция вида `flag`,
-/// значение признака с сервера к нему не применяется. Иначе устаревший ответ
-/// сервера снял бы только что поставленный пользователем флажок и увёл бы дело
-/// в состояние `detached`.
-#[tokio::test]
-async fn imap_flag_delta_yields_to_a_pending_flag_operation() {
-    let db: TestDb = open_test_db("flag-sync-race").await;
-    let account = seed_account(&db, "race@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    let message = seed_message(&db, account, inbox, 11, "<race@example.test>", 1, false).await;
-
-    // Пользователь поставил флажок: в очереди лежит операция вида flag.
-    db.mark_flagged(message, true)
-        .await
-        .expect("поставить флажок");
-    let pending: (i64,) = sqlx::query_as(
-        "SELECT count(*) FROM outbox_ops WHERE message_id=? AND op_kind='flag' AND status IN ('pending','retry')",
-    )
-    .bind(message)
-    .fetch_one(&db.pool)
-    .await
-    .expect("прочитать очередь");
-    assert_eq!(pending.0, 1, "флажок ставится прежним путём, через очередь");
-
-    // Сервер отвечает прежним состоянием: письмо ещё не помечено там.
+/// Прогнать все три пути, которыми значение признака приходит с сервера, и
+/// убедиться, что ни один не перебил обещание пользователя.
+///
+/// Путей ровно три: изменение признаков IMAP, полный обход папки и запись
+/// признака по причине синхронизации. Каждый ломается сам по себе, поэтому
+/// сломанный называется в отказе вместе с состоянием очереди.
+async fn every_sync_path_keeps_the_users_flag(
+    db: &Db,
+    account: i64,
+    uid: u32,
+    message_id: &str,
+    message: i64,
+    queue: &str,
+) {
     db.apply_imap_flag_updates(
         account,
         &[DiscoveredFlagUpdate {
             folder_path: "INBOX".into(),
-            uid: 11,
+            uid,
             seen: false,
             flagged: false,
             answered: false,
@@ -169,120 +158,182 @@ async fn imap_flag_delta_yields_to_a_pending_flag_operation() {
     )
     .await
     .expect("применить изменения признаков IMAP");
-
     assert!(
-        flagged(&db, message).await,
-        "ответ сервера снял только что поставленный пользователем флажок"
+        flagged(db, message).await,
+        "{queue}: ответ сервера снял только что поставленный пользователем флажок"
     );
-    db.close().await;
+
+    db.save_discovered_messages(
+        account,
+        &[discovered("INBOX", uid, message_id, false)],
+        false,
+    )
+    .await
+    .expect("полный обход папки");
+    assert!(
+        flagged(db, message).await,
+        "{queue}: полный обход папки затёр флажок, который ещё не ушёл на сервер"
+    );
+
+    db.mark_flagged_many(&[message], false, FlagChangeReason::Sync)
+        .await
+        .expect("запись признака по причине синхронизации");
+    assert!(
+        flagged(db, message).await,
+        "{queue}: запись признака по причине синхронизации не отступила перед очередью"
+    );
+    assert_eq!(
+        task_state(db, message)
+            .await
+            .expect("дело письма на месте")
+            .0,
+        "active",
+        "{queue}: дело отсоединено из-за собственной же неотправленной операции признака"
+    );
 }
 
-/// S-039: тот же запрет на втором пути записи признака - в полной
-/// синхронизации писем. Путей два, и пропущенный означает, что флажок
-/// пользователя исчезает при первом же обходе папки.
+/// S-039, S-040: пока по письму лежит незавершённая операция вида `flag`,
+/// значение признака с сервера к нему не применяется ни одним из трёх путей.
+/// Иначе устаревший ответ сервера снял бы только что поставленный пользователем
+/// флажок и увёл бы дело в состояние `detached`.
+///
+/// Пути проверяются вместе, одним обещанием пользователя: порознь они
+/// повторяли бы одну и ту же подготовку, а ломается в них одно и то же -
+/// забытый взгляд на очередь. Операция, исчерпавшая попытки, придерживает
+/// значение наравне с ожидающей: отказ отправки не делает обещание
+/// пользователя отменённым, и первый же ответ сервера иначе воскресил бы
+/// выполненное дело. Сколько попыток до отказа - настройка
+/// LIMIT_OPERATION_ATTEMPTS, и проверка берёт число из неё.
 #[tokio::test]
-async fn full_sync_yields_to_a_pending_flag_operation() {
-    let db: TestDb = open_test_db("flag-sync-full").await;
-    let account = seed_account(&db, "full@example.test").await;
+async fn a_pending_flag_operation_holds_off_the_server_value_on_every_path() {
+    let db: TestDb = open_test_db("flag-sync-race").await;
+    let account = seed_account(&db, "race@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     db.save_discovered_messages(
         account,
-        &[discovered("INBOX", 21, "<full@example.test>", false)],
+        &[discovered("INBOX", 11, "<race@example.test>", false)],
         false,
     )
     .await
     .expect("первый обход папки");
-    let message = message_id_by_uid(&db, inbox, 21).await;
+    let message = message_id_by_uid(&db, inbox, 11).await;
 
+    // Пользователь поставил флажок и задал срок: в очереди лежит операция вида
+    // flag, а у письма - действующее дело.
     db.mark_flagged(message, true)
         .await
         .expect("поставить флажок");
-    db.save_discovered_messages(
-        account,
-        &[discovered("INBOX", 21, "<full@example.test>", false)],
-        false,
+    seed_task(&db, message, Some("2026-10-08 09:00:00"), "active").await;
+    let operation: (i64,) = sqlx::query_as(
+        "SELECT id FROM outbox_ops WHERE message_id=? AND op_kind='flag'
+          AND status IN ('pending','retry')",
     )
+    .bind(message)
+    .fetch_one(&db.pool)
     .await
-    .expect("повторный обход папки");
+    .expect("флажок ставится прежним путём, через очередь");
 
-    assert!(
-        flagged(&db, message).await,
-        "полная синхронизация затёрла флажок, который ещё не ушёл на сервер"
+    every_sync_path_keeps_the_users_flag(
+        &db,
+        account,
+        11,
+        "<race@example.test>",
+        message,
+        "операция ждёт отправки",
+    )
+    .await;
+
+    // Попытки исчерпаны: операция уходит в состояние отказа и повтору не
+    // подлежит, но незавершённой быть не перестаёт.
+    for _ in 0..db.limit(LIMIT_OPERATION_ATTEMPTS) {
+        db.fail_outbox_operation(operation.0, "сервер недоступен")
+            .await
+            .expect("попытка отправки не удалась");
+    }
+    let status: (String,) = sqlx::query_as("SELECT status FROM outbox_ops WHERE id=?")
+        .bind(operation.0)
+        .fetch_one(&db.pool)
+        .await
+        .expect("прочитать состояние операции");
+    assert_eq!(
+        status.0, "failed",
+        "операция признака не дошла до отказа за назначенное настройкой число попыток"
     );
+
+    every_sync_path_keeps_the_users_flag(
+        &db,
+        account,
+        11,
+        "<race@example.test>",
+        message,
+        "операция исчерпала попытки",
+    )
+    .await;
     db.close().await;
 }
 
-/// S-092, S-093: флажок, снятый на другом устройстве, переводит дело в
-/// состояние `detached` и сохраняет его сроки. Без этого сроки, введённые
-/// руками, пропали бы без ведома пользователя.
+/// S-092 - S-094: флажок, снятый на другом устройстве, отсоединяет дело и
+/// сохраняет его сроки, а вернувшийся флажок поднимает то же дело обратно в
+/// работу с теми же сроками.
+///
+/// Это один путь пользователя, а не два: он трогает флажок на телефоне туда и
+/// обратно. Порознь снятие и возврат проверялись на разных делах, и сроки,
+/// потерянные при отсоединении, возврату было уже неоткуда взять - проверка
+/// возврата заводила их заново. Здесь сроки задаются один раз и обязаны
+/// пережить оба перехода.
 #[tokio::test]
-async fn sync_detaches_the_task_and_keeps_its_dates() {
-    let db: TestDb = open_test_db("flag-detach").await;
+async fn a_flag_taken_and_returned_by_sync_keeps_the_dates_of_one_task() {
+    let db: TestDb = open_test_db("flag-detach-revive").await;
     let account = seed_account(&db, "detach@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let message = seed_message(&db, account, inbox, 31, "<detach@example.test>", 1, true).await;
-    seed_task(&db, message, Some("2026-09-25 09:00:00"), "active").await;
+    let due = "2026-09-25 09:00:00";
+    seed_task(&db, message, Some(due), "active").await;
 
-    db.apply_imap_flag_updates(
-        account,
-        &[DiscoveredFlagUpdate {
-            folder_path: "INBOX".into(),
-            uid: 31,
-            seen: false,
-            flagged: false,
-            answered: false,
-            draft: false,
-        }],
-    )
-    .await
-    .expect("синхронизация сняла флажок");
-
-    let task = task_state(&db, message)
+    let server_flag = async |db: &Db, flagged: bool| {
+        db.apply_imap_flag_updates(
+            account,
+            &[DiscoveredFlagUpdate {
+                folder_path: "INBOX".into(),
+                uid: 31,
+                seen: false,
+                flagged,
+                answered: false,
+                draft: false,
+            }],
+        )
         .await
-        .expect("дело осталось в базе");
+        .expect("синхронизация принесла значение признака");
+    };
+
+    server_flag(&db, false).await;
+    let detached = task_state(&db, message)
+        .await
+        .expect("дело исчезло вместе с флажком");
     assert_eq!(
-        task.0, "detached",
-        "дело должно отсоединиться, а не исчезнуть вместе с флажком"
+        detached.0, "detached",
+        "дело должно отсоединиться, а не исчезнуть вместе с чужим снятием флажка"
     );
     assert_eq!(
-        task.1.as_deref(),
-        Some("2026-09-25 09:00:00"),
-        "сроки отсоединённого дела сохраняются"
+        detached.1.as_deref(),
+        Some(due),
+        "сроки отсоединённого дела потеряны"
     );
-    db.close().await;
-}
+    assert!(
+        !flagged(&db, message).await,
+        "признак важности с сервера не записан"
+    );
 
-/// S-094: признак важности, появившийся снова, возвращает отсоединённое дело в
-/// работу с прежними сроками. Иначе пользователь, вернувший флажок на телефоне,
-/// увидел бы дело без срока.
-#[tokio::test]
-async fn returning_flag_revives_a_detached_task() {
-    let db: TestDb = open_test_db("flag-revive").await;
-    let account = seed_account(&db, "revive@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    let message = seed_message(&db, account, inbox, 41, "<revive@example.test>", 1, false).await;
-    seed_task(&db, message, Some("2026-09-26 09:00:00"), "detached").await;
-
-    db.apply_imap_flag_updates(
-        account,
-        &[DiscoveredFlagUpdate {
-            folder_path: "INBOX".into(),
-            uid: 41,
-            seen: false,
-            flagged: true,
-            answered: false,
-            draft: false,
-        }],
-    )
-    .await
-    .expect("синхронизация вернула флажок");
-
-    let task = task_state(&db, message).await.expect("дело на месте");
-    assert_eq!(task.0, "active", "дело вернулось в работу");
+    server_flag(&db, true).await;
+    let revived = task_state(&db, message).await.expect("дело исчезло");
     assert_eq!(
-        task.1.as_deref(),
-        Some("2026-09-26 09:00:00"),
-        "прежние сроки остались при деле"
+        revived.0, "active",
+        "вернувшийся флажок не поднял дело обратно в работу"
+    );
+    assert_eq!(
+        revived.1.as_deref(),
+        Some(due),
+        "прежние сроки не пережили возврат флажка: пользователь увидит дело без срока"
     );
     db.close().await;
 }

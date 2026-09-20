@@ -520,9 +520,15 @@ pub fn delete_forever_fingerprint(rule: &MailRuleInput) -> String {
         .collect()
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Db;
+    use crate::storage::repo::test_storage::{TestDb, open_test_db};
+
+    /// Ящик проверок: тот же адрес нужен и условию по полю `account`.
+    const ACCOUNT_EMAIL: &str = "rules@example.test";
 
     /// Проверка на значениях первого запуска: их же получает база, где
     /// настройку ещё не меняли.
@@ -569,48 +575,77 @@ mod tests {
         }
     }
 
-    /// S-020, S-021: словарь полей перечислен целиком, а точный адрес
-    /// отправителя носит собственный идентификатор.
+    /// S-018, S-019, S-022, S-025: правило, которым письмо разобрать нельзя,
+    /// до записи не доходит. Причина сверяется дословно: без неё перестановка
+    /// проверок местами осталась бы незамеченной, а отказ по другой причине
+    /// выглядел бы успехом.
     #[test]
-    fn field_dictionary_matches_specification() {
-        assert_eq!(RULE_FIELDS.len(), 16);
-        assert_eq!(rule_field_kind("sender_address"), Some(RuleFieldKind::Text));
-        assert_eq!(rule_field_kind("sender"), Some(RuleFieldKind::Text));
-        assert_eq!(rule_field_kind("вымышленное"), None);
-    }
-
-    /// S-022: пара поля и оператора проверяется по виду поля.
-    #[test]
-    fn operator_must_match_field_kind() {
-        let ok = rule(
-            vec![group(vec![condition("subject", "ends_with", "счет")])],
-            vec![action("archive")],
-        );
-        assert!(validate_rule_input_default(&ok).is_ok());
-        let bad = rule(
-            vec![group(vec![condition("read_state", "contains", "read")])],
-            vec![action("archive")],
-        );
-        assert!(validate_rule_input_default(&bad).is_err());
-    }
-
-    /// S-025: текстовое условие без значения не сохраняется.
-    #[test]
-    fn empty_text_value_is_rejected() {
-        let rule = rule(
-            vec![group(vec![condition("subject", "contains", "   ")])],
-            vec![action("archive")],
-        );
-        assert!(validate_rule_input_default(&rule).is_err());
-    }
-
-    /// S-018, S-019: пустая группа и правило без условий отклоняются.
-    #[test]
-    fn empty_groups_are_rejected() {
-        let empty_group = rule(vec![group(Vec::new())], vec![action("archive")]);
-        assert!(validate_rule_input_default(&empty_group).is_err());
-        let no_groups = rule(Vec::new(), vec![action("archive")]);
-        assert!(validate_rule_input_default(&no_groups).is_err());
+    fn rule_input_rejections_name_their_reason() {
+        let ok_condition = || condition("subject", "ends_with", "счет");
+        let cases: Vec<(&str, MailRuleInput, Option<&str>)> = vec![
+            (
+                "подходящая пара поля и оператора",
+                rule(
+                    vec![group(vec![ok_condition()])],
+                    vec![action("archive")],
+                ),
+                None,
+            ),
+            (
+                "оператор чужого вида поля",
+                rule(
+                    vec![group(vec![condition("read_state", "contains", "read")])],
+                    vec![action("archive")],
+                ),
+                Some("оператор contains не подходит полю read_state"),
+            ),
+            (
+                "текстовое условие из одних пробелов",
+                rule(
+                    vec![group(vec![condition("subject", "contains", "   ")])],
+                    vec![action("archive")],
+                ),
+                Some("значение условия не может быть пустым"),
+            ),
+            (
+                "единственная группа без условий",
+                rule(vec![group(Vec::new())], vec![action("archive")]),
+                Some("в правиле нет ни одного условия"),
+            ),
+            (
+                "правило без групп",
+                rule(Vec::new(), vec![action("archive")]),
+                Some("в правиле нет ни одного условия"),
+            ),
+            (
+                "пустая группа рядом с заполненной",
+                rule(
+                    vec![group(vec![ok_condition()]), group(Vec::new())],
+                    vec![action("archive")],
+                ),
+                Some("группа без условий не сохраняется"),
+            ),
+            (
+                "пустая группа исключений",
+                {
+                    let mut input =
+                        rule(vec![group(vec![ok_condition()])], vec![action("archive")]);
+                    input.exceptions = vec![group(Vec::new())];
+                    input
+                },
+                Some("группа без условий не сохраняется"),
+            ),
+        ];
+        for (name, input, expected) in cases {
+            match (validate_rule_input_default(&input), expected) {
+                (Ok(()), None) => {}
+                (Err(reason), Some(expected)) => assert_eq!(reason, expected, "{name}"),
+                (Ok(()), Some(expected)) => {
+                    panic!("{name}: правило принято, ожидался отказ \"{expected}\"")
+                }
+                (Err(reason), None) => panic!("{name}: правило отклонено: {reason}"),
+            }
+        }
     }
 
     /// S-028 - S-030: пределы числа групп, условий и действий берутся из
@@ -676,20 +711,388 @@ mod tests {
         );
     }
 
-    /// S-049: изменение любой части правила меняет отпечаток подтверждения.
-    #[test]
-    fn fingerprint_changes_with_the_rule() {
-        let base = rule(
+    /// Условие по полю словаря: значение, которое на письмо проверки
+    /// подходит, и значение, которое подходить не должно.
+    struct FieldCase {
+        field: &'static str,
+        op: &'static str,
+        unit: Option<&'static str>,
+        matching: &'static str,
+        other: &'static str,
+        /// Действие для несовпадающего случая, если тем же действием подобрать
+        /// его нельзя. У даты так и есть: письмо проверки получено только что,
+        /// и "получено за последние N" совпадает при любом допустимом N, а
+        /// нулём или пустым значением условие просто не сохранится.
+        other_op: Option<&'static str>,
+    }
+
+    /// Письмо проверки заполнено так, чтобы у каждого поля словаря было и
+    /// совпадающее, и заведомо чужое значение.
+    const FIELD_CASES: &[FieldCase] = &[
+        FieldCase {
+            field: "sender",
+            op: "contains",
+            unit: None,
+            matching: "Иван Иванов",
+            other: "Пётр Петров",
+            other_op: None,
+        },
+        FieldCase {
+            field: "sender_address",
+            op: "equals",
+            unit: None,
+            matching: "ivan@example.test",
+            other: "petr@example.test",
+            other_op: None,
+        },
+        FieldCase {
+            field: "recipient",
+            op: "contains",
+            unit: None,
+            matching: "sales@example.test",
+            other: "support@example.test",
+            other_op: None,
+        },
+        FieldCase {
+            field: "subject",
+            op: "starts_with",
+            unit: None,
+            matching: "Счет",
+            other: "Договор",
+            other_op: None,
+        },
+        FieldCase {
+            field: "body",
+            op: "contains",
+            unit: None,
+            matching: "оплату",
+            other: "доставку",
+            other_op: None,
+        },
+        FieldCase {
+            field: "account",
+            op: "equals",
+            unit: None,
+            matching: ACCOUNT_EMAIL,
+            other: "other@example.test",
+            other_op: None,
+        },
+        FieldCase {
+            field: "folder",
+            op: "contains",
+            unit: None,
+            matching: "Входящие",
+            other: "Архив",
+            other_op: None,
+        },
+        FieldCase {
+            field: "folder_role",
+            op: "equals",
+            unit: None,
+            matching: "inbox",
+            other: "archive",
+            other_op: None,
+        },
+        FieldCase {
+            field: "read_state",
+            op: "equals",
+            unit: None,
+            matching: "unread",
+            other: "read",
+            other_op: None,
+        },
+        FieldCase {
+            field: "importance",
+            op: "equals",
+            unit: None,
+            matching: "normal",
+            other: "flagged",
+            other_op: None,
+        },
+        FieldCase {
+            field: "reply_state",
+            op: "equals",
+            unit: None,
+            matching: "unanswered",
+            other: "answered",
+            other_op: None,
+        },
+        FieldCase {
+            field: "draft_state",
+            op: "equals",
+            unit: None,
+            matching: "not_draft",
+            other: "draft",
+            other_op: None,
+        },
+        FieldCase {
+            field: "attachment",
+            op: "equals",
+            unit: None,
+            matching: "none",
+            other: "has",
+            other_op: None,
+        },
+        // Письмо проверки весит 2 кб.
+        FieldCase {
+            field: "size",
+            op: "greater_than",
+            unit: Some("kb"),
+            matching: "1",
+            other: "1024",
+            other_op: None,
+        },
+        FieldCase {
+            field: "label",
+            op: "contains",
+            unit: None,
+            matching: "важное",
+            other: "неважное",
+            other_op: None,
+        },
+        // Письмо проверки только что получено.
+        FieldCase {
+            field: "date",
+            op: "within_last",
+            unit: Some("days"),
+            matching: "1",
+            other: "1",
+            other_op: Some("older_than"),
+        },
+    ];
+
+    async fn seed_account(db: &Db, email: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
+             VALUES(?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(email)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать ящик")
+        .0
+    }
+
+    async fn seed_folder(db: &Db, account_id: i64, path: &str, name: &str, role: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO folders(account_id, remote_path, display_name, role)
+             VALUES(?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(path)
+        .bind(name)
+        .bind(role)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать папку")
+        .0
+    }
+
+    /// Письмо в том виде, в каком его оставляет синхронизация: непрочитанное,
+    /// без важности, без вложений и с получателем в заголовке.
+    async fn seed_message(db: &Db, account_id: i64, folder_id: i64) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO messages(account_id, folder_id, uid, remote_id, from_name, from_addr,
+                                  to_addrs, subject, preview, date, size, seen, flagged,
+                                  answered, draft, has_attachments)
+             VALUES(?, ?, 1, 'remote-1', 'Иван Иванов', 'ivan@example.test',
+                    ?, 'Счет за сентябрь', 'просим оплату по счету', datetime('now'),
+                    2048, 0, 0, 0, 0, 0)
+             RETURNING id",
+        )
+        .bind(account_id)
+        .bind(folder_id)
+        .bind(r#"[{"name":"Отдел продаж","email":"sales@example.test"}]"#)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать письмо")
+        .0
+    }
+
+    async fn seed_label(db: &Db, name: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>("INSERT INTO labels(name) VALUES(?) RETURNING id")
+            .bind(name)
+            .fetch_one(&db.write_pool)
+            .await
+            .expect("создать метку")
+            .0
+    }
+
+    async fn message_labels(db: &Db, message_id: i64) -> Vec<String> {
+        let mut names: Vec<String> = sqlx::query_as::<_, (String,)>(
+            "SELECT l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id
+              WHERE ml.message_id=?",
+        )
+        .bind(message_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("метки письма")
+        .into_iter()
+        .map(|(name,)| name)
+        .collect();
+        names.sort();
+        names
+    }
+
+    /// S-020 - S-022: словарь полей проверяется настоящим прогоном правил.
+    /// На каждое поле словаря сохраняются два правила - с условием, которое
+    /// письму подходит, и с условием, которое подходить не должно, - и метку
+    /// обязано поставить только первое. Перечень, сверяющий сам себя,
+    /// пропустил бы и поле, выпавшее из словаря, и поле, которого прогон не
+    /// знает: у неизвестного поля значение пустое, и вхождение в него
+    /// совпадает с чем угодно.
+    #[tokio::test]
+    async fn every_dictionary_field_decides_a_real_rule_run() {
+        let db: TestDb = open_test_db("rule-dictionary").await;
+        let account = seed_account(&db, ACCOUNT_EMAIL).await;
+        let inbox = seed_folder(&db, account, "INBOX", "Входящие", "inbox").await;
+        let message = seed_message(&db, account, inbox).await;
+        let own_label = seed_label(&db, "важное").await;
+        sqlx::query("INSERT INTO message_labels(message_id, label_id) VALUES(?, ?)")
+            .bind(message)
+            .bind(own_label)
+            .execute(&db.write_pool)
+            .await
+            .expect("метка письма");
+
+        let mut expected = vec!["важное".to_owned()];
+        for case in FIELD_CASES {
+            assert!(
+                rule_field_kind(case.field).is_some(),
+                "поле {} проверяется прогоном, но в словаре его нет",
+                case.field
+            );
+            for (outcome, value) in [("подходит", case.matching), ("чужое", case.other)] {
+                let label_name = format!("{}: {outcome}", case.field);
+                let label = seed_label(&db, &label_name).await;
+                let op = if outcome == "чужое" {
+                    case.other_op.unwrap_or(case.op)
+                } else {
+                    case.op
+                };
+                let mut condition = condition(case.field, op, value);
+                condition.unit = case.unit.map(str::to_owned);
+                let mut input = rule(
+                    vec![group(vec![condition])],
+                    vec![MailRuleAction {
+                        kind: "label_add".into(),
+                        label_id: Some(label),
+                        ..action("label_add")
+                    }],
+                );
+                input.id = label_name.clone();
+                input.name = label_name.clone();
+                input.account_id = Some(account);
+                db.save_mail_rule(&input, true, None)
+                    .await
+                    .unwrap_or_else(|error| panic!("сохранить правило {label_name}: {error}"));
+                if outcome == "подходит" {
+                    expected.push(label_name);
+                }
+            }
+        }
+        for (field, _) in RULE_FIELDS {
+            assert!(
+                FIELD_CASES.iter().any(|case| case.field == *field),
+                "поле словаря {field} прогоном не проверено"
+            );
+        }
+
+        db.process_mail_rules().await.expect("прогон правил");
+        expected.sort();
+        assert_eq!(
+            message_labels(&db, message).await,
+            expected,
+            "метку ставит условие по полю словаря и только оно"
+        );
+
+        // Обратная сторона словаря: поле, которого в нём нет, правилом не
+        // становится - иначе условие с пустым значением совпадало бы с любым
+        // письмом.
+        let mut unknown = rule(
+            vec![group(vec![condition("вымышленное", "contains", "счет")])],
+            vec![action("mark_read")],
+        );
+        unknown.id = "неизвестное поле".into();
+        unknown.account_id = Some(account);
+        let error = db
+            .save_mail_rule(&unknown, true, None)
+            .await
+            .expect_err("правило с неизвестным полем сохранилось");
+        assert!(
+            error.to_string().contains("вымышленное"),
+            "отказ должен называть поле: {error}"
+        );
+        let saved = db.list_mail_rules().await.expect("список правил");
+        assert!(
+            saved.iter().all(|rule| rule.id != "неизвестное поле"),
+            "отклонённое правило не должно попадать в список"
+        );
+        db.close().await;
+    }
+
+    /// S-048, S-049: подтверждение удаления навсегда выдаётся на конкретный
+    /// состав правила. Изменённое после выдачи правило сохраняться не должно,
+    /// неизменённое - должно, и ровно один раз. Отпечаток проверяется через
+    /// запись правила, а не сам по себе: его смысл в том, что запись с чужим
+    /// подтверждением не проходит.
+    #[tokio::test]
+    async fn a_changed_rule_needs_a_fresh_delete_confirmation() {
+        let db: TestDb = open_test_db("rule-delete-confirm").await;
+        let account = seed_account(&db, ACCOUNT_EMAIL).await;
+        seed_folder(&db, account, "INBOX", "Входящие", "inbox").await;
+        let mut original = rule(
             vec![group(vec![condition("subject", "contains", "счет")])],
             vec![action("delete")],
         );
-        let first = delete_forever_fingerprint(&base);
-        let mut changed = base.clone();
+        original.account_id = Some(account);
+        let key = db
+            .issue_delete_confirmation(&original)
+            .await
+            .expect("выдать подтверждение");
+
+        let mut changed = original.clone();
         changed.groups[0].conditions[0].value = "договор".into();
-        assert_ne!(first, delete_forever_fingerprint(&changed));
-        let mut scoped = base.clone();
-        scoped.account_id = Some(7);
-        assert_ne!(first, delete_forever_fingerprint(&scoped));
-        assert_eq!(first, delete_forever_fingerprint(&base));
+        changed.confirm_key = Some(key.clone());
+        let error = db
+            .save_mail_rule(&changed, true, None)
+            .await
+            .expect_err("изменённое правило прошло со старым подтверждением");
+        assert!(
+            error.to_string().contains("подтвердить заново"),
+            "отказ должен звать подтвердить заново: {error}"
+        );
+        assert!(
+            db.list_mail_rules()
+                .await
+                .expect("список правил")
+                .is_empty(),
+            "отклонённое правило не должно сохраняться"
+        );
+
+        original.confirm_key = Some(key.clone());
+        db.save_mail_rule(&original, true, None)
+            .await
+            .expect("неизменённое правило с его подтверждением");
+        let repeated = db
+            .save_mail_rule(&original, true, None)
+            .await
+            .expect_err("подтверждение принято второй раз");
+        assert!(
+            repeated.to_string().contains("подтвердить заново"),
+            "подтверждение одноразовое: {repeated}"
+        );
+
+        let fresh = db
+            .issue_delete_confirmation(&changed)
+            .await
+            .expect("выдать подтверждение изменённому правилу");
+        assert_ne!(fresh, key, "у изменённого правила своё подтверждение");
+        changed.confirm_key = Some(fresh);
+        db.save_mail_rule(&changed, true, None)
+            .await
+            .expect("изменённое правило со своим подтверждением");
+        db.close().await;
     }
 }

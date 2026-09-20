@@ -73,10 +73,6 @@
     ];
   }
 
-  function dueQuickChoices(lang = 'ru', now = new Date()) {
-    return duePresets(now, lang);
-  }
-
   function validateTask(task, now = new Date()) {
     const start = task.start_at ? asDate(task.start_at) : null;
     const due = task.due_at ? asDate(task.due_at) : null;
@@ -176,10 +172,6 @@
     return [subject, sender, account, due, state, snoozeText].filter(Boolean).join(' - ');
   }
 
-  function overdueTaskCount(items, now = new Date()) {
-    return (items || []).filter(item => taskGroup(item, now) === 'overdue').length;
-  }
-
   function visibleTasks(items) {
     // Признак уводимого письма ядро называет has_takeaway: по прежнему имени
     // отбор не отсекал ничего вовсе (S-052).
@@ -220,20 +212,6 @@
       subject: lang === 'en' ? `Missed reminders: ${total}` : `Пропущено напоминаний: ${total}`,
       action: lang === 'en' ? 'Open tasks' : 'Открыть дела',
     };
-  }
-
-  function missedReminders(items, now = new Date(), lang = 'ru') {
-    const current = asDate(now)?.getTime() || Date.now();
-    const week = 7 * 24 * 60 * 60 * 1000;
-    const marked = (items || []).map(item => Number(taskField(item, 'message_id')));
-    const shown = (items || []).filter(item => {
-      const reminder = asDate(taskField(item, 'reminder_at'));
-      return reminder && current - reminder.getTime() <= week;
-    });
-    const text = lang === 'en'
-      ? `Missed reminders: ${shown.length}`
-      : `Пропущено напоминаний: ${shown.length}`;
-    return {shown, marked, text};
   }
 
   // Письма, у которых задан хотя бы один из трёх сроков дела. Снятие флажка
@@ -294,18 +272,15 @@
   return {
     GROUPS,
     duePresets,
-    dueQuickChoices,
     validateTask,
     taskGroup,
     sortTasks,
     groupLabel,
     formatDue,
     taskRowText,
-    overdueTaskCount,
     visibleTasks,
     reminderCard,
     missedSummary,
-    missedReminders,
     datedTasks,
     flagClearWarning,
     toggleFlag,

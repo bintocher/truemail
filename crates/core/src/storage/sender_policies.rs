@@ -29,6 +29,16 @@ const LEASE_SECONDS: i64 = 300;
 /// родов совпадают.
 const DEFERRAL_KIND: &str = "sender_policy";
 
+/// Вид отложенных писем самой стадии: у стадии задания нет, поэтому её
+/// отложенные письма хранятся отдельно от писем заданий уборки и не
+/// снимаются вместе с закрытым заданием.
+const STAGE_DEFERRAL_KIND: &str = "sender_policy_stage";
+
+/// Номер задания у писем, отложенных стадией. Стадия идёт без задания, а
+/// столбец в таблице общий, поэтому ей отведено значение, которого у
+/// настоящих заданий не бывает.
+const STAGE_DEFERRAL_JOB: i64 = 0;
+
 /// Метка операции очереди, поставленной списком отправителей (S-047).
 fn policy_marker(policy_id: i64) -> String {
     format!("sender_policy:{policy_id}")
@@ -745,25 +755,57 @@ impl Db {
             return Ok(0);
         }
         let cursor = Self::stage_cursor(&mut tx, SENDER_POLICY_STAGE_NAME).await?;
+        // S-066: письма, отложенные прошлым проходом, повторяются наравне с
+        // письмами после курсора. Их номера читаются заранее одним запросом:
+        // снимать откладывание с каждого письма пачки означало бы пятьсот
+        // лишних запросов на каждый приход почты, а отложенных писем обычно
+        // нет вовсе.
+        let deferred: Vec<i64> = sqlx::query_as::<_, (i64,)>(
+            "SELECT message_id FROM stage_job_deferrals WHERE kind=? AND job_id=?",
+        )
+        .bind(STAGE_DEFERRAL_KIND)
+        .bind(STAGE_DEFERRAL_JOB)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|(id,)| id)
+        .collect();
         // S-022, S-025: догруженные прокруткой письма стадия списков не берёт,
         // как и письма служебных папок и архива.
         let sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.id>? AND m.backfilled=0 AND m.closed_by_stage IS NULL AND {WORKING_FOLDERS}
+              WHERE (m.id>? OR {DEFERRED_MESSAGES})
+                AND m.backfilled=0 AND m.closed_by_stage IS NULL AND {WORKING_FOLDERS}
               ORDER BY m.id LIMIT ?"
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
             .bind(cursor)
+            .bind(STAGE_DEFERRAL_KIND)
+            .bind(STAGE_DEFERRAL_JOB)
             .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut queued = 0usize;
         let mut last_id = cursor;
         for message in &batch {
-            last_id = message.id;
+            // Отложенное письмо лежит до курсора, поэтому курсор от него назад
+            // не двигается.
+            last_id = last_id.max(message.id);
+            let was_deferred = deferred.contains(&message.id);
             let SenderDecision::Blocked(policy_id) = policies.decide(message.from_addr.as_deref())
             else {
+                // Отправителя могли убрать из списка, пока письмо ждало
+                // повтора: тогда ждать больше нечего.
+                if was_deferred {
+                    Self::clear_stage_deferral(
+                        &mut tx,
+                        STAGE_DEFERRAL_KIND,
+                        STAGE_DEFERRAL_JOB,
+                        message.id,
+                    )
+                    .await?;
+                }
                 continue;
             };
             let trash =
@@ -785,6 +827,17 @@ impl Db {
                 .bind(policy_id)
                 .execute(&mut *tx)
                 .await?;
+                // Повторять нечего: без назначенной корзины следующий проход
+                // получил бы тот же отказ.
+                if was_deferred {
+                    Self::clear_stage_deferral(
+                        &mut tx,
+                        STAGE_DEFERRAL_KIND,
+                        STAGE_DEFERRAL_JOB,
+                        message.id,
+                    )
+                    .await?;
+                }
                 continue;
             };
             let outcome = queue_takeaway_operation(
@@ -799,25 +852,58 @@ impl Db {
                 0,
             )
             .await?;
-            match outcome {
-                TakeawayOutcome::Queued(_) => {
-                    // S-002, S-009: письмо закрыто стадией списков и дальше не
-                    // передаётся.
-                    sqlx::query("UPDATE messages SET closed_by_stage=? WHERE id=?")
-                        .bind(SENDER_POLICY_STAGE_NAME)
-                        .bind(message.id)
-                        .execute(&mut *tx)
-                        .await?;
-                    sqlx::query("UPDATE sender_policies SET swept=swept+1 WHERE id=?")
-                        .bind(policy_id)
-                        .execute(&mut *tx)
-                        .await?;
-                    queued += 1;
-                }
-                // S-004: письмо уже уведено другой стадией или пользователем -
-                // второй операции по нему не создаётся.
-                _ => continue,
+            if let TakeawayOutcome::Queued(_) = outcome {
+                // S-002, S-009: письмо закрыто стадией списков и дальше не
+                // передаётся.
+                sqlx::query("UPDATE messages SET closed_by_stage=? WHERE id=?")
+                    .bind(SENDER_POLICY_STAGE_NAME)
+                    .bind(message.id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE sender_policies SET swept=swept+1 WHERE id=?")
+                    .bind(policy_id)
+                    .execute(&mut *tx)
+                    .await?;
+                queued += 1;
             }
+            // S-004: второй операции увода по письму не создаётся. S-066:
+            // чужая незавершённая операция, занятое письмо и отказ очереди
+            // сами по себе не значат, что письмо убирать не нужно, поэтому
+            // оно откладывается до следующего прохода. Без этого письмо
+            // отправителя, прошлая операция которого ждёт решения
+            // пользователя, оставалось бы во входящих навсегда: курсор уже
+            // сдвинут, и стадия к нему не возвращается.
+            if needs_retry(&outcome) {
+                Self::defer_stage_message(
+                    &mut tx,
+                    STAGE_DEFERRAL_KIND,
+                    STAGE_DEFERRAL_JOB,
+                    message.id,
+                )
+                .await?;
+            } else if was_deferred {
+                Self::clear_stage_deferral(
+                    &mut tx,
+                    STAGE_DEFERRAL_KIND,
+                    STAGE_DEFERRAL_JOB,
+                    message.id,
+                )
+                .await?;
+            }
+        }
+        if !deferred.is_empty() {
+            // Отложенное письмо могло уйти совсем - его удалили или закрыла
+            // другая стадия. Такие строки в остаток больше не приводят, и
+            // копиться им незачем.
+            sqlx::query(
+                "DELETE FROM stage_job_deferrals
+                  WHERE kind=? AND job_id=?
+                    AND message_id NOT IN (SELECT id FROM messages WHERE closed_by_stage IS NULL)",
+            )
+            .bind(STAGE_DEFERRAL_KIND)
+            .bind(STAGE_DEFERRAL_JOB)
+            .execute(&mut *tx)
+            .await?;
         }
         Self::set_stage_cursor(&mut tx, SENDER_POLICY_STAGE_NAME, last_id).await?;
         tx.commit().await?;
@@ -828,6 +914,198 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::repo::test_storage::{TestDb, open_test_db};
+
+    async fn seed_account(db: &Db, email: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
+             VALUES(?, ?, 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(email)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать ящик")
+        .0
+    }
+
+    async fn seed_folder(db: &Db, account_id: i64, path: &str, role: Option<&str>) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO folders(account_id, remote_path, display_name, role)
+             VALUES(?, ?, ?, ?) RETURNING id",
+        )
+        .bind(account_id)
+        .bind(path)
+        .bind(path)
+        .bind(role)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать папку")
+        .0
+    }
+
+    async fn seed_message(db: &Db, account_id: i64, folder_id: i64, uid: i64, from: &str) -> i64 {
+        sqlx::query_as::<_, (i64,)>(
+            "INSERT INTO messages(account_id, folder_id, uid, from_name, from_addr, subject,
+                                  preview, date, remote_id, size)
+             VALUES(?, ?, ?, 'Отправитель', ?, 'письмо', 'предпросмотр',
+                    '2026-01-01T00:00:00+00:00', ?, 2048)
+             RETURNING id",
+        )
+        .bind(account_id)
+        .bind(folder_id)
+        .bind(uid)
+        .bind(from)
+        .bind(format!("remote-{folder_id}-{uid}"))
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("сохранить письмо")
+        .0
+    }
+
+    /// Операции увода по письму: вид, состояние и папка назначения.
+    async fn takeaways(db: &Db, message_id: i64) -> Vec<(String, String, Option<i64>)> {
+        sqlx::query_as(
+            "SELECT op_kind, status, CAST(json_extract(payload,'$.target_folder_id') AS INTEGER)
+               FROM outbox_ops WHERE message_id=? AND op_kind IN ('move','delete') ORDER BY id",
+        )
+        .bind(message_id)
+        .fetch_all(&db.pool)
+        .await
+        .expect("прочитать очередь")
+    }
+
+    /// Довести операцию до состояния отказа настоящим путём: работник забирает
+    /// её и сообщает об ошибке, пока не исчерпает разрешённое число попыток.
+    /// Число попыток - настройка, поэтому берётся из реестра, а не из числа в
+    /// проверке. Срок следующей попытки сдвигается запросом: ждать нарастающую
+    /// паузу проверке незачем.
+    async fn fail_until_refused(db: &TestDb, account_id: i64, operation_id: i64) {
+        for _ in 0..=db.limit(LIMIT_OPERATION_ATTEMPTS) {
+            sqlx::query(
+                "UPDATE outbox_ops SET next_attempt_at=datetime('now','-1 hour') WHERE id=?",
+            )
+            .bind(operation_id)
+            .execute(&db.write_pool)
+            .await
+            .expect("вернуть срок попытки");
+            let claimed = db
+                .claim_outbox_operations(account_id, 10)
+                .await
+                .expect("забрать операции");
+            let Some(operation) = claimed.iter().find(|item| item.id == operation_id) else {
+                break;
+            };
+            db.fail_outbox_operation(operation.id, "сервер отверг перемещение")
+                .await
+                .expect("сообщить об ошибке");
+        }
+        let status: (String,) = sqlx::query_as("SELECT status FROM outbox_ops WHERE id=?")
+            .bind(operation_id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("состояние операции");
+        assert_eq!(status.0, "failed", "операция должна дойти до отказа");
+    }
+
+    /// Письмо, прошлая операция которого ждёт решения пользователя, стадия
+    /// списков не бросает: она откладывает его и возвращается к нему следующим
+    /// проходом, хотя курсор уже ушёл вперёд (S-064, S-066, issue #114).
+    /// Прежде такое письмо оставалось во входящих навсегда: стадия видела
+    /// чужую незавершённую операцию, двигала курсор дальше и больше к письму
+    /// не возвращалась.
+    #[tokio::test]
+    async fn a_message_with_a_refused_operation_waits_and_is_taken_after_the_user_decides() {
+        let db = test_db("policy-stage-deferral").await;
+        let account = seed_account(&db, "me@example.test").await;
+        let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+        let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
+        let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+
+        let blocked = seed_message(&db, account, inbox, 1, "spam@example.test").await;
+        // Пользователь сам отправил письмо в архив, а сервер перемещение
+        // отверг: операция дошла до отказа и ждёт решения.
+        let queued = db
+            .queue_message_action(&[blocked], "archive")
+            .await
+            .expect("перенос в архив");
+        let refused = queued.operation_ids[0];
+        fail_until_refused(&db, account, refused).await;
+
+        db.save_sender_policy(
+            POLICY_KIND_ADDRESS,
+            "spam@example.test",
+            POLICY_DECISION_BLOCKED,
+            false,
+        )
+        .await
+        .expect("запись блокировки");
+
+        db.process_sync_batch_stages().await.expect("первый проход");
+        let after_first = takeaways(&db, blocked).await;
+        assert_eq!(
+            after_first,
+            vec![("move".to_string(), "failed".to_string(), Some(archive))],
+            "пока пользователь не решил, второй операции по письму не ставится"
+        );
+        let closed: (Option<String>,) =
+            sqlx::query_as("SELECT closed_by_stage FROM messages WHERE id=?")
+                .bind(blocked)
+                .fetch_one(&db.pool)
+                .await
+                .expect("признак стадии");
+        assert!(
+            closed.0.is_none(),
+            "письмо осталось во входящих и закрытым стадией не считается"
+        );
+
+        // Курсор уходит вперёд на обычной почте: письмо ждёт решения, а работа
+        // стадии не останавливается.
+        let next = seed_message(&db, account, inbox, 2, "friend@example.test").await;
+        db.process_sync_batch_stages().await.expect("второй проход");
+        assert!(
+            takeaways(&db, next).await.is_empty(),
+            "письмо обычного отправителя стадия не трогает"
+        );
+
+        // Пользователь отказался от застрявшей операции - путь к письму открыт.
+        db.discard_failed_operation(refused)
+            .await
+            .expect("отказ от операции");
+        db.process_sync_batch_stages().await.expect("третий проход");
+        let after_decision = takeaways(&db, blocked).await;
+        assert_eq!(
+            after_decision,
+            vec![("move".to_string(), "pending".to_string(), Some(trash))],
+            "после решения пользователя стадия возвращается к письму и уводит его в корзину"
+        );
+        let closed: (Option<String>,) =
+            sqlx::query_as("SELECT closed_by_stage FROM messages WHERE id=?")
+                .bind(blocked)
+                .fetch_one(&db.pool)
+                .await
+                .expect("признак стадии");
+        assert_eq!(
+            closed.0.as_deref(),
+            Some(SENDER_POLICY_STAGE_NAME),
+            "письмо закрыто стадией списков"
+        );
+        let waiting: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM stage_job_deferrals WHERE kind=?")
+                .bind(STAGE_DEFERRAL_KIND)
+                .fetch_one(&db.pool)
+                .await
+                .expect("счёт отложенных");
+        assert_eq!(
+            waiting.0, 0,
+            "обработанное письмо в остатке не задерживается"
+        );
+        db.close().await;
+    }
+
+    async fn test_db(prefix: &str) -> TestDb {
+        open_test_db(prefix).await
+    }
 
     /// Смешанные случаи адреса и домена разом: запись адреса точнее записи
     /// домена, доверие важнее блокировки одного вида, собственный адрес

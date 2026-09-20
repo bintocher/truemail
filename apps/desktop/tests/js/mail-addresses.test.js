@@ -1,220 +1,238 @@
-// Проверки чистой логики apps/desktop/ui/modules/mail-addresses.js.
-// Запуск: node --test apps/desktop/tests/js/mail-addresses.test.js (Node 20+).
-// Каталог вне apps/desktop/ui, поэтому в дистрибутив Tauri не попадает.
+// Проверки подписи отправителя и получателя: модель выбора стороны строки
+// (ui/modules/mail-addresses.js) и настоящий путь отрисовки - строка списка
+// писем и строки "Кому"/"Копия" шапки письма, собранные кодом mail.js на
+// разметке index.html.
+// Суффикс "+N", текст "Без получателя", кружок с инициалом и подпись ящика
+// рисует mail.js, а не модель: проверка, читающая одну модель, не замечает,
+// что строка списка перестала показывать половину из этого.
+// Спецификации: specs/sent-recipient-display.md, specs/message-mailbox-owner.md.
+// Запуск: node --test apps/desktop/tests/js/mail-addresses.test.js (Node 22+).
 'use strict';
-const {test}=require('node:test');
-const assert=require('node:assert/strict');
-const {rowPresentation,addressLineModel,displayName}=require('../../ui/modules/mail-addresses.js');
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const {rowPresentation, addressLineModel, displayName, mailboxLabel, listMailboxLabel} = require('../../ui/modules/mail-addresses.js');
+const {startApp} = require('./ui-app.js');
 
-const rolesOf=map=>new Map(Object.entries(map).map(([id,role])=>[Number(id),role]));
-const addr=(name,email)=>({name,email});
+const rolesOf = map => new Map(Object.entries(map).map(([id, role]) => [Number(id), role]));
+const addr = (name, email) => ({name, email});
+const many = n => Array.from({length: n}, (_, index) => addr(`Имя${index}`, `a${index}@example.com`));
+const accountsOf = (...emails) => emails.map((email, index) => ({id: index + 1, email}));
 
-// S-001: сторона строки определяется ролью папки письма, flags.draft не участвует.
-test('S-001: роль sent/drafts дает получателя, остальные - отправителя',()=>{
-  const message={folder_id:1,from:addr('Аня','anna@example.com'),to:[addr('Боря','boris@example.com')],cc:[]};
-  assert.equal(rowPresentation({...message,folder_id:1},rolesOf({1:'sent'})).kind,'recipient');
-  assert.equal(rowPresentation({...message,folder_id:2},rolesOf({2:'drafts'})).kind,'recipient');
-  assert.equal(rowPresentation({...message,folder_id:3},rolesOf({3:'inbox'})).kind,'sender');
-  assert.equal(rowPresentation({...message,folder_id:4},rolesOf({4:'archive'})).kind,'sender');
-  assert.equal(rowPresentation({...message,folder_id:5},rolesOf({5:'trash'})).kind,'sender');
-  assert.equal(rowPresentation({...message,folder_id:6},rolesOf({6:'spam'})).kind,'sender');
-  assert.equal(rowPresentation({...message,folder_id:99},rolesOf({1:'sent'})).kind,'sender'); // папка не найдена
-  assert.equal(rowPresentation({...message,folder_id:1},new Map()).kind,'sender'); // роль неизвестна
-});
-test('S-001: flags.draft=true в роли inbox все равно показывает отправителя',()=>{
-  const message={folder_id:1,from:addr('Аня','anna@example.com'),to:[addr('Боря','boris@example.com')],cc:[],flags:{draft:true}};
-  const result=rowPresentation(message,rolesOf({1:'inbox'}));
-  assert.equal(result.kind,'sender');
-  assert.equal(result.text,'Аня');
-});
+// --- Модель: сторона строки, подпись, свёртка ---
 
-// S-002: формат "первый +N" по to, с запасным источником cc.
-test('S-002: k=1 - подпись без счетчика',()=>{
-  const message={folder_id:1,from:addr('','from@example.com'),to:[addr('Боря','boris@example.com')],cc:[]};
-  const result=rowPresentation(message,rolesOf({1:'sent'}));
-  assert.equal(result.text,'Боря');assert.equal(result.extra,0);
-});
-test('S-002: k=2,3,5 - первый и суффикс +N',()=>{
-  const many=n=>Array.from({length:n},(_,i)=>addr(`Имя${i}`,`a${i}@example.com`));
-  for(const k of [2,3,5]){
-    const message={folder_id:1,from:addr('',''),to:many(k),cc:[]};
-    const result=rowPresentation(message,rolesOf({1:'sent'}));
-    assert.equal(result.text,'Имя0');assert.equal(result.extra,k-1);
-  }
-});
-test('S-002: адрес без name показывается по email',()=>{
-  const message={folder_id:1,from:addr('',''),to:[addr('','boris@example.com')],cc:[]};
-  assert.equal(rowPresentation(message,rolesOf({1:'sent'})).text,'boris@example.com');
-});
-test('S-002: пустой первый элемент не дает пустую подпись',()=>{
-  const message={folder_id:1,from:addr('',''),to:[addr('',''),addr('Аня','a@example.com'),addr('Боря','b@example.com')],cc:[]};
-  const result=rowPresentation(message,rolesOf({1:'sent'}));
-  assert.equal(result.text,'Аня');assert.equal(result.extra,1); // пустой элемент не считается
-});
-test('S-002: повторяющиеся адреса не схлопываются',()=>{
-  const message={folder_id:1,from:addr('',''),to:[addr('Аня','a@example.com'),addr('Аня','a@example.com')],cc:[]};
-  const result=rowPresentation(message,rolesOf({1:'sent'}));
-  assert.equal(result.text,'Аня');assert.equal(result.extra,1);
-});
-test('S-002: пустой to и непустой cc - подпись строится по cc',()=>{
-  const message={folder_id:1,from:addr('',''),to:[],cc:[addr('Копия','cc@example.com')]};
-  const result=rowPresentation(message,rolesOf({1:'sent'}));
-  assert.equal(result.kind,'recipient');assert.equal(result.text,'Копия');assert.equal(result.extra,0);
+// S-001, S-006: сторона строки определяется ролью папки самого письма.
+// flags.draft не участвует, у каждого письма беседы своя роль.
+test('S-001, S-006: сторона строки - роль папки письма, и только она', () => {
+  const message = {from: addr('Аня', 'anna@example.com'), to: [addr('Боря', 'boris@example.com')], cc: []};
+  const sides = {sent: 'recipient', drafts: 'recipient', inbox: 'sender', archive: 'sender', trash: 'sender', spam: 'sender'};
+  Object.entries(sides).forEach(([role, kind]) => {
+    assert.equal(rowPresentation({...message, folder_id: 1}, rolesOf({1: role})).kind, kind, role);
+  });
+  // Папка письма не найдена и роль неизвестна - сторона отправителя.
+  assert.equal(rowPresentation({...message, folder_id: 99}, rolesOf({1: 'sent'})).kind, 'sender');
+  assert.equal(rowPresentation({...message, folder_id: 1}, new Map()).kind, 'sender');
+  // Признак черновика у самого письма роль папки не подменяет.
+  const draftInInbox = rowPresentation({...message, folder_id: 1, flags: {draft: true}}, rolesOf({1: 'inbox'}));
+  assert.equal(draftInInbox.kind, 'sender');
+  assert.equal(draftInInbox.text, 'Аня');
+  // Письмо самому себе: в Входящих виден отправитель, в Отправленных - получатель.
+  const same = addr('Аня', 'anna@example.com');
+  const roles = rolesOf({1: 'inbox', 2: 'sent'});
+  assert.equal(rowPresentation({folder_id: 1, from: same, to: [same], cc: []}, roles).kind, 'sender');
+  assert.equal(rowPresentation({folder_id: 2, from: same, to: [same], cc: []}, roles).kind, 'recipient');
 });
 
-// S-003: нет ни одного отображаемого адреса ни в to, ни в cc.
-test('S-003: to=[] и cc пуст - заглушка',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('',''),to:[],cc:[]},rolesOf({1:'sent'}));
-  assert.deepEqual(result,{kind:'empty',text:'',extra:0,initial:'?'});
-});
-test('S-003: to отсутствует',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('','')},rolesOf({1:'drafts'}));
-  assert.equal(result.kind,'empty');
-});
-test('S-003: to из одного пустого адреса',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('',''),to:[addr('','')],cc:[]},rolesOf({1:'sent'}));
-  assert.equal(result.kind,'empty');
-});
-test('S-003: to и cc оба пусты (с непустыми элементами без полей)',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('',''),to:[addr('  ','')],cc:[addr('',' ')]},rolesOf({1:'drafts'}));
-  assert.equal(result.kind,'empty');
-});
-// Отката к отправителю быть не должно: заглушка выигрывает даже когда from
-// заполнен - иначе в Отправленных снова видно себя.
-test('S-003: непустой from не подменяет заглушку',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('Аня','anna@example.com'),to:[],cc:[]},rolesOf({1:'sent'}));
-  assert.deepEqual(result,{kind:'empty',text:'',extra:0,initial:'?'});
+// S-002: пустой to и непустой cc - подпись по cc: письмо, отправленное только
+// в копию, не должно выглядеть письмом без получателя.
+test('S-002: пустой to заменяется списком cc, повторы не схлопываются', () => {
+  const byCc = rowPresentation({folder_id: 1, from: addr('', ''), to: [], cc: [addr('Копия', 'cc@example.com')]}, rolesOf({1: 'sent'}));
+  assert.equal(byCc.kind, 'recipient');
+  assert.equal(byCc.text, 'Копия');
+  assert.equal(byCc.extra, 0);
+  // Два одинаковых адреса - это два получателя: удаление повторов показало бы
+  // одного там, где письмо ушло двоим.
+  const twice = rowPresentation({folder_id: 1, from: addr('', ''), to: [addr('Аня', 'a@example.com'), addr('Аня', 'a@example.com')], cc: []}, rolesOf({1: 'sent'}));
+  assert.equal(twice.extra, 1);
 });
 
-// S-004: обычная строка - подпись from, нормализация имени из пробелов.
-test('S-004: отправитель с именем',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('Аня','a@example.com')},rolesOf({1:'inbox'}));
-  assert.equal(result.kind,'sender');assert.equal(result.text,'Аня');
-});
-test('S-004: отправитель только с email',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('','a@example.com')},rolesOf({1:'inbox'}));
-  assert.equal(result.text,'a@example.com');
-});
-test('S-004: имя из одних пробелов показывается по email',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('   ','a@example.com')},rolesOf({1:'inbox'}));
-  assert.equal(result.text,'a@example.com');
-});
-test('S-004: пустые поля - пустая подпись',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('','')},rolesOf({1:'inbox'}));
-  assert.equal(result.kind,'sender');assert.equal(result.text,'');
-});
-test('S-004: письмо самому себе - inbox показывает отправителя, sent - получателя',()=>{
-  const same=addr('Аня','anna@example.com');
-  const inboxResult=rowPresentation({folder_id:1,from:same,to:[same],cc:[]},rolesOf({1:'inbox'}));
-  const sentResult=rowPresentation({folder_id:2,from:same,to:[same],cc:[]},rolesOf({2:'sent'}));
-  assert.equal(inboxResult.kind,'sender');assert.equal(sentResult.kind,'recipient');
-  assert.equal(inboxResult.text,'Аня');assert.equal(sentResult.text,'Аня');
+// S-003: пробельные имя и адрес отображаемым получателем не считаются - без
+// trim строка получила бы подпись из пробелов вместо текста "Без получателя".
+test('S-003: адреса из одних пробелов дают заглушку без получателя', () => {
+  const blank = rowPresentation({folder_id: 1, from: addr('', ''), to: [addr('  ', '')], cc: [addr('', ' ')]}, rolesOf({1: 'drafts'}));
+  assert.deepEqual(blank, {kind: 'empty', text: '', extra: 0, initial: '?'});
+  // Пустой элемент внутри списка не занимает место первого и не идёт в счёт.
+  const withBlankFirst = rowPresentation({folder_id: 1, from: addr('', ''), to: [addr('', ''), addr('Аня', 'a@example.com'), addr('Боря', 'b@example.com')], cc: []}, rolesOf({1: 'sent'}));
+  assert.equal(withBlankFirst.text, 'Аня');
+  assert.equal(withBlankFirst.extra, 1);
 });
 
-// S-005: инициал соответствует стороне подписи.
-test('S-005: инициал берется из подписи, эмодзи не разрезается',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('😀 Аня','a@example.com')},rolesOf({1:'inbox'}));
-  assert.equal(result.initial,'😀');
-});
-test('S-005: пустая подпись дает инициал ?',()=>{
-  const result=rowPresentation({folder_id:1,from:addr('','')},rolesOf({1:'inbox'}));
-  assert.equal(result.initial,'?');
-});
-test('S-005: суффикс +N не влияет на инициал',()=>{
-  const message={folder_id:1,from:addr('',''),to:[addr('Аня','a@example.com'),addr('Боря','b@example.com'),addr('Вера','v@example.com')],cc:[]};
-  const result=rowPresentation(message,rolesOf({1:'sent'}));
-  assert.equal(result.initial,'А');assert.equal(result.extra,2);
-});
-
-// S-006: роль каждого письма беседы применяется к его собственному folder_id.
-test('S-006: представитель и дочернее письмо форматируются независимо по своей роли',()=>{
-  const roles=rolesOf({1:'inbox',2:'sent'});
-  const inboxChild=rowPresentation({folder_id:1,from:addr('Аня','a@example.com'),to:[addr('Я','me@example.com')],cc:[]},roles);
-  const sentChild=rowPresentation({folder_id:2,from:addr('Я','me@example.com'),to:[addr('Боря','b@example.com')],cc:[]},roles);
-  assert.equal(inboxChild.kind,'sender');assert.equal(inboxChild.text,'Аня');
-  assert.equal(sentChild.kind,'recipient');assert.equal(sentChild.text,'Боря');
+// S-004, S-008: подпись адреса - имя после trim, иначе адрес; полный вид для
+// строки шапки и подсказки - "Имя (email)".
+test('S-004, S-008: подпись адреса и полный вид "Имя (email)"', () => {
+  const cases = [
+    [addr('Аня', 'a@example.com'), 'Аня'],
+    [addr('', 'a@example.com'), 'a@example.com'],
+    [addr('   ', 'a@example.com'), 'a@example.com'],
+    [addr('', ''), ''],
+    [undefined, ''],
+  ];
+  cases.forEach(([value, expected]) => assert.equal(displayName(value), expected, JSON.stringify(value)));
+  // В строке шапки показывается тот же полный вид, что и в подсказке: иначе
+  // однофамильцев в свёрнутой строке не различить.
+  const model = addressLineModel([addr('', 'a@example.com'), addr('Аня', 'a@example.com'), addr('Аня', 'b@example.com')], true, 2);
+  assert.deepEqual(model.shown.map(item => item.text), ['a@example.com', 'Аня (a@example.com)', 'Аня (b@example.com)']);
+  assert.deepEqual(model.shown.map(item => item.title), ['a@example.com', 'Аня (a@example.com)', 'Аня (b@example.com)']);
+  assert.equal(addressLineModel([addr('Аня', '')], false, 2).shown[0].text, 'Аня');
 });
 
-// S-008: форматтер адресной строки шапки - подпись "Имя (email)" и такая же подсказка.
-test('S-008: текст и подсказка дают "Имя (email)", порядок сохранен, дубли не удалены',()=>{
-  const list=[addr('','a@example.com'),addr('Аня','a@example.com'),addr('Аня','b@example.com')];
-  const model=addressLineModel(list,true,2);
-  assert.deepEqual(model.shown.map(item=>item.text),['a@example.com','Аня (a@example.com)','Аня (b@example.com)']);
-  assert.deepEqual(model.shown.map(item=>item.title),['a@example.com','Аня (a@example.com)','Аня (b@example.com)']);
-});
-test('S-008: только email без имени, только имя без email',()=>{
-  assert.equal(addressLineModel([addr('','a@example.com')],false,2).shown[0].text,'a@example.com');
-  assert.equal(addressLineModel([addr('Аня','')],false,2).shown[0].text,'Аня');
-});
-test('displayName: подпись адреса, name после trim, иначе email, иначе пусто',()=>{
-  assert.equal(displayName(addr('Аня','a@example.com')),'Аня');
-  assert.equal(displayName(addr('','a@example.com')),'a@example.com');
-  assert.equal(displayName(addr('   ','a@example.com')),'a@example.com');
-  assert.equal(displayName(addr('','')),'');
-  assert.equal(displayName(undefined),'');
+// S-005: инициал берётся из той же подписи, что и текст строки.
+test('S-005: инициал - первая кодовая точка подписи, у пустой подписи "?"', () => {
+  assert.equal(rowPresentation({folder_id: 1, from: addr('😀 Аня', 'a@example.com')}, rolesOf({1: 'inbox'})).initial, '😀');
+  assert.equal(rowPresentation({folder_id: 1, from: addr('', '')}, rolesOf({1: 'inbox'})).initial, '?');
+  assert.equal(rowPresentation({folder_id: 1, from: addr('аня', 'a@example.com')}, rolesOf({1: 'inbox'})).initial, 'А');
 });
 
-// S-009: модель свертки строк "Кому"/"Копия" - сколько показано, сколько скрыто.
-test('S-009: 1 и 2 адреса - показаны все, счетчика нет',()=>{
-  assert.equal(addressLineModel([addr('Аня','a@example.com')],false,2).hidden,0);
-  assert.equal(addressLineModel([addr('Аня','a@example.com'),addr('Боря','b@example.com')],false,2).hidden,0);
+// S-009: сколько адресов показано и сколько скрыто при свёртке.
+test('S-009: свёртка адресной строки по числу адресов и границе maxShown', () => {
+  [[1, 1, 0], [2, 2, 0], [3, 2, 1], [7, 2, 5]].forEach(([count, shown, hidden]) => {
+    const model = addressLineModel(many(count), false, 2);
+    assert.equal(model.shown.length, shown, `${count} адресов - показано`);
+    assert.equal(model.hidden, hidden, `${count} адресов - скрыто`);
+  });
+  // Граница свёртки - это параметр, а не жёсткая двойка внутри модели.
+  const wider = addressLineModel(many(5), false, 3);
+  assert.equal(wider.shown.length, 3);
+  assert.equal(wider.hidden, 2);
+  // Раскрытое состояние показывает все адреса и счётчика не даёт.
+  const expanded = addressLineModel(many(7), true, 2);
+  assert.equal(expanded.shown.length, 7);
+  assert.equal(expanded.hidden, 0);
 });
-test('S-009: 3 и 7 адресов в свернутом виде - первые два и счетчик скрытых',()=>{
-  const many=n=>Array.from({length:n},(_,i)=>addr(`Имя${i}`,`a${i}@example.com`));
-  const three=addressLineModel(many(3),false,2);
-  assert.equal(three.shown.length,2);assert.equal(three.hidden,1);
-  const seven=addressLineModel(many(7),false,2);
-  assert.equal(seven.shown.length,2);assert.equal(seven.hidden,5);
-});
-test('S-009: maxShown задает границу свертки, а не жесткая двойка',()=>{
-  const many=Array.from({length:5},(_,i)=>addr(`Имя${i}`,`a${i}@example.com`));
-  const model=addressLineModel(many,false,3);
-  assert.equal(model.shown.length,3);assert.equal(model.hidden,2);
-});
-test('S-009: раскрытое состояние показывает все адреса без счетчика',()=>{
-  const many=Array.from({length:7},(_,i)=>addr(`Имя${i}`,`a${i}@example.com`));
-  const model=addressLineModel(many,true,2);
-  assert.equal(model.shown.length,7);assert.equal(model.hidden,0);
-});
-test('S-009: адрес с именем из пробелов показывается по email в модели свертки',()=>{
-  const model=addressLineModel([addr('   ','a@example.com')],false,2);
-  assert.equal(model.shown[0].text,'a@example.com');
-});
-test('S-009: пустой вход дает null',()=>{
-  assert.equal(addressLineModel([],false,2),null);
-  assert.equal(addressLineModel(undefined,false,2),null);
-  assert.equal(addressLineModel([addr('',''),addr('  ','')],false,2),null);
+
+test('S-009: показывать нечего - строки нет вовсе', () => {
+  assert.equal(addressLineModel([], false, 2), null);
+  assert.equal(addressLineModel(undefined, false, 2), null);
+  assert.equal(addressLineModel([addr('', ''), addr('  ', '')], false, 2), null);
 });
 
 // --- Подпись ящика письма (message-mailbox-owner.md) ---
-const {mailboxLabel,listMailboxLabel}=require('../../ui/modules/mail-addresses.js');
-const accountsOf=(...emails)=>emails.map((email,index)=>({id:index+1,email}));
 
-// S-002: один ящик - подписи нет, путать нечего.
-test('S-002: при одном подключённом ящике подписи нет',()=>{
-  assert.equal(mailboxLabel(1,accountsOf('one@example.com'),'ящик удалён'),null);
-  assert.equal(mailboxLabel(1,[],'ящик удалён'),null);
-  assert.equal(mailboxLabel(1,null,'ящик удалён'),null);
+test('S-001, S-002, S-006: подпись ящика есть только при нескольких ящиках', () => {
+  const accounts = accountsOf('one@example.com', 'two@example.com');
+  assert.equal(mailboxLabel(1, accounts, 'ящик удалён'), 'one@example.com');
+  assert.equal(mailboxLabel(2, accounts, 'ящик удалён'), 'two@example.com');
+  // Один ящик - путать нечего, подписи нет.
+  assert.equal(mailboxLabel(1, accountsOf('one@example.com'), 'ящик удалён'), null);
+  assert.equal(mailboxLabel(1, [], 'ящик удалён'), null);
+  assert.equal(mailboxLabel(1, null, 'ящик удалён'), null);
+  // Аккаунта письма больше нет либо адрес пуст - подпись удалённого ящика.
+  assert.equal(mailboxLabel(99, accounts, 'ящик удалён'), 'ящик удалён');
+  assert.equal(mailboxLabel(1, [{id: 1, email: '   '}, {id: 2, email: 'two@example.com'}], 'ящик удалён'), 'ящик удалён');
 });
 
-// S-001: два ящика - подпись равна адресу ящика письма.
-test('S-001: при двух ящиках подпись равна адресу ящика письма',()=>{
-  const accounts=accountsOf('one@example.com','two@example.com');
-  assert.equal(mailboxLabel(1,accounts,'ящик удалён'),'one@example.com');
-  assert.equal(mailboxLabel(2,accounts,'ящик удалён'),'two@example.com');
+test('S-004, S-005: в папке одного ящика подпись ящика в списке не нужна', () => {
+  const accounts = accountsOf('one@example.com', 'two@example.com');
+  assert.equal(listMailboxLabel(1, accounts, true, 'ящик удалён'), 'one@example.com');
+  assert.equal(listMailboxLabel(1, accounts, false, 'ящик удалён'), null);
+  assert.equal(listMailboxLabel(1, accountsOf('one@example.com'), true, 'ящик удалён'), null);
 });
 
-// S-006: аккаунта письма больше нет - показываем подпись удалённого ящика.
-test('S-006: неизвестный или пустой аккаунт даёт подпись удалённого ящика',()=>{
-  const accounts=accountsOf('one@example.com','two@example.com');
-  assert.equal(mailboxLabel(99,accounts,'ящик удалён'),'ящик удалён');
-  assert.equal(mailboxLabel(1,[{id:1,email:'   '},{id:2,email:'two@example.com'}],'ящик удалён'),'ящик удалён');
+// --- Настоящий путь: строка списка писем ---
+
+const FOLDERS = [
+  {id: 1, role: 'sent', display_name: 'Отправленные', account_id: 1},
+  {id: 2, role: 'inbox', display_name: 'Входящие', account_id: 1},
+];
+const ACCOUNTS = [{id: 1, email: 'one@example.test'}, {id: 2, email: 'two@example.test'}];
+
+function listApp(options = {}) {
+  return startApp({accounts: options.accounts || ACCOUNTS, folders: FOLDERS, currentFolderId: options.currentFolderId ?? null});
+}
+
+const message = over => ({
+  id: 10, account_id: 1, folder_id: 1, subject: 'Тема', preview: 'Превью',
+  from: addr('Я', 'me@example.test'), to: [], cc: [], flags: {seen: true}, labels: [], ...over,
 });
 
-// S-004, S-005: подпись в списке только в объединённом представлении.
-test('S-004, S-005: подпись строки списка зависит от представления',()=>{
-  const accounts=accountsOf('one@example.com','two@example.com');
-  assert.equal(listMailboxLabel(1,accounts,true,'ящик удалён'),'one@example.com');
-  assert.equal(listMailboxLabel(1,accounts,false,'ящик удалён'),null);
-  assert.equal(listMailboxLabel(1,accountsOf('one@example.com'),true,'ящик удалён'),null);
+// Строка списка собирается кодом mail.js: подпись, счётчик остальных
+// получателей, кружок с инициалом и подпись ящика - разные узлы, и пропажа
+// любого из них модели не видна.
+test('S-002, S-005: строка списка показывает первого получателя, счётчик остальных и инициал', () => {
+  const app = listApp();
+  [[1, null, 'Имя0', 'И'], [2, '+1', 'Имя0', 'И'], [3, '+2', 'Имя0', 'И'], [5, '+4', 'Имя0', 'И']].forEach(([count, extra, text, initial]) => {
+    const row = app.sandbox.createMessageRow(message({to: many(count)}), 0);
+    assert.equal(row.querySelector('.from').textContent, text, `${count} получателей - подпись`);
+    assert.equal(row.querySelector('.from-extra')?.textContent ?? null, extra, `${count} получателей - счётчик`);
+    assert.equal(row.querySelector('.ava').textContent, initial, `${count} получателей - инициал`);
+  });
+});
+
+test('S-003: письмо без получателей показывает "Без получателя", а не отправителя', () => {
+  const app = listApp();
+  // from заполнен: откат к отправителю снова показывал бы в Отправленных себя.
+  const row = app.sandbox.createMessageRow(message({from: addr('Аня', 'anna@example.test'), to: [], cc: []}), 0);
+  assert.equal(row.querySelector('.from').textContent, 'Без получателя');
+  assert.equal(row.querySelector('.ava').textContent, '?');
+  assert.equal(row.querySelector('.from-extra'), null, 'счётчика остальных у заглушки нет');
+});
+
+test('S-004: строка входящего письма показывает отправителя', () => {
+  const app = listApp();
+  const row = app.sandbox.createMessageRow(message({folder_id: 2, from: addr('Аня', 'anna@example.test'), to: [addr('Я', 'me@example.test')]}), 0);
+  assert.equal(row.querySelector('.from').textContent, 'Аня');
+  assert.equal(row.querySelector('.ava').textContent, 'А');
+});
+
+test('S-004, S-005: подпись ящика в строке есть только в объединённом списке', () => {
+  const unified = listApp().sandbox.createMessageRow(message({to: [addr('Аня', 'a@example.test')]}), 0);
+  const box = unified.querySelector('.mbox');
+  assert.ok(box, 'в объединённом списке у строки есть подпись ящика');
+  assert.equal(box.textContent, 'one@example.test');
+  assert.equal(box.title, 'one@example.test', 'подпись целиком доступна подсказкой');
+  // В папке одного ящика все письма одного ящика, и подпись была бы шумом.
+  const inFolder = listApp({currentFolderId: 1}).sandbox.createMessageRow(message({to: [addr('Аня', 'a@example.test')]}), 0);
+  assert.equal(inFolder.querySelector('.mbox'), null);
+  // Один подключённый ящик - подписи нет и в объединённом списке.
+  const single = listApp({accounts: [{id: 1, email: 'one@example.test'}]}).sandbox.createMessageRow(message({to: [addr('Аня', 'a@example.test')]}), 0);
+  assert.equal(single.querySelector('.mbox'), null);
+});
+
+// --- Настоящий путь: строки "Кому" и "Копия" шапки письма ---
+
+// Раскрытие живёт в замыкании render(expanded) внутри mail.js: модель в обоих
+// состояниях одна и та же, и проверка одной модели не видит, что кнопка "+N"
+// перестала раскрывать строку.
+test('S-008, S-009: кнопка "+N" раскрывает строку шапки, "Свернуть" возвращает её', () => {
+  const app = listApp();
+  const line = app.sandbox.buildAddressLine('mail-toline', 'Кому: ', many(5));
+  assert.equal(line.querySelector('.mail-address-label').textContent, 'Кому: ');
+  assert.deepEqual(
+    line.querySelectorAll('.mail-address-item').map(item => item.textContent),
+    ['Имя0 (a0@example.com)', 'Имя1 (a1@example.com)'],
+  );
+  const more = line.querySelector('.mail-address-toggle');
+  assert.equal(more.textContent, '+3');
+  more.onclick();
+  assert.equal(line.querySelectorAll('.mail-address-item').length, 5, 'раскрытая строка показывает всех');
+  assert.ok(line.classes.has('expanded'));
+  const less = line.querySelector('.mail-address-toggle');
+  assert.equal(less.textContent, 'Свернуть');
+  less.onclick();
+  assert.equal(line.querySelectorAll('.mail-address-item').length, 2, 'свёрнутая строка снова показывает двоих');
+  assert.equal(line.querySelector('.mail-address-toggle').textContent, '+3');
+});
+
+test('S-008: у каждого адреса строки шапки есть подсказка с полным видом', () => {
+  const app = listApp();
+  const line = app.sandbox.buildAddressLine('mail-ccline', 'Копия: ', [addr('Аня', 'a@example.com'), addr('', 'b@example.com')]);
+  const items = line.querySelectorAll('.mail-address-item');
+  assert.deepEqual(items.map(item => item.title), ['Аня (a@example.com)', 'b@example.com']);
+  // Двух адресов хватает, чтобы показать их без свёртки: кнопки нет.
+  assert.equal(line.querySelector('.mail-address-toggle'), null);
+});
+
+test('S-008: показывать нечего - строки шапки нет вовсе, отступ не остаётся', () => {
+  const app = listApp();
+  assert.equal(app.sandbox.buildAddressLine('mail-ccline', 'Копия: ', []), null);
+  assert.equal(app.sandbox.buildAddressLine('mail-ccline', 'Копия: ', [addr('  ', ' ')]), null);
 });

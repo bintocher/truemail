@@ -3,9 +3,13 @@
 //! шифруются на уровне приложения.
 
 mod blobs;
+#[cfg(test)]
+mod concurrency_scenarios;
 pub mod encoded_words;
 #[cfg(test)]
 mod flag_due_dates_scenarios;
+#[cfg(test)]
+mod folder_counts_scenarios;
 pub mod ignored_conversations;
 #[cfg(test)]
 mod limit_scenarios;
@@ -16,7 +20,11 @@ pub mod out_of_office;
 mod out_of_office_scenarios;
 pub mod outbox_send;
 #[cfg(test)]
+mod paging_scenarios;
+#[cfg(test)]
 mod pinned_messages_scenarios;
+#[cfg(test)]
+mod queue_lifecycle_scenarios;
 #[cfg(test)]
 mod quick_steps_scenarios;
 pub mod recipient_history;
@@ -24,9 +32,13 @@ pub mod recipient_history;
 mod recipient_history_scenarios;
 pub mod repo;
 #[cfg(test)]
+mod search_lifecycle_scenarios;
+#[cfg(test)]
 mod send_scenarios;
 pub mod sender_policies;
 pub mod sender_sweep;
+#[cfg(test)]
+mod snooze_return_scenarios;
 #[cfg(test)]
 mod stage_scenarios;
 mod stages;
@@ -752,8 +764,8 @@ mod schema_version_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::repo::test_storage::{open_test_db, open_test_db_upto};
     use rand::Rng;
-    use sha2::Digest as _;
 
     fn random_key() -> [u8; 32] {
         let mut key = [0_u8; 32];
@@ -761,59 +773,137 @@ mod tests {
         key
     }
 
-    #[test]
-    fn migration_17_checksum_is_stable() {
-        let checksum =
-            sha2::Sha384::digest(include_bytes!("../../migrations/0017_mail_sync_tokens.sql"));
-        let actual = checksum
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(
-            actual,
-            "5fbb38197fef7288e42c44df0ccd6869e215ef42ae498c3e81b3feb6565da7c33afc70c68e865dc2b9c3937ea73c8067",
-            "applied migrations are immutable"
+    /// Уже применённая миграция неизменна. Если её текст правят задним числом,
+    /// контрольная сумма расходится с записанной в базе, и обновление обязано
+    /// встать: применить новый текст поверх старой базы уже нельзя, а молча
+    /// согласиться означало бы схему, которой нет ни в одной версии программы.
+    /// Свойство проверяется на каждой применённой миграции: неизменны все, а не
+    /// одна выбранная.
+    #[tokio::test]
+    async fn applied_migrations_cannot_be_rewritten_afterwards() {
+        let db = open_test_db("migrations-immutable").await;
+        let applied: Vec<(i64, Vec<u8>)> =
+            sqlx::query_as("SELECT version, checksum FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&db.pool)
+                .await
+                .expect("прочитать применённые миграции");
+        assert!(
+            applied.len() > 1,
+            "база должна нести весь набор миграций, а не одну"
         );
+
+        for (version, checksum) in &applied {
+            // Правка текста миграции видна базе только расхождением контрольной
+            // суммы - другого следа у неё нет, поэтому меняем сумму.
+            let mut rewritten = checksum.clone();
+            rewritten.push(0);
+            sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=?")
+                .bind(&rewritten)
+                .bind(version)
+                .execute(&db.write_pool)
+                .await
+                .expect("подменить контрольную сумму");
+            let failure = db
+                .migrate()
+                .await
+                .expect_err(&format!(
+                    "миграция {version} изменена задним числом, обновление должно встать"
+                ))
+                .to_string();
+            assert!(
+                failure.contains("миграции"),
+                "{version}: обновление должно жаловаться на миграции: {failure}"
+            );
+            // Изменённая миграция - подмена набора, а не более новая версия
+            // программы: предлагать обновление здесь нельзя, оно не помогает.
+            assert!(
+                !failure.contains("обновите truemail"),
+                "{version}: подмена миграции выдана за устаревшую программу: {failure}"
+            );
+            sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=?")
+                .bind(checksum)
+                .bind(version)
+                .execute(&db.write_pool)
+                .await
+                .expect("вернуть контрольную сумму");
+        }
+
+        // С неизменным набором то же обновление проходит: останавливает именно
+        // расхождение, а не сам повторный запуск на уже обновлённой базе.
+        db.migrate().await.expect("обновление неизменной базы");
+        db.close().await;
     }
 
-    /// Миграция 0034 переводит даты писем в UTC средствами SQLite. Проверяем,
-    /// что strftime действительно понимает смещение вида "+03:00" и не отдаёт
-    /// NULL - иначе миграция затёрла бы даты.
+    /// Миграция 0034 приводит даты писем к UTC. Пока рядом лежали "+03:00" и
+    /// "+00:00", страницы списка сравнивали дату строкой: часть писем не
+    /// попадала ни в одну страницу, часть приходила дважды. Проверяем саму
+    /// миграцию на непустой базе прежней схемы, тем же мигратором, который
+    /// работает при запуске программы.
     #[tokio::test]
-    async fn sqlite_rewrites_offset_dates_to_utc() {
-        let root = std::env::temp_dir().join(format!("truemail-dates-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).expect("create temp data dir");
-        let crypto = Arc::new(StorageCrypto::from_key(random_key()));
-        let database_key = DatabaseKey::from_key(random_key());
-        let db = Db::open_with_database_key(&root, crypto, &database_key)
+    async fn migration_0034_rewrites_message_dates_to_utc() {
+        // Последняя миграция до перевода дат в UTC.
+        const BEFORE_DATE_UTC: i64 = 33;
+        let db = open_test_db_upto("migrate-dates", BEFORE_DATE_UTC).await;
+        let (account,): (i64,) = sqlx::query_as(
+            "INSERT INTO accounts(uuid, email, provider, backend_kind, auth_kind)
+             VALUES(?, 'me@example.test', 'generic', 'imap', 'password') RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать ящик");
+        let (folder,): (i64,) = sqlx::query_as(
+            "INSERT INTO folders(account_id, remote_path, display_name, role)
+             VALUES(?, 'INBOX', 'Входящие', 'inbox') RETURNING id",
+        )
+        .bind(account)
+        .fetch_one(&db.write_pool)
+        .await
+        .expect("создать папку");
+        // Даты прежней базы: зона отправителя, уже готовый UTC, суффикс Z,
+        // неразобранный мусор и пустое место.
+        for (uid, date) in [
+            (1_i64, Some("2026-07-20T10:00:00+03:00")),
+            (2, Some("2026-07-20T07:00:00+00:00")),
+            (3, Some("2026-07-20T07:00:00Z")),
+            (4, Some("не дата")),
+            (5, None),
+        ] {
+            sqlx::query(
+                "INSERT INTO messages(account_id, folder_id, uid, subject, preview, date)
+                 VALUES(?, ?, ?, 'письмо', '', ?)",
+            )
+            .bind(account)
+            .bind(folder)
+            .bind(uid)
+            .bind(date)
+            .execute(&db.write_pool)
             .await
-            .expect("open database");
-        db.migrate().await.expect("migrate database");
+            .expect("письмо прежней базы");
+        }
 
-        let (converted,): (Option<String>,) =
-            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
-                .bind("2026-07-20T10:00:00+03:00")
-                .fetch_one(&db.pool)
-                .await
-                .expect("convert offset date");
-        assert_eq!(converted.as_deref(), Some("2026-07-20T07:00:00+00:00"));
+        db.migrate().await.expect("обновление базы миграциями");
 
-        let (already_utc,): (Option<String>,) =
-            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
-                .bind("2026-07-20T07:00:00+00:00")
-                .fetch_one(&db.pool)
+        let dates: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT uid, date FROM messages ORDER BY uid")
+                .fetch_all(&db.pool)
                 .await
-                .expect("convert utc date");
-        assert_eq!(already_utc.as_deref(), Some("2026-07-20T07:00:00+00:00"));
-
-        // Мусор миграция пропускает: условие strftime(...) IS NOT NULL.
-        let (broken,): (Option<String>,) =
-            sqlx::query_as("SELECT strftime('%Y-%m-%dT%H:%M:%S+00:00', ?)")
-                .bind("не дата")
-                .fetch_one(&db.pool)
-                .await
-                .expect("convert broken date");
-        assert_eq!(broken, None);
+                .expect("прочитать даты после обновления");
+        assert_eq!(
+            dates,
+            vec![
+                // Смещение снято, момент времени сохранён.
+                (1, Some("2026-07-20T07:00:00+00:00".to_owned())),
+                // Уже правильное значение переписывать не за чем.
+                (2, Some("2026-07-20T07:00:00+00:00".to_owned())),
+                (3, Some("2026-07-20T07:00:00+00:00".to_owned())),
+                // Неразобранную дату миграция не трогает: затёртую уже не
+                // восстановить, а письмо без даты выпало бы из списка.
+                (4, Some("не дата".to_owned())),
+                (5, None),
+            ]
+        );
+        db.close().await;
     }
 
     #[tokio::test]
@@ -1624,6 +1714,7 @@ mod tests {
             .expect("delete omitted custom smart folder");
 
         let api_token = "tm_integration_test_token";
+        use sha2::Digest;
         let api_hash = sha2::Sha256::digest(api_token.as_bytes())
             .iter()
             .map(|byte| format!("{byte:02x}"))
