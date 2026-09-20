@@ -12,7 +12,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const {FakeNode, FakeEvent, parseHtml} = require('./fake-dom.js');
+const {FakeNode, FakeText, FakeRange, FakeEvent, parseHtml} = require('./fake-dom.js');
 
 const uiDir = path.join(__dirname, '..', '..', 'ui');
 
@@ -86,24 +86,25 @@ function createDocument(html) {
   documentStub.nodeType = 9;
   documentStub.ownerDocument = documentStub;
   const tree = parseHtml(html, documentStub);
-  const htmlNode = tree.querySelector('html') || new FakeNode('html', documentStub);
+  const htmlNode = tree.querySelector('html') || new FakeNode('html');
   tree.children.slice().forEach(child => documentStub.appendChild(child));
   documentStub.documentElement = htmlNode;
   htmlNode.lang = 'ru';
-  documentStub.body = documentStub.querySelector('body') || documentStub.appendChild(new FakeNode('body', documentStub));
-  documentStub.head = documentStub.querySelector('head') || new FakeNode('head', documentStub);
+  documentStub.body = documentStub.querySelector('body') || documentStub.appendChild(new FakeNode('body'));
+  documentStub.head = documentStub.querySelector('head') || new FakeNode('head');
   documentStub.activeElement = null;
   documentStub.hidden = false;
   documentStub.visibilityState = 'visible';
   documentStub.getElementById = id => documentStub.descendants().find(node => node.attributes.id === id) || null;
-  documentStub.createElement = tag => new FakeNode(tag, documentStub);
-  documentStub.createDocumentFragment = () => new FakeNode('#fragment', documentStub);
-  documentStub.createTextNode = value => {
-    const node = new FakeNode('span', documentStub);
-    node.text = String(value);
-    return node;
+  documentStub.createElement = tag => new FakeNode(tag);
+  documentStub.createDocumentFragment = () => {
+    const fragment = new FakeNode('#fragment');
+    fragment.nodeType = 11;
+    fragment.isFragment = true;
+    return fragment;
   };
-  documentStub.createRange = () => ({setStart() {}, setEnd() {}, collapse() {}, selectNodeContents() {}});
+  documentStub.createTextNode = value => new FakeText(value);
+  documentStub.createRange = () => new FakeRange();
   documentStub.execCommand = () => true;
   documentStub.elementFromPoint = () => null;
   return documentStub;
@@ -231,7 +232,7 @@ function createUiWindow(options = {}) {
   context.window.addEventListener = (type, handler) => documentStub.addEventListener(`window:${type}`, handler);
   context.window.removeEventListener = (type, handler) => documentStub.removeEventListener(`window:${type}`, handler);
   context.window.dispatchWindowEvent = (type, event = {}) => {
-    (documentStub.listeners.get(`window:${type}`) || []).forEach(handler => handler(new FakeEvent(type, event)));
+    (documentStub.listeners[`window:${type}`] || []).forEach(handler => handler(new FakeEvent(type, event)));
   };
   context.window.tm = bridge;
   context.window.__TAURI__ = {

@@ -1,115 +1,169 @@
-// Мини-дерево страницы для проверок интерфейса. Нужен, чтобы модули окна
-// выполнялись целиком на настоящей разметке из index.html, а не проверялись
-// как чистые функции в отрыве от окна: почти все дефекты интерфейса жили
-// именно в связке "разметка - обработчик - мост", и чистые проверки их не
-// видели. Узлы, селекторы и всплытие событий повторяют поведение браузера
-// настолько, насколько это нужно проверяемым путям.
-// Разметка разбирается из настоящего index.html, поэтому переименование класса
-// или признака data в окне обязано ронять проверки, которые по ним ищут.
-
+// Мини-DOM для проверок интерфейса.
+// Модули интерфейса подключаются в index.html обычными тегами script и рисуют
+// разметку настоящими вызовами document.*; проверка, читающая только чистые
+// функции, не замечает, что обработчик или сборка узла сломались. Здесь
+// подделаны браузерные примитивы, а сами модули выполняются настоящие - на
+// разметке из apps/desktop/ui/index.html.
+// Поддержано ровно то, чем пользуются модули: поиск по селектору, дерево
+// узлов, обработчики, выделение с вставкой разметки. Остального намеренно нет -
+// заглушка, которую никто не вызывает, только скрывала бы отсутствие поведения.
 'use strict';
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
-const VOID_TAGS = new Set(['input', 'br', 'img', 'hr', 'meta', 'link', 'source', 'area', 'base', 'col']);
+const uiRoot = path.join(__dirname, '..', '..', 'ui');
+const readUi = name => fs.readFileSync(path.join(uiRoot, name), 'utf8');
+const locales = () => ({
+  ru: JSON.parse(readUi('locales/ru.json')),
+  en: JSON.parse(readUi('locales/en.json')),
+});
+
+// Теги без закрывающей части: их содержимое не в дереве, а в атрибутах.
+const VOID_TAGS = new Set(['input', 'br', 'img', 'hr', 'meta', 'link', 'source', 'col']);
 const camel = name => name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 
-// Разбор одного составного селектора: тег, классы, идентификатор, признаки
-// data и :not(). Псевдоклассы показа (:hover и прочие) в проверках не нужны и
-// считаются несовпадением - лучше промолчать, чем совпасть неверно.
-function parseCompound(text) {
-  const part = {tag: null, classes: [], id: null, attributes: [], not: [], scope: false};
-  const pattern = /([.#]?[\w-]+|\[[^\]]+\]|:not\(([^)]+)\)|:scope|\*|::?[\w-]+(?:\([^)]*\))?)/g;
+// Узел текста. Отдельный вид узла нужен потому, что порядок текста и
+// элементов внутри родителя значим: вставка картинки по курсору обязана
+// разрезать текст, а не дописать картинку в конец.
+class FakeText {
+  constructor(data) {
+    this.nodeType = 3;
+    this.data = String(data ?? '');
+    this.parent = null;
+  }
+
+  get textContent() {
+    return this.data;
+  }
+
+  set textContent(value) {
+    this.data = String(value ?? '');
+  }
+
+  get nodeValue() {
+    return this.data;
+  }
+
+  remove() {
+    if (!this.parent) return;
+    this.parent.childNodes = this.parent.childNodes.filter(node => node !== this);
+    this.parent = null;
+  }
+
+  cloneNode() {
+    return new FakeText(this.data);
+  }
+
+  descendants() {
+    return [];
+  }
+}
+
+// Разбор одной части селектора: тег, классы, #id и [attr] либо [attr="value"].
+function parseSimple(part) {
+  const spec = {tag: null, classes: [], id: null, attrs: [], not: [], pseudo: []};
+  const attrPattern = /\[([\w-]+)(?:([~^$*|]?=)"?([^\]"]*)"?)?\]/g;
   let match;
-  while ((match = pattern.exec(text)) !== null) {
-    const token = match[1];
-    if (token === '*') continue;
-    if (token === ':scope') { part.scope = true; continue; }
-    if (token.startsWith(':not(')) { part.not.push(parseCompound(match[2])); continue; }
-    if (token.startsWith('::') || token.startsWith(':')) { part.unsupported = true; continue; }
-    if (token.startsWith('.')) { part.classes.push(token.slice(1)); continue; }
-    if (token.startsWith('#')) { part.id = token.slice(1); continue; }
-    if (token.startsWith('[')) {
-      const attribute = token.slice(1, -1).match(/^([\w-]+)(?:([~^$*|]?=)"?([^"\]]*)"?)?$/);
-      if (attribute) part.attributes.push({name: attribute[1], operator: attribute[2] || null, value: attribute[3] ?? null});
-      continue;
-    }
-    part.tag = token.toLowerCase();
-  }
-  return part;
+  let rest = part;
+  // Отрицание в селекторе: интерфейс отличает им семейства меню
+  // (.att-menu:not(.flag-menu)), и без него реестр меню находит чужое.
+  const notPattern = /:not\(([^)]*)\)/g;
+  let notMatch;
+  while ((notMatch = notPattern.exec(part)) !== null) spec.not.push(notMatch[1]);
+  rest = rest.replace(notPattern, '');
+  part = rest;
+  while ((match = attrPattern.exec(part)) !== null) spec.attrs.push({name: match[1], op: match[2] || null, value: match[3] ?? null});
+  rest = rest.replace(attrPattern, '');
+  const head = rest.match(/^[\w-]+/);
+  if (head) spec.tag = head[0].toLowerCase();
+  rest = rest.slice(head ? head[0].length : 0);
+  const idMatch = rest.match(/#([\w-]+)/);
+  if (idMatch) spec.id = idMatch[1];
+  rest = rest.replace(/#[\w-]+/g, '');
+  // Состояния узла в селекторе: интерфейс ищет ими отмеченные переключатели
+  // настроек и последний элемент перечня. Незнакомое состояние оставляем
+  // несовпадением - лучше промолчать, чем совпасть неверно и дать проверке
+  // ложную зелёную.
+  const pseudoPattern = /::?([\w-]+)/g;
+  let pseudo;
+  while ((pseudo = pseudoPattern.exec(rest)) !== null) spec.pseudo.push(pseudo[1]);
+  rest = rest.replace(pseudoPattern, '');
+  spec.classes = rest.split('.').filter(Boolean);
+  return spec;
 }
 
-function parseSelector(selector) {
-  return String(selector).split(',').map(piece => {
-    const steps = [];
-    const tokens = piece.trim().split(/\s*(>)\s*|\s+/).filter(token => token !== undefined && token !== '');
-    let combinator = null;
-    tokens.forEach(token => {
-      if (token === '>') { combinator = 'child'; return; }
-      steps.push({compound: parseCompound(token), combinator});
-      combinator = 'descendant';
-    });
-    return steps;
+// Состояние узла, которое браузер проверяет псевдоклассом.
+function matchesState(node, name) {
+  const siblings = node.parent ? node.parent.children : [];
+  switch (name) {
+    case 'checked': return Boolean(node.checked);
+    case 'disabled': return Boolean(node.disabled);
+    case 'enabled': return !node.disabled;
+    case 'focus': return Boolean(node.focused);
+    case 'first-child': return siblings[0] === node;
+    case 'last-child': return siblings.at(-1) === node;
+    case 'only-child': return siblings.length === 1 && siblings[0] === node;
+    case 'empty': return node.childNodes.length === 0;
+    case 'root': return !node.parent;
+    default: return false;
+  }
+}
+
+function matchesSimple(node, spec) {
+  if (spec.tag && spec.tag !== '*' && node.tag !== spec.tag) return false;
+  if (spec.not && spec.not.some(piece => matchesSimple(node, parseSimple(piece)))) return false;
+  if (spec.pseudo && !spec.pseudo.every(name => matchesState(node, name))) return false;
+  if (spec.id && node.attributes.id !== spec.id) return false;
+  if (!spec.classes.every(name => node.classes.has(name))) return false;
+  return spec.attrs.every(attr => {
+    const value = attr.name.startsWith('data-') ? node.dataset[camel(attr.name.slice(5))] : node.attributes[attr.name];
+    if (attr.value === null) return value !== undefined && value !== null;
+    return String(value ?? '') === attr.value;
   });
 }
 
-function attributeValue(node, name) {
-  if (name.startsWith('data-')) {
-    const key = camel(name.slice(5));
-    return node.dataset[key] === undefined ? null : node.dataset[key];
-  }
-  if (name === 'class') return node.className;
-  if (name === 'id') return node.attributes.id ?? null;
-  return node.attributes[name] === undefined ? null : node.attributes[name];
-}
-
-function matchesCompound(node, part, scopeNode) {
-  if (part.unsupported) return false;
-  if (part.scope && node !== scopeNode) return false;
-  if (part.tag && node.tag !== part.tag) return false;
-  if (part.id && node.attributes.id !== part.id) return false;
-  if (part.classes.some(name => !node.classes.has(name))) return false;
-  const attributesOk = part.attributes.every(attribute => {
-    const value = attributeValue(node, attribute.name);
-    if (value === null) return false;
-    if (attribute.operator === null) return true;
-    if (attribute.operator === '=') return value === attribute.value;
-    if (attribute.operator === '~=') return String(value).split(/\s+/).includes(attribute.value);
-    if (attribute.operator === '^=') return String(value).startsWith(attribute.value);
-    if (attribute.operator === '$=') return String(value).endsWith(attribute.value);
-    if (attribute.operator === '*=') return String(value).includes(attribute.value);
-    return false;
-  });
-  if (!attributesOk) return false;
-  return !part.not.some(inner => matchesCompound(node, inner, scopeNode));
-}
-
-function matchesSteps(node, steps, scopeNode) {
-  const last = steps[steps.length - 1];
-  if (!matchesCompound(node, last.compound, scopeNode)) return false;
-  let index = steps.length - 2;
-  let current = node;
-  let combinator = last.combinator;
-  while (index >= 0) {
-    const step = steps[index];
-    if (combinator === 'child') {
-      current = current.parentElement;
-      if (!current || !matchesCompound(current, step.compound, scopeNode)) return false;
-    } else {
-      let ancestor = current.parentElement;
-      while (ancestor && !matchesCompound(ancestor, step.compound, scopeNode)) ancestor = ancestor.parentElement;
+// Селектор: перечисление через запятую, внутри - цепочка предков через пробел
+// или через '>'. Этого набора хватает модулям интерфейса.
+function matchesSelector(node, selector, scope) {
+  return String(selector).split(',').map(part => part.trim()).filter(Boolean).some(part => {
+    const pieces = part.split(/\s+/).filter(Boolean);
+    let current = node;
+    for (let index = pieces.length - 1; index >= 0; index -= 1) {
+      const piece = pieces[index];
+      if (piece === '>') {
+        const previous = pieces[index - 1];
+        index -= 1;
+        if (previous === ':scope') {
+          if (current.parent !== scope) return false;
+          continue;
+        }
+        current = current.parent;
+        if (!current || !matchesSimple(current, parseSimple(previous))) return false;
+        continue;
+      }
+      if (piece === ':scope') {
+        if (current !== scope) return false;
+        continue;
+      }
+      if (index === pieces.length - 1) {
+        if (!matchesSimple(current, parseSimple(piece))) return false;
+        continue;
+      }
+      // Предок на любом уровне: поднимаемся, пока не найдём подходящий.
+      let ancestor = current.parent;
+      while (ancestor && !matchesSimple(ancestor, parseSimple(piece))) ancestor = ancestor.parent;
       if (!ancestor) return false;
       current = ancestor;
     }
-    combinator = step.combinator;
-    index -= 1;
-  }
-  return true;
+    return true;
+  });
 }
 
-function matches(node, selector, scopeNode = null) {
-  if (!node || node.nodeType !== 1) return false;
-  return parseSelector(selector).some(steps => steps.length && matchesSteps(node, steps, scopeNode));
-}
-
+// Событие как его видят модули интерфейса: они сами создают Event и
+// MouseEvent и читают поля кнопки и координат. Способы отмены держим в
+// прототипе, а не в самом объекте: всплытие складывает свой набор полей и
+// подменять его собственными способами события нельзя.
 class FakeEvent {
   constructor(type, init = {}) {
     Object.assign(this, {button: 0, bubbles: true, clientX: 0, clientY: 0}, init);
@@ -127,354 +181,802 @@ class FakeEvent {
 }
 
 class FakeNode {
-  constructor(tag, ownerDocument = null) {
+  constructor(tag) {
+    this.nodeType = 1;
     this.tag = String(tag || 'div').toLowerCase();
-    this.nodeType = this.tag === '#fragment' ? 11 : 1;
-    this.ownerDocument = ownerDocument;
-    this.children = [];
+    this.childNodes = [];
     this.classes = new Set();
-    // Значения признаков data всегда строки, как в браузере: код окна пишет
-    // туда и числа (номер письма), а ищет по строке в селекторе.
-    this.dataset = new Proxy({}, {set(target, key, value) { target[key] = String(value); return true; }});
+    this.dataset = {};
     this.attributes = {};
-    this.listeners = new Map();
-    this.text = '';
+    this.listeners = {};
     this.value = '';
-    this.parentElement = null;
-    this.hidden = false;
-    this.title = '';
-    this.tabIndex = -1;
-    this.draggable = false;
-    this.disabled = false;
     this.checked = false;
-    this.scrollTop = 0;
-    this.scrollHeight = 0;
-    this.clientHeight = 600;
-    this.offsetWidth = 200;
-    this.offsetHeight = 100;
+    this.disabled = false;
+    this.parent = null;
+    this.tabIndex = -1;
+    this.focused = false;
     this.style = createStyle();
+    this.options = [];
+    // Размеры и прокрутка: список писем рисует только видимое окно строк и
+    // считает его по высоте узла, а всплывающие меню по своей ширине решают,
+    // раскрыться влево или вправо. Без размеров расчёт даёт NaN и строк в
+    // списке не появляется вовсе.
+    this.scrollTop = 0;
+    this.scrollLeft = 0;
+    this.scrollHeight = 0;
+    this.scrollWidth = 0;
+    this.clientHeight = 600;
+    this.clientWidth = 800;
+    this.offsetTop = 0;
+    this.offsetLeft = 0;
+    this.offsetHeight = 100;
+    this.offsetWidth = 200;
   }
 
-  get parentNode() { return this.parentElement; }
-
-  get childNodes() { return this.children; }
-
-  get firstElementChild() { return this.children[0] || null; }
-
-  get lastElementChild() { return this.children[this.children.length - 1] || null; }
-
-  // Пункты списка выбора: окно перебирает select.options, проверяя, есть ли
-  // нужный ящик среди отправителей. Без этого свойства возврат письма в
-  // композер падает на выборе ящика и проверка не доходит до сути.
-  get options() { return this.children.filter(child => child.tag === 'option'); }
-
-  get nextElementSibling() {
-    const siblings = this.parentElement ? this.parentElement.children : [];
-    return siblings[siblings.indexOf(this) + 1] || null;
+  get tagName() {
+    return this.tag.toUpperCase();
   }
 
-  get previousElementSibling() {
-    const siblings = this.parentElement ? this.parentElement.children : [];
-    return siblings[siblings.indexOf(this) - 1] || null;
+  get children() {
+    return this.childNodes.filter(node => node.nodeType === 1);
+  }
+
+  get firstChild() {
+    return this.childNodes[0] || null;
+  }
+
+  get lastChild() {
+    return this.childNodes.at(-1) || null;
+  }
+
+  get firstElementChild() {
+    return this.children[0] || null;
+  }
+
+  get parentElement() {
+    return this.parent;
+  }
+
+  get parentNode() {
+    return this.parent;
+  }
+
+  get id() {
+    return this.attributes.id || '';
+  }
+
+  set id(value) {
+    this.attributes.id = String(value);
+  }
+
+  // Подсказка и подпись поля - свойства узла и признаки разметки
+  // одновременно: интерфейс пишет их то так, то так, а проверка читает одним
+  // способом.
+  get title() {
+    return this.attributes.title ?? '';
+  }
+
+  set title(value) {
+    this.attributes.title = String(value ?? '');
+  }
+
+  get placeholder() {
+    return this.attributes.placeholder ?? '';
+  }
+
+  set placeholder(value) {
+    this.attributes.placeholder = String(value ?? '');
+  }
+
+  get className() {
+    return [...this.classes].join(' ');
+  }
+
+  set className(value) {
+    this.classes = new Set(String(value).split(/\s+/).filter(Boolean));
   }
 
   get classList() {
+    const classes = this.classes;
     return {
-      add: (...names) => names.forEach(name => this.classes.add(name)),
-      remove: (...names) => names.forEach(name => this.classes.delete(name)),
-      contains: name => this.classes.has(name),
-      toggle: (name, on) => {
-        const wanted = on === undefined ? !this.classes.has(name) : Boolean(on);
-        if (wanted) this.classes.add(name); else this.classes.delete(name);
-        return wanted;
+      add: (...names) => names.forEach(name => classes.add(name)),
+      remove: (...names) => names.forEach(name => classes.delete(name)),
+      contains: name => classes.has(name),
+      toggle: (name, force) => {
+        const on = force === undefined ? !classes.has(name) : Boolean(force);
+        if (on) classes.add(name); else classes.delete(name);
+        return on;
       },
     };
   }
 
-  set className(value) { this.classes = new Set(String(value || '').split(/\s+/).filter(Boolean)); }
-
-  get className() { return [...this.classes].join(' '); }
-
-  // Идентификатор узла свойством, а не только атрибутом: переключение
-  // представлений (showView в shell.js) сравнивает именно node.id, и без этого
-  // свойства ни одно представление окна не становится активным.
-  set id(value) { this.attributes.id = String(value); }
-
-  get id() { return this.attributes.id ?? ''; }
+  get textContent() {
+    return this.childNodes.map(node => node.textContent).join('');
+  }
 
   set textContent(value) {
-    this.children.forEach(child => { child.parentElement = null; });
-    this.children = [];
-    this.text = value === null || value === undefined ? '' : String(value);
+    this.childNodes.forEach(node => {
+      node.parent = null;
+    });
+    this.childNodes = [];
+    const text = String(value ?? '');
+    if (text) this.appendChild(new FakeText(text));
   }
 
-  get textContent() {
-    return this.text + this.children.map(child => child.textContent).join('');
-  }
-
-  get innerText() { return this.textContent; }
-
-  set innerText(value) { this.textContent = value; }
-
-  set innerHTML(value) {
-    this.children.forEach(child => { child.parentElement = null; });
-    this.children = [];
-    this.text = '';
-    const parsed = parseHtml(String(value ?? ''), this.ownerDocument);
-    this.text = parsed.text;
-    // Перенос идёт по копии перечня: appendChild вынимает узел из прежнего
-    // родителя, и обход самого перечня пропускал бы каждый второй узел.
-    [...parsed.children].forEach(child => this.appendChild(child));
+  get innerText() {
+    return this.textContent;
   }
 
   get innerHTML() {
-    return this.text + this.children.map(child => child.outerHTML).join('');
+    return serialize(this);
   }
 
-  get outerHTML() {
-    const attributes = [];
-    if (this.classes.size) attributes.push(`class="${this.className}"`);
-    Object.keys(this.attributes).forEach(name => attributes.push(`${name}="${this.attributes[name]}"`));
-    Object.keys(this.dataset).forEach(key => attributes.push(`data-${key.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}="${this.dataset[key]}"`));
-    const head = `<${this.tag}${attributes.length ? ` ${attributes.join(' ')}` : ''}>`;
-    if (VOID_TAGS.has(this.tag)) return head;
-    return `${head}${this.innerHTML}</${this.tag}>`;
+  set innerHTML(html) {
+    this.childNodes.forEach(node => {
+      node.parent = null;
+    });
+    this.childNodes = [];
+    parseMarkup(String(html ?? '')).forEach(node => this.appendChild(node));
   }
 
   appendChild(node) {
-    if (!node) return node;
-    if (node.nodeType === 11) {
-      [...node.children].forEach(child => this.appendChild(child));
-      node.children = [];
+    if (node && (node.isFragment || node.nodeType === 11)) {
+      [...node.childNodes].forEach(child => this.appendChild(child));
       return node;
     }
-    if (node.parentElement) node.parentElement.removeChild(node);
-    node.parentElement = this;
-    node.ownerDocument = node.ownerDocument || this.ownerDocument;
-    this.children.push(node);
+    if (node.parent) node.remove();
+    node.parent = this;
+    this.childNodes.push(node);
+    if (this.tag === 'select' && node.tag === 'option') {
+      this.options.push(node);
+      if (!this.value) this.value = node.value;
+    }
     return node;
   }
 
-  append(...nodes) { nodes.forEach(node => this.appendChild(typeof node === 'string' ? textNode(node, this.ownerDocument) : node)); }
+  append(...nodes) {
+    nodes.forEach(node => this.appendChild(typeof node === 'string' ? new FakeText(node) : node));
+  }
 
   insertBefore(node, reference) {
     if (!reference) return this.appendChild(node);
-    const index = this.children.indexOf(reference);
-    if (index < 0) return this.appendChild(node);
-    if (node.parentElement) node.parentElement.removeChild(node);
-    node.parentElement = this;
-    this.children.splice(index, 0, node);
+    if (node && (node.isFragment || node.nodeType === 11)) {
+      [...node.childNodes].forEach(child => this.insertBefore(child, reference));
+      return node;
+    }
+    const index = this.childNodes.indexOf(reference);
+    if (index === -1) return this.appendChild(node);
+    if (node.parent) node.remove();
+    node.parent = this;
+    this.childNodes.splice(index, 0, node);
     return node;
   }
 
   before(...nodes) {
-    if (!this.parentElement) return;
-    nodes.forEach(node => this.parentElement.insertBefore(typeof node === 'string' ? textNode(node, this.ownerDocument) : node, this));
+    if (!this.parent) return;
+    nodes.forEach(node => this.parent.insertBefore(typeof node === 'string' ? new FakeText(node) : node, this));
   }
 
   after(...nodes) {
-    if (!this.parentElement) return;
-    const next = this.nextElementSibling;
-    nodes.forEach(node => this.parentElement.insertBefore(typeof node === 'string' ? textNode(node, this.ownerDocument) : node, next));
+    if (!this.parent) return;
+    const next = this.parent.childNodes[this.parent.childNodes.indexOf(this) + 1] || null;
+    nodes.forEach(node => this.parent.insertBefore(typeof node === 'string' ? new FakeText(node) : node, next));
   }
 
   replaceWith(node) {
-    if (!this.parentElement) return;
-    this.parentElement.insertBefore(node, this);
+    this.before(node);
     this.remove();
   }
 
-  removeChild(node) {
-    const index = this.children.indexOf(node);
-    if (index >= 0) this.children.splice(index, 1);
-    node.parentElement = null;
+  insertAdjacentElement(where, node) {
+    if (where === 'beforebegin') this.before(node);
+    else if (where === 'afterend') this.after(node);
+    else if (where === 'afterbegin') this.insertBefore(node, this.firstChild);
+    else this.appendChild(node);
     return node;
   }
 
   replaceChildren(...nodes) {
-    this.children.forEach(child => { child.parentElement = null; });
-    this.children = [];
-    this.text = '';
+    this.childNodes.forEach(node => {
+      node.parent = null;
+    });
+    this.childNodes = [];
     nodes.forEach(node => this.appendChild(node));
   }
 
-  remove() { if (this.parentElement) this.parentElement.removeChild(this); }
-
-  setAttribute(name, value) {
-    if (name.startsWith('data-')) { this.dataset[camel(name.slice(5))] = String(value); return; }
-    if (name === 'class') { this.className = value; return; }
-    this.attributes[name] = String(value);
+  removeChild(node) {
+    this.childNodes = this.childNodes.filter(child => child !== node);
+    node.parent = null;
+    return node;
   }
 
-  getAttribute(name) { return attributeValue(this, name); }
+  remove() {
+    if (!this.parent) return;
+    this.parent.childNodes = this.parent.childNodes.filter(node => node !== this);
+    this.parent = null;
+  }
 
-  hasAttribute(name) { return attributeValue(this, name) !== null; }
+  cloneNode(deep) {
+    const copy = new FakeNode(this.tag);
+    copy.classes = new Set(this.classes);
+    copy.dataset = {...this.dataset};
+    copy.attributes = {...this.attributes};
+    copy.value = this.value;
+    copy.checked = this.checked;
+    if (deep) this.childNodes.forEach(node => copy.appendChild(node.cloneNode(true)));
+    return copy;
+  }
+
+  setAttribute(name, value) {
+    if (name === 'class') {
+      this.className = value;
+      return;
+    }
+    if (name.startsWith('data-')) {
+      this.dataset[camel(name.slice(5))] = String(value);
+      return;
+    }
+    this.attributes[name] = String(value);
+    if (name === 'value') this.value = String(value);
+  }
+
+  getAttribute(name) {
+    if (name === 'class') return this.className;
+    if (name.startsWith('data-')) return this.dataset[camel(name.slice(5))] ?? null;
+    return this.attributes[name] ?? null;
+  }
 
   removeAttribute(name) {
-    if (name.startsWith('data-')) { delete this.dataset[camel(name.slice(5))]; return; }
-    if (name === 'class') { this.classes = new Set(); return; }
     delete this.attributes[name];
   }
 
+  hasAttribute(name) {
+    return this.attributes[name] !== undefined;
+  }
+
   toggleAttribute(name, force) {
-    const wanted = force === undefined ? !this.hasAttribute(name) : Boolean(force);
-    if (wanted) this.setAttribute(name, ''); else this.removeAttribute(name);
-    return wanted;
+    const on = force === undefined ? !this.hasAttribute(name) : Boolean(force);
+    if (on) this.attributes[name] = ''; else delete this.attributes[name];
+    return on;
   }
 
   addEventListener(type, handler) {
-    if (!this.listeners.has(type)) this.listeners.set(type, []);
-    this.listeners.get(type).push(handler);
+    (this.listeners[type] = this.listeners[type] || []).push(handler);
   }
 
   removeEventListener(type, handler) {
-    const list = this.listeners.get(type) || [];
-    const index = list.indexOf(handler);
-    if (index >= 0) list.splice(index, 1);
+    this.listeners[type] = (this.listeners[type] || []).filter(item => item !== handler);
   }
 
-  // Событие идёт от узла вверх по дереву, как в браузере: обработчики на
-  // документе (именно там живут контекстное меню, закрытие меню и конец
-  // удержания списка) обязаны получать его с настоящим target.
-  dispatchEvent(event) {
-    event.target = event.target || this;
+  // Событие идёт от узла вверх по дереву, как в браузере: обработчики
+  // композера и списка висят на окне, а не на самой строке.
+  dispatch(type, event = {}) {
+    const payload = {
+      type,
+      target: this,
+      preventDefault() {
+        payload.defaultPrevented = true;
+      },
+      stopPropagation() {
+        payload.propagationStopped = true;
+      },
+      defaultPrevented: false,
+      propagationStopped: false,
+      ...event,
+    };
     let node = this;
     while (node) {
-      event.currentTarget = node;
-      const inline = node[`on${event.type}`];
-      if (typeof inline === 'function') inline.call(node, event);
-      const handlers = [...(node.listeners.get(event.type) || [])];
-      for (const handler of handlers) {
-        handler.call(node, event);
-        if (event.immediateStopped) break;
-      }
-      if (event.propagationStopped || event.bubbles === false) break;
-      node = node.parentElement || (node.ownerDocument && node !== node.ownerDocument ? node.ownerDocument : null);
+      (node.listeners[type] || []).forEach(handler => handler.call(node, payload));
+      const inline = node[`on${type}`];
+      if (typeof inline === 'function') inline.call(node, payload);
+      if (payload.propagationStopped) break;
+      node = node.parent;
     }
-    return !event.defaultPrevented;
+    return payload;
   }
 
-  dispatch(type, init = {}) { return this.dispatchEvent(new FakeEvent(type, init)); }
+  dispatchEvent(event) {
+    const payload = this.dispatch(event.type, event);
+    return !payload.defaultPrevented;
+  }
 
-  click() { return this.dispatch('click'); }
+  focus() {
+    this.focused = true;
+    const owner = documentOf(this);
+    if (owner) owner.activeElement = this;
+  }
 
-  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; }
+  // Выделение набранного текста: интерфейс зовёт его, открывая поле поиска,
+  // чтобы следующий ввод заменил прежний запрос.
+  select() {
+    this.selectionStart = 0;
+    this.selectionEnd = String(this.value ?? '').length;
+  }
 
-  blur() { if (this.ownerDocument && this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = null; }
+  setSelectionRange(start, end) {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
 
-  // Выделение текста поля: окно зовёт его сразу за focus (кнопка фильтра
-  // списка), и без метода обработчик падал бы на полпути.
-  select() {}
+  blur() {
+    this.focused = false;
+    // Уход фокуса виден и документу: интерфейс решает по activeElement, кому
+    // достался Escape - полю ввода или окну целиком.
+    const owner = documentOf(this);
+    if (owner && owner.activeElement === this) owner.activeElement = null;
+  }
 
-  scrollIntoView() {}
-
-  getBoundingClientRect() { return {top: 0, left: 0, right: this.offsetWidth, bottom: this.offsetHeight, width: this.offsetWidth, height: this.offsetHeight}; }
-
-  descendants() { return this.children.flatMap(child => [child, ...child.descendants()]); }
-
-  querySelector(selector) { return this.descendants().find(node => matches(node, selector, this)) || null; }
-
-  querySelectorAll(selector) { return this.descendants().filter(node => matches(node, selector, this)); }
-
-  matches(selector) { return matches(this, selector, this); }
-
-  closest(selector) {
-    let node = this;
-    while (node && node.nodeType === 1) {
-      if (matches(node, selector, node)) return node;
-      node = node.parentElement;
-    }
-    return null;
+  click() {
+    this.dispatch('click', {});
   }
 
   contains(node) {
     let current = node;
     while (current) {
       if (current === this) return true;
-      current = current.parentElement;
+      current = current.parent;
     }
     return false;
   }
 
-  cloneNode(deep) {
-    const copy = new FakeNode(this.tag, this.ownerDocument);
-    copy.classes = new Set(this.classes);
-    copy.dataset = {...this.dataset};
-    copy.attributes = {...this.attributes};
-    copy.text = this.text;
-    copy.value = this.value;
-    if (deep) this.children.forEach(child => copy.appendChild(child.cloneNode(true)));
-    return copy;
+  closest(selector) {
+    let node = this;
+    while (node) {
+      if (node.nodeType === 1 && matchesSelector(node, selector, node)) return node;
+      node = node.parent;
+    }
+    return null;
   }
+
+  matches(selector) {
+    return matchesSelector(this, selector, this);
+  }
+
+  descendants() {
+    return this.childNodes.flatMap(node => (node.nodeType === 1 ? [node, ...node.descendants()] : []));
+  }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] || null;
+  }
+
+  querySelectorAll(selector) {
+    return this.descendants().filter(node => matchesSelector(node, selector, this));
+  }
+
+  getBoundingClientRect() {
+    return {
+      top: this.offsetTop,
+      left: this.offsetLeft,
+      right: this.offsetLeft + this.offsetWidth,
+      bottom: this.offsetTop + this.offsetHeight,
+      width: this.offsetWidth,
+      height: this.offsetHeight,
+      x: this.offsetLeft,
+      y: this.offsetTop,
+    };
+  }
+
+  scrollIntoView() {}
 }
 
 function createStyle() {
-  const style = {
-    properties: {},
-    setProperty(name, value) { style.properties[name] = String(value); },
-    getPropertyValue(name) { return style.properties[name] ?? ''; },
-    removeProperty(name) { delete style.properties[name]; },
+  const values = {};
+  return {
+    values,
+    setProperty(name, value) {
+      values[name] = value;
+    },
+    getPropertyValue(name) {
+      return values[name] ?? '';
+    },
+    removeProperty(name) {
+      delete values[name];
+    },
   };
-  return style;
 }
 
-function textNode(value, ownerDocument) {
-  const node = new FakeNode('span', ownerDocument);
-  node.text = String(value);
-  return node;
+function documentOf(node) {
+  let current = node;
+  while (current.parent) current = current.parent;
+  return current.ownerDocument || null;
 }
 
-// Разбор разметки. Комментарии и содержимое script/style пропускаются: в
-// проверках нужны только узлы, по которым ищут модули окна.
-function parseHtml(html, ownerDocument = null) {
-  const root = new FakeNode('#fragment', ownerDocument);
-  const stack = [root];
-  const source = String(html).replace(/<!--[\s\S]*?-->/g, '');
-  const pattern = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>])*?)(\/?)>/g;
-  let lastIndex = 0;
+function serialize(node) {
+  return node.childNodes.map(child => {
+    if (child.nodeType === 3) return child.data;
+    const attributes = [];
+    if (child.classes.size) attributes.push(` class="${child.className}"`);
+    Object.entries(child.attributes).forEach(([name, value]) => attributes.push(` ${name}="${value}"`));
+    Object.entries(child.dataset).forEach(([name, value]) => attributes.push(` data-${name}="${value}"`));
+    const open = `<${child.tag}${attributes.join('')}>`;
+    if (VOID_TAGS.has(child.tag)) return open;
+    return `${open}${serialize(child)}</${child.tag}>`;
+  }).join('');
+}
+
+// Разбор разметки в дерево узлов. Нужны теги, атрибуты, классы, признаки data
+// и текст между тегами: модули ищут свои узлы именно по ним, а текст строки
+// списка и шапки письма проверяется как раз по текстовым узлам.
+function parseMarkup(html) {
+  const root = [];
+  const stack = [];
+  const push = node => {
+    const parent = stack.at(-1);
+    if (parent) parent.appendChild(node);
+    else root.push(node);
+  };
+  const tagPattern = /<(\/?)([a-zA-Z][\w-]*)((?:"[^"]*"|'[^']*'|[^>])*?)(\/?)>/g;
+  let position = 0;
   let match;
-  const addText = value => {
-    if (!value) return;
-    const decoded = value.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
-    if (!decoded.trim()) return;
-    stack[stack.length - 1].text += decoded.trim();
-  };
-  while ((match = pattern.exec(source)) !== null) {
-    addText(source.slice(lastIndex, match.index));
-    lastIndex = pattern.lastIndex;
+  while ((match = tagPattern.exec(html)) !== null) {
+    if (match.index > position) {
+      const text = html.slice(position, match.index);
+      if (text) push(new FakeText(decodeEntities(text)));
+    }
+    position = tagPattern.lastIndex;
     const tag = match[2].toLowerCase();
     if (match[1] === '/') {
-      if (stack.length > 1) stack.pop();
+      const index = stack.map(node => node.tag).lastIndexOf(tag);
+      if (index !== -1) stack.length = index;
       continue;
     }
-    if (tag === 'script' || tag === 'style') {
-      const closing = new RegExp(`</${tag}\\s*>`, 'i');
-      const rest = source.slice(pattern.lastIndex);
-      const end = rest.search(closing);
-      if (end >= 0) {
-        pattern.lastIndex += end + rest.slice(end).match(closing)[0].length;
-        lastIndex = pattern.lastIndex;
-      }
-      continue;
-    }
-    const node = new FakeNode(tag, ownerDocument);
-    const attributePattern = /([\w:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+    const node = new FakeNode(tag);
+    const attributePattern = /([\w:-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
     let attribute;
     while ((attribute = attributePattern.exec(match[3] || '')) !== null) {
       const name = attribute[1];
-      const value = attribute[2] ?? attribute[3] ?? attribute[4] ?? '';
+      const raw = attribute[2] ?? attribute[3] ?? attribute[4];
+      const value = raw === undefined ? '' : decodeEntities(raw);
       if (name === 'class') node.className = value;
       else if (name.startsWith('data-')) node.dataset[camel(name.slice(5))] = value;
       else node.attributes[name] = value;
       if (name === 'value') node.value = value;
-      if (name === 'hidden') node.hidden = true;
+      if (name === 'checked') node.checked = true;
       if (name === 'disabled') node.disabled = true;
     }
-    stack[stack.length - 1].appendChild(node);
+    push(node);
     if (!VOID_TAGS.has(tag) && match[4] !== '/') stack.push(node);
   }
-  addText(source.slice(lastIndex));
+  if (position < html.length) {
+    const text = html.slice(position);
+    if (text) push(new FakeText(decodeEntities(text)));
+  }
   return root;
 }
 
-module.exports = {FakeNode, FakeEvent, parseHtml, matches, textNode, VOID_TAGS};
+function decodeEntities(text) {
+  return String(text)
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/&times;/g, '×').replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+// Выделение и вставка разметки. Позиция - пара (узел, смещение): в текстовом
+// узле это номер символа, в элементе - номер потомка. Без разреза текста
+// картинка всегда падала бы в конец тела, и проверка "вставка по курсору" не
+// отличала бы правильное поведение от неправильного.
+class FakeRange {
+  constructor(container, offset) {
+    this.startContainer = container;
+    this.startOffset = offset;
+  }
+
+  setStart(container, offset) {
+    this.startContainer = container;
+    this.startOffset = offset;
+  }
+
+  selectNodeContents(node) {
+    this.startContainer = node;
+    this.startOffset = node.childNodes.length;
+  }
+
+  collapse() {}
+
+  cloneRange() {
+    return new FakeRange(this.startContainer, this.startOffset);
+  }
+
+  // Вставка узлов на место курсора с разрезом текста. Возвращает позицию
+  // сразу за последним вставленным узлом - следующая картинка той же вставки
+  // встаёт за предыдущей, а не поверх неё.
+  insertNodes(nodes) {
+    let parent = this.startContainer;
+    let index = this.startOffset;
+    if (parent.nodeType === 3) {
+      const text = parent;
+      const owner = text.parent;
+      const tail = text.data.slice(this.startOffset);
+      text.data = text.data.slice(0, this.startOffset);
+      index = owner.childNodes.indexOf(text) + 1;
+      if (tail) {
+        const rest = new FakeText(tail);
+        rest.parent = owner;
+        owner.childNodes.splice(index, 0, rest);
+      }
+      parent = owner;
+    }
+    nodes.forEach((node, shift) => {
+      if (node.parent) node.remove();
+      node.parent = parent;
+      parent.childNodes.splice(index + shift, 0, node);
+    });
+    this.startContainer = parent;
+    this.startOffset = index + nodes.length;
+    return this;
+  }
+}
+
+// Файл в памяти - то, что приходит из буфера обмена и из данных переноса.
+// Байты настоящие: по ним считается размер письма и собирается строка data:.
+class FakeFile {
+  constructor(name, type, bytesOrSize) {
+    this.name = name;
+    this.type = type;
+    // Числом задаётся только заявленный размер, без тела: файл на десятки
+    // мегабайт нужен проверке предела, а держать его байты в памяти незачем -
+    // до чтения дело не доходит, отказ случается раньше.
+    if (typeof bytesOrSize === 'number') {
+      this.bytes = Buffer.alloc(0);
+      this.size = bytesOrSize;
+      return;
+    }
+    this.bytes = Buffer.from(bytesOrSize);
+    this.size = this.bytes.length;
+  }
+
+  arrayBuffer() {
+    return Promise.resolve(this.bytes);
+  }
+}
+
+// Чтение файла в строку data: - тот же примитив, которым композер читает
+// картинку из буфера. Чтение асинхронное, как в браузере: между началом
+// чтения и вставкой письмо успевает смениться.
+function createFileReaderClass() {
+  return class FakeFileReader {
+    constructor() {
+      this.result = '';
+      this.error = null;
+      this.onload = null;
+      this.onerror = null;
+    }
+
+    readAsDataURL(file) {
+      setTimeout(() => {
+        if (file && file.failRead) {
+          this.error = new Error('read failed');
+          if (this.onerror) this.onerror();
+          return;
+        }
+        this.result = `data:${file.type};base64,${file.bytes.toString('base64')}`;
+        if (this.onload) this.onload();
+      }, 0);
+    }
+  };
+}
+
+function createSelection() {
+  let range = null;
+  return {
+    get rangeCount() {
+      return range ? 1 : 0;
+    },
+    get anchorNode() {
+      return range ? range.startContainer : null;
+    },
+    getRangeAt() {
+      return range;
+    },
+    removeAllRanges() {
+      range = null;
+    },
+    addRange(value) {
+      range = value;
+    },
+    current() {
+      return range;
+    },
+  };
+}
+
+// Окружение одного окна: document, window и их общие примитивы. Модули
+// интерфейса делят область имён, поэтому все они выполняются в одном
+// контексте, как и в index.html.
+function createEnvironment({html = '', lang = 'ru'} = {}) {
+  const documentElement = new FakeNode('html');
+  documentElement.attributes.lang = lang;
+  const body = new FakeNode('body');
+  documentElement.appendChild(body);
+  const head = new FakeNode('head');
+  documentElement.appendChild(head);
+  if (html) parseMarkup(html).forEach(node => body.appendChild(node));
+
+  const selection = createSelection();
+  const documentListeners = {};
+  const fake = {
+    documentElement,
+    body,
+    head,
+    hidden: false,
+    activeElement: null,
+    createElement: tag => {
+      const node = new FakeNode(tag);
+      node.ownerDocument = fake;
+      return node;
+    },
+    createTextNode: text => new FakeText(text),
+    createDocumentFragment: () => {
+      const fragment = new FakeNode('#fragment');
+      fragment.isFragment = true;
+      return fragment;
+    },
+    createRange: () => new FakeRange(body, 0),
+    getElementById: id => documentElement.querySelectorAll(`[id="${id}"]`)[0] || null,
+    querySelector: selector => documentElement.querySelector(selector),
+    querySelectorAll: selector => documentElement.querySelectorAll(selector),
+    addEventListener: (type, handler) => {
+      (documentListeners[type] = documentListeners[type] || []).push(handler);
+    },
+    removeEventListener: (type, handler) => {
+      documentListeners[type] = (documentListeners[type] || []).filter(item => item !== handler);
+    },
+    dispatch: (type, event = {}) => {
+      (documentListeners[type] || []).forEach(handler => handler({type, ...event}));
+    },
+    // Программная вставка разметки в тело: тот же путь, каким вставляет
+    // картинку сам редактор.
+    execCommand: (command, _ui, value) => {
+      if (command !== 'insertHTML') return true;
+      const range = selection.current();
+      if (!range) return false;
+      range.insertNodes(parseMarkup(String(value ?? '')));
+      return true;
+    },
+  };
+  documentElement.ownerDocument = fake;
+  body.ownerDocument = fake;
+
+  // Отложенные задачи интерфейса идут через свои часы: иначе проверка снятия
+  // карточки по времени ждала бы настоящие девять секунд. Задача всё равно
+  // выполнится сама, но проверка может доиграть её раньше.
+  const timers = new Map();
+  let timerSequence = 0;
+  const fakeSetTimeout = (handler, delay = 0, ...args) => {
+    const id = (timerSequence += 1);
+    const real = setTimeout(() => {
+      timers.delete(id);
+      handler(...args);
+    }, delay);
+    real.unref?.();
+    timers.set(id, {handler, delay, args, real});
+    return id;
+  };
+  const fakeClearTimeout = id => {
+    const timer = timers.get(id);
+    if (!timer) return;
+    clearTimeout(timer.real);
+    timers.delete(id);
+  };
+  const advanceTimers = ms => {
+    [...timers.entries()]
+      .filter(([, timer]) => timer.delay <= ms)
+      .forEach(([id, timer]) => {
+        fakeClearTimeout(id);
+        timer.handler(...timer.args);
+      });
+  };
+
+  const windowListeners = {};
+  const sandbox = {
+    // Отладочный вывод интерфейса в проверке только мешает читать отчёт, а вот
+    // сообщения об ошибках нужны: по ним видно упавший обработчик.
+    console: {...console, log: () => {}, debug: () => {}, info: () => {}},
+    setTimeout: fakeSetTimeout,
+    clearTimeout: fakeClearTimeout,
+    setInterval,
+    clearInterval,
+    Promise,
+    document: fake,
+    navigator: {clipboard: {writeText: () => Promise.resolve()}},
+    localStorage: (() => {
+      const store = new Map();
+      return {
+        getItem: key => (store.has(key) ? store.get(key) : null),
+        setItem: (key, value) => store.set(key, String(value)),
+        removeItem: key => store.delete(key),
+      };
+    })(),
+    getComputedStyle: () => ({getPropertyValue: () => ''}),
+    performance: {now: () => Date.now()},
+    atob: value => Buffer.from(String(value), 'base64').toString('binary'),
+    btoa: value => Buffer.from(String(value), 'binary').toString('base64'),
+    getSelection: () => selection,
+    matchMedia: () => ({matches: false, addEventListener() {}}),
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    Event: FakeEvent,
+    MouseEvent: FakeEvent,
+    KeyboardEvent: FakeEvent,
+    CustomEvent: FakeEvent,
+    FileReader: createFileReaderClass(),
+    // Каталоги переводов читаются с диска тем же запросом, каким их читает
+    // интерфейс: подмена таблицы внутри проверки скрыла бы пропажу ключа.
+    fetch: url => {
+      const match = String(url).match(/locales\/(\w+)\.json/);
+      if (!match) return Promise.reject(new Error(`no route for ${url}`));
+      const body = readUi(`locales/${match[1]}.json`);
+      return Promise.resolve({ok: true, status: 200, json: () => Promise.resolve(JSON.parse(body))});
+    },
+    requestAnimationFrame: handler => setTimeout(() => handler(0), 0),
+    addEventListener: (type, handler) => {
+      (windowListeners[type] = windowListeners[type] || []).push(handler);
+    },
+    removeEventListener: (type, handler) => {
+      windowListeners[type] = (windowListeners[type] || []).filter(item => item !== handler);
+    },
+    dispatchWindow: (type, event = {}) => {
+      const payload = {
+        type,
+        preventDefault() {
+          payload.defaultPrevented = true;
+        },
+        stopPropagation() {
+          payload.propagationStopped = true;
+        },
+        defaultPrevented: false,
+        propagationStopped: false,
+        ...event,
+      };
+      (windowListeners[type] || []).forEach(handler => handler(payload));
+      return payload;
+    },
+  };
+  sandbox.window = sandbox;
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  return {sandbox, document: fake, body, selection, windowListeners, advanceTimers};
+}
+
+// Выполнить файл интерфейса в подготовленном окружении. Имя файла попадает в
+// текст ошибки, иначе падение внутри модуля невозможно опознать.
+function runUiModule(context, name) {
+  vm.runInContext(readUi(name), context, {filename: `ui/${name}`});
+}
+
+// Весь видимый текст поддерева - для проверок вида "эта подпись есть в строке".
+function textOf(node) {
+  return node ? node.textContent : '';
+}
+
+// Разобрать разметку в один узел-обёртку: разбор сам по себе отдаёт
+// перечень корней, а поиск селектором нужен по всему куску сразу.
+function parseHtml(html, ownerDocument = null) {
+  const fragment = new FakeNode('#fragment');
+  fragment.nodeType = 11;
+  fragment.isFragment = true;
+  if (ownerDocument) fragment.ownerDocument = ownerDocument;
+  parseMarkup(String(html ?? '')).forEach(node => fragment.appendChild(node));
+  return fragment;
+}
+
+module.exports = {
+  FakeNode,
+  FakeEvent,
+  FakeText,
+  FakeRange,
+  FakeFile,
+  parseMarkup,
+  parseHtml,
+  matchesSelector,
+  createEnvironment,
+  runUiModule,
+  readUi,
+  locales,
+  textOf,
+  uiRoot,
+};
