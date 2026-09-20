@@ -4,8 +4,13 @@
 // и прекращает отбор на пределе подсказок (S-031, S-032).
 // См. specs/recipient-history.md.
 
-// Предел подсказок тот же, что и был у композера (S-032).
-const HISTORY_SUGGESTION_LIMIT = 8;
+// Длина подсказки (S-032) - настройка ядра, а не число здесь.
+const historyLimits = typeof module === 'object' && module.exports
+  ? require('./limits.js')
+  : globalThis.limitsModel;
+// Пока перечень пределов не загружен, отбор не обрезается: придуманное здесь
+// число и было бы второй копией предела.
+const suggestionLimit = () => historyLimits.limitValue(historyLimits.KEYS.recipientSuggestions) ?? Infinity;
 
 const historyText = (pair, lang) => (lang === 'en' ? pair[1] : pair[0]);
 
@@ -26,14 +31,14 @@ function historySuggestions(candidates, query, used, keysFor, search) {
     candidates || [],
     query,
     used,
-    HISTORY_SUGGESTION_LIMIT,
+    suggestionLimit(),
     keysFor,
   );
 }
 
 // Строка раздела управления историей: имя, адрес, число сохранённых отметок и
-// дата последнего обращения. Число названо числом отметок намеренно: их
-// хранится не больше 50, а писем могло быть больше (S-042).
+// дата последнего обращения. Число названо числом отметок намеренно: отметок
+// хранится не больше настроенного предела, а писем могло быть больше (S-042).
 function historyRowText(entry, lang) {
   const name = String(entry?.name || '').trim();
   const address = String(entry?.address || '').trim();
@@ -63,7 +68,7 @@ function historyCandidateLabel(candidate) {
 }
 
 const recipientHistoryModel = {
-  HISTORY_SUGGESTION_LIMIT,
+  suggestionLimit,
   historyCandidateBadge,
   historySuggestions,
   historyRowText,

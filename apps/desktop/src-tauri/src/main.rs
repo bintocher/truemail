@@ -658,6 +658,8 @@ fn run() -> anyhow::Result<()> {
             commands::image_sender_trusted,
             commands::set_image_sender_trusted,
             commands::all_settings,
+            commands::limit_settings,
+            commands::set_limit_setting,
             commands::begin_account_connection,
             commands::complete_password_imap,
             commands::complete_exchange_ews,
@@ -801,6 +803,12 @@ mod command_contract_tests {
             "due_task_reminders",
             "mark_task_reminders_shown",
             "snooze_task_reminder",
+            // Пределы и сроки настраиваются пользователем: без этих команд
+            // раздел настроек пуст, а интерфейс остаётся без границ полей и
+            // возвращается к собственным числам, которые уже расходились с
+            // ядром.
+            "limit_settings",
+            "set_limit_setting",
             "list_quick_steps",
             "save_quick_step",
             "delete_quick_step",

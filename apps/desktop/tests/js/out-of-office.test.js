@@ -6,6 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const oof = require('../../ui/modules/out-of-office.js');
+const {limits, applyTestLimits} = require('./limits-fixture.js');
 
 test('S-004, S-007, S-008, S-020: режим объясняется честно и не обещает лишнего', () => {
   const server = oof.oofModeExplanation({mode: 'server', available: true}, 'ru');
@@ -32,15 +33,34 @@ test('S-021, S-023, S-026: границы периода, текстов и пе
     external_text: 'Out of office',
     internal_domains: ['example.test'],
   };
+  // Границы приходят из настроек ядра. Числа здесь нарочно не те, что у ядра
+  // по умолчанию: период в 20 суток прежде проходил бы, а теперь упирается в
+  // предел, и это доказывает, что модуль читает реестр, а не своё число.
+  applyTestLimits({
+    [limits.KEYS.oofPeriodDays]: 14,
+    [limits.KEYS.oofTextChars]: 50,
+    [limits.KEYS.oofInternalDomains]: 3,
+  });
   assert.equal(oof.oofValidationError(base, 'ru'), null);
-  // Ровно минута - нижняя граница, она допустима.
+  // Ровно минута - нижняя граница, она не настраивается: период короче минуты
+  // это описка, а не выбор.
   assert.equal(oof.oofValidationError({...base, ends_at: '2026-10-01T00:01:00.000Z'}, 'ru'), null);
   assert.ok(oof.oofValidationError({...base, ends_at: '2026-10-01T00:00:30.000Z'}, 'ru'));
-  assert.ok(oof.oofValidationError({...base, ends_at: '2027-11-01T00:00:00.000Z'}, 'ru'));
+  assert.equal(oof.oofValidationError({...base, ends_at: '2026-10-15T00:00:00.000Z'}, 'ru'), null);
+  const tooLong = oof.oofValidationError({...base, ends_at: '2026-10-16T00:00:00.000Z'}, 'ru');
+  // Отказ называет то же число, что стоит в настройке: прежде в тексте стояла
+  // вторая копия предела и расходилась с проверкой.
+  assert.equal(tooLong, 'Период отсутствия не длиннее 14 суток.');
   assert.ok(oof.oofValidationError({...base, internal_text: '   '}, 'ru'));
-  assert.ok(oof.oofValidationError({...base, external_text: 'x'.repeat(10001)}, 'ru'));
+  assert.equal(oof.oofValidationError({...base, external_text: 'x'.repeat(50)}, 'ru'), null);
+  assert.ok(oof.oofValidationError({...base, external_text: 'x'.repeat(51)}, 'ru'));
   assert.ok(oof.oofValidationError({...base, internal_domains: []}, 'ru'));
-  assert.ok(oof.oofValidationError({...base, internal_domains: Array.from({length: 21}, (_, i) => `d${i}.test`)}, 'ru'));
+  const domains = count => Array.from({length: count}, (_, i) => `d${i}.test`);
+  assert.equal(oof.oofValidationError({...base, internal_domains: domains(3)}, 'ru'), null);
+  assert.equal(
+    oof.oofValidationError({...base, internal_domains: domains(4)}, 'ru'),
+    'Внутренних доменов не больше 3.',
+  );
   // Домен без точки накрыл бы целую доменную зону.
   assert.ok(oof.oofValidationError({...base, internal_domains: ['localhost']}, 'ru'));
   // Выключенный автоответ ничего не требует.

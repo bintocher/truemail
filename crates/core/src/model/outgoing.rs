@@ -6,6 +6,7 @@
 //! работника (S-006). В данных остаются только ссылки на хранилище больших
 //! объектов.
 
+use super::{LIMIT_UNDO_SEND_MAX, LIMIT_UNDO_SEND_MIN, LimitSet};
 use serde::{Deserialize, Serialize};
 
 /// Происхождение отправки (S-055, S-057 - S-059).
@@ -25,27 +26,25 @@ pub const SEND_STATUS_UNCERTAIN: &str = "uncertain";
 
 /// Ключ настройки длительности окна отмены. Значение одно на все ящики (S-014).
 pub const UNDO_SEND_SETTING: &str = "undo_send_seconds";
-/// Длительность окна отмены по умолчанию (S-011).
-pub const DEFAULT_UNDO_SECONDS: i64 = 5;
-/// Границы длительности окна отмены (S-012).
-pub const MIN_UNDO_SECONDS: i64 = 0;
-pub const MAX_UNDO_SECONDS: i64 = 60;
-
-/// Срок хранения ключа запроса и отменённого письма (S-042, S-054).
-pub const REQUEST_KEY_DAYS: i64 = 30;
-/// Ключи запросов удаляются пачками, чтобы не держать писателя.
-pub const REQUEST_KEY_PURGE_BATCH: i64 = 500;
+// Длительность окна отмены по умолчанию (S-011), её границы (S-012) и срок
+// хранения ключа запроса (S-042, S-054) задаются настройками: ключи
+// LIMIT_UNDO_SEND_DEFAULT, LIMIT_UNDO_SEND_MIN, LIMIT_UNDO_SEND_MAX,
+// LIMIT_REQUEST_KEY_DAYS и LIMIT_PURGE_BATCH в crates/core/src/model/limits.rs.
+// Прежде границы окна отмены жили ещё и в модуле интерфейса, и третьей копией
+// в атрибутах min/max самой разметки.
 
 /// Номер формата данных операции отправки. Формат 1 - прежняя отложенная
 /// отправка: в нём лежит само письмо, а не ссылки (S-046).
 pub const SEND_PAYLOAD_VERSION: u32 = 2;
 
-/// Проверить длительность окна отмены. Те же границы проверяет интерфейс, но
-/// решение принимает ядро (S-013).
-pub fn validate_undo_seconds(value: i64) -> Result<i64, String> {
-    if !(MIN_UNDO_SECONDS..=MAX_UNDO_SECONDS).contains(&value) {
+/// Проверить длительность окна отмены. Границы интерфейс получает отсюда же,
+/// а решение принимает ядро (S-013).
+pub fn validate_undo_seconds(value: i64, limits: &LimitSet) -> Result<i64, String> {
+    let min = limits.get(LIMIT_UNDO_SEND_MIN);
+    let max = limits.get(LIMIT_UNDO_SEND_MAX);
+    if !(min..=max).contains(&value) {
         return Err(format!(
-            "окно отмены задаётся целым числом секунд от {MIN_UNDO_SECONDS} до {MAX_UNDO_SECONDS}"
+            "окно отмены задаётся целым числом секунд от {min} до {max}"
         ));
     }
     Ok(value)
@@ -199,13 +198,17 @@ mod tests {
     use super::*;
 
     /// S-012, S-013: границы окна отмены проверяет ядро, а не только
-    /// интерфейс. Значения 0 и 60 допустимы, соседние с ними - нет.
+    /// интерфейс, и берёт их из настроек. Сами границы на краях допустимы,
+    /// соседние с ними значения - нет.
     #[test]
     fn undo_window_accepts_only_whole_seconds_within_its_bounds() {
-        assert_eq!(validate_undo_seconds(0), Ok(0));
-        assert_eq!(validate_undo_seconds(60), Ok(60));
-        assert!(validate_undo_seconds(-1).is_err());
-        assert!(validate_undo_seconds(61).is_err());
+        let limits = LimitSet::defaults();
+        let min = limits.get(LIMIT_UNDO_SEND_MIN);
+        let max = limits.get(LIMIT_UNDO_SEND_MAX);
+        assert_eq!(validate_undo_seconds(min, &limits), Ok(min));
+        assert_eq!(validate_undo_seconds(max, &limits), Ok(max));
+        assert!(validate_undo_seconds(min - 1, &limits).is_err());
+        assert!(validate_undo_seconds(max + 1, &limits).is_err());
     }
 
     /// S-007: сборка мусора узнаёт достижимые объекты по данным операции,

@@ -3,13 +3,13 @@
 //! папок не переиспользует: добавленный там оператор молча изменил бы смысл
 //! почтового правила (S-020 - S-022).
 
+use super::{LIMIT_GROUP_CONDITIONS, LIMIT_RULE_ACTIONS, LIMIT_RULE_GROUPS, LimitSet};
 use serde::{Deserialize, Serialize};
 
-/// Предельные размеры правила. Числа продуктовые: они держат проверку одного
-/// письма в пределах сотни сравнений (S-028 - S-030).
-pub const MAX_RULE_GROUPS: usize = 10;
-pub const MAX_GROUP_CONDITIONS: usize = 10;
-pub const MAX_RULE_ACTIONS: usize = 10;
+// Предельные размеры правила (S-028 - S-030) задаются настройками: ключи LIMIT_RULE_GROUPS,
+// LIMIT_GROUP_CONDITIONS и LIMIT_RULE_ACTIONS (crates/core/src/model/limits.rs).
+// Здесь чисел нет намеренно: прежде те же три числа лежали и в интерфейсе, и
+// копии начали расходиться.
 
 /// Название стадии правил в столбце результата стадии письма (S-009).
 pub const RULES_STAGE_NAME: &str = "rules";
@@ -255,13 +255,14 @@ pub fn canonical_domain(domain: &str) -> String {
 
 /// Проверка состава правила перед записью. Отказ ничего не создаёт и не
 /// изменяет: проверки выполняются до открытия транзакции.
-pub fn validate_rule_input(rule: &MailRuleInput) -> Result<(), String> {
+pub fn validate_rule_input(rule: &MailRuleInput, limits: &LimitSet) -> Result<(), String> {
+    let max_groups = limits.count(LIMIT_RULE_GROUPS);
     if rule.id.trim().is_empty() || rule.name.trim().is_empty() {
         return Err("правилу нужны идентификатор и название".into());
     }
-    if rule.groups.len() > MAX_RULE_GROUPS || rule.exceptions.len() > MAX_RULE_GROUPS {
+    if rule.groups.len() > max_groups || rule.exceptions.len() > max_groups {
         return Err(format!(
-            "в правиле не больше {MAX_RULE_GROUPS} групп условий и {MAX_RULE_GROUPS} групп исключений"
+            "в правиле не больше {max_groups} групп условий и {max_groups} групп исключений"
         ));
     }
     // S-019: правило без единой обычной группы с условием применилось бы к
@@ -270,18 +271,19 @@ pub fn validate_rule_input(rule: &MailRuleInput) -> Result<(), String> {
         return Err("в правиле нет ни одного условия".into());
     }
     for group in rule.groups.iter().chain(rule.exceptions.iter()) {
-        validate_group(group)?;
+        validate_group(group, limits)?;
     }
-    validate_actions(&rule.actions)?;
+    validate_actions(&rule.actions, limits)?;
     Ok(())
 }
 
-fn validate_group(group: &MailRuleGroup) -> Result<(), String> {
+fn validate_group(group: &MailRuleGroup, limits: &LimitSet) -> Result<(), String> {
     if group.conditions.is_empty() {
         return Err("группа без условий не сохраняется".into());
     }
-    if group.conditions.len() > MAX_GROUP_CONDITIONS {
-        return Err(format!("в группе не больше {MAX_GROUP_CONDITIONS} условий"));
+    let max_conditions = limits.count(LIMIT_GROUP_CONDITIONS);
+    if group.conditions.len() > max_conditions {
+        return Err(format!("в группе не больше {max_conditions} условий"));
     }
     if !matches!(group.logic.as_str(), "all" | "any") {
         return Err("логика группы бывает только \"все\" или \"любое\"".into());
@@ -369,12 +371,13 @@ fn parse_size_amount(value: &str) -> Option<f64> {
         .filter(|amount| amount.is_finite() && *amount >= 0.0)
 }
 
-fn validate_actions(actions: &[MailRuleAction]) -> Result<(), String> {
+fn validate_actions(actions: &[MailRuleAction], limits: &LimitSet) -> Result<(), String> {
     if actions.is_empty() {
         return Err("в правиле нет ни одного действия".into());
     }
-    if actions.len() > MAX_RULE_ACTIONS {
-        return Err(format!("в правиле не больше {MAX_RULE_ACTIONS} действий"));
+    let max_actions = limits.count(LIMIT_RULE_ACTIONS);
+    if actions.len() > max_actions {
+        return Err(format!("в правиле не больше {max_actions} действий"));
     }
     for action in actions {
         if !RULE_ACTIONS.contains(&action.kind.as_str()) {
@@ -414,7 +417,10 @@ fn validate_actions(actions: &[MailRuleAction]) -> Result<(), String> {
 /// Проверка цепочки быстрого действия делит с правилами словарь и требования
 /// к целям, но намеренно не вызывает validate_actions: правила допускают stop
 /// и хвост из stop после увода, а кнопка быстрого действия - нет.
-pub fn validate_quick_step_input(step: &super::QuickStepInput) -> Result<(), String> {
+pub fn validate_quick_step_input(
+    step: &super::QuickStepInput,
+    limits: &LimitSet,
+) -> Result<(), String> {
     let name = step.name.trim();
     if name.is_empty() || name.chars().count() > 40 {
         return Err("имя быстрого действия должно содержать от 1 до 40 символов".into());
@@ -422,9 +428,10 @@ pub fn validate_quick_step_input(step: &super::QuickStepInput) -> Result<(), Str
     if step.actions.is_empty() {
         return Err("в быстром действии нет ни одного действия".into());
     }
-    if step.actions.len() > MAX_RULE_ACTIONS {
+    let max_actions = limits.count(LIMIT_RULE_ACTIONS);
+    if step.actions.len() > max_actions {
         return Err(format!(
-            "в быстром действии не больше {MAX_RULE_ACTIONS} действий"
+            "в быстром действии не больше {max_actions} действий"
         ));
     }
     if step
@@ -517,6 +524,12 @@ pub fn delete_forever_fingerprint(rule: &MailRuleInput) -> String {
 mod tests {
     use super::*;
 
+    /// Проверка на значениях первого запуска: их же получает база, где
+    /// настройку ещё не меняли.
+    fn validate_rule_input_default(rule: &MailRuleInput) -> Result<(), String> {
+        validate_rule_input(rule, &LimitSet::defaults())
+    }
+
     fn condition(field: &str, op: &str, value: &str) -> MailRuleCondition {
         MailRuleCondition {
             field: field.into(),
@@ -573,12 +586,12 @@ mod tests {
             vec![group(vec![condition("subject", "ends_with", "счет")])],
             vec![action("archive")],
         );
-        assert!(validate_rule_input(&ok).is_ok());
+        assert!(validate_rule_input_default(&ok).is_ok());
         let bad = rule(
             vec![group(vec![condition("read_state", "contains", "read")])],
             vec![action("archive")],
         );
-        assert!(validate_rule_input(&bad).is_err());
+        assert!(validate_rule_input_default(&bad).is_err());
     }
 
     /// S-025: текстовое условие без значения не сохраняется.
@@ -588,44 +601,47 @@ mod tests {
             vec![group(vec![condition("subject", "contains", "   ")])],
             vec![action("archive")],
         );
-        assert!(validate_rule_input(&rule).is_err());
+        assert!(validate_rule_input_default(&rule).is_err());
     }
 
     /// S-018, S-019: пустая группа и правило без условий отклоняются.
     #[test]
     fn empty_groups_are_rejected() {
         let empty_group = rule(vec![group(Vec::new())], vec![action("archive")]);
-        assert!(validate_rule_input(&empty_group).is_err());
+        assert!(validate_rule_input_default(&empty_group).is_err());
         let no_groups = rule(Vec::new(), vec![action("archive")]);
-        assert!(validate_rule_input(&no_groups).is_err());
+        assert!(validate_rule_input_default(&no_groups).is_err());
     }
 
-    /// S-028 - S-030: пределы числа групп, условий и действий.
+    /// S-028 - S-030: пределы числа групп, условий и действий берутся из
+    /// настроек, а не из числа в коде: проверка идёт по значению первого
+    /// запуска, но через тот же снимок, которым пользуется рабочий путь.
     #[test]
     fn size_limits_are_enforced() {
+        let limits = LimitSet::defaults();
         let many_groups = rule(
-            (0..MAX_RULE_GROUPS + 1)
+            (0..limits.count(LIMIT_RULE_GROUPS) + 1)
                 .map(|_| group(vec![condition("subject", "contains", "счет")]))
                 .collect(),
             vec![action("archive")],
         );
-        assert!(validate_rule_input(&many_groups).is_err());
+        assert!(validate_rule_input_default(&many_groups).is_err());
         let many_conditions = rule(
             vec![group(
-                (0..MAX_GROUP_CONDITIONS + 1)
+                (0..limits.count(LIMIT_GROUP_CONDITIONS) + 1)
                     .map(|_| condition("subject", "contains", "счет"))
                     .collect(),
             )],
             vec![action("archive")],
         );
-        assert!(validate_rule_input(&many_conditions).is_err());
+        assert!(validate_rule_input_default(&many_conditions).is_err());
         let many_actions = rule(
             vec![group(vec![condition("subject", "contains", "счет")])],
-            (0..MAX_RULE_ACTIONS + 1)
+            (0..limits.count(LIMIT_RULE_ACTIONS) + 1)
                 .map(|_| action("mark_read"))
                 .collect(),
         );
-        assert!(validate_rule_input(&many_actions).is_err());
+        assert!(validate_rule_input_default(&many_actions).is_err());
     }
 
     /// S-039, S-040, S-035: одно уводящее действие, после него только
@@ -634,16 +650,16 @@ mod tests {
     fn action_chain_order_is_enforced() {
         let base = vec![group(vec![condition("subject", "contains", "счет")])];
         let two_takeaways = rule(base.clone(), vec![action("archive"), action("trash")]);
-        assert!(validate_rule_input(&two_takeaways).is_err());
+        assert!(validate_rule_input_default(&two_takeaways).is_err());
         let after_takeaway = rule(base.clone(), vec![action("archive"), action("mark_read")]);
-        assert!(validate_rule_input(&after_takeaway).is_err());
+        assert!(validate_rule_input_default(&after_takeaway).is_err());
         let stop_in_middle = rule(base.clone(), vec![action("stop"), action("mark_read")]);
-        assert!(validate_rule_input(&stop_in_middle).is_err());
+        assert!(validate_rule_input_default(&stop_in_middle).is_err());
         let good = rule(
             base,
             vec![action("mark_read"), action("archive"), action("stop")],
         );
-        assert!(validate_rule_input(&good).is_ok());
+        assert!(validate_rule_input_default(&good).is_ok());
     }
 
     /// S-023: домен приводится к нижнему регистру и к общей форме, написание

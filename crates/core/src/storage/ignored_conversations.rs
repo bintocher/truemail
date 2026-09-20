@@ -100,6 +100,7 @@ impl Db {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         account_id: i64,
         seed: Vec<String>,
+        max_ids: usize,
     ) -> Result<ConversationSet> {
         let mut set = ConversationSet::default();
         let mut known: HashSet<String> = HashSet::new();
@@ -112,7 +113,7 @@ impl Db {
             }
         }
         while let Some(current) = frontier.pop() {
-            if set.ids.len() >= MAX_CONVERSATION_IDS {
+            if set.ids.len() >= max_ids {
                 set.partial = true;
                 break;
             }
@@ -154,7 +155,7 @@ impl Db {
                 }
                 set.messages.push(row.id);
                 for id in own {
-                    if set.ids.len() >= MAX_CONVERSATION_IDS {
+                    if set.ids.len() >= max_ids {
                         set.partial = true;
                         break;
                     }
@@ -199,7 +200,8 @@ impl Db {
                 "эту переписку нечем опознать: у письма нет заголовков Message-ID, In-Reply-To и References".into(),
             ));
         }
-        let set = Self::build_conversation_set(&mut tx, account_id, seed).await?;
+        let max_ids = self.limit_count(LIMIT_CONVERSATION_IDS);
+        let set = Self::build_conversation_set(&mut tx, account_id, seed, max_ids).await?;
         let existing = Self::conversation_owner(&mut tx, account_id, &set.ids).await?;
         let candidates = Self::conversation_candidates(&mut tx, account_id, &set.messages).await?;
         let total = candidates.len() as i64;
@@ -326,7 +328,8 @@ impl Db {
                 "эту переписку нечем опознать: у письма нет заголовков Message-ID, In-Reply-To и References".into(),
             ));
         }
-        let set = Self::build_conversation_set(&mut tx, account_id, seed).await?;
+        let max_ids = self.limit_count(LIMIT_CONVERSATION_IDS);
+        let set = Self::build_conversation_set(&mut tx, account_id, seed, max_ids).await?;
         let owners = Self::conversation_owner(&mut tx, account_id, &set.ids).await?;
         let conversation_id = match owners.split_first() {
             Some((first, rest)) => {
@@ -382,9 +385,10 @@ impl Db {
                 )
                 .fetch_one(&mut *tx)
                 .await?;
-                if enabled.0 >= MAX_IGNORED_CONVERSATIONS {
+                let max_conversations = self.limit(LIMIT_IGNORED_CONVERSATIONS);
+                if enabled.0 >= max_conversations {
                     return Err(crate::Error::AccountConfig(format!(
-                        "уже игнорируется {MAX_IGNORED_CONVERSATIONS} переписок: снимите игнорирование с ненужных"
+                        "уже игнорируется {max_conversations} переписок: снимите игнорирование с ненужных"
                     )));
                 }
                 // S-047: снимок темы и участников остаётся читаемым после того,
@@ -407,7 +411,8 @@ impl Db {
                 inserted.0
             }
         };
-        Self::store_conversation_ids(&mut tx, conversation_id, account_id, &set.ids).await?;
+        Self::store_conversation_ids(&mut tx, conversation_id, account_id, &set.ids, max_ids)
+            .await?;
         if set.partial {
             sqlx::query("UPDATE ignored_conversations SET partial=1 WHERE id=?")
                 .bind(conversation_id)
@@ -532,13 +537,16 @@ impl Db {
 
     /// Сохранить идентификаторы набора. Уникальный ключ ящика и идентификатора
     /// не даёт двум записям владеть одним идентификатором.
+    /// Предел набора приходит параметром: функция не метод базы, а держать
+    /// второе чтение настройки внутри неделимой операции незачем.
     async fn store_conversation_ids(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         conversation_id: i64,
         account_id: i64,
         ids: &[String],
+        max_ids: usize,
     ) -> Result<()> {
-        for id in ids.iter().take(MAX_CONVERSATION_IDS) {
+        for id in ids.iter().take(max_ids) {
             sqlx::query(
                 "INSERT OR IGNORE INTO ignored_conversation_ids(conversation_id, account_id, message_id)
                  VALUES(?, ?, ?)",
@@ -1024,7 +1032,10 @@ impl Db {
                 )
                 .bind(requested_at.as_deref())
                 .bind(requested_at.as_deref())
-                .bind(format!("-{RETURN_WAIT_DAYS} days"))
+                .bind(format!(
+                    "-{} days",
+                    self.limit(LIMIT_IGNORE_RETURN_WAIT_DAYS)
+                ))
                 .fetch_one(&mut *tx)
                 .await?;
                 // S-038: письмо, которое так и осталось в своей папке,
@@ -1217,6 +1228,7 @@ impl Db {
     /// Стадия игнорируемых переписок: вторая в сквозном порядке стадий и
     /// первая на пути догрузки писем прокруткой (S-001, S-025, S-026).
     pub(crate) async fn process_ignored_conversation_stage(&self) -> Result<usize> {
+        let max_ids = self.limit_count(LIMIT_CONVERSATION_IDS);
         let mut tx = self.begin_write().await?;
         let enabled: (i64,) =
             sqlx::query_as("SELECT count(*) FROM ignored_conversations WHERE state='enabled'")
@@ -1278,9 +1290,15 @@ impl Db {
                 continue;
             }
             // S-027: набор расширяется идентификаторами нового письма.
-            Self::store_conversation_ids(&mut tx, conversation_id, message.account_id, &ids)
-                .await?;
-            Self::mark_partial_if_full(&mut tx, conversation_id).await?;
+            Self::store_conversation_ids(
+                &mut tx,
+                conversation_id,
+                message.account_id,
+                &ids,
+                max_ids,
+            )
+            .await?;
+            Self::mark_partial_if_full(&mut tx, conversation_id, max_ids as i64).await?;
             let trash = match trash_cache.entry(message.account_id) {
                 std::collections::hash_map::Entry::Occupied(found) => found.get().clone(),
                 std::collections::hash_map::Entry::Vacant(empty) => {
@@ -1364,13 +1382,14 @@ impl Db {
     async fn mark_partial_if_full(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         conversation_id: i64,
+        max_ids: i64,
     ) -> Result<()> {
         let count: (i64,) =
             sqlx::query_as("SELECT count(*) FROM ignored_conversation_ids WHERE conversation_id=?")
                 .bind(conversation_id)
                 .fetch_one(&mut **tx)
                 .await?;
-        if count.0 >= MAX_CONVERSATION_IDS as i64 {
+        if count.0 >= max_ids {
             sqlx::query(
                 "UPDATE ignored_conversations SET partial=1, updated_at=datetime('now') WHERE id=?",
             )

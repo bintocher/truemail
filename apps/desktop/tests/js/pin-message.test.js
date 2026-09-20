@@ -8,6 +8,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const {limits, applyTestLimits} = require('./limits-fixture.js');
 
 // Модуль закрепления появляется вместе с реализацией. Пока его нет, каждая
 // проверка падает на своём месте и своими словами.
@@ -171,8 +172,12 @@ test('S-037: фильтры списка отсекают письма обеи�
   assert.deepEqual(rows.map(row => row.id), [1], 'фильтр пропустил закреплённое письмо мимо себя');
 });
 
-test('S-042, S-043, S-070: закреплённая часть ограничена 50 строками, а разделитель называет непоместившиеся', () => {
-  const pinnedItems = Array.from({length: 62}, (_, index) =>
+test('S-042, S-043, S-070: закреплённая часть ограничена настройкой, а разделитель называет непоместившиеся', () => {
+  // Сколько закреплённых видно - настройка ядра. Число здесь нарочно не то,
+  // что у ядра по умолчанию: прежде интерфейс показывал место под пятьдесят
+  // писем, а ядро давало закрепить двадцать, и отказ никто не объяснял.
+  applyTestLimits({[limits.KEYS.pinnedVisible]: 40});
+  const pinnedItems = Array.from({length: 52}, (_, index) =>
     message({id: 100 + index, pinned_at: '2026-09-18T09:00:00Z', date: `2026-09-${String(10 + (index % 20)).padStart(2, '0')}T10:00:00Z`}));
   const rows = listRows(
     pinnedItems,
@@ -180,7 +185,7 @@ test('S-042, S-043, S-070: закреплённая часть ограниче�
     {sort: 'newest', filters: {}, lang: 'ru'},
   );
   const separator = separatorRow(rows);
-  assert.equal(rows.filter(row => row.kind !== SEPARATOR && row.pinned_at).length, 50,
+  assert.equal(rows.filter(row => row.kind !== SEPARATOR && row.pinned_at).length, 40,
     'закреплённая часть выросла в отдельный список и вытеснила обычные письма за нижний край экрана');
   const text = separatorLabel(separator, 'ru');
   assert.ok(text.includes('12'), `разделитель не называет число непоместившихся писем: ${text}`);

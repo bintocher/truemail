@@ -24,13 +24,14 @@ use truemail_core::api::{
 };
 use truemail_core::model::{
     Account, AuthKind, BackendKind, Contact, Event, EventStatus, FlagChangeReason, Folder,
-    IgnoreConversationPreview, IgnoreJobReport, IgnoredConversation, Keybinding, MailRule,
-    MailRuleInput, MessageFull, MessageMeta, MessageTask, MessageTaskInput, MessageTemplate,
-    PinMessagesResult, PinnedMessageList, Provider, QuickStep, QuickStepInput, QuickStepReport,
-    RsvpResponse, Security, SenderPolicy, SenderPolicyPreview, SenderPolicyReleaseReport,
-    SenderPolicySweepReport, SenderSweepInput, SenderSweepJobReport, SenderSweepPreview,
-    SenderSweepRule, ServerConfig, Signature, SmartFolder, SmartFolderCount, TaskListPage,
-    TaskReminder, is_quick_step_key_action, normalize_key_combo, resolve_my_attendance,
+    IgnoreConversationPreview, IgnoreJobReport, IgnoredConversation, Keybinding, LimitSection,
+    LimitValue, MailRule, MailRuleInput, MessageFull, MessageMeta, MessageTask, MessageTaskInput,
+    MessageTemplate, PinMessagesResult, PinnedMessageList, Provider, QuickStep, QuickStepInput,
+    QuickStepReport, RsvpResponse, Security, SenderPolicy, SenderPolicyPreview,
+    SenderPolicyReleaseReport, SenderPolicySweepReport, SenderSweepInput, SenderSweepJobReport,
+    SenderSweepPreview, SenderSweepRule, ServerConfig, Signature, SmartFolder, SmartFolderCount,
+    TaskListPage, TaskReminder, is_quick_step_key_action, normalize_key_combo,
+    resolve_my_attendance,
 };
 use truemail_core::storage::repo::{
     CalendarChange, CalendarChangeKind, CalendarSummary, MailSyncOutcome,
@@ -100,10 +101,15 @@ pub struct AppState {
     pub send_wakeup: Arc<tokio::sync::Notify>,
 }
 
-/// Сколько сбоев подряд по одному аккаунту считаются исчерпанными повторами:
-/// три прохода - это уже не случайный обрыв связи, а устойчивая неполадка,
-/// про которую пора сказать (error-kinds-and-messages.md, S-022).
-pub const MAIL_FAILURES_BEFORE_TOAST: u32 = 3;
+/// Сколько сбоев подряд по одному аккаунту считаются исчерпанными повторами
+/// (error-kinds-and-messages.md, S-022). Число задаётся настройкой
+/// LIMIT_SYNC_FAILURES_BEFORE_TOAST: на нестойкой связи три прохода молчания
+/// мало, на стойкой - много, и выбирает это пользователь.
+pub fn mail_failure_threshold(core: &Core) -> u32 {
+    core.db
+        .limit(truemail_core::model::LIMIT_SYNC_FAILURES_BEFORE_TOAST)
+        .max(1) as u32
+}
 
 /// Реестр счётчиков сбоев почты по аккаунту (см. `AppState::mail_failures`).
 /// Функции ниже принимают саму ссылку на реестр, а не всё `AppState` - все
@@ -115,11 +121,15 @@ pub type MailFailures = Arc<tokio::sync::Mutex<HashMap<i64, u32>>>;
 
 /// Отмечает сбой прохода почты и говорит, исчерпаны ли повторы по этому
 /// аккаунту.
-pub async fn note_mail_failure(mail_failures: &MailFailures, account_id: i64) -> bool {
+pub async fn note_mail_failure(
+    mail_failures: &MailFailures,
+    account_id: i64,
+    threshold: u32,
+) -> bool {
     let mut failures = mail_failures.lock().await;
     let counter = failures.entry(account_id).or_insert(0);
     *counter = counter.saturating_add(1);
-    *counter >= MAIL_FAILURES_BEFORE_TOAST
+    *counter >= threshold
 }
 
 /// Успешный проход: счёт сбоев подряд обнуляется.
@@ -1551,7 +1561,12 @@ async fn gmail_realtime_loop(
                 Err(error) => {
                     // Настоящий сбой почты - признак исчерпания повторов из
                     // счётчика, а не литералом (G1).
-                    let retries_exhausted = note_mail_failure(&mail_failures, account.id).await;
+                    let retries_exhausted = note_mail_failure(
+                        &mail_failures,
+                        account.id,
+                        mail_failure_threshold(&core),
+                    )
+                    .await;
                     let state = account_sync_error_state(
                         &account,
                         "mail",
@@ -4157,8 +4172,12 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     }
                     // Почта не прошла - отмечаем сбой и берём признак
                     // исчерпания повторов из счётчика, а не литералом (G1).
-                    let retries_exhausted =
-                        note_mail_failure(&sync_mail_failures, account.id).await;
+                    let retries_exhausted = note_mail_failure(
+                        &sync_mail_failures,
+                        account.id,
+                        mail_failure_threshold(&sync_core),
+                    )
+                    .await;
                     let warning = truemail_core::account::SyncWarning {
                         kind: mail_error.code().to_owned(),
                         message,
@@ -4174,8 +4193,12 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         "почта: {mail_error}; календарь/контакты: {auxiliary_error}"
                     ));
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = mail_error.code(), error = %error, "фоновая синхронизация не удалась");
-                    let retries_exhausted =
-                        note_mail_failure(&sync_mail_failures, account.id).await;
+                    let retries_exhausted = note_mail_failure(
+                        &sync_mail_failures,
+                        account.id,
+                        mail_failure_threshold(&sync_core),
+                    )
+                    .await;
                     let mut state = account_sync_error_state(
                         &account,
                         "all",
@@ -4193,8 +4216,12 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     let safe_error =
                         truemail_core::error::sanitize_error_message(&error.to_string());
                     tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "фоновая синхронизация не удалась");
-                    let retries_exhausted =
-                        note_mail_failure(&sync_mail_failures, account.id).await;
+                    let retries_exhausted = note_mail_failure(
+                        &sync_mail_failures,
+                        account.id,
+                        mail_failure_threshold(&sync_core),
+                    )
+                    .await;
                     account_sync_error_state(&account, "all", "error", &error, retries_exhausted)
                 }
             };
@@ -4431,9 +4458,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     mail_changed = true;
                                     // Настоящий сбой почты - признак исчерпания
                                     // повторов из счётчика, а не литералом (G1).
-                                    let retries_exhausted =
-                                        note_mail_failure(&watch_mail_failures, watch_account.id)
-                                            .await;
+                                    let retries_exhausted = note_mail_failure(
+                                        &watch_mail_failures,
+                                        watch_account.id,
+                                        mail_failure_threshold(&watch_core),
+                                    )
+                                    .await;
                                     error_state = Some(account_sync_error_state(
                                         &watch_account,
                                         "mail",
@@ -4497,8 +4527,12 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             // Обрыв ожидания IDLE - тоже сбой почты этого
                             // аккаунта: считаем его тем же счётчиком, что и
                             // сбои самой синхронизации (G1).
-                            let retries_exhausted =
-                                note_mail_failure(&watch_mail_failures, watch_account.id).await;
+                            let retries_exhausted = note_mail_failure(
+                                &watch_mail_failures,
+                                watch_account.id,
+                                mail_failure_threshold(&watch_core),
+                            )
+                            .await;
                             let state = account_sync_error_state(
                                 &watch_account,
                                 "mail",
@@ -5357,6 +5391,38 @@ pub async fn set_setting(state: State<'_, AppState>, key: String, value: String)
     Ok(core(&state).await?.db.set_setting(&key, &value).await?)
 }
 
+/// Раздел настроек пределов целиком: разделы и поля. Одним ответом, а не
+/// двумя командами - разложить поля по разделам можно только вместе.
+#[derive(Serialize)]
+pub struct LimitSettingsView {
+    sections: Vec<LimitSection>,
+    limits: Vec<LimitValue>,
+}
+
+/// Перечень настраиваемых пределов с рабочими значениями, границами и
+/// подписями. Интерфейс берёт пределы отсюда и своих чисел не держит: пока
+/// копия предела жила в разметке, ядро отказывало закрепить письмо, а список
+/// показывал место под большее число.
+#[tauri::command]
+pub async fn limit_settings(state: State<'_, AppState>) -> CmdResult<LimitSettingsView> {
+    let db = &core(&state).await?.db;
+    Ok(LimitSettingsView {
+        sections: truemail_core::model::LIMIT_SECTIONS.to_vec(),
+        limits: db.limit_settings(),
+    })
+}
+
+/// Записать значение предела. Значение вне границ отклоняется с объяснением -
+/// ответ возвращается пользователю текстом ошибки.
+#[tauri::command]
+pub async fn set_limit_setting(
+    state: State<'_, AppState>,
+    key: String,
+    value: i64,
+) -> CmdResult<i64> {
+    Ok(core(&state).await?.db.set_limit(&key, value).await?)
+}
+
 #[tauri::command]
 pub async fn list_keybindings(state: State<'_, AppState>) -> CmdResult<Vec<Keybinding>> {
     Ok(core(&state).await?.db.list_keybindings().await?)
@@ -5604,7 +5670,12 @@ async fn spawn_initial_mail_sync(
                 tracing::error!(account = %truemail_core::logging::mask_email(&account.email), error_kind = error.code(), error = %safe_error, "первая синхронизация почты не удалась");
                 // Настоящий сбой почты - признак исчерпания повторов берём из
                 // счётчика, как и везде (G1), а не литералом.
-                let retries_exhausted = note_mail_failure(&sync_mail_failures, account.id).await;
+                let retries_exhausted = note_mail_failure(
+                    &sync_mail_failures,
+                    account.id,
+                    mail_failure_threshold(&core),
+                )
+                .await;
                 account_sync_error_state(&account, "all", "error", error, retries_exhausted)
             }
         };
@@ -7066,7 +7137,14 @@ mod api_error_tests {
 // обнуляет, и разные аккаунты друг другу не мешают.
 #[cfg(test)]
 mod mail_failures_tests {
-    use super::{MAIL_FAILURES_BEFORE_TOAST, MailFailures, note_mail_failure, reset_mail_failures};
+    use super::{MailFailures, note_mail_failure, reset_mail_failures};
+    use truemail_core::model::{LIMIT_SYNC_FAILURES_BEFORE_TOAST, LimitSet};
+
+    /// Порог из значения первого запуска: настоящий путь берёт его из
+    /// настроек, здесь база не открывается.
+    fn default_threshold() -> u32 {
+        LimitSet::defaults().get(LIMIT_SYNC_FAILURES_BEFORE_TOAST) as u32
+    }
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -7077,44 +7155,44 @@ mod mail_failures_tests {
     #[tokio::test]
     async fn three_failures_in_a_row_exhaust_retries() {
         let failures = empty_registry();
-        assert_eq!(MAIL_FAILURES_BEFORE_TOAST, 3);
+        assert_eq!(default_threshold(), 3);
         assert!(
-            !note_mail_failure(&failures, 1).await,
+            !note_mail_failure(&failures, 1, default_threshold()).await,
             "первый сбой - рано шуметь"
         );
         assert!(
-            !note_mail_failure(&failures, 1).await,
+            !note_mail_failure(&failures, 1, default_threshold()).await,
             "второй сбой - тоже рано"
         );
         assert!(
-            note_mail_failure(&failures, 1).await,
+            note_mail_failure(&failures, 1, default_threshold()).await,
             "третий сбой подряд исчерпывает повторы"
         );
         // Повторы уже исчерпаны - счёт продолжает расти, признак остаётся true.
-        assert!(note_mail_failure(&failures, 1).await);
+        assert!(note_mail_failure(&failures, 1, default_threshold()).await);
     }
 
     #[tokio::test]
     async fn success_resets_the_failure_count() {
         let failures = empty_registry();
-        assert!(!note_mail_failure(&failures, 1).await);
-        assert!(!note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
         reset_mail_failures(&failures, 1).await;
         // Счёт сброшен - следующие два сбоя снова не исчерпывают повторы.
-        assert!(!note_mail_failure(&failures, 1).await);
-        assert!(!note_mail_failure(&failures, 1).await);
-        assert!(note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
+        assert!(note_mail_failure(&failures, 1, default_threshold()).await);
     }
 
     #[tokio::test]
     async fn accounts_do_not_share_a_counter() {
         let failures = empty_registry();
-        assert!(!note_mail_failure(&failures, 1).await);
-        assert!(!note_mail_failure(&failures, 1).await);
-        assert!(note_mail_failure(&failures, 1).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
+        assert!(!note_mail_failure(&failures, 1, default_threshold()).await);
+        assert!(note_mail_failure(&failures, 1, default_threshold()).await);
         // Другой аккаунт начинает с чистого счёта, даже если первый уже
         // исчерпал повторы.
-        assert!(!note_mail_failure(&failures, 2).await);
+        assert!(!note_mail_failure(&failures, 2, default_threshold()).await);
     }
 }
 

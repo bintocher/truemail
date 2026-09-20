@@ -4,6 +4,7 @@
 //! Нормализация адреса сюда не переписывается: она общая со списками
 //! отправителей (S-046) и живёт в `model::sender_policy`.
 
+use super::{LIMIT_SWEEP_MAX_DAYS, LIMIT_SWEEP_MIN_DAYS, LimitSet};
 use serde::{Deserialize, Serialize};
 
 /// Название стадии автоочистки в столбце результата стадии письма
@@ -20,9 +21,9 @@ pub const SWEEP_MODE_ONCE: &str = "once";
 /// (S-023).
 pub const SWEEP_MODE_NEW_NOW: &str = "new_now";
 
-/// Границы числа дней режима "старше N дней" (S-032).
-pub const MIN_SWEEP_DAYS: i64 = 1;
-pub const MAX_SWEEP_DAYS: i64 = 3650;
+// Границы числа дней режима "старше N дней" (S-032) задаются настройками:
+// ключи LIMIT_SWEEP_MIN_DAYS и LIMIT_SWEEP_MAX_DAYS
+// (crates/core/src/model/limits.rs).
 
 /// Проход ждёт чужую операцию не чаще раза в минуту и не более восьми раз
 /// (S-020, S-021).
@@ -141,7 +142,7 @@ pub fn is_persistent_mode(mode: &str) -> bool {
 
 /// Проверка состава уборки до открытия неделимой операции: отказ ничего не
 /// создаёт (S-032).
-pub fn validate_sweep_input(input: &SenderSweepInput) -> Result<(), String> {
+pub fn validate_sweep_input(input: &SenderSweepInput, limits: &LimitSet) -> Result<(), String> {
     if !is_sweep_mode(&input.mode) {
         return Err(format!("вид уборки {} не поддерживается", input.mode));
     }
@@ -149,10 +150,10 @@ pub fn validate_sweep_input(input: &SenderSweepInput) -> Result<(), String> {
         let days = input
             .days
             .ok_or_else(|| "для режима \"старше N дней\" нужно число дней".to_owned())?;
-        if !(MIN_SWEEP_DAYS..=MAX_SWEEP_DAYS).contains(&days) {
-            return Err(format!(
-                "число дней задаётся целым от {MIN_SWEEP_DAYS} до {MAX_SWEEP_DAYS}"
-            ));
+        let min = limits.get(LIMIT_SWEEP_MIN_DAYS);
+        let max = limits.get(LIMIT_SWEEP_MAX_DAYS);
+        if !(min..=max).contains(&days) {
+            return Err(format!("число дней задаётся целым от {min} до {max}"));
         }
     }
     Ok(())
@@ -175,11 +176,18 @@ mod tests {
             days,
             sweep_archive: false,
         };
-        assert!(validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, Some(1))).is_ok());
-        assert!(validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, Some(3650))).is_ok());
-        assert!(validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, Some(0))).is_err());
-        assert!(validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, Some(3651))).is_err());
-        assert!(validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, None)).is_err());
-        assert!(validate_sweep_input(&input("вымышленный", None)).is_err());
+        // Границы берутся из настроек: проверяются края и соседние с ними
+        // значения, а не числа, вписанные здесь во второй раз.
+        let limits = LimitSet::defaults();
+        let min = limits.get(LIMIT_SWEEP_MIN_DAYS);
+        let max = limits.get(LIMIT_SWEEP_MAX_DAYS);
+        let check =
+            |days: Option<i64>| validate_sweep_input(&input(SWEEP_MODE_OLDER_THAN, days), &limits);
+        assert!(check(Some(min)).is_ok());
+        assert!(check(Some(max)).is_ok());
+        assert!(check(Some(min - 1)).is_err());
+        assert!(check(Some(max + 1)).is_err());
+        assert!(check(None).is_err());
+        assert!(validate_sweep_input(&input("вымышленный", None), &limits).is_err());
     }
 }

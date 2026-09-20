@@ -5,10 +5,12 @@
 // скриптом и отдаёт всё через один глобальный объект.
 // См. specs/undo-send.md.
 
-// Границы длительности окна отмены (S-012). Те же числа проверяет ядро:
-// интерфейс объясняет отказ заранее, но решение принимает ядро.
-const UNDO_MIN_SECONDS = 0;
-const UNDO_MAX_SECONDS = 60;
+// Границы длительности окна отмены (S-012) приходят из ядра: интерфейс
+// объясняет отказ заранее, но своих чисел не держит. Прежде одна и та же
+// граница жила тремя копиями - в ядре, здесь и в атрибутах min/max разметки.
+const outboxLimits = typeof module === 'object' && module.exports
+  ? require('./limits.js')
+  : globalThis.limitsModel;
 
 // Подписи состояний операции отправки (S-020, S-064).
 const SEND_STATUS_TEXT = {
@@ -145,12 +147,25 @@ function validUndoSeconds(value) {
   // проверки очищенное поле молча выключило бы окно отмены.
   if (typeof value === 'string' && !value.trim()) return false;
   const number = Number(value);
-  return Number.isInteger(number) && number >= UNDO_MIN_SECONDS && number <= UNDO_MAX_SECONDS;
+  if (!Number.isInteger(number)) return false;
+  const {min, max} = undoSecondsBounds();
+  // Пока перечень пределов не загружен, решение остаётся за ядром: своих
+  // границ интерфейс не выдумывает.
+  if (min === null || max === null) return true;
+  return number >= min && number <= max;
+}
+
+// Границы поля окна отмены. Разметка получает их отсюда, а не держит
+// собственные атрибуты min и max.
+function undoSecondsBounds() {
+  return {
+    min: outboxLimits.limitValue(outboxLimits.KEYS.undoSendMin),
+    max: outboxLimits.limitValue(outboxLimits.KEYS.undoSendMax),
+  };
 }
 
 const outboxModel = {
-  UNDO_MIN_SECONDS,
-  UNDO_MAX_SECONDS,
+  undoSecondsBounds,
   parseQueueTime,
   remainingUndoSeconds,
   showsUndoAction,

@@ -170,7 +170,7 @@ impl Db {
             )
             .bind(history_id)
             .bind(history_id)
-            .bind(MAX_TOUCHES)
+            .bind(self.limit(LIMIT_RECIPIENT_TOUCHES))
             .execute(&mut *tx)
             .await?;
         }
@@ -203,10 +203,11 @@ impl Db {
         .bind(account_id)
         .fetch_one(&self.pool)
         .await?;
-        if visible <= MAX_VISIBLE_ENTRIES {
+        let max_visible = self.limit(LIMIT_RECIPIENT_ENTRIES);
+        if visible <= max_visible {
             return Ok(0);
         }
-        let extra = visible - MAX_VISIBLE_ENTRIES;
+        let extra = visible - max_visible;
         let sql = format!(
             "UPDATE recipient_history SET evicted=1, evicted_at=datetime('now')
               WHERE id IN (
@@ -246,7 +247,10 @@ impl Db {
     pub async fn purge_recipient_own_sends(&self) -> Result<i64> {
         let result =
             sqlx::query("DELETE FROM recipient_own_sends WHERE sent_at < datetime('now', ?)")
-                .bind(format!("-{OWN_SEND_DAYS} days"))
+                .bind(format!(
+                    "-{} days",
+                    self.limit(LIMIT_RECIPIENT_OWN_SEND_DAYS)
+                ))
                 .execute(&self.write_pool)
                 .await?;
         Ok(result.rows_affected() as i64)
@@ -297,7 +301,7 @@ impl Db {
         )
         .bind(account_id)
         .bind(cursor)
-        .bind(BACKFILL_BATCH)
+        .bind(self.limit(LIMIT_PURGE_BATCH))
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
