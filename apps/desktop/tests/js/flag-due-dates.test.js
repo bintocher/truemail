@@ -73,14 +73,19 @@ function task(extra) {
   );
 }
 
-test('S-016, S-100: быстрые значения срока повторяют окно откладывания и переводятся', () => {
-  // Два соседних окна выбора времени предлагали бы пользователю разные наборы,
-  // и одно и то же "Завтра в 09:00" означало бы в них разное.
+test('S-016, S-100: готовые сроки покрывают частые случаи и переводятся', () => {
+  // Набор из пяти значений заставлял открывать выбор даты и времени ради
+  // "через час" и "через месяц" - самых частых сроков напоминания.
   const choices = fn('dueQuickChoices', 'выбрать срок исполнения нечем: окно сроков пустое')('ru');
   const titles = choices.map(choice => choice.title);
-  for (const wanted of ['Сегодня', 'Завтра в 09:00', 'В понедельник в 09:00', 'На следующей неделе', 'Без срока']) {
+  for (const wanted of ['Через час', 'Сегодня', 'Сегодня вечером', 'Завтра в 09:00',
+    'В понедельник в 09:00', 'Через неделю', 'Через месяц', 'Без срока']) {
     assert.ok(titles.includes(wanted), `в наборе нет значения "${wanted}": ${titles.join(', ')}`);
   }
+  assert.equal(
+    choices.filter(choice => choice.id !== 'custom').length, 8,
+    'готовых сроков должно быть ровно восемь: окно раскладывает их сеткой по четыре в ряд',
+  );
   assert.ok(
     choices.some(choice => choice.id === 'custom'),
     'произвольные дата и время обязаны остаться: иначе срок можно поставить только из готового набора',
@@ -90,6 +95,41 @@ test('S-016, S-100: быстрые значения срока повторяю�
     english.every(choice => !/[А-Яа-я]/.test(choice.title)),
     'при английском языке подписи сроков остались русскими',
   );
+});
+
+test('S-016: готовые сроки отсчитываются от текущего момента', () => {
+  // Неверно посчитанный готовый срок молча ставит напоминание не на то время:
+  // ошибку видно только тогда, когда напоминание не пришло.
+  const presets = now => Object.fromEntries(
+    fn('duePresets', 'готовых сроков нет: срок ставится только вручную')(now, 'ru')
+      .map(preset => [preset.id, preset.value]));
+  // Вторник, середина дня: ни одно значение не попадает на границу суток.
+  const tuesday = new Date(2026, 8, 15, 12, 30, 45, 123);
+  const value = presets(tuesday);
+  assert.equal(value.hour.getTime() - tuesday.getTime(), 3600000,
+    '"через час" считается не от текущего момента');
+  assert.deepEqual(
+    [value.today.getDate(), value.today.getHours(), value.today.getMinutes(), value.today.getSeconds()],
+    [15, 23, 59, 59], '"сегодня" обязано означать конец текущих суток');
+  assert.deepEqual([value.evening.getDate(), value.evening.getHours(), value.evening.getMinutes()],
+    [15, 18, 0], '"сегодня вечером" обязано означать 18:00 текущих суток');
+  assert.deepEqual([value.tomorrow.getDate(), value.tomorrow.getHours()], [16, 9],
+    '"завтра в 09:00" уехало с завтрашнего утра');
+  assert.deepEqual([value.monday.getDay(), value.monday.getDate(), value.monday.getHours()], [1, 21, 9],
+    '"в понедельник в 09:00" указывает не на ближайший понедельник');
+  assert.deepEqual([value.next_week.getMonth(), value.next_week.getDate(), value.next_week.getHours()], [8, 22, 9],
+    '"через неделю" считается не семью сутками вперёд');
+  assert.deepEqual([value.next_month.getMonth(), value.next_month.getDate(), value.next_month.getHours()], [9, 15, 9],
+    '"через месяц" считается не месяцем вперёд');
+  assert.equal(value.none, null, '"без срока" обязано оставаться пустым значением');
+  // Час за полночь и месяц от длинного месяца - две границы, на которых
+  // наивный сдвиг даты промахивается.
+  const lateEvening = presets(new Date(2026, 8, 15, 23, 30, 0, 0));
+  assert.deepEqual([lateEvening.hour.getDate(), lateEvening.hour.getHours()], [16, 0],
+    '"через час" перед полуночью обязан уходить на следующие сутки');
+  const marchEnd = presets(new Date(2026, 2, 31, 10, 0, 0, 0));
+  assert.deepEqual([marchEnd.next_month.getMonth(), marchEnd.next_month.getDate()], [3, 30],
+    'месяц от 31 марта обязан давать 30 апреля, а не 1 мая');
 });
 
 test('S-019 - S-023: срок начала не позже исполнения, напоминание не в прошлом, пустой срок исполнения допустим', () => {

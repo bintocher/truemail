@@ -537,6 +537,10 @@
   .modal .mb{padding:18px 20px;max-height:64vh;overflow-y:auto;} .modal .mf{display:flex;align-items:center;gap:8px;padding:14px 20px;border-top:1px solid var(--border);}
   .compact-modal{width:min(690px,94vw)}
   .snooze-presets{display:grid;gap:8px;margin-bottom:14px}.snooze-presets .btn{justify-content:flex-start}
+  /* Готовые сроки окна напоминания идут сеткой по четыре в ряд: столбцом из
+     восьми кнопок окно вытягивалось на весь экран. */
+  .task-presets{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .task-presets .btn{justify-content:center;text-align:center;white-space:normal;line-height:1.25;min-height:40px;padding:7px 8px}
   .template-field{display:grid;gap:6px;color:var(--text-2);font-size:12px}
   .template-list{display:grid;gap:8px}.template-row{display:flex;align-items:center;gap:8px;padding:10px;border:1px solid var(--border);border-radius:9px}.template-row .t{font-weight:600}.template-row .d{font-size:12px;color:var(--text-3)}.template-empty{color:var(--text-3);text-align:center;padding:20px}
   .aux-form .fld{margin-bottom:13px}.aux-form .fld>label{display:block;font-size:12px;color:var(--text-2);margin-bottom:6px}.aux-two{display:grid;grid-template-columns:1fr 1fr;gap:12px}.aux-check{display:flex;align-items:center;gap:8px;font-size:13px;margin:-2px 0 13px}.aux-check input{accent-color:var(--accent)}.event-rsvp-status{font-size:12.5px;color:var(--text-2);margin-bottom:6px}.event-source-line{font-size:13px;color:var(--text-2);font-weight:600}.event-rsvp-actions{display:flex;gap:6px}.event-rsvp-actions .btn{flex:1 1 0;justify-content:center;opacity:.75}.event-rsvp-actions .btn.primary{opacity:1;font-weight:600}.ccard{cursor:pointer}.ccard:hover{background:var(--hover)}

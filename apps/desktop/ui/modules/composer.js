@@ -19,7 +19,7 @@ function recipientFieldAddresses(id){const input=document.getElementById(id);con
 function validAddress(value){return /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(value)||/^.+\s<[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+>$/.test(value);}
 function setRecipientFieldVisible(id,visible,focus=false){const field=document.querySelector(`[data-recipient-field="${id}"]`);if(!field)return;field.classList.toggle('hidden',!visible);if(focus&&visible)document.getElementById(id)?.focus();}
 document.querySelectorAll('[data-recipient-toggle]').forEach(button=>button.onclick=()=>setRecipientFieldVisible(button.dataset.recipientToggle,true,true));
-document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=()=>{const id=button.dataset.recipientHide;if(document.getElementById(id).value.trim()&&!confirm(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;document.getElementById(id).value='';setRecipientFieldVisible(id,false);scheduleDraftSave();});
+document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=async()=>{const id=button.dataset.recipientHide;if(document.getElementById(id).value.trim()&&!await confirmAction(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;document.getElementById(id).value='';setRecipientFieldVisible(id,false);scheduleDraftSave();});
 /* Каждый сброс композера - новое письмо: вложение, дочитанное после этого,
    уже не наше и в новое письмо не попадает. */
 let composerGeneration=0;

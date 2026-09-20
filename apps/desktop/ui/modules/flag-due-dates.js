@@ -28,21 +28,46 @@
     return date;
   }
 
+  // Сдвиг на месяц вперёд с удержанием в пределах месяца: 31 марта + месяц
+  // даёт 30 апреля, а не 1 мая. Без удержания срок уезжал бы на день дальше
+  // обещанного у всех длинных месяцев.
+  function monthLater(value) {
+    const date = dayStart(value);
+    const day = date.getDate();
+    date.setDate(1);
+    date.setMonth(date.getMonth() + 1);
+    const lastDay = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+    date.setDate(Math.min(day, lastDay));
+    return date;
+  }
+
   function duePresets(now = new Date(), lang = 'ru') {
-    const today = dayStart(now);
-    const tomorrow = dayStart(now);
-    const monday = nextMonday(now);
-    const nextWeek = new Date(monday);
-    nextWeek.setDate(nextWeek.getDate() + 7);
+    const base = asDate(now) || new Date();
+    // Час отсчитывается от текущего момента, остальные значения - от начала
+    // суток: "завтра в 09:00" не должно зависеть от времени нажатия.
+    const hour = new Date(base.getTime() + 60 * 60 * 1000);
+    const today = dayStart(base);
+    const evening = dayStart(base);
+    const tomorrow = dayStart(base);
+    const monday = nextMonday(base);
+    const nextWeek = dayStart(base);
+    const nextMonth = monthLater(base);
     today.setHours(23, 59, 59, 999);
+    evening.setHours(18, 0, 0, 0);
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(9, 0, 0, 0);
+    nextWeek.setDate(nextWeek.getDate() + 7);
+    nextWeek.setHours(9, 0, 0, 0);
+    nextMonth.setHours(9, 0, 0, 0);
     const en = lang === 'en';
     return [
+      {id: 'hour', title: en ? 'In an hour' : 'Через час', value: hour},
       {id: 'today', title: en ? 'Today' : 'Сегодня', value: today},
+      {id: 'evening', title: en ? 'This evening' : 'Сегодня вечером', value: evening},
       {id: 'tomorrow', title: en ? 'Tomorrow at 09:00' : 'Завтра в 09:00', value: tomorrow},
       {id: 'monday', title: en ? 'Monday at 09:00' : 'В понедельник в 09:00', value: monday},
-      {id: 'next_week', title: en ? 'Next week' : 'На следующей неделе', value: nextWeek},
+      {id: 'next_week', title: en ? 'In a week' : 'Через неделю', value: nextWeek},
+      {id: 'next_month', title: en ? 'In a month' : 'Через месяц', value: nextMonth},
       {id: 'none', title: en ? 'No due date' : 'Без срока', value: null},
       {id: 'custom', title: en ? 'Custom time' : 'Другие дата и время', value: null},
     ];
@@ -225,12 +250,12 @@
   function flagClearWarning(count, lang = 'ru') {
     if (count <= 1) {
       return lang === 'en'
-        ? 'Clear the flag and delete task dates?'
-        : 'Снять флажок и удалить сроки дела?';
+        ? 'Clear the flag and delete the reminder?'
+        : 'Снять флажок и удалить напоминание?';
     }
     return lang === 'en'
-      ? `Clear the flag? Task dates will be deleted for ${count} message(s).`
-      : `Снять флажок? Сроки дела будут удалены у писем: ${count}.`;
+      ? `Clear the flag? Reminders will be deleted for ${count} message(s).`
+      : `Снять флажок? Напоминания будут удалены у писем: ${count}.`;
   }
 
   async function toggleFlag(bridge, ids, flagged, options = {}) {
