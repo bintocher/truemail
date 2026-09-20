@@ -83,6 +83,17 @@ async fn pinned_at(db: &Db, message_id: i64) -> Option<String> {
         .0
 }
 
+/// Состарить закрепление: закрепления делают в разное время, и проверке нужно
+/// различимое значение, а не одна и та же секунда у всех писем.
+async fn age_pin(db: &Db, message_id: i64, hours: i64) {
+    sqlx::query("UPDATE messages SET pinned_at=datetime('now', ?) WHERE id=?")
+        .bind(format!("-{hours} hours"))
+        .bind(message_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("состарить закрепление");
+}
+
 async fn add_label(db: &Db, message_id: i64, label_id: i64) {
     db.toggle_message_label(message_id, label_id, true)
         .await
@@ -302,31 +313,53 @@ async fn cache_pruning_keeps_pinned_messages() {
     db.close().await;
 }
 
-/// S-050, S-051, S-055: сквозная проверка судьбы закрепления при переносе.
-/// Письмо закреплено, уведено в корзину, очередь завершила перенос и удалила
-/// прежнюю строку, а следующая синхронизация принесла то же письмо на новом
-/// месте. Закрепление и время закрепления обязаны приехать вместе с ним.
+/// S-050, S-051, S-055, S-058: закрепление переживает каждый из трёх путей,
+/// которыми исчезает локальная строка письма, - свою операцию переноса,
+/// извещение сервера об исчезнувших номерах и сверку снимка папки. Сверяется
+/// точное время закрепления: подставленное заново, оно означало бы, что
+/// пользователь закрепил письмо только что, и закреплённая часть списка
+/// переставилась бы сама собой.
 #[tokio::test]
-async fn a_moved_pinned_message_keeps_its_pin() {
-    let db: TestDb = open_test_db("pin-move").await;
+async fn a_pin_survives_every_path_that_drops_the_message_row() {
+    let db: TestDb = open_test_db("pin-row-loss").await;
     let account = seed_account(&db, "move@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
+    let work = seed_folder(&db, account, "Work", None).await;
     db.save_discovered_messages(
         account,
-        &[discovered("INBOX", 11, "<move@example.test>")],
+        &[
+            discovered("INBOX", 11, "<move@example.test>"),
+            discovered("INBOX", 21, "<rebuild@example.test>"),
+            discovered("Work", 31, "<snapshot@example.test>"),
+        ],
         false,
     )
     .await
-    .expect("письмо пришло во входящие");
-    let message = message_id_by_uid(&db, inbox, 11).await;
-    pin(&db, message).await;
-    let before = pinned_at(&db, message).await.expect("время закрепления");
+    .expect("письма пришли");
+    let moved = message_id_by_uid(&db, inbox, 11).await;
+    let rebuilt = message_id_by_uid(&db, inbox, 21).await;
+    let elsewhere = message_id_by_uid(&db, work, 31).await;
+    let pinned = db
+        .set_messages_pinned(&[moved, rebuilt, elsewhere], true)
+        .await
+        .expect("закрепить письма");
+    assert_eq!(pinned.changed, 3, "закрепление не дошло до писем");
+    // Закрепления состарены на разный срок: с одинаковым временем подстановка
+    // "закреплено сейчас" совпала бы с прежним значением и прошла бы молча.
+    for (message, hours) in [(moved, 3), (rebuilt, 2), (elsewhere, 1)] {
+        age_pin(&db, message, hours).await;
+    }
+    let before_move = pinned_at(&db, moved).await.expect("время закрепления");
+    let before_rebuild = pinned_at(&db, rebuilt).await.expect("время закрепления");
+    let before_snapshot = pinned_at(&db, elsewhere).await.expect("время закрепления");
 
-    db.queue_message_action(&[message], "trash")
+    // Путь первый: своя операция переноса. Очередь довела перенос до конца и
+    // удалила прежнюю строку, а синхронизация принесла письмо из корзины.
+    db.queue_message_action(&[moved], "trash")
         .await
         .expect("поставить перенос в корзину");
-
     // Окно отмены переноса - 10 секунд; ждать их незачем, время сдвигается.
     sqlx::query(
         "UPDATE outbox_ops SET next_attempt_at=datetime('now','-1 minutes') WHERE op_kind='move'",
@@ -350,34 +383,15 @@ async fn a_moved_pinned_message_keeps_its_pin() {
     )
     .await
     .expect("письмо нашлось в корзине");
-
-    let moved = message_id_by_uid(&db, trash, 904).await;
+    let after_move = message_id_by_uid(&db, trash, 904).await;
     assert_eq!(
-        pinned_at(&db, moved).await.as_deref(),
-        Some(before.as_str()),
-        "закрепление и время закрепления не вернулись на новую строку письма"
+        pinned_at(&db, after_move).await.as_deref(),
+        Some(before_move.as_str()),
+        "перенос очередью унёс закрепление вместе со строкой письма"
     );
-    db.close().await;
-}
 
-/// S-058: пересборка папки удаляет строку письма другим путём - по сообщению
-/// сервера об исчезнувших номерах. Закрепление обязано вернуться и здесь,
-/// иначе обычная переиндексация ящика молча роняет письмо вниз списка.
-#[tokio::test]
-async fn a_folder_rebuild_returns_the_pin_to_the_new_row() {
-    let db: TestDb = open_test_db("pin-rebuild").await;
-    let account = seed_account(&db, "rebuild@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    db.save_discovered_messages(
-        account,
-        &[discovered("INBOX", 21, "<rebuild@example.test>")],
-        false,
-    )
-    .await
-    .expect("письмо пришло");
-    let message = message_id_by_uid(&db, inbox, 21).await;
-    pin(&db, message).await;
-
+    // Путь второй: пересборка папки. Сервер сообщил об исчезнувшем номере, и
+    // то же письмо пришло новым номером - обычная переиндексация ящика.
     db.apply_imap_vanished(account, &[("INBOX".to_owned(), vec![21])])
         .await
         .expect("сервер сообщил об исчезнувшем номере");
@@ -388,41 +402,16 @@ async fn a_folder_rebuild_returns_the_pin_to_the_new_row() {
     )
     .await
     .expect("то же письмо пришло новым номером");
-
-    let rebuilt = message_id_by_uid(&db, inbox, 22).await;
-    assert!(
-        pinned_at(&db, rebuilt).await.is_some(),
-        "закрепление не вернулось на новую строку письма"
+    let after_rebuild = message_id_by_uid(&db, inbox, 22).await;
+    assert_eq!(
+        pinned_at(&db, after_rebuild).await.as_deref(),
+        Some(before_rebuild.as_str()),
+        "пересборка папки унесла закрепление вместе со строкой письма"
     );
-    db.close().await;
-}
 
-/// S-051, S-058: закрепление переживает и обычную синхронизацию. Строку письма
-/// удаляют не только своя операция переноса и извещение об исчезновении: то же
-/// делают сверка снимка папки и смена признака её действительности. Письмо,
-/// разложенное по папкам на другом устройстве, иначе молча теряло бы
-/// закрепление и уезжало вниз списка.
-#[tokio::test]
-async fn a_snapshot_reconcile_keeps_the_pin_of_a_message_moved_elsewhere() {
-    let db: TestDb = open_test_db("pin-snapshot").await;
-    let account = seed_account(&db, "snapshot@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    let archive = seed_folder(&db, account, "Archive", Some("archive")).await;
-    db.save_discovered_messages(
-        account,
-        &[discovered("INBOX", 31, "<snapshot@example.test>")],
-        false,
-    )
-    .await
-    .expect("письмо пришло во входящие");
-    let message = message_id_by_uid(&db, inbox, 31).await;
-    db.set_messages_pinned(&[message], true)
-        .await
-        .expect("закрепить письмо");
-    let before = pinned_at(&db, message).await.expect("время закрепления");
-
-    // Снимок папки письма больше не называет: его унесли на другом устройстве.
-    db.reconcile_imap_snapshot(account, &[("INBOX".to_owned(), Vec::new())], &[])
+    // Путь третий: обычная синхронизация. Снимок папки письма больше не
+    // называет - его разложили по папкам на другом устройстве.
+    db.reconcile_imap_snapshot(account, &[("Work".to_owned(), Vec::new())], &[])
         .await
         .expect("сверка снимка папки");
     db.save_discovered_messages(
@@ -432,28 +421,31 @@ async fn a_snapshot_reconcile_keeps_the_pin_of_a_message_moved_elsewhere() {
     )
     .await
     .expect("письмо нашлось в архиве");
-
-    let moved = message_id_by_uid(&db, archive, 931).await;
+    let after_snapshot = message_id_by_uid(&db, archive, 931).await;
     assert_eq!(
-        pinned_at(&db, moved).await.as_deref(),
-        Some(before.as_str()),
-        "обычная синхронизация унесла закрепление вместе со строкой письма"
+        pinned_at(&db, after_snapshot).await.as_deref(),
+        Some(before_snapshot.as_str()),
+        "сверка снимка унесла закрепление вместе со строкой письма"
     );
     db.close().await;
 }
 
-/// S-007, S-008, S-059: предел в 20 закреплённых писем на ящик проверяется в
-/// ядре и считается по всем закреплённым письмам, включая отложенные и
-/// уводимые. Второй ящик при этом свой предел держит сам.
+/// S-007, S-008, S-059: предел закреплений ядро считает по ящику и по всем
+/// закреплённым письмам, включая отложенные и уводимые - они вернутся в список
+/// сами и место занимают. Само число берётся из реестра настроек
+/// (crates/core/src/model/limits.rs), а проверка идёт по границе: последнее
+/// разрешённое письмо, первое сверх предела, место, освободившееся после
+/// открепления, и предел, поднятый на единицу.
 #[tokio::test]
 async fn the_pin_limit_is_counted_in_the_core_per_mailbox() {
     let db: TestDb = open_test_db("pin-limit").await;
+    let limit = db.limit_count(LIMIT_PINNED_PER_ACCOUNT);
     let first = seed_account(&db, "limit-one@example.test").await;
     let second = seed_account(&db, "limit-two@example.test").await;
     let first_inbox = seed_folder(&db, first, "INBOX", Some("inbox")).await;
     let second_inbox = seed_folder(&db, second, "INBOX", Some("inbox")).await;
     let mut ids = Vec::new();
-    for uid in 1..=21 {
+    for uid in 1..=limit as i64 + 2 {
         ids.push(
             seed_message(
                 &db,
@@ -478,24 +470,61 @@ async fn the_pin_limit_is_counted_in_the_core_per_mailbox() {
         .expect("поставить перенос в корзину");
 
     let result = db
-        .set_messages_pinned(&ids[..20], true)
+        .set_messages_pinned(&ids[..limit], true)
         .await
-        .expect("закрепить двадцать писем");
-    assert_eq!(result.changed, 20, "двадцать писем закрепляются");
-    assert_eq!(result.rejected_limit, 0, "предел ещё не достигнут");
+        .expect("закрепить письма до предела");
+    assert_eq!(result.changed, limit, "письма до предела не закрепились");
+    assert_eq!(
+        result.rejected_limit, 0,
+        "отказ пришёл раньше границы предела"
+    );
 
     let over = db
-        .set_messages_pinned(&ids[20..], true)
+        .set_messages_pinned(&ids[limit..limit + 1], true)
         .await
-        .expect("двадцать первое письмо");
-    assert_eq!(over.changed, 0, "двадцать первое письмо не закрепляется");
-    assert_eq!(
-        over.rejected_limit, 1,
-        "отказ назван пределом, а не ошибкой"
-    );
+        .expect("письмо сверх предела");
+    assert_eq!(over.changed, 0, "письмо сверх предела закрепилось");
+    assert_eq!(over.rejected_limit, 1, "отказ назван пределом, а не ошибкой");
     assert!(
-        pinned_at(&db, ids[20]).await.is_none(),
+        pinned_at(&db, ids[limit]).await.is_none(),
         "письмо сверх предела всё-таки закреплено"
+    );
+
+    // Открепление освободило ровно одно место, и занимает его ровно одно
+    // письмо: место считается по всем закреплённым, включая отложенное.
+    db.set_messages_pinned(&ids[..1], false)
+        .await
+        .expect("открепить отложенное письмо");
+    let released = db
+        .set_messages_pinned(&ids[limit..], true)
+        .await
+        .expect("занять освободившееся место");
+    assert_eq!(released.changed, 1, "освободившееся место осталось пустым");
+    assert_eq!(
+        released.rejected_limit, 1,
+        "второе письмо заняло место, которого нет"
+    );
+
+    // Предел - настройка, а не число в ядре: поднятый на единицу, он пускает
+    // ещё одно письмо и ни одного сверх того.
+    db.set_limit(LIMIT_PINNED_PER_ACCOUNT, limit as i64 + 1)
+        .await
+        .expect("поднять предел закреплений");
+    let raised = db
+        .set_messages_pinned(&ids[..1], true)
+        .await
+        .expect("закрепить письмо по поднятому пределу");
+    assert_eq!(
+        raised.changed, 1,
+        "поднятый предел не подействовал: число взято не из настроек"
+    );
+    let above_raised = db
+        .set_messages_pinned(&ids[limit + 1..], true)
+        .await
+        .expect("письмо сверх поднятого предела");
+    assert_eq!(
+        above_raised.rejected_limit, 1,
+        "поднятый предел перестал держать границу"
     );
 
     let other = seed_message(&db, second, second_inbox, 1, "<other@example.test>", 1).await;
@@ -516,6 +545,11 @@ async fn the_pin_limit_is_counted_in_the_core_per_mailbox() {
 /// письма, прошедшие её условия, объединённое представление - письма всех
 /// ящиков. Без отдельного перечня закреплённое письмо пропадает из списка:
 /// страницы списка закреплённые письма исключают.
+///
+/// Сверяется сам порядок выдачи, число закреплённых и обычная часть того же
+/// ответа: список рисует закреплённую часть сверху в том порядке, в каком её
+/// получил, число показывает подписью, а обычную часть ставит следом - и
+/// закреплённое письмо не должно прийти в ней вторым показом.
 #[tokio::test]
 async fn the_pinned_list_answers_each_of_the_four_views() {
     let db: TestDb = open_test_db("pin-views").await;
@@ -525,16 +559,24 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
     let archive = seed_folder(&db, first, "Archive", Some("archive")).await;
     let other_inbox = seed_folder(&db, second, "INBOX", Some("inbox")).await;
 
-    // Все три письма закреплены и лежат далеко в прошлом: в загруженные
-    // страницы они не попали бы вовсе.
-    let in_inbox = seed_message(&db, first, inbox, 1, "<inbox@example.test>", 400).await;
-    let in_archive = seed_message(&db, first, archive, 2, "<archive@example.test>", 500).await;
+    // Закреплённые письма лежат далеко в прошлом - в загруженные страницы они
+    // не попали бы вовсе. Их порядок по дате намеренно обратен порядку
+    // заведения: иначе перепутанная выдача совпала бы с порядком строк базы.
+    let in_inbox = seed_message(&db, first, inbox, 1, "<inbox@example.test>", 500).await;
+    let in_archive = seed_message(&db, first, archive, 2, "<archive@example.test>", 400).await;
     let in_other = seed_message(&db, second, other_inbox, 3, "<other@example.test>", 600).await;
+    // Обычные письма тех же представлений: они приходят тем же ответом
+    // отдельной частью.
+    let plain_inbox = seed_message(&db, first, inbox, 4, "<plain-inbox@example.test>", 2).await;
+    let plain_fresh = seed_message(&db, first, inbox, 5, "<plain-fresh@example.test>", 1).await;
+    let plain_archive =
+        seed_message(&db, first, archive, 6, "<plain-archive@example.test>", 3).await;
     let label = db
         .create_label("Работа", "#ff0000")
         .await
         .expect("создать метку");
     add_label(&db, in_archive, label).await;
+    add_label(&db, plain_archive, label).await;
     for message in [in_inbox, in_archive, in_other] {
         pin(&db, message).await;
     }
@@ -547,13 +589,16 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         .expect("снять признак важности у письма второго ящика");
 
     let ids = |list: &PinnedMessageList| {
-        let mut ids = list
-            .messages
+        list.messages
             .iter()
             .map(|message| message.id)
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
+            .collect::<Vec<_>>()
+    };
+    let ordinary = |list: &PinnedMessageList| {
+        list.ordinary
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>()
     };
 
     let folder_view = db
@@ -565,6 +610,15 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         vec![in_inbox],
         "перечень папки отдал чужие закреплённые письма"
     );
+    assert_eq!(
+        folder_view.total, 1,
+        "число закреплённых разошлось с выдачей"
+    );
+    assert_eq!(
+        ordinary(&folder_view),
+        vec![plain_fresh, plain_inbox],
+        "обычная часть папки собрана не по дате или отдала закреплённое письмо"
+    );
 
     let label_view = db
         .list_pinned_messages("label", Some("Работа"))
@@ -575,6 +629,12 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         vec![in_archive],
         "перечень метки собран не по метке"
     );
+    assert_eq!(label_view.total, 1, "число закреплённых разошлось с выдачей");
+    assert_eq!(
+        ordinary(&label_view),
+        vec![plain_archive],
+        "обычная часть метки собрана не по метке или отдала закреплённое письмо"
+    );
 
     let smart_view = db
         .list_pinned_messages("smart", Some(&smart))
@@ -582,8 +642,14 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         .expect("закреплённые письма умной папки");
     assert_eq!(
         ids(&smart_view),
-        vec![in_inbox, in_archive],
-        "перечень умной папки не спросил вхождение у того же отбора, что и страницы"
+        vec![in_archive, in_inbox],
+        "перечень умной папки отдан не по дате или собран не тем же отбором, что и страницы"
+    );
+    assert_eq!(smart_view.total, 2, "число закреплённых разошлось с выдачей");
+    assert_eq!(
+        ordinary(&smart_view),
+        vec![plain_fresh, plain_inbox, plain_archive],
+        "обычная часть умной папки собрана не по дате или отдала закреплённое письмо"
     );
 
     let unified_view = db
@@ -592,8 +658,17 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         .expect("закреплённые письма объединённого представления");
     assert_eq!(
         ids(&unified_view),
-        vec![in_inbox, in_archive, in_other],
-        "объединённое представление потеряло закреплённые письма одного из ящиков"
+        vec![in_archive, in_inbox, in_other],
+        "объединённое представление отдало письма не по дате или потеряло письма одного из ящиков"
+    );
+    assert_eq!(
+        unified_view.total, 3,
+        "число закреплённых разошлось с выдачей"
+    );
+    assert_eq!(
+        ordinary(&unified_view),
+        vec![plain_fresh, plain_inbox, plain_archive],
+        "обычная часть объединённого представления отдала закреплённое письмо вторым показом"
     );
 
     // Вид неизвестен - ошибка, а не молчаливый пустой перечень.
