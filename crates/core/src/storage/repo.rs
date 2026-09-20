@@ -410,8 +410,15 @@ impl Db {
     }
 
     pub async fn set_keybinding(&self, action: &str, combo: &str) -> Result<()> {
-        let combo = normalize_key_combo(combo)
-            .ok_or_else(|| crate::Error::Other("неверное сочетание клавиш".into()))?;
+        // Пустая строка снимает клавишу с действия и доходит сюда с настоящего
+        // пути снятия. Разбирать её нечем, а отказ означал бы, что назначенное
+        // сочетание освободить нечем вовсе (issue #104).
+        let combo = if combo.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_key_combo(combo)
+                .ok_or_else(|| crate::Error::Other("неверное сочетание клавиш".into()))?
+        };
         let result = if is_quick_step_key_action(action) {
             sqlx::query(
                 "INSERT INTO keybindings(action,scope,combo) VALUES(?,'local',?)
