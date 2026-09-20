@@ -463,9 +463,14 @@ window.corePageSize = null;
         };
         releaseSnoozed().catch(console.error);
         // Срок между проверками отложенных писем - настройка ядра, а не число
-        // здесь.
-        const snoozeSeconds = window.limitsModel.limitValue(window.limitsModel.KEYS.snoozeReleaseSeconds);
-        if (snoozeSeconds) setInterval(() => releaseSnoozed().catch(console.error), snoozeSeconds * 1000);
+        // здесь. Цикл спрашивает её перед каждым оборотом: записанное значение
+        // действует со следующего прохода, без перезапуска программы
+        // (configurable-limits.md, S-008, S-014).
+        window.limitsModel.startLimitLoop(
+          window.limitsModel.KEYS.snoozeReleaseSeconds,
+          releaseSnoozed,
+          { timers: window },
+        );
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере
@@ -475,13 +480,13 @@ window.corePageSize = null;
         // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE.
         // Gmail проверяет новые ID каждые 25 секунд, а этот проход подхватывает
         // изменения ярлыков/удаления, которые не создали новое входящее письмо.
-        // Срок между проходами - настройка ядра, а не число здесь.
-        const syncMinutes = window.limitsModel.limitValue(window.limitsModel.KEYS.backgroundSyncMinutes);
-        if (syncMinutes) {
-          setInterval(() => {
-            window.tm.syncAccounts().catch(console.error);
-          }, syncMinutes * 60 * 1000);
-        }
+        // Срок между проходами - настройка ядра, а не число здесь, и читается
+        // он перед каждым оборотом (configurable-limits.md, S-008, S-014).
+        window.limitsModel.startLimitLoop(
+          window.limitsModel.KEYS.backgroundSyncMinutes,
+          () => window.tm.syncAccounts(),
+          { scale: 60 * 1000, timers: window },
+        );
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
             // Только фоновая синхронизация. Полную перезагрузку списка тут НЕ
