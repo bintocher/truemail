@@ -1096,7 +1096,10 @@ mod tests {
                 .fetch_one(&db.pool)
                 .await
                 .expect("счёт отложенных");
-        assert_eq!(waiting.0, 0, "обработанное письмо в остатке не задерживается");
+        assert_eq!(
+            waiting.0, 0,
+            "обработанное письмо в остатке не задерживается"
+        );
         db.close().await;
     }
 
