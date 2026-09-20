@@ -291,8 +291,13 @@ impl Db {
         // S-011: ключ снимка расходуется неделимо и для всех четырёх режимов,
         // поэтому подтверждение нельзя применить к другой области, другому
         // числу дней или другому согласию на архив.
-        let (payload, max_message_id, total) =
-            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        let (payload, max_message_id, total) = Self::consume_stage_snapshot(
+            &mut tx,
+            snapshot_key,
+            SNAPSHOT_KIND,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         if payload != sweep_payload(&address, &input) {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой уборке, откройте подтверждение заново".into(),

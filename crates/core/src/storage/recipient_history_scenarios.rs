@@ -777,3 +777,86 @@ async fn rank_boundaries_belong_to_the_next_group() {
     }
     db.close().await;
 }
+
+/// Место адресата в подсказке тем же путём, которым его берёт композер.
+async fn rank_of(db: &Db, account_id: i64, email: &str) -> i64 {
+    db.recipient_candidates(account_id)
+        .await
+        .expect("кандидаты подсказки")
+        .into_iter()
+        .find(|candidate| candidate.email == email)
+        .expect("адресат пропал из подсказки")
+        .rank
+}
+
+/// Пороги свежести остаются шкалой: порог, догнавший соседний, отклоняется с
+/// именем зависимого поля, а упорядоченный сдвиг принимается и действует
+/// (S-028, configurable-limits.md S-021).
+///
+/// Пороги проверялись поодиночке, каждый в своих границах. Недавнее, опущенное
+/// ниже свежего, перехватывалось первым условием каскада, вес недавнего
+/// становился недостижимым, и подсказка молча переставала различать свежие и
+/// недавние обращения.
+#[tokio::test]
+async fn freshness_thresholds_stay_ordered_so_the_scale_keeps_working() {
+    let db: TestDb = open_test_db("history-rank-order").await;
+    let account = seed_account(&db, "me@example.test").await;
+    for (email, days) in [("fresh@partner.test", 10_i64), ("recent@partner.test", 45)] {
+        db.record_recipient_touches(
+            account,
+            &[RecipientTouch {
+                email: email.into(),
+                name: String::new(),
+                message_key: format!("<{email}>"),
+                used_at: iso(days),
+            }],
+            TouchOrigin::OwnSend,
+        )
+        .await
+        .expect("записать обращение");
+    }
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 3);
+    assert_eq!(rank_of(&db, account, "recent@partner.test").await, 2);
+
+    let refused = db
+        .set_limit(LIMIT_RANK_RECENT_DAYS, 10)
+        .await
+        .expect_err("недавнее принято ниже свежего: пороги проверяются поодиночке");
+    let message = refused.to_string();
+    assert!(
+        message.contains("считать свежим"),
+        "отказ не называет зависимое поле: {message}"
+    );
+    assert!(
+        message.contains("30"),
+        "отказ не называет значение зависимого поля: {message}"
+    );
+    assert_eq!(
+        db.limit(LIMIT_RANK_RECENT_DAYS),
+        90,
+        "отклонённое значение всё-таки изменило порог"
+    );
+    // Равенство порогов ломает шкалу так же, как их перестановка.
+    assert!(
+        db.set_limit(LIMIT_RANK_FRESH_DAYS, 90).await.is_err(),
+        "свежее, догнавшее недавнее, принято: вес недавнего стал недостижим"
+    );
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 3);
+    assert_eq!(
+        rank_of(&db, account, "recent@partner.test").await,
+        2,
+        "подсказка перестала различать свежие и недавние обращения"
+    );
+
+    // Упорядоченный сдвиг шкалы принимается, и обращения меняют вес вместе с
+    // ним: обе записи сдвигаются на ступень вниз.
+    db.set_limit(LIMIT_RANK_FRESH_DAYS, 5)
+        .await
+        .expect("сузить порог свежести");
+    db.set_limit(LIMIT_RANK_RECENT_DAYS, 20)
+        .await
+        .expect("сузить порог недавнего");
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 2);
+    assert_eq!(rank_of(&db, account, "recent@partner.test").await, 1);
+    db.close().await;
+}

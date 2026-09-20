@@ -312,8 +312,13 @@ impl Db {
         let account_id = source.account_id;
         // Снимок расходуется неделимо: повторное подтверждение с тем же ключом
         // второй уборки не запускает.
-        let (payload, max_message_id, _) =
-            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        let (payload, max_message_id, _) = Self::consume_stage_snapshot(
+            &mut tx,
+            snapshot_key,
+            SNAPSHOT_KIND,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         if payload != format!("{account_id}\n{message_id}") {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой переписке, откройте подтверждение заново".into(),

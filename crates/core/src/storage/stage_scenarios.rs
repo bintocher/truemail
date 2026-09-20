@@ -1993,3 +1993,199 @@ async fn mailbox_without_trash_closes_lists_but_lets_rules_run() {
     assert_eq!(rule_move[0].2, Some(archive));
     db.close().await;
 }
+
+/// Состарить снимок кандидатов: подтверждение открывают и возвращаются к нему
+/// спустя часы, а ждать их в проверке нельзя.
+async fn age_snapshot(db: &Db, key: &str, hours: i64) {
+    sqlx::query("UPDATE stage_snapshots SET created_at=datetime('now', ?) WHERE key=?")
+        .bind(format!("-{hours} hours"))
+        .bind(key)
+        .execute(&db.write_pool)
+        .await
+        .expect("состарить снимок");
+}
+
+/// Число заведённых заданий всех трёх стадий.
+async fn job_counts(db: &Db) -> (i64, i64, i64) {
+    let count = |sql: &'static str| async move {
+        sqlx::query_as::<_, (i64,)>(sql)
+            .fetch_one(&db.pool)
+            .await
+            .expect("посчитать задания")
+            .0
+    };
+    (
+        count("SELECT count(*) FROM sender_policy_jobs").await,
+        count("SELECT count(*) FROM ignored_conversation_jobs").await,
+        count("SELECT count(*) FROM sender_sweep_jobs").await,
+    )
+}
+
+/// Просроченный список писем не подтверждается ни одним из трёх путей:
+/// списками отправителей, игнорированием переписки и автоочисткой по
+/// отправителю (blocked-senders.md S-030, ignore-conversation.md S-016,
+/// sweep-by-sender.md S-011, configurable-limits.md S-018).
+///
+/// Срок жизни снимка спрашивала только уборка - при запуске программы и перед
+/// новым снимком. Между ними снимок жил сколько угодно, и подтверждение
+/// недельной давности запускало массовое перемещение писем по списку, который
+/// пользователь уже не видел.
+#[tokio::test]
+async fn a_stale_list_of_messages_is_refused_on_every_confirmation_path() {
+    let db = test_db("stage-stale-snapshot").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let blocked = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "news@example.test",
+            subject: "выпуск",
+            ..Seed::default()
+        },
+    )
+    .await;
+    let talk = seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Seed {
+            from: "one@example.test",
+            subject: "Обсуждение",
+            date: Some(&days_ago(3)),
+            message_id: Some("<talk@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let swept = seed_message(
+        &db,
+        account,
+        inbox,
+        3,
+        Seed {
+            from: "shop@example.test",
+            subject: "счёт",
+            date: Some(&days_ago(40)),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let sweep_input = SenderSweepInput {
+        address: "shop@example.test".into(),
+        mode: SWEEP_MODE_OLDER_THAN.into(),
+        account_id: Some(account),
+        days: Some(30),
+        sweep_archive: false,
+    };
+
+    let policy_preview = db
+        .preview_sender_policy(POLICY_KIND_ADDRESS, "news@example.test")
+        .await
+        .expect("предпросмотр списка отправителей");
+    let policy = db
+        .save_sender_policy(
+            POLICY_KIND_ADDRESS,
+            &policy_preview.value,
+            POLICY_DECISION_BLOCKED,
+            false,
+        )
+        .await
+        .expect("запись блокировки");
+    let ignore_preview = db
+        .preview_ignore_conversation(talk)
+        .await
+        .expect("предпросмотр игнорирования");
+    let sweep_preview = db
+        .preview_sender_sweep(sweep_input.clone())
+        .await
+        .expect("предпросмотр автоочистки");
+
+    // Все три списка собраны вчера, а срок им отведён суточный.
+    db.set_limit(LIMIT_STAGE_SNAPSHOT_HOURS, 24)
+        .await
+        .expect("записать срок жизни снимка");
+    for key in [
+        &policy_preview.snapshot_key,
+        &ignore_preview.snapshot_key,
+        &sweep_preview.snapshot_key,
+    ] {
+        age_snapshot(&db, key, 30).await;
+    }
+
+    let refusals = [
+        db.start_sender_policy_sweep(policy.id, &policy_preview.snapshot_key, true)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        db.enable_ignore_conversation(talk, &ignore_preview.snapshot_key, true)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        db.start_sender_sweep(sweep_input.clone(), &sweep_preview.snapshot_key)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+    ];
+    for refusal in &refusals {
+        let message = refusal
+            .as_deref()
+            .expect("просроченный список писем подтверждён: возраст снимка не проверяется");
+        assert!(
+            message.contains("устарел"),
+            "отказ не объясняет, что список устарел: {message}"
+        );
+    }
+    for message in [blocked, talk, swept] {
+        assert!(
+            takeaways(&db, message).await.is_empty(),
+            "по просроченному списку письмо всё-таки уводится"
+        );
+    }
+    assert_eq!(
+        job_counts(&db).await,
+        (0, 0, 0),
+        "отказ оставил после себя задание уборки"
+    );
+    assert!(
+        db.list_ignored_conversations()
+            .await
+            .expect("записи игнорирования")
+            .is_empty(),
+        "переписка записана в игнорируемые по просроченному списку"
+    );
+
+    // Тот же путь с живым списком доходит до уборки: отказ вызван возрастом
+    // снимка, а не поломкой подтверждения.
+    let policy_preview = db
+        .preview_sender_policy(POLICY_KIND_ADDRESS, "news@example.test")
+        .await
+        .expect("второй предпросмотр списка отправителей");
+    db.start_sender_policy_sweep(policy.id, &policy_preview.snapshot_key, true)
+        .await
+        .expect("уборка по списку отправителей");
+    let ignore_preview = db
+        .preview_ignore_conversation(talk)
+        .await
+        .expect("второй предпросмотр игнорирования");
+    db.enable_ignore_conversation(talk, &ignore_preview.snapshot_key, true)
+        .await
+        .expect("включение игнорирования");
+    let sweep_preview = db
+        .preview_sender_sweep(sweep_input.clone())
+        .await
+        .expect("второй предпросмотр автоочистки");
+    db.start_sender_sweep(sweep_input, &sweep_preview.snapshot_key)
+        .await
+        .expect("автоочистка по отправителю");
+    for message in [blocked, talk, swept] {
+        let queued = takeaways(&db, message).await;
+        assert_eq!(queued.len(), 1, "живой список письмо не убрал");
+        assert_eq!(queued[0].2, Some(trash));
+    }
+    db.close().await;
+}

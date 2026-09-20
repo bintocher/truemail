@@ -216,19 +216,29 @@ impl Db {
     }
 
     /// Израсходовать снимок: строка снимка удаляется тем же запросом, которым
-    /// читается. Одно подтверждение пользователя запускает уборку один раз,
-    /// даже если команда пришла дважды. Строки кандидатов остаются заданию.
+    /// читается, и тем же запросом проверяется её возраст. Одно подтверждение
+    /// пользователя запускает уборку один раз, даже если команда пришла
+    /// дважды. Строки кандидатов остаются заданию.
+    ///
+    /// Срок жизни спрашивается здесь, а не только уборкой: между уборкой и
+    /// подтверждением снимок живёт сколько угодно, и пользователь подтвердил
+    /// бы список, собранный неделю назад. Отдельным запросом возраст проверять
+    /// нельзя - между проверкой и удалением второе подтверждение израсходовало
+    /// бы тот же ключ.
     pub(crate) async fn consume_stage_snapshot(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         key: &str,
         kind: &str,
+        snapshot_hours: i64,
     ) -> Result<(String, i64, i64)> {
         let row: Option<(String, i64, i64)> = sqlx::query_as(
-            "DELETE FROM stage_snapshots WHERE key=? AND kind=?
+            "DELETE FROM stage_snapshots
+              WHERE key=? AND kind=? AND datetime(created_at) > datetime('now', ?)
              RETURNING payload, max_message_id, total",
         )
         .bind(key)
         .bind(kind)
+        .bind(format!("-{snapshot_hours} hours"))
         .fetch_optional(&mut **tx)
         .await?;
         row.ok_or_else(|| {

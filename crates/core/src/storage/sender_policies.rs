@@ -431,8 +431,13 @@ impl Db {
         };
         // Снимок расходуется неделимо: повторная команда с тем же ключом
         // второй уборки не запускает.
-        let (payload, max_message_id, _) =
-            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        let (payload, max_message_id, _) = Self::consume_stage_snapshot(
+            &mut tx,
+            snapshot_key,
+            SNAPSHOT_KIND,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         if payload != format!("{kind}\n{value}") {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой записи, откройте подтверждение заново".into(),
