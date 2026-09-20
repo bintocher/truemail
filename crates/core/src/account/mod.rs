@@ -701,7 +701,7 @@ impl SyncRegistry {
 /// в остальном файле - только эта операция допускает подмену хранилища в
 /// тестах (S-014): CI-раннер не всегда имеет системный keychain.
 pub trait SecretStore: Send + Sync {
-    /// `None` - записи нет или чтение не удалось; смене пароля это не мешает (S-016a).
+    /// `None` - записи нет или чтение не удалось; смене пароля это не мешает (S-041).
     fn read(&self, secret_ref: &str) -> Option<String>;
     /// Возвращает `true`, если `keyring` подтвердил запись без ошибки транспорта.
     /// Итог смены пароля определяется контрольным чтением (S-014), а не этим
@@ -806,7 +806,7 @@ fn classify_validation_error(message: &str) -> bool {
 }
 
 /// Сравнение параметров подключения между двумя снимками одного аккаунта
-/// (S-016b, accounts-accordion-password.md): `secret_ref` и все поля, которые
+/// (S-042, accounts-accordion-password.md): `secret_ref` и все поля, которые
 /// `mail_backend` использует для построения соединения. Цвет, глубина кэша и
 /// название аккаунта к подключению отношения не имеют и не считаются сменой.
 fn connection_config_matches(before: &Account, after: &Account) -> bool {
@@ -3081,7 +3081,7 @@ impl AccountManager {
         }
 
         // Между проверкой и записью пользователь мог переподключить аккаунт
-        // через мастер (S-016b) - конфигурация перечитывается перед записью.
+        // через мастер (S-042) - конфигурация перечитывается перед записью.
         let accounts_now = self
             .db
             .list_accounts()
@@ -3096,7 +3096,7 @@ impl AccountManager {
         }
 
         // Старое значение - только для сравнения при контрольном чтении;
-        // отсутствие записи или нечитаемый секрет смене не мешают (S-016a).
+        // отсутствие записи или нечитаемый секрет смене не мешают (S-041).
         let old_value = store.read(&secret_ref);
         let wrote = store.write(&secret_ref, new_password);
         if !wrote {
@@ -3505,7 +3505,7 @@ mod change_password_tests {
         (base, server)
     }
 
-    /// Мок для S-016b: в момент, когда сервер отвечает на проверку пароля, он
+    /// Мок для S-042: в момент, когда сервер отвечает на проверку пароля, он
     /// же меняет secret_ref строки аккаунта в базе напрямую - имитирует
     /// пользователя, успевшего переподключить ящик через мастер, пока
     /// проверка нового пароля ещё шла по сети.
@@ -3742,7 +3742,7 @@ mod change_password_tests {
         cleanup(db, root, server).await;
     }
 
-    // ---------- контракт и повреждённые состояния (S-010, S-016a) ----------
+    // ---------- контракт и повреждённые состояния (S-010, S-041) ----------
 
     #[tokio::test]
     async fn unsupported_auth_kind_for_oauth2_account() {
@@ -3929,7 +3929,7 @@ mod change_password_tests {
 
     #[tokio::test]
     async fn missing_old_secret_does_not_block_change_and_compares_only_to_new_value() {
-        // S-016a: записи в keyring нет (initial пуст) - смене это не мешает.
+        // S-041: записи в keyring нет (initial пуст) - смене это не мешает.
         let (db, root) = temp_db("no-old-secret").await;
         let (base, server) = spawn_mock_jmap("correct-password").await;
         let account = save_jmap_account(&db, &base, "secret-ref-none", AuthKind::Password).await;
@@ -3942,7 +3942,7 @@ mod change_password_tests {
         cleanup(db, root, server).await;
     }
 
-    // ---------- S-016b: конфигурация перечитывается перед записью ----------
+    // ---------- S-042: конфигурация перечитывается перед записью ----------
 
     #[tokio::test]
     async fn account_changed_between_validation_and_write_aborts_without_writing() {
@@ -3974,7 +3974,7 @@ mod change_password_tests {
         assert_eq!(
             store.write_count(),
             0,
-            "secret_ref поменялся во время проверки - запись не должна выполняться (S-016b)"
+            "secret_ref поменялся во время проверки - запись не должна выполняться (S-042)"
         );
         cleanup(db, root, server).await;
     }

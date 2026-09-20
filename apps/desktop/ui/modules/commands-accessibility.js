@@ -98,7 +98,7 @@ function buildResults(q,coreResults=[]){const base=[...getStaticCmds()];
   }
   const terms=searchTerms(q),termVariants=terms?personSearch.personSearchVariants(terms):[];
   // Подбор людей по транслиту (person-search-translit.md): у контактов - по
-  // кэшированным ключам, у остальных команд - обычный personMatches (S-013a:
+  // кэшированным ключам, у остальных команд - обычный personMatches (S-017:
   // совпадение только через транслит не подсвечивается - см. highlightMatch).
   return q.trim()?base.filter(c=>c.searchHit||(terms&&(c.personKeys?termVariants.some(variant=>c.personKeys.some(key=>key.includes(variant))):personSearch.personMatches(c.t+' '+(c.sub||'')+' '+c.g,terms)))):base;}
 function renderCmd(q='',coreResults=[]){const f=buildResults(q,coreResults);currentCommands=f;sel=0;let html='',lg='';
