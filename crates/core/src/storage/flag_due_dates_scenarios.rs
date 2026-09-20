@@ -840,15 +840,14 @@ async fn interface_times_are_stored_in_the_format_the_core_compares() {
         shown.task.due_at
     );
 
-    // Время напоминания наступает через секунду: проход цикла напоминаний
-    // обязан его забрать, а не отложить до следующих суток.
-    let soon = (chrono::Utc::now() + chrono::Duration::seconds(1))
+    // Напоминание, назначенное на ближайший час, ещё не наступило.
+    let later = (chrono::Utc::now() + chrono::Duration::hours(1))
         .to_rfc3339_opts(SecondsFormat::Millis, true);
     db.save_message_task(&MessageTaskInput {
         message_id: reminded,
         start_at: None,
         due_at: None,
-        reminder_at: Some(soon),
+        reminder_at: Some(later),
     })
     .await
     .expect("сохранить время напоминания");
@@ -859,7 +858,23 @@ async fn interface_times_are_stored_in_the_format_the_core_compares() {
             .is_empty(),
         "напоминание показано раньше своего времени"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
+    // Время напоминания наступает через секунду: проход цикла обязан его
+    // забрать, а не отложить до следующих суток. Проверка "ещё рано" сделана
+    // выше на часовом сроке, а не на этом: между записью и чтением проходит
+    // неизвестное время, и под нагрузкой секунда успевала истечь, превращая
+    // проверку в случайную.
+    let soon = (chrono::Utc::now() + chrono::Duration::seconds(1))
+        .to_rfc3339_opts(SecondsFormat::Millis, true);
+    db.save_message_task(&MessageTaskInput {
+        message_id: reminded,
+        start_at: None,
+        due_at: None,
+        reminder_at: Some(soon),
+    })
+    .await
+    .expect("сохранить наступающее время напоминания");
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let reminders = db
         .due_task_reminders(50)
         .await
