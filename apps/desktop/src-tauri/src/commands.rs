@@ -164,7 +164,10 @@ pub fn register_global_shortcuts(app: &AppHandle, bindings: &[Keybinding]) -> an
     let manager = app.global_shortcut();
     manager.unregister_all()?;
     let mut actions = HashMap::new();
-    for binding in bindings.iter().filter(|binding| binding.scope == "global") {
+    for binding in bindings
+        .iter()
+        .filter(|binding| binding.scope == "global" && !binding.combo.trim().is_empty())
+    {
         let emitted = match binding.action.as_str() {
             "toggle_window" => "toggle",
             "compose_global" => "compose",
@@ -5366,11 +5369,10 @@ pub async fn set_keybinding(
     action: String,
     combo: String,
 ) -> CmdResult<()> {
-    let Some(combo) = normalize_key_combo(combo.trim()) else {
-        return Err(ApiError {
-            message: "сочетание клавиш не может быть пустым".into(),
-        });
-    };
+    // Пустое сочетание снимает клавишу с действия: иначе занятое сочетание
+    // освободить нечем, а часть глобальных сочетаний занимает сама система и
+    // переназначить их на другое действие не выйдет (issue #100).
+    let combo = normalize_key_combo(combo.trim()).unwrap_or_default();
     let core = core(&state).await?;
     let previous = core.db.list_keybindings().await?;
     let mut updated = previous.clone();
@@ -5388,20 +5390,24 @@ pub async fn set_keybinding(
         .ok_or_else(|| ApiError {
             message: "неизвестное действие клавиатуры".into(),
         })?;
-    if binding.scope == "global" {
+    if binding.scope == "global" && !combo.is_empty() {
         Shortcut::from_str(&combo).map_err(|error| ApiError {
             message: format!("неверное сочетание клавиш: {error}"),
         })?;
     }
     binding.combo = combo.clone();
     let mut seen = HashSet::new();
-    if updated.iter().any(|binding| {
-        !seen.insert(
-            normalize_key_combo(&binding.combo)
-                .unwrap_or_else(|| binding.combo.clone())
-                .to_ascii_lowercase(),
-        )
-    }) {
+    if updated
+        .iter()
+        .filter(|binding| !binding.combo.trim().is_empty())
+        .any(|binding| {
+            !seen.insert(
+                normalize_key_combo(&binding.combo)
+                    .unwrap_or_else(|| binding.combo.clone())
+                    .to_ascii_lowercase(),
+            )
+        })
+    {
         return Err(ApiError {
             message: "это сочетание уже назначено другому действию".into(),
         });

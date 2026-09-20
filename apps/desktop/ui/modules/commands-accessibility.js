@@ -118,9 +118,34 @@ const activeKeybindings=new Map([
   ['archive','E'],['snooze','H'],['next_message','J'],['prev_message','K'],['delete','Del'],
 ]);
 function eventCombo(event){return quickStepsModel.eventCombo(event);}
-function bindingMatches(action,event){return activeKeybindings.get(action)?.toLocaleLowerCase()===eventCombo(event).toLocaleLowerCase();}
+// Снятое сочетание не срабатывает никогда. Без проверки на пустоту нажатие
+// одного модификатора давало пустую строку с обеих сторон, и действие со
+// снятой клавишей запускалось бы от нажатия Shift (issue #100).
+function bindingMatches(action,event){const bound=activeKeybindings.get(action);if(!bound)return false;const pressed=eventCombo(event);if(!pressed)return false;return bound.toLocaleLowerCase()===pressed.toLocaleLowerCase();}
 async function refreshKeybindings(){if(!window.tm?.listKeybindings)return;const bindings=await window.tm.listKeybindings();bindings.forEach(binding=>activeKeybindings.set(binding.action,binding.combo));document.querySelectorAll('[data-key-action]').forEach(input=>{input.value=activeKeybindings.get(input.dataset.keyAction)||'';});}
 window.refreshKeybindings=refreshKeybindings;
+// Снятие сочетания: назначенную клавишу нельзя было убрать вовсе, а нажатие
+// Del в поле записывалось как сочетание "Del" и уходило на регистрацию
+// глобального сочетания, откуда приходила ошибка системы (issue #100).
+document.querySelectorAll('[data-key-clear]').forEach(button=>{button.addEventListener('click',async()=>{
+  const action=button.dataset.keyClear;
+  const input=document.querySelector(`[data-key-action="${action}"]`);
+  const previous=activeKeybindings.get(action)||'';
+  if(!previous){showToast(L('У этого действия и так нет сочетания','This action has no shortcut anyway'));return;}
+  button.disabled=true;if(input)input.disabled=true;
+  try{
+    await window.tm.setKeybinding(action,'');
+    activeKeybindings.set(action,'');
+    if(input)input.value='';
+    showToast(L('Сочетание снято','Shortcut cleared'));
+  }catch(error){
+    if(input)input.value=previous;
+    showToast(error);
+  }finally{
+    button.disabled=false;
+    if(input){input.disabled=false;}
+  }
+});});
 document.querySelectorAll('[data-key-action]').forEach(input=>{input.addEventListener('keydown',async event=>{event.preventDefault();event.stopPropagation();const combo=eventCombo(event);if(!combo)return;const previous=activeKeybindings.get(input.dataset.keyAction)||'';input.value=combo;input.disabled=true;try{await window.tm.setKeybinding(input.dataset.keyAction,combo);activeKeybindings.set(input.dataset.keyAction,combo);showToast(L('Сочетание сохранено','Shortcut saved'));}catch(error){input.value=previous;showToast(error);}finally{input.disabled=false;input.focus();}});});
 document.addEventListener('keydown',e=>{
   const target=e.target;if(target.matches?.('[data-key-action]'))return;

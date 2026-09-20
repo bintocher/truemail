@@ -550,5 +550,6 @@
   "setRecipientHistory": "Recipient history",
   "historyLead": "Addresses you have written to from the selected mailbox. The recipient suggestion takes into account how often and how recently you wrote to them. An address removed here does not come back after a sync, but returns if you write to it again.",
   "historyClearAction": "Clear the mailbox history",
-  "historyListTitle": "History entries"
+  "historyListTitle": "History entries",
+  "keyClearTitle": "Clear shortcut"
 }
