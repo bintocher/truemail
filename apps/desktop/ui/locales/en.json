@@ -11,7 +11,6 @@
   "accentViolet": "Violet",
   "accountsLead": "Connected mailboxes. Click for account settings, signature and servers.",
   "accountOauthReauth": "Sign in again",
-  "accountOauthPasswordNotStored": "The password for this mailbox is not stored.",
   "accountWizardTitle": "Account connection wizard",
   "applicationUpdates": "Application updates",
   "applicationUpdatesDesc": "New signed versions are checked automatically.",

@@ -119,12 +119,6 @@ function renderAccountSettings(accounts,foldersByAccount,calendars){
   if(accountCards.isOAuthAccount(account.auth_kind)){
     const reconnect=card.querySelector('.account-reconnect');
     reconnect.lastChild.textContent=wt('accountOauthReauth');
-    // Пояснение стоит своей строкой под кнопками, а не внутри их ряда:
-    // в ряду оно отнимало у кнопок ширину и ломало шапку карточки (issue #81).
-    const explanation=document.createElement('small');
-    explanation.className='account-note account-oauth-explanation';
-    explanation.textContent=wt('accountOauthPasswordNotStored');
-    card.querySelector('.account-actions').after(explanation);
   }
   // Аккордеон (S-002, S-006 accounts-accordion-password.md): переключение
   // только по выделенной кнопке и свободной области шапки, не по кнопкам действий.

@@ -430,7 +430,7 @@
   .setnav .sec{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;color:var(--text-2);cursor:pointer;font-size:var(--fs);}
   .setnav .sec:hover{background:var(--hover);} .setnav .sec.active{background:var(--active);color:var(--accent-text);font-weight:560;}
   .setnav .sec i svg{width:17px;height:17px;}
-  .setbody{min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:26px 34px;} .setpage{display:none;width:min(100%,720px);max-width:720px;} .setpage.active{display:block;}
+  .setbody{min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding:26px 34px;} .setpage{display:none;width:min(100%,1000px);max-width:1000px;} .setpage.active{display:block;}
   .setpage{--field-col:280px;}
   .setpage h1{margin:0 0 4px;font-size:22px;letter-spacing:-.02em;} .setpage .lead{color:var(--text-3);margin:0 0 22px;}
   .card{border:1px solid var(--border);border-radius:12px;margin-bottom:16px;overflow:hidden;}
@@ -763,7 +763,7 @@
 .account-actions{cursor:default}
 .account-card>.account-sync-state{width:100%;box-sizing:border-box;padding:0 18px 12px;color:var(--text-3);font-size:12.5px;line-height:1.45}
 .account-card>.account-sync-state:empty{display:none}
-.account-oauth-explanation{display:block;max-width:190px;color:var(--text-3);font-size:11px;line-height:1.25;text-align:right}
+
 /* Диалог смены пароля: адрес аккаунта как описание, статус - под полем ввода. */
 .pw-account{color:var(--text-3);font-size:12.5px;margin-bottom:2px}
 .pw-status{min-height:18px;font-size:12.5px;color:var(--text-3);margin-top:8px}
