@@ -158,7 +158,15 @@ function createBridge(answers = {}) {
         calls.push({command: name, args});
         const handler = handlers[name];
         if (typeof handler === 'function') return handler(...args);
-        return handler === undefined ? null : handler;
+        if (handler !== undefined) return handler;
+        // Неописанная команда отвечает пустым перечнем, а запрос одиночного
+        // значения - null. При старте и при смене языка окно перерисовывает
+        // свои разделы, и ответ null на запрос перечня роняет перерисовку в
+        // её тихий catch: проверка тогда идёт по пути, которого в работающей
+        // программе нет, и молча этого не замечает.
+        return /^(get|read|save|set|delete|remove|open|start|preview|change)/.test(name)
+          ? null
+          : [];
       };
     },
     has() { return true; },
@@ -231,8 +239,17 @@ function createUiWindow(options = {}) {
     // Чтение вложенного файла: композер читает вставленную картинку им же.
     FileReader: createFileReaderClass(),
     // Кодирование base64: им интерфейс раскодирует имена папок IMAP
-    // (модифицированный UTF-7) и читает вложения.
-    atob: value => Buffer.from(String(value), 'base64').toString('binary'),
+    // (модифицированный UTF-7) и читает вложения. Проверка строгая, как в
+    // браузере: Buffer.from молча отбрасывает посторонние символы, а
+    // интерфейс на этом отказе и держится - повреждённое имя папки
+    // показывается сырым, повреждённая картинка отклоняется.
+    atob: value => {
+      const text = String(value);
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(text) || text.length % 4 !== 0) {
+        throw new Error('InvalidCharacterError');
+      }
+      return Buffer.from(text, 'base64').toString('binary');
+    },
     btoa: value => Buffer.from(String(value), 'binary').toString('base64'),
     Buffer,
     URL: {createObjectURL: () => 'blob:stub', revokeObjectURL: () => {}},

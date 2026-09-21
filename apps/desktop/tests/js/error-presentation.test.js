@@ -353,12 +353,12 @@ test('S-015: сообщение без действия снимается по 
   const app = await errorApp();
   app.sandbox.window.showToast('Письма отмечены прочитанными');
   assert.equal(cards(app).length, 1);
-  app.advanceTimers(9000);
+  await app.advanceTimers(9000);
   assert.equal(cards(app).length, 0, 'сообщение снято по времени');
   assert.equal(app.document.querySelector('.app-toast-stack'), null, 'пустая стопка убрана из разметки');
   // Ошибка с действием ждёт человека и сама не исчезает.
   app.sandbox.window.showApiError({kind: 'timeout', account_id: 1, message: 'raw'});
-  app.advanceTimers(60000);
+  await app.advanceTimers(60000);
   assert.equal(cards(app).length, 1);
 });
 
