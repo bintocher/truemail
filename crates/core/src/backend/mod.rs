@@ -168,7 +168,15 @@ async fn ensure_unsubscribe_target_is_public(
     // Порт нужен и для lookup_host, и чтобы вернуть готовый SocketAddr для
     // привязки соединения.
     let port = url.port_or_known_default().unwrap_or(80);
-    if let Ok(literal) = host.parse::<std::net::IpAddr>() {
+    // Адрес в URL записывается литералом, и IPv6 приходит в квадратных
+    // скобках: без их снятия литерал не разбирался бы как адрес и уходил в
+    // разрешение имён. Там решение зависело бы от резолвера системы, то есть
+    // запрет обращения на внутренний адрес держался бы на чужом поведении.
+    let literal_host = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(literal) = literal_host.parse::<std::net::IpAddr>() {
         reject_if_disallowed(literal)?;
         return Ok(None);
     }
@@ -1031,10 +1039,11 @@ mod unsubscribe_ssrf_tests {
             let url = url::Url::parse(raw).unwrap();
             let decision = ensure_unsubscribe_target_is_public(&url).await;
             assert_eq!(decision.is_ok(), allowed, "URL {raw}");
-            if allowed && !raw.contains('[') {
-                // Для IPv4-литерала резолвить нечего: соединение идёт по
-                // самому URL. IPv6-литерал приходит со скобками и разбирается
-                // уже в lookup_host, тоже без обращения к сети.
+            if allowed {
+                // Резолвить нечего: адрес записан литералом, и решение принято
+                // по нему самому. Это верно и для IPv6 в квадратных скобках -
+                // иначе запрет держался бы на поведении резолвера системы, а
+                // оно на разных системах разное.
                 assert!(decision.unwrap().is_none(), "URL {raw}");
             }
         }
