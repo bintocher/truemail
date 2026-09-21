@@ -484,7 +484,10 @@ async fn the_pin_limit_is_counted_in_the_core_per_mailbox() {
         .await
         .expect("письмо сверх предела");
     assert_eq!(over.changed, 0, "письмо сверх предела закрепилось");
-    assert_eq!(over.rejected_limit, 1, "отказ назван пределом, а не ошибкой");
+    assert_eq!(
+        over.rejected_limit, 1,
+        "отказ назван пределом, а не ошибкой"
+    );
     assert!(
         pinned_at(&db, ids[limit]).await.is_none(),
         "письмо сверх предела всё-таки закреплено"
@@ -629,7 +632,10 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         vec![in_archive],
         "перечень метки собран не по метке"
     );
-    assert_eq!(label_view.total, 1, "число закреплённых разошлось с выдачей");
+    assert_eq!(
+        label_view.total, 1,
+        "число закреплённых разошлось с выдачей"
+    );
     assert_eq!(
         ordinary(&label_view),
         vec![plain_archive],
@@ -645,7 +651,10 @@ async fn the_pinned_list_answers_each_of_the_four_views() {
         vec![in_archive, in_inbox],
         "перечень умной папки отдан не по дате или собран не тем же отбором, что и страницы"
     );
-    assert_eq!(smart_view.total, 2, "число закреплённых разошлось с выдачей");
+    assert_eq!(
+        smart_view.total, 2,
+        "число закреплённых разошлось с выдачей"
+    );
     assert_eq!(
         ordinary(&smart_view),
         vec![plain_fresh, plain_inbox, plain_archive],

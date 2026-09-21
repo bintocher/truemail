@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_second_secret_after_an_authorization_header_is_replaced_too(){
+    fn a_second_secret_after_an_authorization_header_is_replaced_too() {
         // Заголовок авторизации разбирается раньше полей, и его значение
         // становится псевдонимом. Шаблон поля после этого захватывает остаток
         // строки целиком, поэтому пропуск уже обезличенного значения обязан
@@ -774,25 +774,43 @@ mod tests {
             &salt,
             &mut counts,
         );
-        assert!(line.starts_with("INFO "), "текст перед полем потерян: {line}");
+        assert!(
+            line.starts_with("INFO "),
+            "текст перед полем потерян: {line}"
+        );
         assert!(!line.contains("abcdefgh"), "{line}");
-        assert!(!line.contains("hunter2"), "второй секрет остался открытым: {line}");
+        assert!(
+            !line.contains("hunter2"),
+            "второй секрет остался открытым: {line}"
+        );
         assert!(line.contains("Bearer [secret-"), "{line}");
         assert!(line.contains("op=login"), "соседнее поле съедено: {line}");
     }
 
     #[test]
-    fn a_secret_never_reaches_the_archive(){
+    fn a_secret_never_reaches_the_archive() {
         // Ядро таких строк в журнал не пишет, но архив уходит в поддержку, и
         // первая же отладочная строка со значением токена попала бы туда
         // открытым текстом - а заметить это было бы некому (issue #111).
         let salt = salt(25);
         let cases = [
             ("password=hunter2 account_id=42", "hunter2", "account_id="),
-            ("access_token=ya29.AbCdEf-1234_xyz", "ya29.AbCdEf-1234_xyz", ""),
+            (
+                "access_token=ya29.AbCdEf-1234_xyz",
+                "ya29.AbCdEf-1234_xyz",
+                "",
+            ),
             ("refresh_token=\"1//04aBcD-eFgH\"", "1//04aBcD-eFgH", ""),
-            ("api_key=sk-live-0123456789abcdef", "sk-live-0123456789abcdef", ""),
-            ("client_secret=GOCSPX-abc_def, op=login", "GOCSPX-abc_def", "op=login"),
+            (
+                "api_key=sk-live-0123456789abcdef",
+                "sk-live-0123456789abcdef",
+                "",
+            ),
+            (
+                "client_secret=GOCSPX-abc_def, op=login",
+                "GOCSPX-abc_def",
+                "op=login",
+            ),
         ];
         for (source, secret, tail) in cases {
             let mut counts = ReplacementCounts::default();

@@ -150,12 +150,13 @@ async fn a_queued_message_stays_hidden_until_the_operation_fails() {
     db.save_discovered_messages(account, &[discovered(1)], false)
         .await
         .expect("синхронизация принесла письмо");
-    let message = sqlx::query_as::<_, (i64,)>("SELECT id FROM messages WHERE folder_id=? AND uid=1")
-        .bind(inbox)
-        .fetch_one(&db.pool)
-        .await
-        .expect("найти письмо")
-        .0;
+    let message =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM messages WHERE folder_id=? AND uid=1")
+            .bind(inbox)
+            .fetch_one(&db.pool)
+            .await
+            .expect("найти письмо")
+            .0;
 
     assert!(
         message_is_visible(&db, inbox, message).await,
@@ -285,7 +286,11 @@ async fn a_queued_message_stays_hidden_until_the_operation_fails() {
         .claim_outbox_operations(account, 1)
         .await
         .expect("забрать операцию после повтора");
-    assert_eq!(claimed.len(), 1, "повторённая операция не досталась работнику");
+    assert_eq!(
+        claimed.len(),
+        1,
+        "повторённая операция не досталась работнику"
+    );
     db.complete_outbox_operation(&claimed[0])
         .await
         .expect("закрыть операцию успехом");
@@ -300,6 +305,9 @@ async fn a_queued_message_stays_hidden_until_the_operation_fails() {
         .fetch_one(&db.pool)
         .await
         .expect("прочитать письма");
-    assert_eq!(rows.0, 0, "перенесённое письмо обязано уйти с прежнего места");
+    assert_eq!(
+        rows.0, 0,
+        "перенесённое письмо обязано уйти с прежнего места"
+    );
     db.close().await;
 }

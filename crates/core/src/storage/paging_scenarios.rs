@@ -96,17 +96,20 @@ async fn cursor_paging_covers_every_message_when_dates_are_equal() {
     let total = page * 100 + page / 2;
     seed_messages_with_one_date(&db, account, folder, total).await;
 
-    let expected: Vec<i64> = sqlx::query_as::<_, (i64,)>(
-        "SELECT id FROM messages WHERE folder_id=? ORDER BY id DESC",
-    )
-    .bind(folder)
-    .fetch_all(&db.pool)
-    .await
-    .expect("прочитать номера писем")
-    .into_iter()
-    .map(|row| row.0)
-    .collect();
-    assert_eq!(expected.len() as i64, total, "проверка засеяла не все письма");
+    let expected: Vec<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM messages WHERE folder_id=? ORDER BY id DESC")
+            .bind(folder)
+            .fetch_all(&db.pool)
+            .await
+            .expect("прочитать номера писем")
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
+    assert_eq!(
+        expected.len() as i64,
+        total,
+        "проверка засеяла не все письма"
+    );
 
     let mut walked: Vec<i64> = Vec::new();
     let mut cursor: Option<(String, i64)> = None;
@@ -208,12 +211,7 @@ async fn the_first_page_and_the_cursor_walk_agree_on_order() {
     // Продолжение обхода не должно возвращать письма первой страницы.
     let last = first.last().expect("первая страница не пуста");
     let next = db
-        .list_messages_page(
-            folder,
-            last.date.as_deref(),
-            Some(last.id),
-            page,
-        )
+        .list_messages_page(folder, last.date.as_deref(), Some(last.id), page)
         .await
         .expect("вторая страница");
     let first_ids: HashSet<i64> = first.iter().map(|message| message.id).collect();

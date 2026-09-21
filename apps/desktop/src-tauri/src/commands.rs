@@ -6342,7 +6342,7 @@ pub async fn complete_password_imap(
                         host: smtp_host.trim().to_owned(),
                         port: smtp_port,
                         security: parse_security(&smtp_security)?,
-                            tls_insecure: false,
+                        tls_insecure: false,
                     })
                 })
                 .transpose()?,

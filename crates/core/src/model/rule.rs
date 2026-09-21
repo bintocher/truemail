@@ -520,7 +520,6 @@ pub fn delete_forever_fingerprint(rule: &MailRuleInput) -> String {
         .collect()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,10 +584,7 @@ mod tests {
         let cases: Vec<(&str, MailRuleInput, Option<&str>)> = vec![
             (
                 "подходящая пара поля и оператора",
-                rule(
-                    vec![group(vec![ok_condition()])],
-                    vec![action("archive")],
-                ),
+                rule(vec![group(vec![ok_condition()])], vec![action("archive")]),
                 None,
             ),
             (
@@ -963,7 +959,8 @@ mod tests {
                 "поле {} проверяется прогоном, но в словаре его нет",
                 case.field
             );
-            for (outcome, value) in [("подходит", case.matching), ("чужое", case.other)] {
+            for (outcome, value) in [("подходит", case.matching), ("чужое", case.other)]
+            {
                 let label_name = format!("{}: {outcome}", case.field);
                 let label = seed_label(&db, &label_name).await;
                 let op = if outcome == "чужое" {

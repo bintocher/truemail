@@ -1070,8 +1070,7 @@ mod unsubscribe_ssrf_tests {
                 "отказ запроса",
             ));
             assert_eq!(
-                failure.after_handoff,
-                after_handoff,
+                failure.after_handoff, after_handoff,
                 "{:?} должен давать after_handoff = {after_handoff}",
                 kind
             );

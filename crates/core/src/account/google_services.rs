@@ -1135,7 +1135,10 @@ mod tests {
         };
         let encoded = encode_tasks_cursor(&saved).expect("encode cursor");
         let restored = decode_tasks_cursor(Some(&encoded)).expect("decode cursor");
-        assert_eq!(restored.last_full, fresh, "метка полной сверки не сохранена");
+        assert_eq!(
+            restored.last_full, fresh,
+            "метка полной сверки не сохранена"
+        );
         let (full, updated_min) = tasks_pass_plan(Some(&restored));
         assert!(!full, "свежая сверка не требует полного прохода");
         let expected = (chrono::DateTime::parse_from_rfc3339(&fresh).expect("fresh")

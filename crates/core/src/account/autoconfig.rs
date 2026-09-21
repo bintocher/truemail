@@ -23,7 +23,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             host: h.into(),
             port: p,
             security: Security::Ssl,
-                tls_insecure: false,
+            tls_insecure: false,
         })
     };
     let smtp = |h: &str, p: u16| {
@@ -31,7 +31,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             host: h.into(),
             port: p,
             security: Security::Ssl,
-                tls_insecure: false,
+            tls_insecure: false,
         })
     };
 

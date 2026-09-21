@@ -350,8 +350,14 @@ mod notification_border_tests {
         // всего окна в прошлое или будущее иначе остался бы незамеченным.
         let limit = chrono::Duration::hours(NOTIFICATION_MAX_AGE_HOURS);
         let slack = chrono::Duration::seconds(5);
-        assert!((now - before - limit).abs() < slack, "нижняя граница: {not_before}");
-        assert!((after - now - limit).abs() < slack, "верхняя граница: {not_after}");
+        assert!(
+            (now - before - limit).abs() < slack,
+            "нижняя граница: {not_before}"
+        );
+        assert!(
+            (after - now - limit).abs() < slack,
+            "верхняя граница: {not_after}"
+        );
     }
 }
 
@@ -1016,7 +1022,6 @@ mod sync_warning_tests {
         assert_eq!(warning.response_code, Some(500));
         assert!(warning.message.contains("HTTP 500"));
     }
-
 }
 
 impl AccountManager {
@@ -2849,13 +2854,13 @@ impl AccountManager {
                     host: "imap.yandex.com".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: Some(ServerConfig {
                     host: "smtp.yandex.com".into(),
                     port: 465,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 ews_url: None,
                 caldav_url: None,
@@ -2960,13 +2965,13 @@ impl AccountManager {
                     host: "imap.gmail.com".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: Some(ServerConfig {
                     host: "smtp.gmail.com".into(),
                     port: 465,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 ews_url: None,
                 caldav_url: None,
@@ -3047,13 +3052,13 @@ impl AccountManager {
                     host: "outlook.office365.com".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: Some(ServerConfig {
                     host: "smtp.office365.com".into(),
                     port: 587,
                     security: Security::Starttls,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 ews_url: None,
                 caldav_url: None,
@@ -3298,11 +3303,7 @@ impl AccountManager {
         let mail_folders = match imap_result {
             Ok(imap) => {
                 // Обрыв связи посреди обхода папок (imap-reconnect-resilience.md).
-                apply_skipped_folders(
-                    &imap.skipped_folders,
-                    imap.folders.len(),
-                    &mut warnings,
-                )?;
+                apply_skipped_folders(&imap.skipped_folders, imap.folders.len(), &mut warnings)?;
                 let saved = match self
                     .db
                     .save_discovered_folders(account.id, &imap.folders)
@@ -3590,7 +3591,9 @@ mod change_password_tests {
         mock_jmap_session(State(state), headers).await
     }
 
-    async fn spawn_slow_mock_jmap(expected_password: &str) -> (String, tokio::task::JoinHandle<()>) {
+    async fn spawn_slow_mock_jmap(
+        expected_password: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -3891,7 +3894,11 @@ mod change_password_tests {
                 &store,
             )
             .await;
-        assert_eq!(again, Ok(()), "после завершения смены аккаунт снова доступен");
+        assert_eq!(
+            again,
+            Ok(()),
+            "после завершения смены аккаунт снова доступен"
+        );
 
         cleanup(db, root, server).await;
     }
@@ -4094,10 +4101,10 @@ mod change_password_tests {
             );
             let result = manager
                 .change_account_password_with_store(
-                account.id,
-                Zeroizing::new("correct-password".into()),
-                &store,
-            )
+                    account.id,
+                    Zeroizing::new("correct-password".into()),
+                    &store,
+                )
                 .await;
             assert_eq!(
                 result,
@@ -4122,10 +4129,10 @@ mod change_password_tests {
             );
             let result = manager
                 .change_account_password_with_store(
-                account.id,
-                Zeroizing::new("correct-password".into()),
-                &store,
-            )
+                    account.id,
+                    Zeroizing::new("correct-password".into()),
+                    &store,
+                )
                 .await;
             assert_eq!(result, Err(ChangePasswordError::SecretStoreWriteFailed));
         }
@@ -4146,10 +4153,10 @@ mod change_password_tests {
                     MockSecretStore::new(&[("secret-ref-su", "old-password")], wrote, outcome);
                 let result = manager
                     .change_account_password_with_store(
-                account.id,
-                Zeroizing::new("correct-password".into()),
-                &store,
-            )
+                        account.id,
+                        Zeroizing::new("correct-password".into()),
+                        &store,
+                    )
                     .await;
                 assert_eq!(result, Err(ChangePasswordError::SecretStoreStateUnknown));
             }
@@ -4286,9 +4293,14 @@ mod change_password_tests {
 
         // Отказ сервера: пароль не подошёл.
         let (other_base, other_server) = spawn_mock_jmap("совсем другой пароль").await;
-        let rejected_account =
-            save_jmap_account_as(&db, &other_base, "secret-ref-log-2", AuthKind::Password, "other@example.test")
-                .await;
+        let rejected_account = save_jmap_account_as(
+            &db,
+            &other_base,
+            "secret-ref-log-2",
+            AuthKind::Password,
+            "other@example.test",
+        )
+        .await;
         let store = MockSecretStore::new(&[], true, ReadAfterWrite::NewValue);
         assert!(matches!(
             manager
@@ -4323,10 +4335,7 @@ mod change_password_tests {
             !text.is_empty(),
             "подписчик не собрал ни одной записи - проверять нечего"
         );
-        assert!(
-            !text.contains(PASSWORD),
-            "пароль попал в журнал:\n{text}"
-        );
+        assert!(!text.contains(PASSWORD), "пароль попал в журнал:\n{text}");
         // Адрес ящика в журнале тоже маскируется - иначе утечка просто
         // переезжает с пароля на владельца.
         assert!(

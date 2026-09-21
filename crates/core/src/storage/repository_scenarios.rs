@@ -190,14 +190,16 @@ async fn remote_projections_are_reduced_to_what_the_server_reports() {
         (all_mail, 2_i64, "remote-1"),
         (all_mail, 3_i64, "remote-deleted"),
     ] {
-        sqlx::query("INSERT INTO messages(account_id, folder_id, uid, remote_id) VALUES(?, ?, ?, ?)")
-            .bind(account)
-            .bind(folder)
-            .bind(uid)
-            .bind(remote_id)
-            .execute(&db.write_pool)
-            .await
-            .expect("копия письма в папке");
+        sqlx::query(
+            "INSERT INTO messages(account_id, folder_id, uid, remote_id) VALUES(?, ?, ?, ?)",
+        )
+        .bind(account)
+        .bind(folder)
+        .bind(uid)
+        .bind(remote_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("копия письма в папке");
     }
 
     let removed = db
@@ -287,7 +289,10 @@ async fn signatures_and_templates_are_kept_per_account() {
     db.upsert_signature(account, "new", "<b>С уважением</b>", true)
         .await
         .expect("сохранить подпись");
-    let signatures = db.list_signatures(account).await.expect("перечень подписей");
+    let signatures = db
+        .list_signatures(account)
+        .await
+        .expect("перечень подписей");
     assert_eq!(signatures.len(), 1);
     assert_eq!(signatures[0].body_html, "<b>С уважением</b>");
 
@@ -828,9 +833,11 @@ async fn a_mailbox_decides_whether_its_certificate_is_checked() {
         "новый ящик проверяется по умолчанию"
     );
     assert!(
-        loaded
-            .iter()
-            .all(|account| !account.imap.as_ref().expect("сервер получения").tls_insecure),
+        loaded.iter().all(|account| !account
+            .imap
+            .as_ref()
+            .expect("сервер получения")
+            .tls_insecure),
         "настройки сервера получены с выключенной проверкой без решения человека"
     );
 
@@ -846,13 +853,24 @@ async fn a_mailbox_decides_whether_its_certificate_is_checked() {
     };
 
     let mine_account = found("me@corp.test");
-    assert!(mine_account.tls_insecure, "решение не сохранилось в записи ящика");
     assert!(
-        mine_account.imap.as_ref().expect("сервер получения").tls_insecure,
+        mine_account.tls_insecure,
+        "решение не сохранилось в записи ящика"
+    );
+    assert!(
+        mine_account
+            .imap
+            .as_ref()
+            .expect("сервер получения")
+            .tls_insecure,
         "сервер получения своего ящика не получил решение"
     );
     assert!(
-        mine_account.smtp.as_ref().expect("сервер отправки").tls_insecure,
+        mine_account
+            .smtp
+            .as_ref()
+            .expect("сервер отправки")
+            .tls_insecure,
         "сервер отправки не получил решение: письма уходили бы прежним путём"
     );
 
@@ -862,7 +880,11 @@ async fn a_mailbox_decides_whether_its_certificate_is_checked() {
         "решение владельца соседнего ящика не спрашивали"
     );
     assert!(
-        !colleague.imap.as_ref().expect("сервер получения").tls_insecure,
+        !colleague
+            .imap
+            .as_ref()
+            .expect("сервер получения")
+            .tls_insecure,
         "ящик соседа на том же сервере потерял проверку, ничего не нажимая"
     );
 
@@ -874,9 +896,16 @@ async fn a_mailbox_decides_whether_its_certificate_is_checked() {
         .iter()
         .find(|account| account.email == "me@corp.test")
         .expect("ящик на месте");
-    assert!(!mine_account.tls_insecure, "снятое решение продолжало действовать");
     assert!(
-        !mine_account.imap.as_ref().expect("сервер получения").tls_insecure,
+        !mine_account.tls_insecure,
+        "снятое решение продолжало действовать"
+    );
+    assert!(
+        !mine_account
+            .imap
+            .as_ref()
+            .expect("сервер получения")
+            .tls_insecure,
         "снятое решение осталось в настройках сервера"
     );
 }

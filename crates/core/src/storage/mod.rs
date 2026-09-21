@@ -765,8 +765,8 @@ mod schema_version_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::repo::test_storage::{open_test_db, open_test_db_upto};
+    use super::*;
     use rand::Rng;
 
     fn random_key() -> [u8; 32] {
@@ -1292,7 +1292,7 @@ mod tests {
                     host: "imap.example.test".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: None,
                 ews_url: None,
@@ -2568,7 +2568,7 @@ mod tests {
                     host: "imap.example.test".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: None,
                 ews_url: None,
@@ -2694,7 +2694,7 @@ mod tests {
                     host: "imap.example.test".into(),
                     port: 993,
                     security: Security::Ssl,
-                tls_insecure: false,
+                    tls_insecure: false,
                 }),
                 smtp: None,
                 ews_url: None,

@@ -169,12 +169,20 @@ async fn unread_counter_matches_the_list_after_rules_and_queue() {
     seed_folder(&db, account, "INBOX", "inbox").await;
     seed_folder(&db, account, "Trash", "trash").await;
 
-    db.save_mail_rule(&rule("rule-read", "reports@example.test", "mark_read"), false, None)
-        .await
-        .expect("правило отметки прочитанным");
-    db.save_mail_rule(&rule("rule-trash", "list@example.test", "trash"), false, None)
-        .await
-        .expect("правило уборки в корзину");
+    db.save_mail_rule(
+        &rule("rule-read", "reports@example.test", "mark_read"),
+        false,
+        None,
+    )
+    .await
+    .expect("правило отметки прочитанным");
+    db.save_mail_rule(
+        &rule("rule-trash", "list@example.test", "trash"),
+        false,
+        None,
+    )
+    .await
+    .expect("правило уборки в корзину");
 
     // Три письма пометит правило, два уведёт правило, два останутся нетронутыми.
     let mut letters = Vec::new();
@@ -208,7 +216,10 @@ async fn unread_counter_matches_the_list_after_rules_and_queue() {
     .fetch_one(&db.pool)
     .await
     .expect("прочитать очередь");
-    assert_eq!(queued.0, 2, "правило уборки поставило не две операции увода");
+    assert_eq!(
+        queued.0, 2,
+        "правило уборки поставило не две операции увода"
+    );
 
     let (_, unread, listed) = counts_and_list(&db, UNREAD_FOLDER).await;
     let by_hand = unread_by_hand(&db).await;
@@ -227,7 +238,10 @@ async fn unread_counter_matches_the_list_after_rules_and_queue() {
         (2, 2, 2),
         "после выполнения очереди счётчик, список и пересчёт разошлись"
     );
-    assert_eq!(total, unread, "в папке непрочитанных оказались прочитанные письма");
+    assert_eq!(
+        total, unread,
+        "в папке непрочитанных оказались прочитанные письма"
+    );
 
     // Общий список входящих считается тем же проходом: уведённые письма ушли,
     // помеченные прочитанными остались.

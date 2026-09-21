@@ -90,7 +90,9 @@ async fn two_confirmations_of_one_snapshot_start_a_single_sweep() {
     let account = seed_account(&db, "me@example.test").await;
     seed_folder(&db, account, "INBOX", "inbox").await;
     seed_folder(&db, account, "Trash", "trash").await;
-    let letters: Vec<DiscoveredMessage> = (1..=3).map(|uid| discovered(uid, "list@example.test")).collect();
+    let letters: Vec<DiscoveredMessage> = (1..=3)
+        .map(|uid| discovered(uid, "list@example.test"))
+        .collect();
     db.save_discovered_messages(account, &letters, false)
         .await
         .expect("синхронизация принесла письма");
@@ -116,11 +118,18 @@ async fn two_confirmations_of_one_snapshot_start_a_single_sweep() {
     let (first_db, second_db) = ((*db).clone(), (*db).clone());
     let (first_input, second_input) = (input.clone(), input.clone());
     let (first_key, second_key) = (preview.snapshot_key.clone(), preview.snapshot_key.clone());
-    let first = tokio::spawn(async move { first_db.start_sender_sweep(first_input, &first_key).await });
-    let second =
-        tokio::spawn(async move { second_db.start_sender_sweep(second_input, &second_key).await });
+    let first =
+        tokio::spawn(async move { first_db.start_sender_sweep(first_input, &first_key).await });
+    let second = tokio::spawn(async move {
+        second_db
+            .start_sender_sweep(second_input, &second_key)
+            .await
+    });
     let (first, second) = tokio::join!(first, second);
-    let results = [first.expect("первая задача"), second.expect("вторая задача")];
+    let results = [
+        first.expect("первая задача"),
+        second.expect("вторая задача"),
+    ];
     let accepted = results.iter().filter(|result| result.is_ok()).count();
     assert_eq!(
         accepted,
@@ -139,7 +148,11 @@ async fn two_confirmations_of_one_snapshot_start_a_single_sweep() {
         .fetch_one(&db.pool)
         .await
         .expect("прочитать задания уборки");
-    assert_eq!(jobs.0, 1, "одно подтверждение завело {} заданий уборки", jobs.0);
+    assert_eq!(
+        jobs.0, 1,
+        "одно подтверждение завело {} заданий уборки",
+        jobs.0
+    );
     assert_eq!(
         takeaway_count(&db).await,
         letters.len() as i64,
@@ -176,11 +189,14 @@ async fn a_send_operation_is_claimed_by_exactly_one_worker() {
     let first = tokio::spawn(async move { first_db.claim_send_operation(account).await });
     let second = tokio::spawn(async move { second_db.claim_send_operation(account).await });
     let (first, second) = tokio::join!(first, second);
-    let claimed: Vec<i64> = [first.expect("первый работник"), second.expect("второй работник")]
-        .into_iter()
-        .flat_map(|result| result.expect("захват операции"))
-        .map(|operation| operation.id)
-        .collect();
+    let claimed: Vec<i64> = [
+        first.expect("первый работник"),
+        second.expect("второй работник"),
+    ]
+    .into_iter()
+    .flat_map(|result| result.expect("захват операции"))
+    .map(|operation| operation.id)
+    .collect();
     assert_eq!(
         claimed,
         vec![queued.operation_id],
@@ -192,7 +208,10 @@ async fn a_send_operation_is_claimed_by_exactly_one_worker() {
         .fetch_one(&db.pool)
         .await
         .expect("прочитать состояние операции");
-    assert_eq!(status.0, "processing", "захваченная операция обязана быть в передаче");
+    assert_eq!(
+        status.0, "processing",
+        "захваченная операция обязана быть в передаче"
+    );
     db.close().await;
 }
 
@@ -245,10 +264,13 @@ async fn two_stage_passes_take_one_message_away_once() {
     let first = tokio::spawn(async move { first_db.process_sync_batch_stages().await });
     let second = tokio::spawn(async move { second_db.process_sync_batch_stages().await });
     let (first, second) = tokio::join!(first, second);
-    let applied = [first.expect("первый проход"), second.expect("второй проход")]
-        .into_iter()
-        .map(|result| result.expect("проход стадий"))
-        .sum::<usize>();
+    let applied = [
+        first.expect("первый проход"),
+        second.expect("второй проход"),
+    ]
+    .into_iter()
+    .map(|result| result.expect("проход стадий"))
+    .sum::<usize>();
     assert_eq!(
         applied, 1,
         "правило применилось к одному письму {applied} раз"

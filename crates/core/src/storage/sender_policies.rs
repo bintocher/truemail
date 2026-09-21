@@ -1258,13 +1258,15 @@ mod stage_batch_tests {
         let fresh = message(11).await;
         let mut tx = db.begin_write().await.expect("запись");
         for id in &deferred_ids {
-            sqlx::query("INSERT INTO stage_job_deferrals(kind, job_id, message_id) VALUES(?, ?, ?)")
-                .bind(STAGE_DEFERRAL_KIND)
-                .bind(STAGE_DEFERRAL_JOB)
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .expect("отложить письмо");
+            sqlx::query(
+                "INSERT INTO stage_job_deferrals(kind, job_id, message_id) VALUES(?, ?, ?)",
+            )
+            .bind(STAGE_DEFERRAL_KIND)
+            .bind(STAGE_DEFERRAL_JOB)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .expect("отложить письмо");
         }
         Db::set_stage_cursor(
             &mut tx,

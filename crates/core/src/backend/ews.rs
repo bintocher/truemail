@@ -126,23 +126,34 @@ fn decode_mail_sync_token(value: Option<&str>) -> MailSyncToken {
 /// незнакомый код остаётся как есть и относится к неизвестным.
 fn winhttp_failure(message: &str) -> Option<(ErrorKind, &'static str)> {
     let code = message.trim().to_ascii_uppercase();
-    let code = code.strip_prefix("0X").map(|rest| rest.trim_start_matches('0'))?;
+    let code = code
+        .strip_prefix("0X")
+        .map(|rest| rest.trim_start_matches('0'))?;
     Some(match code {
         // 12002 ERROR_WINHTTP_TIMEOUT
         "80072EE2" => (ErrorKind::Timeout, "сервер не ответил вовремя"),
         // 12005 ERROR_WINHTTP_INVALID_URL
         "80072EE5" => (ErrorKind::AccountConfig, "адрес сервера записан неверно"),
         // 12006 ERROR_WINHTTP_UNRECOGNIZED_SCHEME
-        "80072EE6" => (ErrorKind::AccountConfig, "в адресе сервера неизвестная схема"),
+        "80072EE6" => (
+            ErrorKind::AccountConfig,
+            "в адресе сервера неизвестная схема",
+        ),
         // 12007 ERROR_WINHTTP_NAME_NOT_RESOLVED
         "80072EE7" => (
             ErrorKind::NetworkUnavailable,
             "имя сервера не удалось разрешить",
         ),
         // 12029 ERROR_WINHTTP_CANNOT_CONNECT
-        "80072EFD" => (ErrorKind::ServerUnavailable, "не удалось соединиться с сервером"),
+        "80072EFD" => (
+            ErrorKind::ServerUnavailable,
+            "не удалось соединиться с сервером",
+        ),
         // 12030 ERROR_WINHTTP_CONNECTION_ERROR
-        "80072EFE" => (ErrorKind::NetworkUnavailable, "соединение с сервером оборвалось"),
+        "80072EFE" => (
+            ErrorKind::NetworkUnavailable,
+            "соединение с сервером оборвалось",
+        ),
         // 12152 ERROR_WINHTTP_INVALID_SERVER_RESPONSE
         "80072F78" => (ErrorKind::ServerUnavailable, "сервер ответил неразборчиво"),
         // 12175 ERROR_WINHTTP_SECURE_FAILURE
@@ -3617,7 +3628,10 @@ mod tests {
             assert_eq!(error.kind(), kind, "код {code}");
             let text = error.to_string();
             assert!(text.contains(part), "код {code}: причина словами: {text}");
-            assert!(text.contains(code), "код {code} потерялся из подробностей: {text}");
+            assert!(
+                text.contains(code),
+                "код {code} потерялся из подробностей: {text}"
+            );
         }
 
         // Незнакомый код остаётся как есть и в неизвестных: выдумывать ему

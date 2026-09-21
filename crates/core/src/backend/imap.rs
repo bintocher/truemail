@@ -321,7 +321,9 @@ fn insecure_tls_client_config() -> Arc<ClientConfig> {
             // второй привёл бы к разным наборам шифров на разных соединениях.
             let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
                 .cloned()
-                .unwrap_or_else(|| Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()));
+                .unwrap_or_else(|| {
+                    Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
+                });
             let mut config = ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
@@ -897,7 +899,8 @@ pub async fn validate_password(
     password: &str,
     tls_insecure: bool,
 ) -> Result<()> {
-    let mut session = connect_password(host, port, security, username, password, tls_insecure).await?;
+    let mut session =
+        connect_password(host, port, security, username, password, tls_insecure).await?;
     validate_session(&mut session).await?;
     let _ = session.logout().await;
     Ok(())
@@ -1175,7 +1178,8 @@ pub async fn discover_password_folders(
     password: &str,
     tls_insecure: bool,
 ) -> Result<Vec<DiscoveredFolder>> {
-    let mut session = connect_password(host, port, security, username, password, tls_insecure).await?;
+    let mut session =
+        connect_password(host, port, security, username, password, tls_insecure).await?;
     let folders = list_oauth_folders(&mut session).await?;
     let _ = session.logout().await;
     Ok(folders)
@@ -1691,9 +1695,7 @@ impl ImapAuth<'_> {
                 username,
                 password,
                 tls_insecure,
-            } => {
-                connect_password(host, *port, *security, username, password, *tls_insecure).await
-            }
+            } => connect_password(host, *port, *security, username, password, *tls_insecure).await,
         }
     }
 }
@@ -2755,7 +2757,10 @@ mod reconnect_tests {
                 "Удаленный хост принудительно разорвал существующее подключение. (os error 10054)",
                 Some(ErrorKind::NetworkUnavailable),
             ),
-            ("connection reset by peer", Some(ErrorKind::NetworkUnavailable)),
+            (
+                "connection reset by peer",
+                Some(ErrorKind::NetworkUnavailable),
+            ),
             ("unexpected eof", Some(ErrorKind::NetworkUnavailable)),
             ("operation timed out", Some(ErrorKind::Timeout)),
             // Настоящая беда с сертификатом текстом не опознаётся, и шаг

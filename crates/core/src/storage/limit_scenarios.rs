@@ -834,9 +834,13 @@ async fn the_limit_list_carries_everything_the_interface_draws() {
             assert!(!untranslated(key), "у раздела {key} нет подписи в каталоге");
         }
         for field in rows.iter().filter(|row| row["section"] == section.id) {
-            let key = field["key"].as_str().expect("в перечне нет имени настройки");
+            let key = field["key"]
+                .as_str()
+                .expect("в перечне нет имени настройки");
             let min = field["min"].as_i64().expect("в перечне нет нижней границы");
-            let max = field["max"].as_i64().expect("в перечне нет верхней границы");
+            let max = field["max"]
+                .as_i64()
+                .expect("в перечне нет верхней границы");
             let default = field["default"]
                 .as_i64()
                 .expect("в перечне нет значения первого запуска");
@@ -941,7 +945,8 @@ fn the_user_interface_takes_every_limit_from_the_core() {
 /// ключа там называется, а число не читается.
 fn sources_without_comments(dir: &std::path::Path, extension: &str, skip: &[&str]) -> String {
     let mut text = String::new();
-    for entry in std::fs::read_dir(dir).expect("прочитать каталог исходников") {
+    for entry in std::fs::read_dir(dir).expect("прочитать каталог исходников")
+    {
         let path = entry.expect("запись каталога").path();
         if path.is_dir() {
             text.push_str(&sources_without_comments(&path, extension, skip));
@@ -1005,9 +1010,8 @@ fn every_limit_is_asked_for_by_the_place_that_applies_it() {
 
     for spec in LIMITS {
         let constant = spec.key.to_uppercase();
-        let alias = ui_alias(&registry, spec.key).unwrap_or_else(|| {
-            panic!("в реестре ключей интерфейса нет предела {}", spec.key)
-        });
+        let alias = ui_alias(&registry, spec.key)
+            .unwrap_or_else(|| panic!("в реестре ключей интерфейса нет предела {}", spec.key));
         assert!(
             core.contains(&constant) || interface.contains(&format!("KEYS.{alias}")),
             "предел {} не спрашивает никто: место применения осталось со своим числом",

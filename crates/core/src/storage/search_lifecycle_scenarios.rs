@@ -100,16 +100,15 @@ async fn a_message_is_searchable_while_it_lives_and_gone_after_deletion() {
         .await
         .expect("синхронизация принесла письма");
 
-    let ids: Vec<i64> = sqlx::query_as::<_, (i64,)>(
-        "SELECT id FROM messages WHERE folder_id=? ORDER BY uid",
-    )
-    .bind(inbox)
-    .fetch_all(&db.pool)
-    .await
-    .expect("найти письма")
-    .into_iter()
-    .map(|row| row.0)
-    .collect();
+    let ids: Vec<i64> =
+        sqlx::query_as::<_, (i64,)>("SELECT id FROM messages WHERE folder_id=? ORDER BY uid")
+            .bind(inbox)
+            .fetch_all(&db.pool)
+            .await
+            .expect("найти письма")
+            .into_iter()
+            .map(|row| row.0)
+            .collect();
     assert_eq!(ids.len(), 2, "синхронизация сохранила не два письма");
     let (doomed, kept) = (ids[0], ids[1]);
 
@@ -141,7 +140,11 @@ async fn a_message_is_searchable_while_it_lives_and_gone_after_deletion() {
         .queue_message_action(&[doomed], "delete")
         .await
         .expect("поставить удаление в очередь");
-    assert_eq!(queued.operation_ids.len(), 1, "удаление не встало в очередь");
+    assert_eq!(
+        queued.operation_ids.len(),
+        1,
+        "удаление не встало в очередь"
+    );
     sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now','-1 second') WHERE id=?")
         .bind(queued.operation_ids[0])
         .execute(&db.write_pool)
@@ -189,6 +192,9 @@ async fn a_message_is_searchable_while_it_lives_and_gone_after_deletion() {
         .fetch_one(&db.pool)
         .await
         .expect("прочитать поисковый индекс");
-    assert_eq!(orphans.0, 0, "в поисковом индексе осталась строка удалённого письма");
+    assert_eq!(
+        orphans.0, 0,
+        "в поисковом индексе осталась строка удалённого письма"
+    );
     db.close().await;
 }

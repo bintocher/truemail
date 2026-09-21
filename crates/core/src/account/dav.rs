@@ -2106,11 +2106,7 @@ mod tests {
         server.abort();
         // Два REPORT: первый с прежним токеном, второй - за полным снимком.
         assert_eq!(stand.methods(), ["REPORT", "REPORT"]);
-        let bodies: Vec<String> = stand
-            .requests()
-            .into_iter()
-            .map(|(_, body)| body)
-            .collect();
+        let bodies: Vec<String> = stand.requests().into_iter().map(|(_, body)| body).collect();
         assert!(bodies[0].contains("urn:sync:stale"));
         assert!(bodies[1].contains("<d:sync-token></d:sync-token>"));
         assert_eq!(outcome.scope, SyncScope::Delta);

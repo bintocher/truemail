@@ -528,10 +528,18 @@ pub async fn send_password(
     security: Security,
     tls_insecure: bool,
 ) -> Result<()> {
-    send_password_with_raw(message, username, password, host, port, security, tls_insecure)
-        .await
-        .map(|_| ())
-        .map_err(|failure| failure.error)
+    send_password_with_raw(
+        message,
+        username,
+        password,
+        host,
+        port,
+        security,
+        tls_insecure,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failure| failure.error)
 }
 
 pub(crate) async fn send_password_with_raw(
