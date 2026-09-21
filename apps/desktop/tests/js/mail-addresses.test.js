@@ -11,7 +11,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {rowPresentation, addressLineModel, displayName, mailboxLabel, listMailboxLabel} = require('../../ui/modules/mail-addresses.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 
 const rolesOf = map => new Map(Object.entries(map).map(([id, role]) => [Number(id), role]));
 const addr = (name, email) => ({name, email});

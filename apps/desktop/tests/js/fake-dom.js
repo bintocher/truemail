@@ -782,176 +782,7 @@ function createSelection() {
   };
 }
 
-// Окружение одного окна: document, window и их общие примитивы. Модули
-// интерфейса делят область имён, поэтому все они выполняются в одном
-// контексте, как и в index.html.
-function createEnvironment({html = '', lang = 'ru'} = {}) {
-  const documentElement = new FakeNode('html');
-  documentElement.attributes.lang = lang;
-  const body = new FakeNode('body');
-  documentElement.appendChild(body);
-  const head = new FakeNode('head');
-  documentElement.appendChild(head);
-  if (html) parseMarkup(html).forEach(node => body.appendChild(node));
 
-  const selection = createSelection();
-  const documentListeners = {};
-  const fake = {
-    documentElement,
-    body,
-    head,
-    hidden: false,
-    activeElement: null,
-    createElement: tag => {
-      const node = new FakeNode(tag);
-      node.ownerDocument = fake;
-      return node;
-    },
-    createTextNode: text => new FakeText(text),
-    createDocumentFragment: () => {
-      const fragment = new FakeNode('#fragment');
-      fragment.isFragment = true;
-      return fragment;
-    },
-    createRange: () => new FakeRange(body, 0),
-    getElementById: id => documentElement.querySelectorAll(`[id="${id}"]`)[0] || null,
-    querySelector: selector => documentElement.querySelector(selector),
-    querySelectorAll: selector => documentElement.querySelectorAll(selector),
-    addEventListener: (type, handler) => {
-      (documentListeners[type] = documentListeners[type] || []).push(handler);
-    },
-    removeEventListener: (type, handler) => {
-      documentListeners[type] = (documentListeners[type] || []).filter(item => item !== handler);
-    },
-    dispatch: (type, event = {}) => {
-      (documentListeners[type] || []).forEach(handler => handler({type, ...event}));
-    },
-    // Программная вставка разметки в тело: тот же путь, каким вставляет
-    // картинку сам редактор.
-    execCommand: (command, _ui, value) => {
-      if (command !== 'insertHTML') return true;
-      const range = selection.current();
-      if (!range) return false;
-      range.insertNodes(parseMarkup(String(value ?? '')));
-      return true;
-    },
-  };
-  documentElement.ownerDocument = fake;
-  body.ownerDocument = fake;
-
-  // Отложенные задачи интерфейса идут через свои часы: иначе проверка снятия
-  // карточки по времени ждала бы настоящие девять секунд. Задача всё равно
-  // выполнится сама, но проверка может доиграть её раньше.
-  const timers = new Map();
-  let timerSequence = 0;
-  const fakeSetTimeout = (handler, delay = 0, ...args) => {
-    const id = (timerSequence += 1);
-    const real = setTimeout(() => {
-      timers.delete(id);
-      handler(...args);
-    }, delay);
-    real.unref?.();
-    timers.set(id, {handler, delay, args, real});
-    return id;
-  };
-  const fakeClearTimeout = id => {
-    const timer = timers.get(id);
-    if (!timer) return;
-    clearTimeout(timer.real);
-    timers.delete(id);
-  };
-  const advanceTimers = ms => {
-    [...timers.entries()]
-      .filter(([, timer]) => timer.delay <= ms)
-      .forEach(([id, timer]) => {
-        fakeClearTimeout(id);
-        timer.handler(...timer.args);
-      });
-  };
-
-  const windowListeners = {};
-  const sandbox = {
-    // Отладочный вывод интерфейса в проверке только мешает читать отчёт, а вот
-    // сообщения об ошибках нужны: по ним видно упавший обработчик.
-    console: {...console, log: () => {}, debug: () => {}, info: () => {}},
-    setTimeout: fakeSetTimeout,
-    clearTimeout: fakeClearTimeout,
-    setInterval,
-    clearInterval,
-    Promise,
-    document: fake,
-    navigator: {clipboard: {writeText: () => Promise.resolve()}},
-    localStorage: (() => {
-      const store = new Map();
-      return {
-        getItem: key => (store.has(key) ? store.get(key) : null),
-        setItem: (key, value) => store.set(key, String(value)),
-        removeItem: key => store.delete(key),
-      };
-    })(),
-    getComputedStyle: () => ({getPropertyValue: () => ''}),
-    performance: {now: () => Date.now()},
-    atob: value => Buffer.from(String(value), 'base64').toString('binary'),
-    btoa: value => Buffer.from(String(value), 'binary').toString('base64'),
-    getSelection: () => selection,
-    matchMedia: () => ({matches: false, addEventListener() {}}),
-    MutationObserver: class {
-      observe() {}
-      disconnect() {}
-    },
-    Event: FakeEvent,
-    MouseEvent: FakeEvent,
-    KeyboardEvent: FakeEvent,
-    CustomEvent: FakeEvent,
-    FileReader: createFileReaderClass(),
-    // Каталоги переводов читаются с диска тем же запросом, каким их читает
-    // интерфейс: подмена таблицы внутри проверки скрыла бы пропажу ключа.
-    fetch: url => {
-      const match = String(url).match(/locales\/(\w+)\.json/);
-      if (!match) return Promise.reject(new Error(`no route for ${url}`));
-      const body = readUi(`locales/${match[1]}.json`);
-      return Promise.resolve({ok: true, status: 200, json: () => Promise.resolve(JSON.parse(body))});
-    },
-    requestAnimationFrame: handler => setTimeout(() => handler(0), 0),
-    addEventListener: (type, handler) => {
-      (windowListeners[type] = windowListeners[type] || []).push(handler);
-    },
-    removeEventListener: (type, handler) => {
-      windowListeners[type] = (windowListeners[type] || []).filter(item => item !== handler);
-    },
-    dispatchWindow: (type, event = {}) => {
-      const payload = {
-        type,
-        preventDefault() {
-          payload.defaultPrevented = true;
-        },
-        stopPropagation() {
-          payload.propagationStopped = true;
-        },
-        defaultPrevented: false,
-        propagationStopped: false,
-        ...event,
-      };
-      (windowListeners[type] || []).forEach(handler => handler(payload));
-      return payload;
-    },
-  };
-  sandbox.window = sandbox;
-  sandbox.globalThis = sandbox;
-  sandbox.self = sandbox;
-  return {sandbox, document: fake, body, selection, windowListeners, advanceTimers};
-}
-
-// Выполнить файл интерфейса в подготовленном окружении. Имя файла попадает в
-// текст ошибки, иначе падение внутри модуля невозможно опознать.
-function runUiModule(context, name) {
-  vm.runInContext(readUi(name), context, {filename: `ui/${name}`});
-}
-
-// Весь видимый текст поддерева - для проверок вида "эта подпись есть в строке".
-function textOf(node) {
-  return node ? node.textContent : '';
-}
 
 // Разобрать разметку в один узел-обёртку: разбор сам по себе отдаёт
 // перечень корней, а поиск селектором нужен по всему куску сразу.
@@ -966,6 +797,8 @@ function parseHtml(html, ownerDocument = null) {
 
 module.exports = {
   FakeNode,
+  createSelection,
+  createFileReaderClass,
   FakeEvent,
   FakeText,
   FakeRange,
@@ -973,10 +806,7 @@ module.exports = {
   parseMarkup,
   parseHtml,
   matchesSelector,
-  createEnvironment,
-  runUiModule,
   readUi,
   locales,
-  textOf,
   uiRoot,
 };

@@ -22,7 +22,7 @@ const {
   finishToastAction,
   nextSyncToastMemo,
 } = require('../../ui/modules/error-presentation.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 
 const uiRoot = path.join(__dirname, '../../ui');
 const translations = {

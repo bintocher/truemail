@@ -7,16 +7,18 @@
 // привязка обработчика, переименованный класс или потерянный признак data
 // роняют проверки, которые строятся на этом окне.
 
-// В проверках интерфейса две обвязки, и обе стоят на общем мини-DOM
-// (fake-dom.js): эта поднимает окно целиком: разметка index.html, все модули и мост-счётчик вызовов;
-// вторая - ui-app.js. Поведение узлов и событий у них общее, поэтому правка
-// поведения делается в fake-dom.js, а не здесь.
+// Обвязка в проверках интерфейса одна: и createUiWindow, и startApp поднимают
+// окно этим же путём. Поведение узлов, событий и выделения живёт в общем
+// мини-DOM (fake-dom.js) и правится там, а не здесь.
 'use strict';
 
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const {FakeNode, FakeText, FakeRange, FakeEvent, parseHtml} = require('./fake-dom.js');
+const {
+  FakeNode, FakeText, FakeRange, FakeEvent, parseHtml, parseMarkup, createSelection,
+  createFileReaderClass,
+} = require('./fake-dom.js');
 
 const uiDir = path.join(__dirname, '..', '..', 'ui');
 
@@ -109,7 +111,15 @@ function createDocument(html) {
   };
   documentStub.createTextNode = value => new FakeText(value);
   documentStub.createRange = () => new FakeRange();
-  documentStub.execCommand = () => true;
+  // Вставка разметки тем же путём, каким её делает редактор письма: картинка
+  // встаёт в текущий диапазон выделения, а не дописывается в конец тела.
+  documentStub.execCommand = (command, _ui, value) => {
+    if (command !== 'insertHTML') return true;
+    const range = documentStub.selection && documentStub.selection.current();
+    if (!range) return false;
+    range.insertNodes(parseMarkup(String(value ?? '')));
+    return true;
+  };
   documentStub.elementFromPoint = () => null;
   return documentStub;
 }
@@ -184,6 +194,8 @@ function createUiWindow(options = {}) {
   const {bridge, calls} = createBridge(answers);
   const toasts = [];
   const storage = createStorage();
+  const selection = createSelection();
+  documentStub.selection = selection;
 
   const context = {
     console: {log() {}, info() {}, warn() {}, error() {}, debug() {}},
@@ -197,6 +209,9 @@ function createUiWindow(options = {}) {
     requestAnimationFrame: fn => clock.setTimeout(() => fn(clock.now()), 16),
     cancelAnimationFrame: id => clock.clearTimeout(id),
     getComputedStyle: () => ({getPropertyValue: () => ''}),
+    // Выделение в окне: композер вставляет разметку в текущий диапазон, и без
+    // него путь вставки в проверке не воспроизводится.
+    getSelection: () => selection,
     localStorage: storage,
     sessionStorage: createStorage(),
     navigator: {language: locale, clipboard: {writeText: async () => {}}, userAgent: 'node'},
@@ -213,6 +228,13 @@ function createUiWindow(options = {}) {
     ResizeObserver: class { observe() {} disconnect() {} },
     IntersectionObserver: class { observe() {} disconnect() {} },
     Blob: class { constructor(parts) { this.parts = parts; } },
+    // Чтение вложенного файла: композер читает вставленную картинку им же.
+    FileReader: createFileReaderClass(),
+    // Кодирование base64: им интерфейс раскодирует имена папок IMAP
+    // (модифицированный UTF-7) и читает вложения.
+    atob: value => Buffer.from(String(value), 'base64').toString('binary'),
+    btoa: value => Buffer.from(String(value), 'binary').toString('base64'),
+    Buffer,
     URL: {createObjectURL: () => 'blob:stub', revokeObjectURL: () => {}},
     innerWidth: 1280,
     innerHeight: 800,
@@ -270,6 +292,7 @@ function createUiWindow(options = {}) {
     storage,
     loaded,
     evaluate,
+    selection,
     byId: id => documentStub.getElementById(id),
     query: selector => documentStub.querySelector(selector),
     queryAll: selector => documentStub.querySelectorAll(selector),
@@ -279,4 +302,94 @@ function createUiWindow(options = {}) {
   };
 }
 
-module.exports = {createUiWindow, createDocument, createClock, createBridge, readUiFile, uiDir, ALL_UI_MODULES};
+
+/*
+  Запустить интерфейс с данными ядра - второй вход в ту же обвязку.
+
+  Отличается от createUiWindow только подачей входных данных: значения ядра
+  кладутся в общую область имён модулей, пределы подаются реестром, а язык
+  переключается настоящим applyWizardLanguage. Само окно поднимается тем же
+  путём, поэтому правка поведения окна одна на оба входа.
+
+  accounts/folders/messages/tags/contacts - данные ядра;
+  bridge - ответы команд по имени;
+  locale - язык окна.
+*/
+function startApp(options = {}) {
+  const ui = createUiWindow({
+    answers: options.bridge || {},
+    locale: options.locale || 'ru',
+  });
+  const {context, document: documentStub} = ui;
+  // Запись настроек в ядро при старте проверке не нужна: интерфейс сам не
+  // сохраняет язык, пока хранилище не готово.
+  context.tmStorageReady = false;
+  context.tmComposerReady = true;
+
+  const run = ui.evaluate;
+  // Значения, объявленные модулями через let, свойствами окна не становятся -
+  // это обычные переменные общей области. Читаем и пишем их выражением в том
+  // же контексте, а не подменой свойства окна.
+  const get = name => run(name);
+  const set = (name, value) => {
+    context.__testValue = value;
+    run(`${name}=__testValue`);
+  };
+  const apply = values => Object.entries(values).forEach(([name, value]) => set(name, value));
+
+  apply({
+    coreAccounts: options.accounts || [],
+    coreTags: options.tags || [],
+    coreContacts: options.contacts || [],
+    messages: options.messages || [],
+  });
+  if (options.folders) {
+    context.__testValue = options.folders;
+    run('setCoreFolders(__testValue)');
+  }
+  if (options.currentFolderId !== undefined) set('currentFolderId', options.currentFolderId);
+  // Пределы приходят из ядра командой limit_settings; здесь их подаёт
+  // проверка, и значения нарочно не такие, как у ядра по умолчанию -
+  // сработавший предел тогда доказывает, что модуль прочитал реестр.
+  const applyLimits = values => {
+    context.__testValue = {
+      sections: [{id: 'test', title_key: 'section:test', hint_key: 'hint:test'}],
+      limits: Object.entries(values).map(([key, value]) => ({
+        key, section: 'test', title_key: `title:${key}`, hint_key: `hint:${key}`,
+        unit_key: `unit:${key}`, default: value, min: 0, max: 1000000, value,
+      })),
+    };
+    run('limitsModel.applyLimits(__testValue)');
+  };
+  if (options.limits) applyLimits(options.limits);
+
+  return {
+    ...ui,
+    sandbox: context,
+    body: documentStub.body,
+    run,
+    get,
+    set,
+    apply,
+    applyLimits,
+    // Доиграть отложенные задачи интерфейса, не дожидаясь их срока.
+    advanceTimers: ms => ui.clock.advance(ms),
+    // Дождаться уже начатых обещаний: путь интерфейса асинхронный, и без
+    // ожидания разметка ещё не готова.
+    settle: async (rounds = 20) => {
+      for (let index = 0; index < rounds; index += 1) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    },
+    // Настоящая смена языка со всей перерисовкой (i18n-onboarding.js).
+    async setLanguage(locale) {
+      await context.localizationReady;
+      context.applyWizardLanguage(locale, false);
+    },
+    ready() {
+      return context.localizationReady;
+    },
+  };
+}
+
+module.exports = {createUiWindow, startApp, createDocument, createClock, createBridge, readUiFile, uiDir, ALL_UI_MODULES};

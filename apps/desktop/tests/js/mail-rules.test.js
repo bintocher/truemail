@@ -12,7 +12,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const rules = require('../../ui/modules/mail-rules.js');
 const {limits, applyTestLimits, clearTestLimits} = require('./limits-fixture.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 
 const CONDITION = {field: 'subject', op: 'contains', value: 'счет'};
 const GROUP = {logic: 'all', conditions: [CONDITION]};

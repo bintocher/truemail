@@ -10,7 +10,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {folderPathLabel, compareFolderLabels} = require('../../ui/modules/folder-names.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 
 const byId = list => new Map(list.map(folder => [folder.id, folder]));
 const folder = over => ({id: 1, remote_path: '', display_name: '', parent_id: null, role: null, account_id: 1, ...over});
@@ -156,7 +156,7 @@ test('снятый флажок источника доходит до ядра 
   box.dispatch('change', {target: box});
   await app.settle(10);
   assert.deepEqual(
-    app.calls.filter(call => call.name === 'setUnifiedSource').map(call => call.args),
+    app.calls.filter(call => call.command === 'setUnifiedSource').map(call => call.args),
     [[2, false]],
     'снятие ушло в ядро одной командой с номером папки',
   );
@@ -184,7 +184,7 @@ test('кнопка "Только стандартные" оставляет ис
   const app = await sourcesApp({setUnifiedSource: () => null});
   app.document.querySelector('[data-source-mode="standard"]').onclick();
   await app.settle(10);
-  const sent = app.calls.filter(call => call.name === 'setUnifiedSource').map(call => call.args);
+  const sent = app.calls.filter(call => call.command === 'setUnifiedSource').map(call => call.args);
   assert.deepEqual(
     sent.sort((left, right) => left[0] - right[0]),
     [[1, true], [2, false], [3, true]],

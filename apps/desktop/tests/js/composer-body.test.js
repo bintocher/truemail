@@ -13,7 +13,7 @@ const {
   SUPPORTED_IMAGE_TYPES, MAX_MESSAGE_BYTES, isSupportedImageType, isFileTransfer,
   clipboardImageItems, parseDataUrl, buildImageTag, htmlHasImageTag, totalMessageBytes,
 } = require('../../ui/modules/composer-body.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 const {FakeFile} = require('./fake-dom.js');
 
 const base64 = text => Buffer.from(text).toString('base64');
@@ -162,8 +162,10 @@ test('S-001, S-003, S-005, S-010: две картинки встают по ку
   ]);
   // S-010: черновик сохраняется сам - программная вставка события ввода не
   // порождает, и без этого письмо с картинкой терялось до следующей клавиши.
-  await new Promise(resolve => setTimeout(resolve, 700));
-  const saved = app.calls.find(call => call.name === 'setSetting' && call.args[0] === 'composer_draft');
+  // Срок откладывания сохранения доигрывается часами окна, а не ожиданием
+  // вживую: настоящая пауза удлиняет прогон и ничего не проверяет.
+  await app.advanceTimers(700);
+  const saved = app.calls.find(call => call.command === 'setSetting' && call.args[0] === 'composer_draft');
   assert.ok(saved, 'после вставки запускается сохранение черновика');
   assert.match(saved.args[1], /data:image\/png;base64/);
 });

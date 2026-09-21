@@ -11,7 +11,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {personSearchKeys, personSearchVariants, personMatches, suggestRecipients, createPersonSearchCache} = require('../../ui/modules/person-search.js');
-const {startApp} = require('./ui-app.js');
+const {startApp} = require('./ui-window.js');
 
 // S-002: раскладко-независимый поиск работает в обе стороны - и для набранного
 // не в той раскладке латинского текста, и для кириллического.
