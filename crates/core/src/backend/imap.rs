@@ -300,6 +300,32 @@ async fn connect_password(
         .map_err(|(error, _)| imap_error("imap-auth", error.to_string()))
 }
 
+/// Вид транспортной ошибки по её тексту: обрыв соединения и истечение времени
+/// ожидания узнаются одинаково на любом шаге - при рукопожатии, входе и
+/// обычных командах. `None` значит, что текст ни о чём не говорит и вид
+/// решает вызывающая сторона по тому, на каком шаге отказ случился.
+fn transport_error_kind(text: &str) -> Option<ErrorKind> {
+    if text.contains("timed out") || text.contains("timeout") || text.contains("тайм-аут") {
+        return Some(ErrorKind::Timeout);
+    }
+    if [
+        "connection reset",
+        "connection lost",
+        "broken pipe",
+        "unexpected eof",
+        "10054",
+        "соединение разорвано",
+        "сервер закрыл соединение",
+        "принудительно разорвал",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return Some(ErrorKind::NetworkUnavailable);
+    }
+    None
+}
+
 /// async-imap не предоставляет отдельный тип для отказа LOGIN и обрыва.
 /// Временная эвристика остается внутри ядра и наружу отдается только код.
 fn imap_error(backend: &str, message: String) -> Error {
@@ -316,24 +342,8 @@ fn imap_error(backend: &str, message: String) -> Error {
         .any(|marker| text.contains(marker))
     {
         ErrorKind::InvalidCredentials
-    } else if text.contains("timed out") || text.contains("timeout") || text.contains("тайм-аут")
-    {
-        ErrorKind::Timeout
-    } else if [
-        "connection reset",
-        "connection lost",
-        "broken pipe",
-        "unexpected eof",
-        "10054",
-        "соединение разорвано",
-        "сервер закрыл соединение",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-    {
-        ErrorKind::NetworkUnavailable
     } else {
-        ErrorKind::Unknown
+        transport_error_kind(&text).unwrap_or(ErrorKind::Unknown)
     };
     Error::classified_backend(backend, kind, message)
 }
@@ -397,7 +407,15 @@ async fn connect_tls_client(
         .connect(server_name, tcp)
         .await
         .map_err(|error| {
-            Error::classified_backend("imap-tls", ErrorKind::CertificateError, error.to_string())
+            // Рукопожатие обрывается не только из-за сертификата: сервер
+            // закрывает соединение (os error 10054) и не дожидается ответа.
+            // Пока любой отказ этого шага звался ошибкой сертификата,
+            // человеку показывали "не удалось проверить сертификат сервера",
+            // а настоящая причина оставалась только в подробностях (#115).
+            let message = error.to_string();
+            let kind = transport_error_kind(&message.to_ascii_lowercase())
+                .unwrap_or(ErrorKind::CertificateError);
+            Error::classified_backend("imap-tls", kind, message)
         })?;
     let mut client = async_imap::Client::new(tls);
     if security == Security::Ssl {
@@ -2560,7 +2578,8 @@ mod utf7_tests {
 mod reconnect_tests {
     //! Проверки устойчивости к обрыву соединения (imap-reconnect-resilience.md).
     use super::{
-        Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, imap_error, reconnect_delay,
+        Error, ErrorKind, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, imap_error,
+        reconnect_delay, transport_error_kind,
     };
 
     fn backend_error(message: &str) -> Error {
@@ -2610,6 +2629,37 @@ mod reconnect_tests {
             imap_error("imap-select", "NO mailbox missing".into()).code(),
             "unknown"
         );
+    }
+
+    /// Отказ рукопожатия называется по своей настоящей причине (#115).
+    ///
+    /// Сервер закрывает соединение на шаге TLS, и до этой правки такой отказ
+    /// звался ошибкой сертификата: человеку показывали "не удалось проверить
+    /// сертификат сервера", а настоящая причина оставалась в подробностях.
+    /// Ошибка самого сертификата при этом должна остаться собой - иначе
+    /// просроченный сертификат выглядел бы обрывом связи.
+    #[test]
+    fn a_broken_handshake_is_named_by_its_real_cause() {
+        let cases = [
+            (
+                "Удаленный хост принудительно разорвал существующее подключение. (os error 10054)",
+                Some(ErrorKind::NetworkUnavailable),
+            ),
+            ("connection reset by peer", Some(ErrorKind::NetworkUnavailable)),
+            ("unexpected eof", Some(ErrorKind::NetworkUnavailable)),
+            ("operation timed out", Some(ErrorKind::Timeout)),
+            // Настоящая беда с сертификатом текстом не опознаётся, и шаг
+            // рукопожатия остаётся при своём виде ошибки.
+            ("invalid peer certificate: Expired", None),
+            ("certificate verify failed", None),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                transport_error_kind(&message.to_ascii_lowercase()),
+                expected,
+                "текст: {message}"
+            );
+        }
     }
 
     #[test]
