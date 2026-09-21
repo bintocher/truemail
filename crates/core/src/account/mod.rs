@@ -588,6 +588,7 @@ mod sync_registry_tests {
             last_sync_error: None,
             last_sync_error_kind: None,
             needs_reauth: false,
+            tls_insecure: false,
         }
     }
 

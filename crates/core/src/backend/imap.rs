@@ -252,6 +252,86 @@ impl Authenticator for OAuth2<'_> {
 /// TLS-конфиг строим один раз и переиспользуем: системные корневые сертификаты
 /// не меняются в рамках сессии, а грузились они при каждом IMAP-подключении
 /// (десятки раз в минуту из-за IDLE/поллинга) - это было и дорого, и шумело в лог.
+/// Настройки TLS для узла, сертификат которого человек решил не проверять
+/// (issue #118). Подпись сервера принимается любая, поэтому соединение с
+/// таким узлом можно подменить - решение принимает только человек и только
+/// для своего ящика.
+fn insecure_tls_client_config() -> Arc<ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            #[derive(Debug)]
+            struct AcceptAnyServer(Arc<tokio_rustls::rustls::crypto::CryptoProvider>);
+
+            impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
+                fn verify_server_cert(
+                    &self,
+                    _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+                    _server_name: &ServerName<'_>,
+                    _ocsp: &[u8],
+                    _now: tokio_rustls::rustls::pki_types::UnixTime,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::ServerCertVerified,
+                    tokio_rustls::rustls::Error,
+                > {
+                    Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+                }
+
+                fn verify_tls12_signature(
+                    &self,
+                    message: &[u8],
+                    cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    dss: &tokio_rustls::rustls::DigitallySignedStruct,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+                    tokio_rustls::rustls::Error,
+                > {
+                    tokio_rustls::rustls::crypto::verify_tls12_signature(
+                        message,
+                        cert,
+                        dss,
+                        &self.0.signature_verification_algorithms,
+                    )
+                }
+
+                fn verify_tls13_signature(
+                    &self,
+                    message: &[u8],
+                    cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    dss: &tokio_rustls::rustls::DigitallySignedStruct,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+                    tokio_rustls::rustls::Error,
+                > {
+                    tokio_rustls::rustls::crypto::verify_tls13_signature(
+                        message,
+                        cert,
+                        dss,
+                        &self.0.signature_verification_algorithms,
+                    )
+                }
+
+                fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+                    self.0.signature_verification_algorithms.supported_schemes()
+                }
+            }
+
+            // Провайдер берём тот, что уже установлен процессом: свой
+            // второй привёл бы к разным наборам шифров на разных соединениях.
+            let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()));
+            let mut config = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
+                .with_no_client_auth();
+            config.enable_sni = true;
+            Arc::new(config)
+        })
+        .clone()
+}
+
 fn tls_client_config() -> Arc<ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
     CONFIG
@@ -374,7 +454,14 @@ async fn connect_tls_client(
             tracing::debug!(%error, "не удалось включить TCP keepalive для IMAP");
         }
     }
-    let config = tls_client_config();
+    // Ящик, для которого человек выключил проверку, узнаётся по имени своего
+    // сервера: запись ящика до этого места не доходит (backend::tls).
+    let config = if super::tls::is_insecure(host) {
+        tracing::warn!(%host, "сертификат сервера не проверяется по решению пользователя");
+        insecure_tls_client_config()
+    } else {
+        tls_client_config()
+    };
     let server_name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Backend {
         backend: "imap".into(),
         message: e.to_string(),

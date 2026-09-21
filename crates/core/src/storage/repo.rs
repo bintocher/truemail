@@ -593,11 +593,22 @@ impl Db {
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
                 ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, include_in_unified, color, retention_days, enabled,
-                last_sync_at, last_sync_error, last_sync_error_kind, needs_reauth
+                last_sync_at, last_sync_error, last_sync_error_kind, needs_reauth, tls_insecure
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
         .await?;
+        // Решение о проверке сертификата принадлежит ящику, но спрашивает о
+        // нём слой соединения, до которого запись ящика не доходит. Перечень
+        // узлов обновляется здесь: список ящиков перечитывается и при старте,
+        // и после каждой правки настроек (issue #118).
+        crate::backend::tls::set_insecure_hosts(rows.iter().filter(|row| row.tls_insecure != 0).flat_map(
+            |row| {
+                [row.imap_host.clone(), row.smtp_host.clone()]
+                    .into_iter()
+                    .flatten()
+            },
+        ));
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -752,6 +763,33 @@ impl Db {
     }
 
     /// Задать глубину локального кэша аккаунта в днях (0 - без ограничений).
+    /// Включить или выключить проверку сертификата для ящика (issue #118).
+    ///
+    /// Решение принадлежит ящику и переживает перезапуск. Перечень узлов
+    /// обновляется сразу же: иначе выключение начало бы действовать только
+    /// после следующего чтения списка ящиков, а включение обратно - с той же
+    /// задержкой, то есть соединение оставалось бы непроверенным дольше, чем
+    /// человек согласился.
+    pub async fn set_account_tls_insecure(&self, account_id: i64, insecure: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE accounts SET tls_insecure=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        )
+        .bind(insecure as i64)
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        if insecure {
+            tracing::warn!(
+                account = account_id,
+                "проверка сертификата выключена для ящика по решению пользователя"
+            );
+        } else {
+            tracing::info!(account = account_id, "проверка сертификата включена обратно");
+        }
+        self.list_accounts().await?;
+        Ok(())
+    }
+
     pub async fn set_account_retention(&self, account_id: i64, days: i64) -> Result<()> {
         sqlx::query(
             "UPDATE accounts SET retention_days=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
@@ -7247,6 +7285,7 @@ struct AccountRow {
     last_sync_error: Option<String>,
     last_sync_error_kind: Option<String>,
     needs_reauth: i64,
+    tls_insecure: i64,
 }
 
 impl From<AccountRow> for Account {
@@ -7305,6 +7344,7 @@ impl From<AccountRow> for Account {
             last_sync_error: r.last_sync_error,
             last_sync_error_kind: r.last_sync_error_kind,
             needs_reauth: r.needs_reauth != 0,
+            tls_insecure: r.tls_insecure != 0,
         }
     }
 }

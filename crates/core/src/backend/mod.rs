@@ -5,6 +5,7 @@ mod gmail_api;
 mod imap;
 mod jmap;
 mod smtp;
+pub mod tls;
 
 pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
 pub use imap::{

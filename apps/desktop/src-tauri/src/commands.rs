@@ -2174,6 +2174,25 @@ pub async fn set_account_retention(
         .map_err(|error| ApiError::from(error).with_account_id(account_id))
 }
 
+/// Проверять ли сертификат сервера этого ящика (issue #118).
+///
+/// Выключается только явным действием человека и только для своего ящика:
+/// с выключенной проверкой подмену сервера между программой и почтой уже
+/// ничто не выдаст.
+#[tauri::command]
+pub async fn set_account_tls_insecure(
+    state: State<'_, AppState>,
+    account_id: i64,
+    insecure: bool,
+) -> CmdResult<()> {
+    core(&state)
+        .await?
+        .db
+        .set_account_tls_insecure(account_id, insecure)
+        .await
+        .map_err(|error| ApiError::from(error).with_account_id(account_id))
+}
+
 /// Ошибка тихой смены пароля (accounts-accordion-password.md, S-010): свой
 /// тип с полем `code` - интерфейс различает случаи по нему, а не по тексту
 /// сообщения. Его прежняя форма сохраняется отдельно от общего `ApiError`.

@@ -34,6 +34,12 @@ pub enum Category {
     /// в полях записи и текст ошибки очереди операций
     /// (mail-rules-conditions-and-actions.md, S-084).
     Content,
+    /// Пароль, токен, ключ и заголовок авторизации (issue #111). Отдельная
+    /// категория, а не содержимое письма: цена такой утечки другая, и число
+    /// замен видно в manifest.json отдельной строкой. Ядро таких строк в
+    /// журнал не пишет, но архив уходит наружу, и первая же отладочная
+    /// строка со значением токена попала бы туда открытым текстом.
+    Secret,
 }
 
 impl Category {
@@ -51,6 +57,7 @@ impl Category {
             Self::Uid => "uid",
             Self::MessageIdHeader => "message_id_header",
             Self::Content => "content",
+            Self::Secret => "secret",
         }
     }
 
@@ -101,6 +108,26 @@ const FIELD_CATEGORIES: &[(&str, Category)] = &[
     ("domain", Category::Content),
     ("participants", Category::Content),
     ("conversation_subject", Category::Content),
+    ("password", Category::Secret),
+    ("passwd", Category::Secret),
+    ("pwd", Category::Secret),
+    ("new_password", Category::Secret),
+    ("old_password", Category::Secret),
+    ("secret", Category::Secret),
+    ("client_secret", Category::Secret),
+    ("token", Category::Secret),
+    ("access_token", Category::Secret),
+    ("refresh_token", Category::Secret),
+    ("id_token", Category::Secret),
+    ("api_key", Category::Secret),
+    ("apikey", Category::Secret),
+    ("api_token", Category::Secret),
+    ("key", Category::Secret),
+    ("credential", Category::Secret),
+    ("credentials", Category::Secret),
+    ("authorization", Category::Secret),
+    ("auth", Category::Secret),
+    ("bearer", Category::Secret),
 ];
 
 /// Счётчики замен по категориям для `manifest.json` (S-007). Сериализуется
@@ -174,6 +201,25 @@ static_regex!(
     field_content_re,
     r#"(?i)\b(subject|preview|body|value|rule_value|condition_value|from|from_addr|to|to_addrs|recipient|sender|last_error|policy_value|address|domain|participants|conversation_subject)\s*=\s*("[^"]*"|[^,;}]+)"#
 );
+// Поля, несущие секрет: пароль, токен, ключ, заголовок авторизации
+// (issue #111). Разбираются раньше прочих полей и раньше адреса с узлом:
+// значение токена бывает похоже на путь или на имя узла, и разобранное
+// чужим шаблоном оно осталось бы в архиве наполовину.
+static_regex!(
+    field_secret_re,
+    r#"(?i)\b(password|passwd|pwd|new_password|old_password|secret|client_secret|token|access_token|refresh_token|id_token|api_key|apikey|api_token|key|credential|credentials|authorization|auth|bearer)\s*[=:]\s*("[^"]*"|[^,;}]+)"#
+);
+// Заголовок авторизации в свободном тексте: "Authorization: Bearer abc",
+// "Basic dXNlcjpwYXNz". Схема остаётся - по ней видно способ входа, - а само
+// значение заменяется псевдонимом.
+static_regex!(
+    auth_header_re,
+    r#"(?i)\b(bearer|basic|digest|ntlm|negotiate)\s+([A-Za-z0-9._~+/=-]{8,})"#
+);
+// Готовый псевдоним: значение, уже заменённое разбором выше. Второй раз его
+// заменять нельзя - рядом с ним стоит то, что решено было сохранить (схема
+// входа в заголовке авторизации).
+static_regex!(alias_re, r"\[[a-z_]+-[0-9a-f]{6}\]");
 // Начало следующего поля записи. Значение без кавычек доходит до разделителя
 // записи, но внутри одной записи полей бывает несколько
 // ("subject=Отчёт за месяц account_id=42"), и без этой границы обезличивание
@@ -270,6 +316,17 @@ fn replace_encoded_email(salt: &[u8; 16], text: &str, counts: &mut ReplacementCo
 /// Заменить значение, обрамлённое с обеих сторон: сами границы в замену не
 /// входят и возвращаются на место. Нужно там, где значение нельзя опознать
 /// без соседей - адрес IPv6 иначе совпадает внутри обычного имени исходника.
+/// Заменить значение заголовка авторизации, оставив схему: по схеме видно,
+/// каким способом шёл вход, а само значение - секрет (issue #111).
+fn replace_auth_header(salt: &[u8; 16], text: &str, counts: &mut ReplacementCounts) -> String {
+    auth_header_re()
+        .replace_all(text, |caps: &Captures<'_>| {
+            counts.increment(Category::Secret);
+            format!("{} {}", &caps[1], alias(salt, Category::Secret, &caps[2]))
+        })
+        .into_owned()
+}
+
 fn replace_bounded_value(
     re: &Regex,
     category: Category,
@@ -341,6 +398,11 @@ fn replace_named_field(
                 None => inner,
             }
         };
+        if alias_re().is_match(inner) {
+            out.push_str(&rest[whole.start()..value.end()]);
+            rest = &rest[value.end()..];
+            continue;
+        }
         let value_end = if quoted {
             value.end()
         } else {
@@ -380,6 +442,12 @@ pub fn anonymize_line(line: &str, salt: &[u8; 16], counts: &mut ReplacementCount
         counts,
     );
     text = replace_whole_match(uuid_re(), Category::Uuid, salt, &text, counts);
+    // Секреты - раньше всех прочих шаблонов: значение токена похоже и на
+    // путь, и на имя узла, и чужой шаблон унёс бы из него только часть.
+    // Заголовок авторизации идёт первым: схема входа ("Bearer", "Basic")
+    // остаётся видна, а поле целиком заменил бы разбор полей ниже.
+    text = replace_auth_header(salt, &text, counts);
+    text = replace_named_field(field_secret_re(), salt, &text, counts);
     text = replace_named_field(field_id_re(), salt, &text, counts);
     text = replace_named_field(field_folder_re(), salt, &text, counts);
     text = replace_named_field(field_content_re(), salt, &text, counts);
@@ -686,6 +754,54 @@ mod tests {
             assert!(line.starts_with("соединение с [host-"), "{line}");
             assert!(line.ends_with(" разорвано"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_secret_never_reaches_the_archive(){
+        // Ядро таких строк в журнал не пишет, но архив уходит в поддержку, и
+        // первая же отладочная строка со значением токена попала бы туда
+        // открытым текстом - а заметить это было бы некому (issue #111).
+        let salt = salt(25);
+        let cases = [
+            ("password=hunter2 account_id=42", "hunter2", "account_id="),
+            ("access_token=ya29.AbCdEf-1234_xyz", "ya29.AbCdEf-1234_xyz", ""),
+            ("refresh_token=\"1//04aBcD-eFgH\"", "1//04aBcD-eFgH", ""),
+            ("api_key=sk-live-0123456789abcdef", "sk-live-0123456789abcdef", ""),
+            ("client_secret=GOCSPX-abc_def, op=login", "GOCSPX-abc_def", "op=login"),
+        ];
+        for (source, secret, tail) in cases {
+            let mut counts = ReplacementCounts::default();
+            let line = anonymize_line(source, &salt, &mut counts);
+            assert!(!line.contains(secret), "секрет остался в строке: {line}");
+            assert!(line.contains("[secret-"), "{line}");
+            if !tail.is_empty() {
+                assert!(line.contains(tail), "соседнее поле съедено: {line}");
+            }
+        }
+
+        // Заголовок авторизации: способ входа виден, значение - нет.
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "запрос отклонён: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.abc",
+            &salt,
+            &mut counts,
+        );
+        assert!(!line.contains("eyJhbGciOiJIUzI1NiJ9.abc"), "{line}");
+        assert!(line.contains("Bearer [secret-"), "{line}");
+
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line("proxy: Basic dXNlcjpwYXNzd29yZA==", &salt, &mut counts);
+        assert!(!line.contains("dXNlcjpwYXNzd29yZA=="), "{line}");
+        assert!(line.contains("Basic [secret-"), "{line}");
+
+        // Псевдоним секрета отличается от псевдонима того же текста в другой
+        // категории: иначе по архиву можно было бы связать их между собой.
+        let mut counts = ReplacementCounts::default();
+        let secret_line = anonymize_line("token=example.test", &salt, &mut counts);
+        let host_line = anonymize_line("соединение с example.test", &salt, &mut counts);
+        let secret_alias = secret_line.split("[secret-").nth(1).unwrap_or_default();
+        let host_alias = host_line.split("[host-").nth(1).unwrap_or_default();
+        assert_ne!(secret_alias, host_alias, "{secret_line} / {host_line}");
     }
 
     #[test]

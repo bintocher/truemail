@@ -520,6 +520,7 @@ fn run() -> anyhow::Result<()> {
             commands::rename_account,
             commands::set_account_color,
             commands::set_account_retention,
+            commands::set_account_tls_insecure,
             commands::change_account_password,
             commands::list_labels,
             commands::create_label,
