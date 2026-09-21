@@ -38,6 +38,7 @@ window.corePageSize = null;
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
     setAccountRetention: (accountId, days) => invoke("set_account_retention", { accountId, days }),
+    setAccountTlsInsecure: (accountId, insecure) => invoke("set_account_tls_insecure", { accountId, insecure }),
     changeAccountPassword: (accountId, password) => invoke("change_account_password", { accountId, password }),
     listLabels: () => invoke("list_labels"),
     createLabel: (name, color) => invoke("create_label", { name, color }),
@@ -54,7 +55,9 @@ window.corePageSize = null;
     listMessagesPage: (folderId, beforeDate, beforeId, limit = 100) => invoke("list_messages_page", { folderId, beforeDate, beforeId, limit }),
     listLabelMessagesPage: (label, beforeDate, beforeId, limit = 100) => invoke("list_label_messages_page", { label, beforeDate, beforeId, limit }),
     labelMessageCounts: () => invoke("label_message_counts"),
-    fetchOlderMessages: (folderId, before, limit = 500) => invoke("fetch_older_messages", { folderId, before, limit }),
+    // Пустой предел означает "спроси настройку": размер порции догрузки
+    // называет ядро, а не запасное число моста.
+    fetchOlderMessages: (folderId, before, limit = null) => invoke("fetch_older_messages", { folderId, before, limit }),
     uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
@@ -460,7 +463,15 @@ window.corePageSize = null;
           if (released) scheduleReload(0);
         };
         releaseSnoozed().catch(console.error);
-        setInterval(() => releaseSnoozed().catch(console.error), 30000);
+        // Срок между проверками отложенных писем - настройка ядра, а не число
+        // здесь. Цикл спрашивает её перед каждым оборотом: записанное значение
+        // действует со следующего прохода, без перезапуска программы
+        // (configurable-limits.md, S-008, S-014).
+        window.limitsModel.startLimitLoop(
+          window.limitsModel.KEYS.snoozeReleaseSeconds,
+          releaseSnoozed,
+          { timers: window },
+        );
         window.tm.startRealtime().catch(console.error);
         window.tm.syncAccounts().catch(console.error);
         // Фоновая синхронизация не блокирует запуск. Обновляем экран по мере
@@ -470,13 +481,13 @@ window.corePageSize = null;
         // не перекачивая почту. Письма Yandex приходят через постоянный IMAP IDLE.
         // Gmail проверяет новые ID каждые 25 секунд, а этот проход подхватывает
         // изменения ярлыков/удаления, которые не создали новое входящее письмо.
-        // Срок между проходами - настройка ядра, а не число здесь.
-        const syncMinutes = window.limitsModel.limitValue(window.limitsModel.KEYS.backgroundSyncMinutes);
-        if (syncMinutes) {
-          setInterval(() => {
-            window.tm.syncAccounts().catch(console.error);
-          }, syncMinutes * 60 * 1000);
-        }
+        // Срок между проходами - настройка ядра, а не число здесь, и читается
+        // он перед каждым оборотом (configurable-limits.md, S-008, S-014).
+        window.limitsModel.startLimitLoop(
+          window.limitsModel.KEYS.backgroundSyncMinutes,
+          () => window.tm.syncAccounts(),
+          { scale: 60 * 1000, timers: window },
+        );
         document.addEventListener("visibilitychange", () => {
           if (document.visibilityState === "visible") {
             // Только фоновая синхронизация. Полную перезагрузку списка тут НЕ

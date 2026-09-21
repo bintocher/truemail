@@ -7,6 +7,27 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-21
+
+### Added
+
+- A mailbox with a self-signed certificate can now be connected. Mailbox settings have a new "Do not check the server certificate" switch - it is meant for an organisation mail server that issues its own certificate. Such a mailbox could not be connected at all before: the connection was dropped. The switch applies only to the mailbox where it is turned on, it is off by default, and the warning next to it says what it costs: while the check is off, nothing reveals a server substituted between the app and your mail.
+
+### Fixed
+
+- A dropped connection is no longer called a certificate error. When the server closed the connection, the program showed "Could not verify the server certificate" while the real cause was hidden in the details - and the certificate was perfectly fine. The cause is now named for what it is, and the certificate is only blamed when it is really at fault.
+- An Exchange failure is no longer shown as a hexadecimal code. Instead of "transport (ews-http): 0x80072EE7" the mailbox card now says what happened: the server name could not be resolved, the server did not answer in time, the connection could not be made. The code itself stays in the details - support needs it.
+- Passwords and tokens no longer reach the diagnostics archive. The archive goes to support, that is, outside, and it used to replace addresses, hosts and paths but not passwords and tokens. They are now replaced with aliases too, and the dialog before collecting says so. Message subjects and error texts are also replaced in full rather than up to the first space, and IPv6 addresses are recognised in all their forms.
+- The settings pane is wider - 1000 points instead of 720. Labels and buttons in mailbox cards no longer wrap or crowd each other.
+- The "The password for this mailbox is not stored" note is gone from the mailbox card: it took a line of its own, wrapped onto two, and said nothing useful.
+- A message from a blocked sender no longer stays in the mailbox forever. If the move operation failed once and waited for a decision, the stage never came back to that message. A related case is fixed too: accumulated retries could fill a whole pass, leaving new messages unprocessed.
+- Restored what an unfinished internal run had broken: the check for disallowed addresses before going to the network, keeping the previous refresh token, releasing the lock after a password change, parsing escaped separators in a contact card, the meeting organiser and the full contact address, the freshness of the Google calendar pass, and reading message subjects in rare encodings.
+
+### Other
+
+- Core checks were rewritten as scenarios: instead of small checks against stubs, the real path with a real database and a real operation queue. Interface checks run against the real window markup, and clicks go through the same handlers as in the running program.
+- The archive packing library was updated (zip 4.6.1 -> 8.6.0).
+
 ## [0.3.2] - 2026-09-20
 
 ### Added

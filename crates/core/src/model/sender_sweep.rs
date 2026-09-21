@@ -25,12 +25,10 @@ pub const SWEEP_MODE_NEW_NOW: &str = "new_now";
 // ключи LIMIT_SWEEP_MIN_DAYS и LIMIT_SWEEP_MAX_DAYS
 // (crates/core/src/model/limits.rs).
 
-/// Проход ждёт чужую операцию не чаще раза в минуту и не более восьми раз
-/// (S-020, S-021).
-pub const SWEEP_WAIT_SECONDS: i64 = 60;
-pub const SWEEP_MAX_WAITS: i64 = 8;
-/// Полный проход включённой записи выполняется не реже раза в сутки (S-035).
-pub const SWEEP_FULL_PASS_HOURS: i64 = 24;
+// Пауза перед новой попыткой и число попыток (S-020, S-021), а также срок
+// полного прохода включённой записи (S-035) задаются настройками: ключи
+// LIMIT_SWEEP_WAIT_SECONDS, LIMIT_SWEEP_MAX_WAITS и LIMIT_SWEEP_FULL_PASS_HOURS
+// (crates/core/src/model/limits.rs).
 
 /// Состояния прохода (S-019 - S-021, S-041, S-043).
 pub const SWEEP_JOB_PENDING: &str = "pending";

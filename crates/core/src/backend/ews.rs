@@ -118,10 +118,63 @@ fn decode_mail_sync_token(value: Option<&str>) -> MailSyncToken {
         .unwrap_or_default()
 }
 
+/// Вид и человеческая причина отказа транспорта Windows (WinHTTP).
+///
+/// Сам транспорт отдаёт только код вида `0x80072EE7`, и до разбора он же
+/// попадал человеку в карточку аккаунта (#117): ни понять, ни что-то сделать
+/// по такому тексту нельзя. Разбираются коды, которые встречаются в работе;
+/// незнакомый код остаётся как есть и относится к неизвестным.
+fn winhttp_failure(message: &str) -> Option<(ErrorKind, &'static str)> {
+    let code = message.trim().to_ascii_uppercase();
+    let code = code
+        .strip_prefix("0X")
+        .map(|rest| rest.trim_start_matches('0'))?;
+    Some(match code {
+        // 12002 ERROR_WINHTTP_TIMEOUT
+        "80072EE2" => (ErrorKind::Timeout, "сервер не ответил вовремя"),
+        // 12005 ERROR_WINHTTP_INVALID_URL
+        "80072EE5" => (ErrorKind::AccountConfig, "адрес сервера записан неверно"),
+        // 12006 ERROR_WINHTTP_UNRECOGNIZED_SCHEME
+        "80072EE6" => (
+            ErrorKind::AccountConfig,
+            "в адресе сервера неизвестная схема",
+        ),
+        // 12007 ERROR_WINHTTP_NAME_NOT_RESOLVED
+        "80072EE7" => (
+            ErrorKind::NetworkUnavailable,
+            "имя сервера не удалось разрешить",
+        ),
+        // 12029 ERROR_WINHTTP_CANNOT_CONNECT
+        "80072EFD" => (
+            ErrorKind::ServerUnavailable,
+            "не удалось соединиться с сервером",
+        ),
+        // 12030 ERROR_WINHTTP_CONNECTION_ERROR
+        "80072EFE" => (
+            ErrorKind::NetworkUnavailable,
+            "соединение с сервером оборвалось",
+        ),
+        // 12152 ERROR_WINHTTP_INVALID_SERVER_RESPONSE
+        "80072F78" => (ErrorKind::ServerUnavailable, "сервер ответил неразборчиво"),
+        // 12175 ERROR_WINHTTP_SECURE_FAILURE
+        "80072F8F" => (
+            ErrorKind::CertificateError,
+            "не удалось проверить сертификат сервера",
+        ),
+        _ => return None,
+    })
+}
+
 fn backend_error(kind: &str, message: impl ToString) -> Error {
-    Error::Backend {
-        backend: format!("ews-{kind}"),
-        message: message.to_string(),
+    let message = message.to_string();
+    let backend = format!("ews-{kind}");
+    // Код транспорта остаётся в тексте: поддержке он нужен, а человеку рядом
+    // с ним стоит причина словами.
+    match winhttp_failure(&message) {
+        Some((error_kind, reason)) => {
+            Error::classified_backend(backend, error_kind, format!("{reason} ({message})"))
+        }
+        None => Error::Backend { backend, message },
     }
 }
 
@@ -3556,6 +3609,37 @@ impl EwsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Отказ транспорта Exchange называется словами, а не кодом (#117).
+    ///
+    /// Транспорт Windows отдаёт только код вида 0x80072EE7, и он же попадал
+    /// человеку в карточку аккаунта: ни понять причину, ни что-то сделать по
+    /// такому тексту нельзя. Код остаётся в подробностях - поддержке он нужен.
+    #[test]
+    fn a_transport_failure_is_named_in_words() {
+        let cases = [
+            ("0x80072EE7", ErrorKind::NetworkUnavailable, "имя сервера"),
+            ("0x80072EE2", ErrorKind::Timeout, "не ответил вовремя"),
+            ("0x80072EFD", ErrorKind::ServerUnavailable, "соединиться"),
+            ("0x80072F8F", ErrorKind::CertificateError, "сертификат"),
+        ];
+        for (code, kind, part) in cases {
+            let error = backend_error("http", code);
+            assert_eq!(error.kind(), kind, "код {code}");
+            let text = error.to_string();
+            assert!(text.contains(part), "код {code}: причина словами: {text}");
+            assert!(
+                text.contains(code),
+                "код {code} потерялся из подробностей: {text}"
+            );
+        }
+
+        // Незнакомый код остаётся как есть и в неизвестных: выдумывать ему
+        // причину нельзя, а прятать - тем более.
+        let unknown = backend_error("http", "0x80070005");
+        assert_eq!(unknown.kind(), ErrorKind::Unknown);
+        assert!(unknown.to_string().contains("0x80070005"));
+    }
 
     /// out-of-office.md S-063: облегчённая проекция письма Exchange несёт
     /// заголовки правил молчания и адрес для ответа. Без них автоответ ответил

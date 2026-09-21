@@ -6,7 +6,6 @@
 //! (S-009).
 
 use super::Db;
-use super::stages::STAGE_BATCH;
 use crate::Result;
 use crate::model::*;
 
@@ -363,7 +362,7 @@ impl Db {
               WHERE m.id>? ORDER BY m.id LIMIT ?",
         )
         .bind(cursor)
-        .bind(STAGE_BATCH)
+        .bind(self.limit(LIMIT_STAGE_BATCH))
         .fetch_all(&mut *tx)
         .await?;
         let own: Vec<String> = sqlx::query_as::<_, (String,)>("SELECT email FROM accounts")

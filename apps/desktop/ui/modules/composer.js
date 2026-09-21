@@ -14,12 +14,20 @@ function renderRecipientChips(id){const input=document.getElementById(id),box=in
 function addRecipientEntry(id,raw){const entry=parseRecipient(raw);if(!entry||!entry.email)return false;if(recipientModel[id].some(e=>e.email.toLowerCase()===entry.email.toLowerCase()))return false;recipientModel[id].push(entry);renderRecipientChips(id);return true;}
 function removeRecipientEntry(id,index){recipientModel[id].splice(index,1);renderRecipientChips(id);scheduleDraftSave();document.getElementById(id)?.focus();}
 function commitRecipientInput(id){const input=document.getElementById(id);let added=false;splitAddresses(input.value).forEach(part=>{if(addRecipientEntry(id,part))added=true;});input.value='';if(added)scheduleDraftSave();return added;}
-function setRecipients(id,list){recipientModel[id]=[];(Array.isArray(list)?list:splitAddresses(list)).forEach(item=>{if(typeof item==='string')addRecipientEntry(id,item);else if(item&&item.email){if(!recipientModel[id].some(e=>e.email.toLowerCase()===item.email.toLowerCase()))recipientModel[id].push({name:item.name||'',email:item.email});}});renderRecipientChips(id);}
+function setRecipients(id,list){clearRecipientField(id);(Array.isArray(list)?list:splitAddresses(list)).forEach(item=>{if(typeof item==='string')addRecipientEntry(id,item);else if(item&&item.email){if(!recipientModel[id].some(e=>e.email.toLowerCase()===item.email.toLowerCase()))recipientModel[id].push({name:item.name||'',email:item.email});}});renderRecipientChips(id);}
+/* Очистка поля получателей одна на всех: адреса живут в двух местах - завершённые
+   плашками в recipientModel, недовведённый остаток в строке ввода, - и очистка
+   только одного из них незаметно уносила бы второй в письмо. */
+function clearRecipientField(id){const input=document.getElementById(id);if(input)input.value='';recipientModel[id]=[];renderRecipientChips(id);}
+function recipientFieldHasAddresses(id){const input=document.getElementById(id);return Boolean(recipientModel[id].length||input?.value.trim());}
 function recipientFieldAddresses(id){const input=document.getElementById(id);const list=recipientModel[id].map(recipientFormat);splitAddresses(input.value).forEach(part=>list.push(part));return list;}
 function validAddress(value){return /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(value)||/^.+\s<[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+>$/.test(value);}
 function setRecipientFieldVisible(id,visible,focus=false){const field=document.querySelector(`[data-recipient-field="${id}"]`);if(!field)return;field.classList.toggle('hidden',!visible);if(focus&&visible)document.getElementById(id)?.focus();}
 document.querySelectorAll('[data-recipient-toggle]').forEach(button=>button.onclick=()=>setRecipientFieldVisible(button.dataset.recipientToggle,true,true));
-document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=()=>{const id=button.dataset.recipientHide;if(document.getElementById(id).value.trim()&&!confirm(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;document.getElementById(id).value='';setRecipientFieldVisible(id,false);scheduleDraftSave();});
+/* Спрашиваем по всем адресам поля, а не по одной строке ввода: завершённый адрес
+   виден плашкой, а закрытое без вопроса поле оставляло его в письме - получатель,
+   убранный с глаз, письмо всё равно получал. */
+document.querySelectorAll('[data-recipient-hide]').forEach(button=>button.onclick=async()=>{const id=button.dataset.recipientHide;if(recipientFieldHasAddresses(id)&&!await confirmAction(L('Очистить адреса в этом поле?','Clear addresses in this field?')))return;clearRecipientField(id);setRecipientFieldVisible(id,false);scheduleDraftSave();});
 /* Каждый сброс композера - новое письмо: вложение, дочитанное после этого,
    уже не наше и в новое письмо не попадает. */
 let composerGeneration=0;
@@ -29,7 +37,7 @@ let composerGeneration=0;
    открытия нового письма он сбрасывается, иначе ядро вернуло бы прежнюю
    операцию, а новое содержимое пропало бы вместе с очищенным композером. */
 let composerRequestKey='';
-function resetComposer(){composerGeneration++;composerRequestKey='';composerFieldIds.forEach(id=>document.getElementById(id).value='');['compTo','compCc','compBcc'].forEach(id=>{recipientModel[id]=[];renderRecipientChips(id);});setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+function resetComposer(){composerGeneration++;composerRequestKey='';['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}

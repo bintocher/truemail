@@ -477,7 +477,9 @@ fn run() -> anyhow::Result<()> {
             // Не задерживаем старт и не пугаем сетевой ошибкой: при появлении
             // подписанного релиза UI сам предложит установить новую версию.
             // Проверяем через 8 с после запуска и далее периодически, чтобы
-            // обновление находилось само и без перезапуска приложения.
+            // обновление находилось само и без перезапуска приложения. Срок
+            // между проверками - настройка: на дорогом трафике шесть часов
+            // выбирает не программа.
             let update_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(8)).await;
@@ -487,7 +489,12 @@ fn run() -> anyhow::Result<()> {
                     {
                         tracing::debug!(error = %error.message, "автопроверка обновлений пропущена");
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                    let hours = commands::limit_or_default(
+                        &update_app,
+                        truemail_core::model::LIMIT_UPDATE_CHECK_HOURS,
+                    )
+                    .max(1) as u64;
+                    tokio::time::sleep(std::time::Duration::from_secs(hours * 3600)).await;
                 }
             });
             Ok(())
@@ -513,6 +520,7 @@ fn run() -> anyhow::Result<()> {
             commands::rename_account,
             commands::set_account_color,
             commands::set_account_retention,
+            commands::set_account_tls_insecure,
             commands::change_account_password,
             commands::list_labels,
             commands::create_label,

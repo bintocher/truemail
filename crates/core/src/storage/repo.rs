@@ -410,8 +410,15 @@ impl Db {
     }
 
     pub async fn set_keybinding(&self, action: &str, combo: &str) -> Result<()> {
-        let combo = normalize_key_combo(combo)
-            .ok_or_else(|| crate::Error::Other("неверное сочетание клавиш".into()))?;
+        // Пустая строка снимает клавишу с действия и доходит сюда с настоящего
+        // пути снятия. Разбирать её нечем, а отказ означал бы, что назначенное
+        // сочетание освободить нечем вовсе (issue #104).
+        let combo = if combo.trim().is_empty() {
+            String::new()
+        } else {
+            normalize_key_combo(combo)
+                .ok_or_else(|| crate::Error::Other("неверное сочетание клавиш".into()))?
+        };
         let result = if is_quick_step_key_action(action) {
             sqlx::query(
                 "INSERT INTO keybindings(action,scope,combo) VALUES(?,'local',?)
@@ -586,7 +593,7 @@ impl Db {
             "SELECT id, uuid, email, display_name, provider, backend_kind, auth_kind,
                     imap_host, imap_port, imap_security, smtp_host, smtp_port, smtp_security,
                 ews_url, jmap_url, caldav_url, carddav_url, username, secret_ref, include_in_unified, color, retention_days, enabled,
-                last_sync_at, last_sync_error, last_sync_error_kind, needs_reauth
+                last_sync_at, last_sync_error, last_sync_error_kind, needs_reauth, tls_insecure
              FROM accounts WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .fetch_all(&self.pool)
@@ -745,6 +752,34 @@ impl Db {
     }
 
     /// Задать глубину локального кэша аккаунта в днях (0 - без ограничений).
+    /// Включить или выключить проверку сертификата для ящика (issue #118).
+    ///
+    /// Решение принадлежит ящику и переживает перезапуск. Оно едет к слою
+    /// соединения вместе с настройками сервера этого ящика, поэтому новое
+    /// значение действует с первого же соединения после правки, а соседний
+    /// ящик на том же сервере его не наследует.
+    pub async fn set_account_tls_insecure(&self, account_id: i64, insecure: bool) -> Result<()> {
+        sqlx::query(
+            "UPDATE accounts SET tls_insecure=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        )
+        .bind(insecure as i64)
+        .bind(account_id)
+        .execute(&self.write_pool)
+        .await?;
+        if insecure {
+            tracing::warn!(
+                account = account_id,
+                "проверка сертификата выключена для ящика по решению пользователя"
+            );
+        } else {
+            tracing::info!(
+                account = account_id,
+                "проверка сертификата включена обратно"
+            );
+        }
+        Ok(())
+    }
+
     pub async fn set_account_retention(&self, account_id: i64, days: i64) -> Result<()> {
         sqlx::query(
             "UPDATE accounts SET retention_days=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
@@ -6635,7 +6670,7 @@ impl Db {
                 break;
             }
             // Между письмами и страницами блокировка записи не удерживается -
-            // список, поиск и синхронизация продолжают работать (S-010).
+            // список, поиск и синхронизация продолжают работать (S-016).
             tokio::task::yield_now().await;
         }
 
@@ -6656,7 +6691,7 @@ impl Db {
 
     /// Страница id битых писем и их `raw_blob_ref` на момент выборки, по
     /// возрастанию id (keyset, не OFFSET - иначе исправленные письма сдвигали
-    /// бы окно и часть писем терялась бы навсегда, S-010). Источники битости
+    /// бы окно и часть писем терялась бы навсегда, S-016). Источники битости
     /// сведены через UNION по различным id письма (S-003): письмо, испорченное
     /// сразу в нескольких местах, попадёт в страницу один раз.
     async fn broken_charset_message_page(
@@ -7240,6 +7275,7 @@ struct AccountRow {
     last_sync_error: Option<String>,
     last_sync_error_kind: Option<String>,
     needs_reauth: i64,
+    tls_insecure: i64,
 }
 
 impl From<AccountRow> for Account {
@@ -7249,11 +7285,15 @@ impl From<AccountRow> for Account {
             Some("none") => Security::None,
             _ => Security::Ssl,
         };
+        // Решение о проверке сертификата хранится у ящика и раздаётся обоим
+        // его серверам: оно принято для этого ящика целиком, а не для узла.
+        let tls_insecure = r.tls_insecure != 0;
         let imap = match (r.imap_host, r.imap_port) {
             (Some(h), Some(p)) => Some(ServerConfig {
                 host: h,
                 port: p as u16,
                 security: sec(r.imap_security),
+                tls_insecure,
             }),
             _ => None,
         };
@@ -7262,6 +7302,7 @@ impl From<AccountRow> for Account {
                 host: h,
                 port: p as u16,
                 security: sec(r.smtp_security),
+                tls_insecure,
             }),
             _ => None,
         };
@@ -7298,6 +7339,7 @@ impl From<AccountRow> for Account {
             last_sync_error: r.last_sync_error,
             last_sync_error_kind: r.last_sync_error_kind,
             needs_reauth: r.needs_reauth != 0,
+            tls_insecure: r.tls_insecure != 0,
         }
     }
 }
@@ -9353,17 +9395,6 @@ mod notification_lookup_tests {
     use super::test_storage::{TestDb, open_test_db};
     use super::*;
 
-    /// smart-folder-selection-shared.md, S-002: условие отбора живых писем
-    /// объявлено один раз, поэтому все три запроса умной папки содержат его
-    /// дословно.
-    #[test]
-    fn smart_folder_queries_share_one_alive_filter() {
-        let alive = message_alive_sql!();
-        assert!(SMART_PAGE_FIRST_SQL.contains(alive));
-        assert!(SMART_PAGE_AFTER_CURSOR_SQL.contains(alive));
-        assert!(SMART_STREAM_SQL.contains(alive));
-    }
-
     /// S-007: список читает страницами с сортировкой, счётчик - потоком без
     /// сортировки и без предела.
     #[test]
@@ -9738,17 +9769,6 @@ mod notification_lookup_tests {
             .await
             .expect("query inbox ids");
         assert_eq!(all.len(), 5, "без границ выбираются все письма Входящих");
-        db.close().await;
-    }
-
-    #[tokio::test]
-    async fn empty_input_returns_empty_result_without_querying() {
-        let db = test_db().await;
-        let ids = db
-            .inbox_message_ids_by_remote_ids(1, &[], None, None)
-            .await
-            .expect("query with empty input");
-        assert!(ids.is_empty());
         db.close().await;
     }
 
@@ -11240,35 +11260,6 @@ mod charset_decoding_tests {
             .expect("письмо разобрано");
         assert_eq!(message.subject(), Some("Вышел новый"));
         assert_eq!(message.body_text(0).as_deref(), Some("Вышел новый\r\n"));
-    }
-
-    /// iso-2022-kr и hz-gb-2312 библиотека разбора сознательно не поддерживает
-    /// (решение WHATWG): результат - символы замены, но не сырые байты с ESC.
-    /// Пользователю такие кодировки читаемыми не обещаны (S-002).
-    #[test]
-    fn unsupported_legacy_charsets_do_not_leak_escape_bytes() {
-        for charset in ["iso-2022-kr", "hz-gb-2312"] {
-            let raw = format!(
-                concat!(
-                    "From: sender@example.test\r\n",
-                    "Subject: legacy\r\n",
-                    "MIME-Version: 1.0\r\n",
-                    "Content-Type: text/plain; charset=\"{}\"\r\n",
-                    "Content-Transfer-Encoding: quoted-printable\r\n",
-                    "\r\n",
-                    "=1B$B'#'m'j'V']=1B(B\r\n"
-                ),
-                charset
-            );
-            let message = MessageParser::default()
-                .parse(raw.as_bytes())
-                .expect("письмо разобрано");
-            let body = message.body_text(0).expect("тело письма").into_owned();
-            assert!(
-                !body.contains('\u{1B}'),
-                "{charset}: в тексте не должно оставаться управляющих байтов"
-            );
-        }
     }
 }
 

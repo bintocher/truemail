@@ -95,9 +95,11 @@ impl Db {
         // S-005: адресаты проверяются до записи операции, поэтому непригодный
         // адрес не создаёт ожидающего письма вовсе.
         crate::backend::validate_outgoing(&message)?;
-        let undo_seconds = validate_undo_seconds(undo_seconds, &self.limit_set())
-            .map_err(crate::Error::AccountConfig)?
-            .max(0);
+        // Границы окна отмены проверяются по происхождению письма: выбор
+        // пользователя ограничен ими, а письмо без окна проходит с нулём при
+        // любом наименьшем окне (S-013, S-055, S-057, S-059).
+        let undo_seconds = validate_send_undo_seconds(origin, undo_seconds, &self.limit_set())
+            .map_err(crate::Error::AccountConfig)?;
         if let Some(key) = request_key.as_deref()
             && let Some(existing) = self.existing_send_request(account_id, key).await?
         {

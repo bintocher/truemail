@@ -8,8 +8,8 @@
 
 use super::Db;
 use super::stages::{
-    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage,
-    WORKING_FOLDERS, WORKING_FOLDERS_WITH_ARCHIVE, needs_retry,
+    DEFERRED_MESSAGES, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, WORKING_FOLDERS,
+    WORKING_FOLDERS_WITH_ARCHIVE, needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -261,6 +261,7 @@ impl Db {
             &payload,
             max_message_id,
             &candidates,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
         )
         .await?;
         tx.commit().await?;
@@ -290,8 +291,13 @@ impl Db {
         // S-011: ключ снимка расходуется неделимо и для всех четырёх режимов,
         // поэтому подтверждение нельзя применить к другой области, другому
         // числу дней или другому согласию на архив.
-        let (payload, max_message_id, total) =
-            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        let (payload, max_message_id, total) = Self::consume_stage_snapshot(
+            &mut tx,
+            snapshot_key,
+            SNAPSHOT_KIND,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         if payload != sweep_payload(&address, &input) {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой уборке, откройте подтверждение заново".into(),
@@ -606,7 +612,7 @@ impl Db {
             .bind(cursor)
             .bind(DEFERRAL_KIND)
             .bind(job_id)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut counters = StageCounters::default();
@@ -671,16 +677,18 @@ impl Db {
             .bind(job_id)
             .fetch_one(&mut *tx)
             .await?;
-        // S-020, S-021: ожидание чужой операции назначается не раньше чем через
-        // минуту и повторяется не более восьми раз.
+        // S-020, S-021: пауза перед новой попыткой и число попыток - настройки.
+        // На медленном сервере чужая операция не успевает за минуту, и проход
+        // сдавался восьмой раз подряд, ничего не убрав.
+        let wait_seconds = self.limit(LIMIT_SWEEP_WAIT_SECONDS);
         let (next_state, next_waits, next_check) = if busy > 0 {
-            if waits + 1 >= SWEEP_MAX_WAITS {
+            if waits + 1 >= self.limit(LIMIT_SWEEP_MAX_WAITS) {
                 (SWEEP_JOB_FAILED, waits + 1, None)
             } else {
                 (
                     SWEEP_JOB_WAITING,
                     waits + 1,
-                    Some(format!("+{SWEEP_WAIT_SECONDS} seconds")),
+                    Some(format!("+{wait_seconds} seconds")),
                 )
             }
         } else if remaining.0 > 0 {
@@ -850,7 +858,10 @@ impl Db {
                                  WHERE j.rule_id=sender_sweep_rules.id
                                    AND j.state IN ('pending','running','waiting_operation'))",
         )
-        .bind(format!("-{SWEEP_FULL_PASS_HOURS} hours"))
+        .bind(format!(
+            "-{} hours",
+            self.limit(LIMIT_SWEEP_FULL_PASS_HOURS)
+        ))
         .fetch_all(&mut *tx)
         .await?;
         let max_message_id = Self::max_message_id(&mut tx).await?;
@@ -913,7 +924,7 @@ impl Db {
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
             .bind(cursor)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut queued = 0usize;

@@ -24,9 +24,6 @@ pub(crate) const WORKING_FOLDERS: &str =
 pub(crate) const WORKING_FOLDERS_WITH_ARCHIVE: &str =
     "(f.role IS NULL OR f.role NOT IN ('sent','drafts','spam','trash'))";
 
-/// Размер пачки стадии: то же число, что уже выбирает один проход правил.
-pub(crate) const STAGE_BATCH: i64 = 500;
-
 /// Условие отбора писем, отложенных этим заданием: они повторяются наравне с
 /// письмами после курсора, поэтому проход к ним возвращается.
 pub(crate) const DEFERRED_MESSAGES: &str =
@@ -189,8 +186,9 @@ impl Db {
         payload: &str,
         max_message_id: i64,
         candidates: &[i64],
+        snapshot_hours: i64,
     ) -> Result<String> {
-        Self::purge_stale_snapshots_in_tx(tx, Some(kind)).await?;
+        Self::purge_stale_snapshots_in_tx(tx, Some(kind), snapshot_hours).await?;
         let key = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO stage_snapshots(key, kind, payload, max_message_id, total)
@@ -218,19 +216,29 @@ impl Db {
     }
 
     /// Израсходовать снимок: строка снимка удаляется тем же запросом, которым
-    /// читается. Одно подтверждение пользователя запускает уборку один раз,
-    /// даже если команда пришла дважды. Строки кандидатов остаются заданию.
+    /// читается, и тем же запросом проверяется её возраст. Одно подтверждение
+    /// пользователя запускает уборку один раз, даже если команда пришла
+    /// дважды. Строки кандидатов остаются заданию.
+    ///
+    /// Срок жизни спрашивается здесь, а не только уборкой: между уборкой и
+    /// подтверждением снимок живёт сколько угодно, и пользователь подтвердил
+    /// бы список, собранный неделю назад. Отдельным запросом возраст проверять
+    /// нельзя - между проверкой и удалением второе подтверждение израсходовало
+    /// бы тот же ключ.
     pub(crate) async fn consume_stage_snapshot(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         key: &str,
         kind: &str,
+        snapshot_hours: i64,
     ) -> Result<(String, i64, i64)> {
         let row: Option<(String, i64, i64)> = sqlx::query_as(
-            "DELETE FROM stage_snapshots WHERE key=? AND kind=?
+            "DELETE FROM stage_snapshots
+              WHERE key=? AND kind=? AND datetime(created_at) > datetime('now', ?)
              RETURNING payload, max_message_id, total",
         )
         .bind(key)
         .bind(kind)
+        .bind(format!("-{snapshot_hours} hours"))
         .fetch_optional(&mut **tx)
         .await?;
         row.ok_or_else(|| {
@@ -245,30 +253,38 @@ impl Db {
     /// строки копились бы навсегда.
     pub(crate) async fn purge_stale_stage_snapshots(&self) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        Self::purge_stale_snapshots_in_tx(&mut tx, None).await?;
+        Self::purge_stale_snapshots_in_tx(&mut tx, None, self.limit(LIMIT_STAGE_SNAPSHOT_HOURS))
+            .await?;
         tx.commit().await?;
         Ok(())
     }
 
+    /// Срок жизни снимка приходит значением, а не читается здесь: обе ветки
+    /// уборки работают внутри чужой транзакции, а база настроек за ней не
+    /// видна.
     async fn purge_stale_snapshots_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         kind: Option<&str>,
+        snapshot_hours: i64,
     ) -> Result<()> {
+        let border = format!("-{snapshot_hours} hours");
         match kind {
             Some(kind) => {
                 sqlx::query(
                     "DELETE FROM stage_snapshots
-                      WHERE kind=? AND datetime(created_at) <= datetime('now', '-1 day')",
+                      WHERE kind=? AND datetime(created_at) <= datetime('now', ?)",
                 )
                 .bind(kind)
+                .bind(&border)
                 .execute(&mut **tx)
                 .await?;
             }
             None => {
                 sqlx::query(
                     "DELETE FROM stage_snapshots
-                      WHERE datetime(created_at) <= datetime('now', '-1 day')",
+                      WHERE datetime(created_at) <= datetime('now', ?)",
                 )
+                .bind(&border)
                 .execute(&mut **tx)
                 .await?;
             }

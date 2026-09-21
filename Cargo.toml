@@ -7,7 +7,7 @@ members = [
 exclude = ["vendor/libsqlite3-sys"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["chernov <bintocher@yandex.com>"]
@@ -67,6 +67,16 @@ argon2 = "0.6.0"
 # libsqlite3-sys 0.38.x не удовлетворяет диапазону SQLx 0.9 (`<0.38`).
 # Этот совместимый patch обновляет только bundled SQLCipher amalgamation.
 libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
+# Проверки: полные отладочные символы в тестовых бинарях не нужны, а их
+# линковка - главный едок памяти при сборке (один крупный тестовый бинарь
+# требовал гигабайты и ронял сборку на ноутбуке). Номера строк в панике
+# сохраняются.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3

@@ -116,6 +116,24 @@ pub const LIMIT_RECIPIENT_OWN_SEND_DAYS: &str = "limit_recipient_own_send_days";
 pub const LIMIT_MESSAGE_TRAITS_DAYS: &str = "limit_message_traits_days";
 pub const LIMIT_OPERATION_ATTEMPTS: &str = "limit_operation_attempts";
 pub const LIMIT_BACKGROUND_SYNC_MINUTES: &str = "limit_background_sync_minutes";
+pub const LIMIT_GMAIL_POLL_SECONDS: &str = "limit_gmail_poll_seconds";
+pub const LIMIT_SNOOZE_RELEASE_SECONDS: &str = "limit_snooze_release_seconds";
+pub const LIMIT_BACKFILL_PAGE: &str = "limit_backfill_page";
+pub const LIMIT_BODY_PREFETCH_MESSAGES: &str = "limit_body_prefetch_messages";
+pub const LIMIT_BODY_PREFETCH_SIZE_MB: &str = "limit_body_prefetch_size_mb";
+
+pub const LIMIT_HISTORY_PAGE: &str = "limit_history_page";
+pub const LIMIT_RANK_FRESH_DAYS: &str = "limit_rank_fresh_days";
+pub const LIMIT_RANK_RECENT_DAYS: &str = "limit_rank_recent_days";
+pub const LIMIT_RANK_OLD_DAYS: &str = "limit_rank_old_days";
+
+pub const LIMIT_STAGE_BATCH: &str = "limit_stage_batch";
+pub const LIMIT_STAGE_SNAPSHOT_HOURS: &str = "limit_stage_snapshot_hours";
+pub const LIMIT_SWEEP_WAIT_SECONDS: &str = "limit_sweep_wait_seconds";
+pub const LIMIT_SWEEP_MAX_WAITS: &str = "limit_sweep_max_waits";
+pub const LIMIT_SWEEP_FULL_PASS_HOURS: &str = "limit_sweep_full_pass_hours";
+pub const LIMIT_REMINDER_CHECK_SECONDS: &str = "limit_reminder_check_seconds";
+pub const LIMIT_UPDATE_CHECK_HOURS: &str = "limit_update_check_hours";
 
 /// Перечень настраиваемых пределов. Порядок - порядок показа внутри раздела.
 pub const LIMITS: &[LimitSpec] = &[
@@ -197,6 +215,56 @@ pub const LIMITS: &[LimitSpec] = &[
         hint_key: "limitSyncFailuresBeforeToastDesc",
         unit_key: "limitUnitChecks",
         default: 3,
+        min: 1,
+        max: 100,
+    },
+    LimitSpec {
+        key: LIMIT_GMAIL_POLL_SECONDS,
+        section: "messages",
+        title_key: "limitGmailPollSeconds",
+        hint_key: "limitGmailPollSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 25,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_SNOOZE_RELEASE_SECONDS,
+        section: "messages",
+        title_key: "limitSnoozeReleaseSeconds",
+        hint_key: "limitSnoozeReleaseSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 30,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_BACKFILL_PAGE,
+        section: "messages",
+        title_key: "limitBackfillPage",
+        hint_key: "limitBackfillPageDesc",
+        unit_key: "limitUnitMessages",
+        default: 15,
+        min: 1,
+        max: 500,
+    },
+    LimitSpec {
+        key: LIMIT_BODY_PREFETCH_MESSAGES,
+        section: "messages",
+        title_key: "limitBodyPrefetchMessages",
+        hint_key: "limitBodyPrefetchMessagesDesc",
+        unit_key: "limitUnitMessages",
+        default: 50,
+        min: 1,
+        max: 1000,
+    },
+    LimitSpec {
+        key: LIMIT_BODY_PREFETCH_SIZE_MB,
+        section: "messages",
+        title_key: "limitBodyPrefetchSizeMb",
+        hint_key: "limitBodyPrefetchSizeMbDesc",
+        unit_key: "limitUnitMegabytes",
+        default: 5,
         min: 1,
         max: 100,
     },
@@ -331,6 +399,49 @@ pub const LIMITS: &[LimitSpec] = &[
         default: 8,
         min: 1,
         max: 50,
+    },
+    LimitSpec {
+        key: LIMIT_HISTORY_PAGE,
+        section: "sending",
+        title_key: "limitHistoryPage",
+        hint_key: "limitHistoryPageDesc",
+        unit_key: "limitUnitEntries",
+        default: 100,
+        min: 10,
+        max: 1000,
+    },
+    // Пороги свежести идут от свежего к давнему: обращение, попавшее в первый
+    // порог, весит больше, чем попавшее во второй. Сами веса настройкой не
+    // стали - они задают не предел, а само правило сравнения.
+    LimitSpec {
+        key: LIMIT_RANK_FRESH_DAYS,
+        section: "sending",
+        title_key: "limitRankFreshDays",
+        hint_key: "limitRankFreshDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 30,
+        min: 1,
+        max: 3650,
+    },
+    LimitSpec {
+        key: LIMIT_RANK_RECENT_DAYS,
+        section: "sending",
+        title_key: "limitRankRecentDays",
+        hint_key: "limitRankRecentDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 90,
+        min: 1,
+        max: 3650,
+    },
+    LimitSpec {
+        key: LIMIT_RANK_OLD_DAYS,
+        section: "sending",
+        title_key: "limitRankOldDays",
+        hint_key: "limitRankOldDaysDesc",
+        unit_key: "limitUnitDays",
+        default: 365,
+        min: 1,
+        max: 3650,
     },
     // --- Автоответ ---
     LimitSpec {
@@ -504,7 +615,101 @@ pub const LIMITS: &[LimitSpec] = &[
         min: 1,
         max: 3650,
     },
+    LimitSpec {
+        key: LIMIT_STAGE_BATCH,
+        section: "maintenance",
+        title_key: "limitStageBatch",
+        hint_key: "limitStageBatchDesc",
+        unit_key: "limitUnitMessages",
+        default: 500,
+        min: 10,
+        max: 10_000,
+    },
+    LimitSpec {
+        key: LIMIT_STAGE_SNAPSHOT_HOURS,
+        section: "maintenance",
+        title_key: "limitStageSnapshotHours",
+        hint_key: "limitStageSnapshotHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 24,
+        min: 1,
+        max: 8760,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_WAIT_SECONDS,
+        section: "maintenance",
+        title_key: "limitSweepWaitSeconds",
+        hint_key: "limitSweepWaitSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 60,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_MAX_WAITS,
+        section: "maintenance",
+        title_key: "limitSweepMaxWaits",
+        hint_key: "limitSweepMaxWaitsDesc",
+        unit_key: "limitUnitWaits",
+        default: 8,
+        min: 1,
+        max: 100,
+    },
+    LimitSpec {
+        key: LIMIT_SWEEP_FULL_PASS_HOURS,
+        section: "maintenance",
+        title_key: "limitSweepFullPassHours",
+        hint_key: "limitSweepFullPassHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 24,
+        min: 1,
+        max: 8760,
+    },
+    LimitSpec {
+        key: LIMIT_REMINDER_CHECK_SECONDS,
+        section: "maintenance",
+        title_key: "limitReminderCheckSeconds",
+        hint_key: "limitReminderCheckSecondsDesc",
+        unit_key: "limitUnitSeconds",
+        default: 60,
+        min: 5,
+        max: 3600,
+    },
+    LimitSpec {
+        key: LIMIT_UPDATE_CHECK_HOURS,
+        section: "maintenance",
+        title_key: "limitUpdateCheckHours",
+        hint_key: "limitUpdateCheckHoursDesc",
+        unit_key: "limitUnitHours",
+        default: 6,
+        min: 1,
+        max: 8760,
+    },
 ];
+
+/// Связанные пределы: значения перечисленных ключей идут по неубыванию.
+///
+/// Поодиночке каждый из них остаётся в своих границах, а вместе расходятся:
+/// наименьшее окно отмены, поднятое выше значения первого запуска, оставляет
+/// обычную отправку без пригодной длительности - выбранное по умолчанию окно
+/// отклоняется при приёме письма, и отправка перестаёт работать целиком.
+pub const LIMIT_ORDERS: &[&[&str]] = &[&[
+    LIMIT_UNDO_SEND_MIN,
+    LIMIT_UNDO_SEND_DEFAULT,
+    LIMIT_UNDO_SEND_MAX,
+]];
+
+/// Цепочки пределов, идущих строго по возрастанию. Пороги свежести обращения
+/// образуют шкалу "свежее - недавнее - давнее", и сравнение идёт по порядку:
+/// порог, догнавший предыдущий, недостижим - вес за ним не выдаётся никогда, а
+/// подсказка получателей молча перестаёт различать свежие и недавние
+/// обращения. От неубывающих цепочек это отделено намеренно: там равные
+/// значения осмысленны, здесь равенство ломает шкалу.
+pub const LIMIT_STRICT_ORDERS: &[&[&str]] = &[&[
+    LIMIT_RANK_FRESH_DAYS,
+    LIMIT_RANK_RECENT_DAYS,
+    LIMIT_RANK_OLD_DAYS,
+]];
 
 /// Снимок рабочих значений пределов.
 ///
@@ -533,7 +738,7 @@ impl LimitSet {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Self {
+        let mut set = Self {
             values: LIMITS
                 .iter()
                 .map(|spec| {
@@ -544,7 +749,27 @@ impl LimitSet {
                     (spec.key, value)
                 })
                 .collect(),
+        };
+        // Собственные границы не видят связей между пределами, а в настройки
+        // несогласованный набор попадает и мимо записи - перенесённой базой или
+        // правкой руками. Расходящаяся цепочка целиком возвращается к значениям
+        // первого запуска: они согласованы по построению, а починить одно звено
+        // означало бы угадывать, какое из значений пользователь считал верным.
+        for (chains, strict) in [(LIMIT_ORDERS, false), (LIMIT_STRICT_ORDERS, true)] {
+            for chain in chains {
+                if chain.windows(2).any(|pair| {
+                    let (lower, upper) = (set.get(pair[0]), set.get(pair[1]));
+                    lower > upper || (strict && lower == upper)
+                }) {
+                    for key in *chain {
+                        if let Some(spec) = limit_spec(key) {
+                            set.set(spec.key, spec.default);
+                        }
+                    }
+                }
+            }
         }
+        set
     }
 
     pub fn get(&self, key: &str) -> i64 {
@@ -624,6 +849,51 @@ pub fn validate_limit(key: &str, value: i64) -> Result<i64, String> {
     Ok(value)
 }
 
+/// Проверить значение вместе с соседями по цепочке. Каждое из связанных
+/// значений остаётся в собственных границах, а вместе они расходятся, и
+/// поведение, которое задаёт соседнее поле, становится недостижимым.
+pub fn validate_limit_in_set(key: &str, value: i64, limits: &LimitSet) -> Result<i64, String> {
+    let value = validate_limit(key, value)?;
+    for (chains, strict) in [(LIMIT_ORDERS, false), (LIMIT_STRICT_ORDERS, true)] {
+        for chain in chains {
+            let Some(place) = chain.iter().position(|item| *item == key) else {
+                continue;
+            };
+            if let Some(lower) = place.checked_sub(1).map(|index| chain[index]) {
+                let bound = limits.get(lower);
+                if value < bound || (strict && value == bound) {
+                    return Err(order_refusal(key, value, lower, bound, "больше"));
+                }
+            }
+            if let Some(upper) = chain.get(place + 1) {
+                let bound = limits.get(upper);
+                if value > bound || (strict && value == bound) {
+                    return Err(order_refusal(key, value, upper, bound, "меньше"));
+                }
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Отказ по цепочке. Называет зависимое поле и его рабочее значение: "должно
+/// быть больше" без имени соседа не говорит пользователю, что именно менять.
+fn order_refusal(key: &str, value: i64, neighbour: &str, bound: i64, order: &str) -> String {
+    let text = crate::i18n::I18n::new("ru");
+    let title =
+        |key: &str| limit_spec(key).map_or_else(|| key.to_owned(), |spec| text.t(spec.title_key));
+    let unit = limit_spec(neighbour).map_or(String::new(), |spec| text.t(spec.unit_key));
+    format!(
+        "\"{}\": значение должно быть {} значения настройки \"{}\" ({} {}), получено {}",
+        title(key),
+        order,
+        title(neighbour),
+        bound,
+        unit,
+        value
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +924,32 @@ mod tests {
             let text = crate::i18n::I18n::new("ru");
             for key in [spec.title_key, spec.hint_key, spec.unit_key] {
                 assert_ne!(text.t(key), key, "нет русской подписи для ключа {key}");
+            }
+        }
+        // Значения первого запуска связанных пределов обязаны идти по
+        // неубыванию: на них возвращается расходящаяся цепочка из настроек, и
+        // несогласованный реестр чинить было бы нечем.
+        for chain in LIMIT_ORDERS {
+            for pair in chain.windows(2) {
+                assert!(
+                    limit_default(pair[0]) <= limit_default(pair[1]),
+                    "значения первого запуска пределов {} и {} идут не по порядку",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+        // У строгой цепочки равенство тоже запрещено: порог, догнавший
+        // предыдущий, недостижим, и пользователь не смог бы записать ни одно
+        // значение, которое сосед не отклонит.
+        for chain in LIMIT_STRICT_ORDERS {
+            for pair in chain.windows(2) {
+                assert!(
+                    limit_default(pair[0]) < limit_default(pair[1]),
+                    "значения первого запуска пределов {} и {} не образуют шкалу",
+                    pair[0],
+                    pair[1]
+                );
             }
         }
     }

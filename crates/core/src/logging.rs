@@ -51,39 +51,39 @@ mod tests {
     use super::{mask_email, mask_error_text};
 
     #[test]
-    fn masks_addresses_inside_server_error() {
-        assert_eq!(
-            mask_error_text("NO [OVERQUOTA] mailbox boss@example.test is full"),
-            "NO [OVERQUOTA] mailbox b***@example.test is full",
-            "адрес маскируется, остальной текст ошибки остаётся"
-        );
+    fn masks_the_local_part_and_keeps_the_domain() {
+        // Домен в журнале нужен, чтобы отличить один аккаунт от другого, а
+        // локальная часть - уже карта переписки. Строка без "@" не адрес, и
+        // отдать её в журнал целиком нельзя: это может быть что угодно.
+        let cases = [
+            ("stanislav.chernov@ligastavok.ru", "s***@ligastavok.ru"),
+            ("a@example.com", "a***@example.com"),
+            ("@example.com", "***@example.com"),
+            ("not-an-email", "***"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(mask_email(source), expected, "адрес: {source}");
+        }
     }
 
     #[test]
-    fn keeps_error_without_addresses_as_is() {
-        assert_eq!(mask_error_text("connection reset"), "connection reset");
-    }
-
-    #[test]
-    fn masks_regular_address() {
-        assert_eq!(
-            mask_email("stanislav.chernov@ligastavok.ru"),
-            "s***@ligastavok.ru"
-        );
-    }
-
-    #[test]
-    fn masks_single_char_local_part() {
-        assert_eq!(mask_email("a@example.com"), "a***@example.com");
-    }
-
-    #[test]
-    fn does_not_panic_without_at_sign() {
-        assert_eq!(mask_email("not-an-email"), "***");
-    }
-
-    #[test]
-    fn does_not_panic_on_empty_string() {
-        assert_eq!(mask_email(""), "***");
+    fn masks_every_address_inside_server_error_and_keeps_the_rest() {
+        // Текст ошибки сервера идёт и в журнал, и в last_error очереди
+        // операций (S-084): адреса маскируются, код и слова сервера остаются -
+        // без них ошибка перестала бы что-либо объяснять.
+        let cases = [
+            (
+                "NO [OVERQUOTA] mailbox boss@example.test is full",
+                "NO [OVERQUOTA] mailbox b***@example.test is full",
+            ),
+            (
+                "550 5.1.1 boss@example.test, copy@example.test unknown",
+                "550 5.1.1 b***@example.test, c***@example.test unknown",
+            ),
+            ("connection reset", "connection reset"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(mask_error_text(source), expected, "текст: {source}");
+        }
     }
 }

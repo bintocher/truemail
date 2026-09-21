@@ -19,12 +19,24 @@ const HISTORY_NOW_SQL: &str = "strftime('%Y-%m-%dT%H:%M:%S+00:00','now')";
 
 /// Ранг записи выражением базы: веса считаются на стороне SQLite, чтобы не
 /// поднимать в память до 50 отметок на каждую из 2000 записей (S-028).
-const RANK_SQL: &str = "(SELECT coalesce(sum(CASE
-            WHEN julianday('now') - julianday(t.used_at) < 30 THEN 3
-            WHEN julianday('now') - julianday(t.used_at) < 90 THEN 2
-            WHEN julianday('now') - julianday(t.used_at) < 365 THEN 1
+///
+/// Пороги свежести - настройки: у того, кто пишет одним и тем же людям
+/// ежедневно, месяц не отделяет частых адресатов от разовых, а у того, кто
+/// пишет раз в квартал, отделяет слишком резко. Веса остаются в коде: они
+/// задают не предел, а само правило сравнения.
+fn rank_sql(limits: &LimitSet) -> String {
+    format!(
+        "(SELECT coalesce(sum(CASE
+            WHEN julianday('now') - julianday(t.used_at) < {fresh} THEN 3
+            WHEN julianday('now') - julianday(t.used_at) < {recent} THEN 2
+            WHEN julianday('now') - julianday(t.used_at) < {old} THEN 1
             ELSE 0 END), 0)
-      FROM recipient_history_touches t WHERE t.history_id = h.id)";
+      FROM recipient_history_touches t WHERE t.history_id = h.id)",
+        fresh = limits.get(LIMIT_RANK_FRESH_DAYS),
+        recent = limits.get(LIMIT_RANK_RECENT_DAYS),
+        old = limits.get(LIMIT_RANK_OLD_DAYS),
+    )
+}
 
 /// Строка отправленного письма при пополнении истории: номер, ключ письма,
 /// адресаты полей "Кому" и "Копия" и дата.
@@ -208,12 +220,13 @@ impl Db {
             return Ok(0);
         }
         let extra = visible - max_visible;
+        let rank = rank_sql(&self.limit_set());
         let sql = format!(
             "UPDATE recipient_history SET evicted=1, evicted_at=datetime('now')
               WHERE id IN (
                 SELECT h.id FROM recipient_history h
                  WHERE h.account_id=? AND h.hidden_by_user=0 AND h.evicted=0
-                 ORDER BY {RANK_SQL} ASC, coalesce(h.last_used_at,'') ASC, h.id ASC
+                 ORDER BY {rank} ASC, coalesce(h.last_used_at,'') ASC, h.id ASC
                  LIMIT ?)"
         );
         let result = sqlx::query(AssertSqlSafe(sql))
@@ -393,8 +406,9 @@ impl Db {
     /// Кандидаты подсказки: история выбранного ящика, объединённая с контактами
     /// по ключу адреса, уже упорядоченная ядром (S-031, S-035).
     pub async fn recipient_candidates(&self, account_id: i64) -> Result<Vec<RecipientCandidate>> {
+        let rank = rank_sql(&self.limit_set());
         let sql = format!(
-            "SELECT h.display_address, h.display_name, {RANK_SQL},
+            "SELECT h.display_address, h.display_name, {rank},
                     (SELECT count(*) FROM recipient_history_touches t WHERE t.history_id=h.id),
                     h.last_used_at
                FROM recipient_history h
@@ -499,7 +513,10 @@ impl Db {
                   LIMIT ? OFFSET ?",
         )
         .bind(account_id)
-        .bind(limit.clamp(1, HISTORY_PAGE))
+        // Потолок страницы - та же настройка, которую спрашивает раздел: иначе
+        // поднятый предел резался бы здесь молча, и пользователь видел бы сто
+        // записей вместо выбранных им.
+        .bind(limit.clamp(1, self.limit(LIMIT_HISTORY_PAGE)))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await?;

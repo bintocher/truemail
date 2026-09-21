@@ -5,6 +5,7 @@ use crate::{Error, Result};
 use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, Mechanism};
+use lettre::transport::smtp::client::{Tls, TlsParameters};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -429,6 +430,8 @@ pub(crate) async fn send_oauth_with_raw(
     port: u16,
     security: Security,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
+    // Отправка по OAuth идёт к известным серверам с настоящим сертификатом.
+    let tls_insecure = false;
     let from = message.from.clone();
     let email = build_message(message)?;
     let raw = email.formatted();
@@ -437,6 +440,10 @@ pub(crate) async fn send_oauth_with_raw(
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    };
+    let builder = match insecure_tls(host, security, tls_insecure) {
+        Some(tls) => builder.map(|builder| builder.tls(tls)),
+        None => builder,
     };
     let transport = builder
         .map_err(|error| smtp_failure("smtp", error))?
@@ -450,6 +457,33 @@ pub(crate) async fn send_oauth_with_raw(
         .await
         .map_err(|error| smtp_failure("smtp", error))?;
     Ok(raw)
+}
+
+/// Настройки TLS для узла, сертификат которого человек решил не проверять
+/// (issue #118). `None` - узел проверяется как обычно, и строитель остаётся
+/// при своих настройках по умолчанию.
+fn insecure_tls(host: &str, security: Security, tls_insecure: bool) -> Option<Tls> {
+    if !tls_insecure {
+        return None;
+    }
+    match TlsParameters::builder(host.to_owned())
+        .dangerous_accept_invalid_certs(true)
+        .dangerous_accept_invalid_hostnames(true)
+        .build()
+    {
+        Ok(params) => {
+            tracing::warn!(%host, "сертификат сервера отправки не проверяется по решению пользователя");
+            Some(if security == Security::Starttls {
+                Tls::Required(params)
+            } else {
+                Tls::Wrapper(params)
+            })
+        }
+        Err(error) => {
+            tracing::warn!(%host, %error, "не удалось собрать настройки TLS без проверки, идём обычным путём");
+            None
+        }
+    }
 }
 
 pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
@@ -492,11 +526,20 @@ pub async fn send_password(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> Result<()> {
-    send_password_with_raw(message, username, password, host, port, security)
-        .await
-        .map(|_| ())
-        .map_err(|failure| failure.error)
+    send_password_with_raw(
+        message,
+        username,
+        password,
+        host,
+        port,
+        security,
+        tls_insecure,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|failure| failure.error)
 }
 
 pub(crate) async fn send_password_with_raw(
@@ -506,6 +549,7 @@ pub(crate) async fn send_password_with_raw(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
     if security == Security::None {
         return Err(Error::AccountConfig(
@@ -521,6 +565,10 @@ pub(crate) async fn send_password_with_raw(
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     }
     .map_err(|error| smtp_failure("smtp", error))?;
+    let builder = match insecure_tls(host, security, tls_insecure) {
+        Some(tls) => builder.tls(tls),
+        None => builder,
+    };
     let transport = builder
         .port(port)
         .credentials(Credentials::new(username.to_owned(), password.to_owned()))

@@ -50,3 +50,8 @@ argon2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winhttp = { version = "0.1.3", features = ["async"] }
+
+[dev-dependencies]
+# Проверка S-018: подписчик собирает записи журнала в буфер, чтобы убедиться,
+# что пароль в них не попадает.
+tracing-subscriber.workspace = true

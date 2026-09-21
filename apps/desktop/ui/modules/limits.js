@@ -52,6 +52,22 @@
     recipientOwnSendDays: 'limit_recipient_own_send_days',
     messageTraitsDays: 'limit_message_traits_days',
     operationAttempts: 'limit_operation_attempts',
+    gmailPollSeconds: 'limit_gmail_poll_seconds',
+    snoozeReleaseSeconds: 'limit_snooze_release_seconds',
+    backfillPage: 'limit_backfill_page',
+    bodyPrefetchMessages: 'limit_body_prefetch_messages',
+    bodyPrefetchSizeMb: 'limit_body_prefetch_size_mb',
+    historyPage: 'limit_history_page',
+    rankFreshDays: 'limit_rank_fresh_days',
+    rankRecentDays: 'limit_rank_recent_days',
+    rankOldDays: 'limit_rank_old_days',
+    stageBatch: 'limit_stage_batch',
+    stageSnapshotHours: 'limit_stage_snapshot_hours',
+    sweepWaitSeconds: 'limit_sweep_wait_seconds',
+    sweepMaxWaits: 'limit_sweep_max_waits',
+    sweepFullPassHours: 'limit_sweep_full_pass_hours',
+    reminderCheckSeconds: 'limit_reminder_check_seconds',
+    updateCheckHours: 'limit_update_check_hours',
   };
 
   let sections = [];
@@ -125,6 +141,50 @@
       : `"${title}": допустимы значения от ${spec.min} до ${spec.max} (${unit})`;
   }
 
+  // Фоновые циклы интерфейса. Срок берётся из реестра перед каждым оборотом:
+  // прочитанный один раз при запуске, он держал бы прежний ритм до перезагрузки
+  // окна, хотя настройка уже записана (configurable-limits.md, S-008, S-014).
+  // Цикл на ключ ровно один: повторный запуск снимает прежний, иначе каждая
+  // смена значения добавляла бы к работающему циклу ещё один.
+  const loops = new Map();
+
+  function stopLimitLoop(key) {
+    const running = loops.get(key);
+    if (!running) return;
+    running.stopped = true;
+    if (running.timer !== null) running.timers.clearTimeout(running.timer);
+    loops.delete(key);
+  }
+
+  // scale - во что переводить значение предела: 1000 для срока в секундах,
+  // 60000 для срока в минутах. Своего числа у цикла нет, есть только единица
+  // измерения настройки. timers - окно, которому цикл принадлежит: его таймеры
+  // и останавливаются вместе с ним.
+  function startLimitLoop(key, action, options = {}) {
+    stopLimitLoop(key);
+    const scale = Number(options.scale) || 1000;
+    const timers = options.timers || globalThis;
+    const running = {stopped: false, timer: null, timers};
+    loops.set(key, running);
+    const plan = () => {
+      if (running.stopped) return;
+      const value = limitValue(key);
+      // Значения нет - перечень пределов не прочитан, и собственного срока цикл
+      // не выдумывает: решение остаётся за ядром.
+      if (!value || value <= 0) { stopLimitLoop(key); return; }
+      running.timer = timers.setTimeout(async () => {
+        running.timer = null;
+        // Сбой одного прохода цикла не прекращает: следующий проход обязан
+        // состояться, иначе одна ошибка ядра молча останавливает фоновую работу
+        // до перезапуска.
+        try { await action(); } catch (error) { console.error(error); }
+        plan();
+      }, value * scale);
+    };
+    plan();
+    return () => stopLimitLoop(key);
+  }
+
   // Записать значение через мост и обновить реестр ответом ядра: принятое
   // значение всегда приходит от ядра, а не додумывается интерфейсом.
   async function saveLimit(bridge, key, value) {
@@ -145,5 +205,7 @@
     limitSectionRows,
     limitErrorText,
     saveLimit,
+    startLimitLoop,
+    stopLimitLoop,
   };
 });

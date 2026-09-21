@@ -152,17 +152,49 @@ fn days_ago(days: i64) -> String {
         .to_string()
 }
 
-/// Блокировка отправителя от начала до конца: запись, приход письма, порядок
-/// стадий, постановка переноса в корзину, исключение письма из уведомления о
-/// новой почте и защита письма, уже лежащего в корзине
+/// Блокировка отправителя от начала до конца: запись правила, приход письма,
+/// порядок стадий, постановка переноса в корзину, исключение письма из
+/// уведомления о новой почте и защита письма, уже лежащего в корзине
 /// (blocked-senders.md S-001 - S-005, S-021, S-023 - S-025).
+///
+/// Письмо нарочно подходит сразу под три стадии - список отправителей,
+/// игнорируемую переписку и правило: его закрывает первая стадия, второй
+/// операции увода по нему не появляется, и правило к закрытому письму не
+/// применяется. Два увода по одному письму - это перенос в корзину и следом
+/// перенос из корзины в спам, то есть письмо, потерянное на сервере.
 #[tokio::test]
 async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
     let db = test_db("stage-blocked").await;
     let account = seed_account(&db, "me@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
     let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
-    // Правило, которое пометило бы письмо, если бы оно дошло до стадии правил.
+    let spam = seed_folder(&db, account, "Spam", Some("spam")).await;
+
+    // Первое письмо переписки: по нему человек включает игнорирование, и та же
+    // переписка попадает под блокировку отправителя.
+    let root = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "spam@example.test",
+            subject: "Переписка",
+            message_id: Some("<root@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let ignore_preview = db
+        .preview_ignore_conversation(root)
+        .await
+        .expect("предпросмотр игнорирования");
+    db.enable_ignore_conversation(root, &ignore_preview.snapshot_key, true)
+        .await
+        .expect("игнорирование переписки");
+
+    // Правило, которое увело бы письмо в спам и пометило прочитанным, если бы
+    // оно дошло до стадии правил.
     let rule = MailRuleInput {
         id: "rule-after-block".into(),
         name: "После блокировки".into(),
@@ -171,20 +203,30 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
         groups: vec![MailRuleGroup {
             logic: "all".into(),
             conditions: vec![MailRuleCondition {
-                field: "subject".into(),
-                op: "contains".into(),
-                value: "рассылка".into(),
+                field: "sender_address".into(),
+                op: "equals".into(),
+                value: "spam@example.test".into(),
                 unit: None,
                 value2: None,
             }],
         }],
         exceptions: Vec::new(),
-        actions: vec![MailRuleAction {
-            kind: "mark_read".into(),
-            folder_id: None,
-            folder_role: None,
-            label_id: None,
-        }],
+        actions: vec![
+            // Пометка раньше увода: после уводящего действия хвост правила
+            // не выполняется, и правило с таким порядком просто не сохранить.
+            MailRuleAction {
+                kind: "mark_read".into(),
+                folder_id: None,
+                folder_role: None,
+                label_id: None,
+            },
+            MailRuleAction {
+                kind: "spam".into(),
+                folder_id: None,
+                folder_role: None,
+                label_id: None,
+            },
+        ],
         confirm_key: None,
     };
     db.save_mail_rule(&rule, false, None)
@@ -210,10 +252,12 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
         &db,
         account,
         inbox,
-        1,
+        2,
         Seed {
             from: "spam@example.test",
-            subject: "рассылка",
+            subject: "Re: Переписка",
+            message_id: Some("<next@example.test>"),
+            in_reply_to: Some("<root@example.test>"),
             ..Seed::default()
         },
     )
@@ -222,7 +266,7 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
         &db,
         account,
         inbox,
-        2,
+        3,
         Seed {
             from: "friend@example.test",
             subject: "рассылка",
@@ -236,7 +280,7 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
         &db,
         account,
         trash,
-        3,
+        4,
         Seed {
             from: "spam@example.test",
             subject: "старое",
@@ -248,13 +292,22 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
     db.process_sync_batch_stages().await.expect("стадии");
 
     let queued = takeaways(&db, blocked).await;
-    assert_eq!(queued.len(), 1, "по письму ровно одна операция увода");
+    assert_eq!(
+        queued.len(),
+        1,
+        "по письму больше одной операции увода: следующие стадии разобрали закрытое письмо"
+    );
     assert_eq!(queued[0].0, "move", "письмо переносится, а не удаляется");
-    assert_eq!(queued[0].2, Some(trash));
+    assert_eq!(
+        queued[0].2,
+        Some(trash),
+        "письмо увело не первой стадией, а правилом"
+    );
+    assert_ne!(queued[0].2, Some(spam));
     assert_eq!(
         closed_by(&db, blocked).await.as_deref(),
         Some(SENDER_POLICY_STAGE_NAME),
-        "письмо закрыто стадией списков и дальше не идёт"
+        "письмо закрыто не стадией списков отправителей и дальше идёт"
     );
     let read: (i64,) = sqlx::query_as("SELECT seen FROM messages WHERE id=?")
         .bind(blocked)
@@ -275,7 +328,7 @@ async fn blocked_sender_is_queued_to_trash_and_closes_the_message() {
     let notify = db
         .inbox_message_ids_by_remote_ids(
             account,
-            &[format!("remote-{inbox}-1"), format!("remote-{inbox}-2")],
+            &[format!("remote-{inbox}-2"), format!("remote-{inbox}-3")],
             None,
             None,
         )
@@ -1139,108 +1192,6 @@ async fn full_sweep_pass_runs_on_start() {
     db.close().await;
 }
 
-/// Порядок стадий и одна операция увода на письмо: письмо подходит и под
-/// список отправителей, и под игнорируемую переписку, и под правило - его
-/// закрывает первая стадия, а второй операции по нему не появляется
-/// (blocked-senders.md S-001, S-002, S-004).
-#[tokio::test]
-async fn first_stage_closes_the_message_and_no_second_takeaway_appears() {
-    let db = test_db("stage-order").await;
-    let account = seed_account(&db, "me@example.test").await;
-    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
-    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
-    let spam = seed_folder(&db, account, "Spam", Some("spam")).await;
-
-    let root = seed_message(
-        &db,
-        account,
-        inbox,
-        1,
-        Seed {
-            from: "sender@example.test",
-            subject: "Переписка",
-            message_id: Some("<root@example.test>"),
-            ..Seed::default()
-        },
-    )
-    .await;
-    let preview = db
-        .preview_ignore_conversation(root)
-        .await
-        .expect("предпросмотр");
-    db.enable_ignore_conversation(root, &preview.snapshot_key, true)
-        .await
-        .expect("игнорирование");
-    db.save_sender_policy(
-        POLICY_KIND_ADDRESS,
-        "sender@example.test",
-        POLICY_DECISION_BLOCKED,
-        false,
-    )
-    .await
-    .expect("блокировка");
-    let rule = MailRuleInput {
-        id: "rule-spam".into(),
-        name: "В спам".into(),
-        account_id: None,
-        enabled: true,
-        groups: vec![MailRuleGroup {
-            logic: "all".into(),
-            conditions: vec![MailRuleCondition {
-                field: "sender_address".into(),
-                op: "equals".into(),
-                value: "sender@example.test".into(),
-                unit: None,
-                value2: None,
-            }],
-        }],
-        exceptions: Vec::new(),
-        actions: vec![MailRuleAction {
-            kind: "spam".into(),
-            folder_id: None,
-            folder_role: None,
-            label_id: None,
-        }],
-        confirm_key: None,
-    };
-    db.save_mail_rule(&rule, false, None)
-        .await
-        .expect("правило");
-
-    let next = seed_message(
-        &db,
-        account,
-        inbox,
-        2,
-        Seed {
-            from: "sender@example.test",
-            subject: "Re: Переписка",
-            message_id: Some("<next@example.test>"),
-            in_reply_to: Some("<root@example.test>"),
-            ..Seed::default()
-        },
-    )
-    .await;
-    db.process_sync_batch_stages().await.expect("стадии");
-    let queued = takeaways(&db, next).await;
-    assert_eq!(
-        queued.len(),
-        1,
-        "одна незавершённая операция увода на письмо"
-    );
-    assert_eq!(
-        queued[0].2,
-        Some(trash),
-        "письмо закрыто первой стадией, а не правилом"
-    );
-    assert_ne!(queued[0].2, Some(spam));
-    assert_eq!(
-        closed_by(&db, next).await.as_deref(),
-        Some(SENDER_POLICY_STAGE_NAME)
-    );
-    db.close().await;
-}
-
 /// Конфликт ограничения очереди пропускает письмо со счётчиком, а не роняет
 /// проход: письмо с чужой незавершённой операцией переводит проход автоочистки
 /// в состояние ожидания (sweep-by-sender.md S-004, S-019 - S-021).
@@ -1991,5 +1942,226 @@ async fn mailbox_without_trash_closes_lists_but_lets_rules_run() {
         "письмо автоочистки без корзины доходит до правил"
     );
     assert_eq!(rule_move[0].2, Some(archive));
+    db.close().await;
+}
+
+/// Состарить снимок кандидатов: подтверждение открывают и возвращаются к нему
+/// спустя часы, а ждать их в проверке нельзя.
+async fn age_snapshot(db: &Db, key: &str, hours: i64) {
+    sqlx::query("UPDATE stage_snapshots SET created_at=datetime('now', ?) WHERE key=?")
+        .bind(format!("-{hours} hours"))
+        .bind(key)
+        .execute(&db.write_pool)
+        .await
+        .expect("состарить снимок");
+}
+
+/// Число заведённых заданий всех трёх стадий.
+async fn job_counts(db: &Db) -> (i64, i64, i64) {
+    let count = |sql: &'static str| async move {
+        sqlx::query_as::<_, (i64,)>(sql)
+            .fetch_one(&db.pool)
+            .await
+            .expect("посчитать задания")
+            .0
+    };
+    (
+        count("SELECT count(*) FROM sender_policy_jobs").await,
+        count("SELECT count(*) FROM ignored_conversation_jobs").await,
+        count("SELECT count(*) FROM sender_sweep_jobs").await,
+    )
+}
+
+/// Список писем-кандидатов живёт ровно столько, сколько говорит настройка, и
+/// это проверяется на всех трёх путях подтверждения: списками отправителей,
+/// игнорированием переписки и автоочисткой по отправителю (blocked-senders.md
+/// S-030, ignore-conversation.md S-016, sweep-by-sender.md S-011,
+/// configurable-limits.md S-018).
+///
+/// Срок жизни снимка спрашивала только уборка - при запуске программы и перед
+/// новым снимком. Между ними снимок жил сколько угодно, и подтверждение
+/// недельной давности запускало массовое перемещение писем по списку, который
+/// пользователь уже не видел. Само число сроком в сутки было вписано в оба
+/// запроса уборки: кто открывал подтверждение вечером и возвращался к нему
+/// через день, начинал сначала, а кому суток много, тот не мог их сократить.
+/// Поэтому один и тот же возраст снимка проверяется дважды - при сроке короче
+/// него и при сроке длиннее.
+#[tokio::test]
+async fn a_list_of_messages_expires_by_the_setting_on_every_confirmation_path() {
+    let db = test_db("stage-stale-snapshot").await;
+    let account = seed_account(&db, "me@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let blocked = seed_message(
+        &db,
+        account,
+        inbox,
+        1,
+        Seed {
+            from: "news@example.test",
+            subject: "выпуск",
+            ..Seed::default()
+        },
+    )
+    .await;
+    let talk = seed_message(
+        &db,
+        account,
+        inbox,
+        2,
+        Seed {
+            from: "one@example.test",
+            subject: "Обсуждение",
+            date: Some(&days_ago(3)),
+            message_id: Some("<talk@example.test>"),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let swept = seed_message(
+        &db,
+        account,
+        inbox,
+        3,
+        Seed {
+            from: "shop@example.test",
+            subject: "счёт",
+            date: Some(&days_ago(40)),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let sweep_input = SenderSweepInput {
+        address: "shop@example.test".into(),
+        mode: SWEEP_MODE_OLDER_THAN.into(),
+        account_id: Some(account),
+        days: Some(30),
+        sweep_archive: false,
+    };
+
+    let policy_preview = db
+        .preview_sender_policy(POLICY_KIND_ADDRESS, "news@example.test")
+        .await
+        .expect("предпросмотр списка отправителей");
+    let policy = db
+        .save_sender_policy(
+            POLICY_KIND_ADDRESS,
+            &policy_preview.value,
+            POLICY_DECISION_BLOCKED,
+            false,
+        )
+        .await
+        .expect("запись блокировки");
+    let ignore_preview = db
+        .preview_ignore_conversation(talk)
+        .await
+        .expect("предпросмотр игнорирования");
+    let sweep_preview = db
+        .preview_sender_sweep(sweep_input.clone())
+        .await
+        .expect("предпросмотр автоочистки");
+
+    // Все три списка собраны тридцать часов назад, а срок им отведён часовой.
+    db.set_limit(LIMIT_STAGE_SNAPSHOT_HOURS, 1)
+        .await
+        .expect("записать срок жизни снимка");
+    for key in [
+        &policy_preview.snapshot_key,
+        &ignore_preview.snapshot_key,
+        &sweep_preview.snapshot_key,
+    ] {
+        age_snapshot(&db, key, 30).await;
+    }
+    db.purge_stale_stage_snapshots()
+        .await
+        .expect("уборка снимков");
+
+    let refusals = [
+        db.start_sender_policy_sweep(policy.id, &policy_preview.snapshot_key, true)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        db.enable_ignore_conversation(talk, &ignore_preview.snapshot_key, true)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        db.start_sender_sweep(sweep_input.clone(), &sweep_preview.snapshot_key)
+            .await
+            .err()
+            .map(|error| error.to_string()),
+    ];
+    for refusal in &refusals {
+        let message = refusal
+            .as_deref()
+            .expect("просроченный список писем подтверждён: возраст снимка не проверяется");
+        assert!(
+            message.contains("устарел"),
+            "отказ не объясняет, что список устарел: {message}"
+        );
+    }
+    for message in [blocked, talk, swept] {
+        assert!(
+            takeaways(&db, message).await.is_empty(),
+            "по просроченному списку письмо всё-таки уводится"
+        );
+    }
+    assert_eq!(
+        job_counts(&db).await,
+        (0, 0, 0),
+        "отказ оставил после себя задание уборки"
+    );
+    assert!(
+        db.list_ignored_conversations()
+            .await
+            .expect("записи игнорирования")
+            .is_empty(),
+        "переписка записана в игнорируемые по просроченному списку"
+    );
+
+    // Тот же возраст снимка при сроке в двое суток доходит до уборки: отказ
+    // выше вызван настройкой, а не поломкой подтверждения и не числом,
+    // вписанным в запрос.
+    db.set_limit(LIMIT_STAGE_SNAPSHOT_HOURS, 48)
+        .await
+        .expect("поднять срок жизни снимка");
+    let policy_preview = db
+        .preview_sender_policy(POLICY_KIND_ADDRESS, "news@example.test")
+        .await
+        .expect("второй предпросмотр списка отправителей");
+    let ignore_preview = db
+        .preview_ignore_conversation(talk)
+        .await
+        .expect("второй предпросмотр игнорирования");
+    let sweep_preview = db
+        .preview_sender_sweep(sweep_input.clone())
+        .await
+        .expect("второй предпросмотр автоочистки");
+    for key in [
+        &policy_preview.snapshot_key,
+        &ignore_preview.snapshot_key,
+        &sweep_preview.snapshot_key,
+    ] {
+        age_snapshot(&db, key, 30).await;
+    }
+    // Уборка идёт по тому же сроку: снимок, который ещё жив, она забрать не
+    // вправе - подтверждение после неё отказа не получает.
+    db.purge_stale_stage_snapshots()
+        .await
+        .expect("уборка снимков");
+
+    db.start_sender_policy_sweep(policy.id, &policy_preview.snapshot_key, true)
+        .await
+        .expect("уборка по списку отправителей отказана живому снимку");
+    db.enable_ignore_conversation(talk, &ignore_preview.snapshot_key, true)
+        .await
+        .expect("включение игнорирования отказано живому снимку");
+    db.start_sender_sweep(sweep_input, &sweep_preview.snapshot_key)
+        .await
+        .expect("автоочистка по отправителю отказана живому снимку");
+    for message in [blocked, talk, swept] {
+        let queued = takeaways(&db, message).await;
+        assert_eq!(queued.len(), 1, "живой список письмо не убрал");
+        assert_eq!(queued[0].2, Some(trash));
+    }
     db.close().await;
 }

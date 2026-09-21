@@ -8,7 +8,7 @@
 
 use super::Db;
 use super::stages::{
-    DEFERRED_MESSAGES, STAGE_BATCH, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, needs_retry,
+    DEFERRED_MESSAGES, STAGE_MESSAGE_COLUMNS, StageCounters, StageMessage, needs_retry,
 };
 use crate::Result;
 use crate::model::*;
@@ -213,6 +213,7 @@ impl Db {
             &payload,
             max_message_id,
             &candidates,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
         )
         .await?;
         tx.commit().await?;
@@ -311,8 +312,13 @@ impl Db {
         let account_id = source.account_id;
         // Снимок расходуется неделимо: повторное подтверждение с тем же ключом
         // второй уборки не запускает.
-        let (payload, max_message_id, _) =
-            Self::consume_stage_snapshot(&mut tx, snapshot_key, SNAPSHOT_KIND).await?;
+        let (payload, max_message_id, _) = Self::consume_stage_snapshot(
+            &mut tx,
+            snapshot_key,
+            SNAPSHOT_KIND,
+            self.limit(LIMIT_STAGE_SNAPSHOT_HOURS),
+        )
+        .await?;
         if payload != format!("{account_id}\n{message_id}") {
             return Err(crate::Error::AccountConfig(
                 "список писем относится к другой переписке, откройте подтверждение заново".into(),
@@ -751,7 +757,7 @@ impl Db {
             .bind(cursor)
             .bind(DEFERRAL_KIND)
             .bind(job_id)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut counters = StageCounters::default();
@@ -959,7 +965,7 @@ impl Db {
               ORDER BY id LIMIT ?",
         )
         .bind(conversation_id)
-        .bind(STAGE_BATCH)
+        .bind(self.limit(LIMIT_STAGE_BATCH))
         .fetch_all(&mut *tx)
         .await?;
         for row in pending {
@@ -1252,7 +1258,7 @@ impl Db {
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
             .bind(cursor)
-            .bind(STAGE_BATCH)
+            .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)
             .await?;
         let mut queued = 0usize;

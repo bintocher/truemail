@@ -94,6 +94,16 @@ async fn touch_count(db: &Db, account_id: i64, address: &str) -> i64 {
     .0
 }
 
+/// Отмотать курсор прохода: так выглядит следующая синхронизация, которая
+/// перечитывает папку отправленных с начала.
+async fn rewind_history_cursor(db: &Db, account_id: i64) {
+    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
+        .bind(account_id)
+        .execute(&db.write_pool)
+        .await
+        .expect("отмотать курсор");
+}
+
 fn iso(days_ago: i64) -> String {
     (chrono::Utc::now() - chrono::Duration::days(days_ago))
         .format("%Y-%m-%dT%H:%M:%S+00:00")
@@ -183,116 +193,6 @@ async fn own_send_counts_once_while_a_letter_from_another_device_still_counts() 
         touch_count(&db, account, "partner@partner.test").await,
         1,
         "ключ письма не даёт учесть одно письмо дважды"
-    );
-    db.close().await;
-}
-
-/// Убранный пользователем адрес не возвращается старым отправленным письмом, но
-/// возвращается собственной новой отправкой (S-046, S-048, S-049).
-#[tokio::test]
-async fn removed_address_survives_synchronisation_and_returns_after_a_new_message() {
-    let db: TestDb = open_test_db("history-hidden").await;
-    let account = seed_account(&db, "me@example.test").await;
-    let sent = seed_folder(&db, account, "Sent", Some("sent")).await;
-    seed_sent_message(
-        &db,
-        account,
-        sent,
-        1,
-        Some("<old-1@example.test>"),
-        "typo@partner.test",
-        &iso(10),
-    )
-    .await;
-    db.advance_recipient_history(account)
-        .await
-        .expect("первичное заполнение");
-    assert_eq!(
-        visible_addresses(&db, account).await,
-        vec!["typo@partner.test"]
-    );
-
-    let (entry_id,): (i64,) =
-        sqlx::query_as("SELECT id FROM recipient_history WHERE account_id=? AND address_key=?")
-            .bind(account)
-            .bind("typo@partner.test")
-            .fetch_one(&db.pool)
-            .await
-            .expect("найти запись");
-    db.hide_recipient_history_entry(account, entry_id)
-        .await
-        .expect("убрать адрес");
-
-    // Следующая синхронизация перечитывает ту же папку: адрес возвращаться не
-    // должен.
-    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
-        .bind(account)
-        .execute(&db.write_pool)
-        .await
-        .expect("отмотать курсор");
-    db.advance_recipient_history(account)
-        .await
-        .expect("повторное пополнение");
-    assert!(
-        visible_addresses(&db, account).await.is_empty(),
-        "старое письмо убранный адрес не возвращает"
-    );
-
-    // Пользователь сам написал на этот адрес: запись снова видима.
-    db.record_recipient_touches(
-        account,
-        &[RecipientTouch {
-            email: "typo@partner.test".into(),
-            name: String::new(),
-            message_key: "<new-1@example.test>".into(),
-            used_at: iso(0),
-        }],
-        TouchOrigin::OwnSend,
-    )
-    .await
-    .expect("новая отправка");
-    assert_eq!(
-        visible_addresses(&db, account).await,
-        vec!["typo@partner.test"],
-        "собственная отправка снимает скрытие"
-    );
-    db.close().await;
-}
-
-/// Очистка истории сохраняет границу очистки, поэтому старые письма адреса не
-/// возвращают (S-047, S-048).
-#[tokio::test]
-async fn clearing_the_history_keeps_old_messages_from_refilling_it() {
-    let db: TestDb = open_test_db("history-clear").await;
-    let account = seed_account(&db, "me@example.test").await;
-    let sent = seed_folder(&db, account, "Sent", Some("sent")).await;
-    seed_sent_message(
-        &db,
-        account,
-        sent,
-        1,
-        Some("<old-1@example.test>"),
-        "client@partner.test",
-        &iso(30),
-    )
-    .await;
-    db.advance_recipient_history(account)
-        .await
-        .expect("первичное заполнение");
-    db.clear_recipient_history(account)
-        .await
-        .expect("очистить историю");
-    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
-        .bind(account)
-        .execute(&db.write_pool)
-        .await
-        .expect("отмотать курсор");
-    db.advance_recipient_history(account)
-        .await
-        .expect("повторное пополнение");
-    assert!(
-        visible_addresses(&db, account).await.is_empty(),
-        "граница очистки держит и те адреса, которые ещё не прочитаны"
     );
     db.close().await;
 }
@@ -573,12 +473,16 @@ async fn duplicates_own_address_and_key_conflicts_are_handled_explicitly() {
     db.close().await;
 }
 
-/// Убранный адрес и очищенная история держатся в пределах одних суток: письмо,
-/// пришедшее раньше решения человека, адрес не возвращает, а письмо, пришедшее
-/// позже, возвращает (S-046 - S-049).
+/// Решение человека убрать адрес и очистка истории держатся против повторной
+/// синхронизации и держатся в пределах одних суток: письмо, пришедшее раньше
+/// решения, адрес не возвращает, письмо, пришедшее позже, возвращает, а
+/// собственная новая отправка возвращает адрес сразу (S-046 - S-049).
 ///
 /// Время обращения и время решения человека пишутся разными запросами, и
 /// сравнение их как строк разных видов давало на одной дате обратный ответ.
+/// Синхронизация же перечитывает ту же папку с начала: без границы решения
+/// убранный адрес возвращался бы первым же проходом, а очищенная история
+/// наполнялась бы теми же прежними письмами.
 #[tokio::test]
 async fn hiding_and_clearing_hold_within_the_same_day() {
     let db: TestDb = open_test_db("history-same-day").await;
@@ -597,44 +501,84 @@ async fn hiding_and_clearing_hold_within_the_same_day() {
         &morning,
     )
     .await;
+    // Второе письмо давнее: решение человека и граница очистки проверяются не
+    // только на одной дате, но и на разнице в дни.
+    seed_sent_message(
+        &db,
+        account,
+        sent,
+        2,
+        Some("<old@example.test>"),
+        "typo@partner.test",
+        &iso(10),
+    )
+    .await;
     db.advance_recipient_history(account)
         .await
         .expect("первичное заполнение");
+    assert_eq!(
+        visible_addresses(&db, account).await,
+        vec!["client@partner.test", "typo@partner.test"],
+        "первичное заполнение собрало не все адреса"
+    );
+
+    // Человек убрал оба адреса, а прежние письма остались в папке.
     let entries = db
         .list_recipient_history(account, 100, 0)
         .await
         .expect("записи истории");
-    let entry = entries.first().expect("запись адреса").id;
-
-    // Человек убрал адрес, а прежнее письмо того же дня осталось в папке.
-    db.hide_recipient_history_entry(account, entry)
-        .await
-        .expect("убрать адрес");
-    // Решение человека состоялось минуту назад: иначе оно и письмо ниже попали
-    // бы в одну и ту же секунду, и проверка зависела бы от скорости машины.
+    assert_eq!(entries.len(), 2, "в истории не обе записи");
+    for entry in &entries {
+        db.hide_recipient_history_entry(account, entry.id)
+            .await
+            .expect("убрать адрес");
+    }
+    // Решение человека состоялось минуту назад: иначе оно и письмо того же дня
+    // попали бы в одну и ту же секунду, и проверка зависела бы от скорости
+    // машины.
     sqlx::query(
         "UPDATE recipient_history
             SET hidden_at=strftime('%Y-%m-%dT%H:%M:%S+00:00','now','-1 minute')
-          WHERE id=?",
+          WHERE account_id=?",
     )
-    .bind(entry)
+    .bind(account)
     .execute(&db.write_pool)
     .await
     .expect("сдвинуть время решения");
-    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
-        .bind(account)
-        .execute(&db.write_pool)
-        .await
-        .expect("отмотать курсор");
+
+    // Следующая синхронизация перечитывает ту же папку с начала: ни письмо
+    // того же дня, ни давнее письмо убранный адрес не возвращают.
+    rewind_history_cursor(&db, account).await;
     db.advance_recipient_history(account)
         .await
         .expect("повторное пополнение");
     assert!(
         visible_addresses(&db, account).await.is_empty(),
-        "письмо, пришедшее до решения человека, адрес не возвращает"
+        "письмо, пришедшее до решения человека, вернуло убранный адрес"
     );
 
-    // Новое письмо тому же адресату пришло уже после решения: адрес вернулся.
+    // Собственная новая отправка - действие человека, а не перечитанная папка:
+    // адрес возвращается сразу и без нового письма в папке отправленных.
+    db.record_recipient_touches(
+        account,
+        &[RecipientTouch {
+            email: "typo@partner.test".into(),
+            name: String::new(),
+            message_key: "<new@example.test>".into(),
+            used_at: iso(0),
+        }],
+        TouchOrigin::OwnSend,
+    )
+    .await
+    .expect("новая отправка");
+    assert_eq!(
+        visible_addresses(&db, account).await,
+        vec!["typo@partner.test"],
+        "собственная отправка не сняла скрытие"
+    );
+
+    // Новое письмо тому же адресату пришло уже после решения: адрес вернулся и
+    // по папке отправленных.
     let later = (chrono::Utc::now() + chrono::Duration::seconds(2))
         .format("%Y-%m-%dT%H:%M:%S+00:00")
         .to_string();
@@ -642,7 +586,7 @@ async fn hiding_and_clearing_hold_within_the_same_day() {
         &db,
         account,
         sent,
-        2,
+        3,
         Some("<later@example.test>"),
         "client@partner.test",
         &later,
@@ -653,25 +597,22 @@ async fn hiding_and_clearing_hold_within_the_same_day() {
         .expect("пополнение после нового письма");
     assert_eq!(
         visible_addresses(&db, account).await,
-        vec!["client@partner.test"],
-        "новое письмо возвращает адрес"
+        vec!["client@partner.test", "typo@partner.test"],
+        "новое письмо не вернуло адрес"
     );
 
-    // Очистка держит ту же границу: письмо того же дня историю не наполняет.
+    // Очистка держит ту же границу: прежние письма - и сегодняшнее, и давнее -
+    // историю заново не наполняют.
     db.clear_recipient_history(account)
         .await
         .expect("очистить историю");
-    sqlx::query("UPDATE recipient_history_state SET cursor_message_id=0 WHERE account_id=?")
-        .bind(account)
-        .execute(&db.write_pool)
-        .await
-        .expect("отмотать курсор");
+    rewind_history_cursor(&db, account).await;
     db.advance_recipient_history(account)
         .await
         .expect("пополнение после очистки");
     assert!(
         visible_addresses(&db, account).await.is_empty(),
-        "граница очистки держит письма того же дня"
+        "граница очистки не удержала прежние письма"
     );
     db.close().await;
 }
@@ -775,5 +716,88 @@ async fn rank_boundaries_belong_to_the_next_group() {
             "обращение возрастом {days} суток весит не столько"
         );
     }
+    db.close().await;
+}
+
+/// Место адресата в подсказке тем же путём, которым его берёт композер.
+async fn rank_of(db: &Db, account_id: i64, email: &str) -> i64 {
+    db.recipient_candidates(account_id)
+        .await
+        .expect("кандидаты подсказки")
+        .into_iter()
+        .find(|candidate| candidate.email == email)
+        .expect("адресат пропал из подсказки")
+        .rank
+}
+
+/// Пороги свежести остаются шкалой: порог, догнавший соседний, отклоняется с
+/// именем зависимого поля, а упорядоченный сдвиг принимается и действует
+/// (S-028, configurable-limits.md S-021).
+///
+/// Пороги проверялись поодиночке, каждый в своих границах. Недавнее, опущенное
+/// ниже свежего, перехватывалось первым условием каскада, вес недавнего
+/// становился недостижимым, и подсказка молча переставала различать свежие и
+/// недавние обращения.
+#[tokio::test]
+async fn freshness_thresholds_stay_ordered_so_the_scale_keeps_working() {
+    let db: TestDb = open_test_db("history-rank-order").await;
+    let account = seed_account(&db, "me@example.test").await;
+    for (email, days) in [("fresh@partner.test", 10_i64), ("recent@partner.test", 45)] {
+        db.record_recipient_touches(
+            account,
+            &[RecipientTouch {
+                email: email.into(),
+                name: String::new(),
+                message_key: format!("<{email}>"),
+                used_at: iso(days),
+            }],
+            TouchOrigin::OwnSend,
+        )
+        .await
+        .expect("записать обращение");
+    }
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 3);
+    assert_eq!(rank_of(&db, account, "recent@partner.test").await, 2);
+
+    let refused = db
+        .set_limit(LIMIT_RANK_RECENT_DAYS, 10)
+        .await
+        .expect_err("недавнее принято ниже свежего: пороги проверяются поодиночке");
+    let message = refused.to_string();
+    assert!(
+        message.contains("считать свежим"),
+        "отказ не называет зависимое поле: {message}"
+    );
+    assert!(
+        message.contains("30"),
+        "отказ не называет значение зависимого поля: {message}"
+    );
+    assert_eq!(
+        db.limit(LIMIT_RANK_RECENT_DAYS),
+        90,
+        "отклонённое значение всё-таки изменило порог"
+    );
+    // Равенство порогов ломает шкалу так же, как их перестановка.
+    assert!(
+        db.set_limit(LIMIT_RANK_FRESH_DAYS, 90).await.is_err(),
+        "свежее, догнавшее недавнее, принято: вес недавнего стал недостижим"
+    );
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 3);
+    assert_eq!(
+        rank_of(&db, account, "recent@partner.test").await,
+        2,
+        "подсказка перестала различать свежие и недавние обращения"
+    );
+
+    // Упорядоченный сдвиг шкалы принимается, и обращения меняют вес вместе с
+    // ним: обе записи сдвигаются на ступень вниз.
+    db.set_limit(LIMIT_RANK_FRESH_DAYS, 5)
+        .await
+        .expect("сузить порог свежести");
+    db.set_limit(LIMIT_RANK_RECENT_DAYS, 20)
+        .await
+        .expect("сузить порог недавнего");
+    assert_eq!(rank_of(&db, account, "fresh@partner.test").await, 2);
+    assert_eq!(rank_of(&db, account, "recent@partner.test").await, 1);
     db.close().await;
 }

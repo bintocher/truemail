@@ -339,3 +339,68 @@ async fn a_batch_run_skips_busy_and_foreign_messages_and_applies_the_rest() {
     );
     db.close().await;
 }
+
+/// Снятие горячей клавиши идёт тем же путём, что и назначение: интерфейс шлёт
+/// пустое сочетание. Хранилище отвергало его разбором, поэтому назначенную
+/// клавишу освободить было нечем ни у встроенного действия, ни у слота
+/// быстрого действия (issue #104).
+#[tokio::test]
+async fn an_empty_combo_takes_the_key_off_an_action() {
+    let db: TestDb = open_test_db("keybinding-clear").await;
+    db.set_keybinding("quick_step_1", "Ctrl+Shift+1")
+        .await
+        .expect("назначить сочетание слоту");
+
+    db.set_keybinding("quick_step_1", "")
+        .await
+        .expect("снять сочетание со слота");
+    let slot: (String,) =
+        sqlx::query_as("SELECT combo FROM keybindings WHERE action='quick_step_1'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("прочитать строку слота");
+    assert_eq!(slot.0, "", "сочетание осталось назначенным слоту");
+
+    // Строка действия остаётся на месте: снятие освобождает клавишу, а не
+    // выкидывает действие из перечня.
+    let rows: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM keybindings WHERE action='quick_step_1'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("пересчитать строки слота");
+    assert_eq!(rows.0, 1, "снятие удалило строку действия");
+
+    // Встроенное действие снимается тем же вызовом, и освободившееся сочетание
+    // достаётся другому действию: ради этого снятие и нужно.
+    let built_in: (String, String) = sqlx::query_as(
+        "SELECT action, combo FROM keybindings WHERE action<>'quick_step_1' AND combo<>'' LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("взять встроенное действие с назначенным сочетанием");
+    db.set_keybinding(&built_in.0, "")
+        .await
+        .expect("снять сочетание со встроенного действия");
+    db.set_keybinding("quick_step_1", &built_in.1)
+        .await
+        .expect("назначить освободившееся сочетание слоту");
+    let moved: (String,) =
+        sqlx::query_as("SELECT combo FROM keybindings WHERE action='quick_step_1'")
+            .fetch_one(&db.pool)
+            .await
+            .expect("прочитать сочетание слота");
+    assert_eq!(
+        moved.0, built_in.1,
+        "освободившееся сочетание не досталось слоту"
+    );
+
+    // Мусор сочетанием по-прежнему не считается: снятие - это пустая строка, а
+    // не любая неразобранная.
+    assert!(
+        db.set_keybinding("quick_step_1", "Ctrl+Shift+A+B")
+            .await
+            .is_err(),
+        "принято сочетание, которое не разбирается"
+    );
+    db.close().await;
+}

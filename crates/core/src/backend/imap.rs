@@ -252,6 +252,88 @@ impl Authenticator for OAuth2<'_> {
 /// TLS-конфиг строим один раз и переиспользуем: системные корневые сертификаты
 /// не меняются в рамках сессии, а грузились они при каждом IMAP-подключении
 /// (десятки раз в минуту из-за IDLE/поллинга) - это было и дорого, и шумело в лог.
+/// Настройки TLS для узла, сертификат которого человек решил не проверять
+/// (issue #118). Подпись сервера принимается любая, поэтому соединение с
+/// таким узлом можно подменить - решение принимает только человек и только
+/// для своего ящика.
+fn insecure_tls_client_config() -> Arc<ClientConfig> {
+    static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            #[derive(Debug)]
+            struct AcceptAnyServer(Arc<tokio_rustls::rustls::crypto::CryptoProvider>);
+
+            impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
+                fn verify_server_cert(
+                    &self,
+                    _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+                    _server_name: &ServerName<'_>,
+                    _ocsp: &[u8],
+                    _now: tokio_rustls::rustls::pki_types::UnixTime,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::ServerCertVerified,
+                    tokio_rustls::rustls::Error,
+                > {
+                    Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+                }
+
+                fn verify_tls12_signature(
+                    &self,
+                    message: &[u8],
+                    cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    dss: &tokio_rustls::rustls::DigitallySignedStruct,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+                    tokio_rustls::rustls::Error,
+                > {
+                    tokio_rustls::rustls::crypto::verify_tls12_signature(
+                        message,
+                        cert,
+                        dss,
+                        &self.0.signature_verification_algorithms,
+                    )
+                }
+
+                fn verify_tls13_signature(
+                    &self,
+                    message: &[u8],
+                    cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+                    dss: &tokio_rustls::rustls::DigitallySignedStruct,
+                ) -> std::result::Result<
+                    tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+                    tokio_rustls::rustls::Error,
+                > {
+                    tokio_rustls::rustls::crypto::verify_tls13_signature(
+                        message,
+                        cert,
+                        dss,
+                        &self.0.signature_verification_algorithms,
+                    )
+                }
+
+                fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+                    self.0.signature_verification_algorithms.supported_schemes()
+                }
+            }
+
+            // Провайдер берём тот, что уже установлен процессом: свой
+            // второй привёл бы к разным наборам шифров на разных соединениях.
+            let provider = tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+                .cloned()
+                .unwrap_or_else(|| {
+                    Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider())
+                });
+            let mut config = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
+                .with_no_client_auth();
+            config.enable_sni = true;
+            Arc::new(config)
+        })
+        .clone()
+}
+
 fn tls_client_config() -> Arc<ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<ClientConfig>> = std::sync::OnceLock::new();
     CONFIG
@@ -274,7 +356,9 @@ fn tls_client_config() -> Arc<ClientConfig> {
 }
 
 async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OAuthSession> {
-    let client = connect_tls_client(host, 993, Security::Ssl).await?;
+    // Почта по OAuth идёт к известным серверам с настоящим сертификатом:
+    // выключать проверку тут нечему и незачем.
+    let client = connect_tls_client(host, 993, Security::Ssl, false).await?;
     let auth = OAuth2 {
         email,
         access_token,
@@ -292,12 +376,39 @@ async fn connect_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<OAuthSession> {
-    let client = connect_tls_client(host, port, security).await?;
+    let client = connect_tls_client(host, port, security, tls_insecure).await?;
     client
         .login(username, password)
         .await
         .map_err(|(error, _)| imap_error("imap-auth", error.to_string()))
+}
+
+/// Вид транспортной ошибки по её тексту: обрыв соединения и истечение времени
+/// ожидания узнаются одинаково на любом шаге - при рукопожатии, входе и
+/// обычных командах. `None` значит, что текст ни о чём не говорит и вид
+/// решает вызывающая сторона по тому, на каком шаге отказ случился.
+fn transport_error_kind(text: &str) -> Option<ErrorKind> {
+    if text.contains("timed out") || text.contains("timeout") || text.contains("тайм-аут") {
+        return Some(ErrorKind::Timeout);
+    }
+    if [
+        "connection reset",
+        "connection lost",
+        "broken pipe",
+        "unexpected eof",
+        "10054",
+        "соединение разорвано",
+        "сервер закрыл соединение",
+        "принудительно разорвал",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return Some(ErrorKind::NetworkUnavailable);
+    }
+    None
 }
 
 /// async-imap не предоставляет отдельный тип для отказа LOGIN и обрыва.
@@ -316,24 +427,8 @@ fn imap_error(backend: &str, message: String) -> Error {
         .any(|marker| text.contains(marker))
     {
         ErrorKind::InvalidCredentials
-    } else if text.contains("timed out") || text.contains("timeout") || text.contains("тайм-аут")
-    {
-        ErrorKind::Timeout
-    } else if [
-        "connection reset",
-        "connection lost",
-        "broken pipe",
-        "unexpected eof",
-        "10054",
-        "соединение разорвано",
-        "сервер закрыл соединение",
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
-    {
-        ErrorKind::NetworkUnavailable
     } else {
-        ErrorKind::Unknown
+        transport_error_kind(&text).unwrap_or(ErrorKind::Unknown)
     };
     Error::classified_backend(backend, kind, message)
 }
@@ -342,6 +437,7 @@ async fn connect_tls_client(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> Result<async_imap::Client<tokio_rustls::client::TlsStream<TcpStream>>> {
     if security == Security::None {
         return Err(Error::AccountConfig(
@@ -364,7 +460,14 @@ async fn connect_tls_client(
             tracing::debug!(%error, "не удалось включить TCP keepalive для IMAP");
         }
     }
-    let config = tls_client_config();
+    // Решение принял владелец ящика, и оно доехало сюда вместе с настройками
+    // его сервера: соседний ящик на том же сервере проверяется как обычно.
+    let config = if tls_insecure {
+        tracing::warn!(%host, "сертификат сервера не проверяется по решению пользователя");
+        insecure_tls_client_config()
+    } else {
+        tls_client_config()
+    };
     let server_name = ServerName::try_from(host.to_owned()).map_err(|e| Error::Backend {
         backend: "imap".into(),
         message: e.to_string(),
@@ -397,7 +500,15 @@ async fn connect_tls_client(
         .connect(server_name, tcp)
         .await
         .map_err(|error| {
-            Error::classified_backend("imap-tls", ErrorKind::CertificateError, error.to_string())
+            // Рукопожатие обрывается не только из-за сертификата: сервер
+            // закрывает соединение (os error 10054) и не дожидается ответа.
+            // Пока любой отказ этого шага звался ошибкой сертификата,
+            // человеку показывали "не удалось проверить сертификат сервера",
+            // а настоящая причина оставалась только в подробностях (#115).
+            let message = error.to_string();
+            let kind = transport_error_kind(&message.to_ascii_lowercase())
+                .unwrap_or(ErrorKind::CertificateError);
+            Error::classified_backend("imap-tls", kind, message)
         })?;
     let mut client = async_imap::Client::new(tls);
     if security == Security::Ssl {
@@ -519,10 +630,11 @@ pub(crate) async fn append_password_sent(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     raw: &[u8],
 ) -> Result<()> {
     append_sent(
-        connect_password(host, port, security, username, password).await?,
+        connect_password(host, port, security, username, password, tls_insecure).await?,
         raw,
     )
     .await
@@ -545,10 +657,11 @@ pub(crate) async fn create_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     parent_path: Option<&str>,
     name: &str,
 ) -> Result<String> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     create_folder(session, parent_path, name).await
 }
 
@@ -616,10 +729,11 @@ pub(crate) async fn rename_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     remote_path: &str,
     new_name: &str,
 ) -> Result<String> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     rename_folder(session, remote_path, new_name).await
 }
 
@@ -675,9 +789,10 @@ pub(crate) async fn delete_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     remote_path: &str,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     delete_folder(session, remote_path).await
 }
 
@@ -782,8 +897,10 @@ pub async fn validate_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<()> {
-    let mut session = connect_password(host, port, security, username, password).await?;
+    let mut session =
+        connect_password(host, port, security, username, password, tls_insecure).await?;
     validate_session(&mut session).await?;
     let _ = session.logout().await;
     Ok(())
@@ -824,10 +941,11 @@ pub async fn apply_password_operation(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     op_kind: &str,
     payload: &str,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     apply_operation(session, op_kind, payload).await
 }
 
@@ -1058,8 +1176,10 @@ pub async fn discover_password_folders(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<Vec<DiscoveredFolder>> {
-    let mut session = connect_password(host, port, security, username, password).await?;
+    let mut session =
+        connect_password(host, port, security, username, password, tls_insecure).await?;
     let folders = list_oauth_folders(&mut session).await?;
     let _ = session.logout().await;
     Ok(folders)
@@ -1378,6 +1498,7 @@ pub async fn discover_password_inbox(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
     discover_inbox(
@@ -1387,6 +1508,7 @@ pub async fn discover_password_inbox(
             security,
             username,
             password,
+            tls_insecure,
         },
         cursors,
     )
@@ -1480,8 +1602,9 @@ pub async fn wait_for_password_change(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     wait_for_change(session).await
 }
 
@@ -1553,6 +1676,7 @@ enum ImapAuth<'a> {
         security: Security,
         username: &'a str,
         password: &'a str,
+        tls_insecure: bool,
     },
 }
 
@@ -1570,7 +1694,8 @@ impl ImapAuth<'_> {
                 security,
                 username,
                 password,
-            } => connect_password(host, *port, *security, username, password).await,
+                tls_insecure,
+            } => connect_password(host, *port, *security, username, password, *tls_insecure).await,
         }
     }
 }
@@ -1639,6 +1764,7 @@ pub async fn discover_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
@@ -1649,6 +1775,7 @@ pub async fn discover_password(
             security,
             username,
             password,
+            tls_insecure,
         },
         cursors,
         retention_days,
@@ -1962,10 +2089,11 @@ pub async fn fetch_password_message_raw(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     folder_path: &str,
     uid: u32,
 ) -> Result<Vec<u8>> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     fetch_message_raw(session, folder_path, uid).await
 }
 
@@ -2270,6 +2398,7 @@ pub async fn fetch_older_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     folder_path: &str,
     before: &str,
     limit: usize,
@@ -2281,6 +2410,7 @@ pub async fn fetch_older_password(
             security,
             username,
             password,
+            tls_insecure,
         },
         folder_path,
         before,
@@ -2560,7 +2690,8 @@ mod utf7_tests {
 mod reconnect_tests {
     //! Проверки устойчивости к обрыву соединения (imap-reconnect-resilience.md).
     use super::{
-        Error, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, imap_error, reconnect_delay,
+        Error, ErrorKind, RECONNECT_ATTEMPTS, RECONNECT_BUDGET, connection_lost, imap_error,
+        reconnect_delay, transport_error_kind,
     };
 
     fn backend_error(message: &str) -> Error {
@@ -2610,6 +2741,40 @@ mod reconnect_tests {
             imap_error("imap-select", "NO mailbox missing".into()).code(),
             "unknown"
         );
+    }
+
+    /// Отказ рукопожатия называется по своей настоящей причине (#115).
+    ///
+    /// Сервер закрывает соединение на шаге TLS, и до этой правки такой отказ
+    /// звался ошибкой сертификата: человеку показывали "не удалось проверить
+    /// сертификат сервера", а настоящая причина оставалась в подробностях.
+    /// Ошибка самого сертификата при этом должна остаться собой - иначе
+    /// просроченный сертификат выглядел бы обрывом связи.
+    #[test]
+    fn a_broken_handshake_is_named_by_its_real_cause() {
+        let cases = [
+            (
+                "Удаленный хост принудительно разорвал существующее подключение. (os error 10054)",
+                Some(ErrorKind::NetworkUnavailable),
+            ),
+            (
+                "connection reset by peer",
+                Some(ErrorKind::NetworkUnavailable),
+            ),
+            ("unexpected eof", Some(ErrorKind::NetworkUnavailable)),
+            ("operation timed out", Some(ErrorKind::Timeout)),
+            // Настоящая беда с сертификатом текстом не опознаётся, и шаг
+            // рукопожатия остаётся при своём виде ошибки.
+            ("invalid peer certificate: Expired", None),
+            ("certificate verify failed", None),
+        ];
+        for (message, expected) in cases {
+            assert_eq!(
+                transport_error_kind(&message.to_ascii_lowercase()),
+                expected,
+                "текст: {message}"
+            );
+        }
     }
 
     #[test]

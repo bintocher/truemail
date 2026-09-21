@@ -23,6 +23,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             host: h.into(),
             port: p,
             security: Security::Ssl,
+            tls_insecure: false,
         })
     };
     let smtp = |h: &str, p: u16| {
@@ -30,6 +31,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
             host: h.into(),
             port: p,
             security: Security::Ssl,
+            tls_insecure: false,
         })
     };
 
@@ -61,6 +63,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
                 host: "smtp.mail.me.com".into(),
                 port: 587,
                 security: Security::Starttls,
+                tls_insecure: false,
             }),
             ews_url: None,
             jmap_url: None,
@@ -83,6 +86,7 @@ pub fn autoconfig(email: &str) -> ProviderConfig {
                 host: "smtp.office365.com".into(),
                 port: 587,
                 security: Security::Starttls,
+                tls_insecure: false,
             }),
             ews_url: None,
             jmap_url: None,
@@ -210,6 +214,7 @@ async fn xml_autoconfig(email: &str, domain: &str) -> Option<ProviderConfig> {
                 host,
                 port,
                 security,
+                tls_insecure: false,
             })
         };
         let imap = incoming.and_then(|node| server(node, 993));
@@ -360,6 +365,7 @@ pub async fn discover_provider(email: &str) -> ProviderConfig {
                     } else {
                         Security::Starttls
                     },
+                    tls_insecure: false,
                 });
             }
         }
