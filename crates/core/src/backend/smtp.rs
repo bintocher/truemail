@@ -430,6 +430,8 @@ pub(crate) async fn send_oauth_with_raw(
     port: u16,
     security: Security,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
+    // Отправка по OAuth идёт к известным серверам с настоящим сертификатом.
+    let tls_insecure = false;
     let from = message.from.clone();
     let email = build_message(message)?;
     let raw = email.formatted();
@@ -439,7 +441,7 @@ pub(crate) async fn send_oauth_with_raw(
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     };
-    let builder = match insecure_tls(host, security) {
+    let builder = match insecure_tls(host, security, tls_insecure) {
         Some(tls) => builder.map(|builder| builder.tls(tls)),
         None => builder,
     };
@@ -460,8 +462,8 @@ pub(crate) async fn send_oauth_with_raw(
 /// Настройки TLS для узла, сертификат которого человек решил не проверять
 /// (issue #118). `None` - узел проверяется как обычно, и строитель остаётся
 /// при своих настройках по умолчанию.
-fn insecure_tls(host: &str, security: Security) -> Option<Tls> {
-    if !super::tls::is_insecure(host) {
+fn insecure_tls(host: &str, security: Security, tls_insecure: bool) -> Option<Tls> {
+    if !tls_insecure {
         return None;
     }
     match TlsParameters::builder(host.to_owned())
@@ -524,8 +526,9 @@ pub async fn send_password(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> Result<()> {
-    send_password_with_raw(message, username, password, host, port, security)
+    send_password_with_raw(message, username, password, host, port, security, tls_insecure)
         .await
         .map(|_| ())
         .map_err(|failure| failure.error)
@@ -538,6 +541,7 @@ pub(crate) async fn send_password_with_raw(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
     if security == Security::None {
         return Err(Error::AccountConfig(
@@ -553,7 +557,7 @@ pub(crate) async fn send_password_with_raw(
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     }
     .map_err(|error| smtp_failure("smtp", error))?;
-    let builder = match insecure_tls(host, security) {
+    let builder = match insecure_tls(host, security, tls_insecure) {
         Some(tls) => builder.tls(tls),
         None => builder,
     };

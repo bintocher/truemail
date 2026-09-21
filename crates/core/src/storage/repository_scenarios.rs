@@ -777,72 +777,106 @@ async fn the_local_api_checks_tokens_and_records_denied_calls() {
     db.close().await;
 }
 
-/// Решение о проверке сертификата переживает перезапуск и разворачивается в
-/// перечень узлов, о котором спрашивает слой соединения (issue #118).
+/// Решение о проверке сертификата принадлежит ящику и доезжает до его
+/// серверов, не задевая соседний ящик на том же сервере (issue #118).
 ///
-/// Признак принадлежит ящику, но соединение устанавливают два десятка мест, и
-/// запись ящика до них не доходит: между ними стоит перечень имён узлов.
-/// Проверяется весь путь целиком - запись в базу, чтение списка ящиков и
-/// ответ слоя соединения по имени сервера.
+/// Признак хранится в записи ящика и раздаётся настройкам обоих его серверов -
+/// получения и отправки, - поэтому слой соединения получает решение вместе с
+/// адресом, к которому идёт. Ящик соседа с тем же сервером своего решения не
+/// менял, и его соединения обязаны проверяться как обычно: иначе человек
+/// потерял бы защиту, ничего не нажимая.
 #[tokio::test]
 async fn a_mailbox_decides_whether_its_certificate_is_checked() {
     let db: TestDb = open_test_db("tls-insecure").await;
-    let account = db
-        .save_account(&NewAccount {
-            email: "me@corp.test".into(),
-            display_name: "Корпоративный".into(),
-            provider: Provider::Generic,
-            backend_kind: BackendKind::Imap,
-            auth_kind: AuthKind::Password,
-            imap: Some(ServerConfig {
-                host: "mail.corp.test".into(),
-                port: 993,
-                security: Security::Ssl,
-            }),
-            smtp: Some(ServerConfig {
-                host: "smtp.corp.test".into(),
-                port: 465,
-                security: Security::Ssl,
-            }),
-            ews_url: None,
-            jmap_url: None,
-            caldav_url: None,
-            carddav_url: None,
-            username: Some("me".into()),
-            secret_ref: "corp-secret".into(),
-            color: None,
-        })
+    let corporate = |email: &str, secret: &str| NewAccount {
+        email: email.to_owned(),
+        display_name: "Корпоративный".into(),
+        provider: Provider::Generic,
+        backend_kind: BackendKind::Imap,
+        auth_kind: AuthKind::Password,
+        imap: Some(ServerConfig {
+            host: "mail.corp.test".into(),
+            port: 993,
+            security: Security::Ssl,
+            tls_insecure: false,
+        }),
+        smtp: Some(ServerConfig {
+            host: "smtp.corp.test".into(),
+            port: 465,
+            security: Security::Ssl,
+            tls_insecure: false,
+        }),
+        ews_url: None,
+        jmap_url: None,
+        caldav_url: None,
+        carddav_url: None,
+        username: Some("me".into()),
+        secret_ref: secret.to_owned(),
+        color: None,
+    };
+    let mine = db
+        .save_account(&corporate("me@corp.test", "corp-mine"))
         .await
-        .expect("сохранить ящик");
+        .expect("сохранить свой ящик");
+    db.save_account(&corporate("colleague@corp.test", "corp-colleague"))
+        .await
+        .expect("сохранить ящик соседа");
 
-    // По умолчанию проверка включена: молчание никогда не означает отказ.
     let loaded = db.list_accounts().await.expect("список ящиков");
-    assert!(!loaded[0].tls_insecure, "новый ящик проверяется по умолчанию");
-    assert!(!crate::backend::tls::is_insecure("mail.corp.test"));
+    assert!(
+        loaded.iter().all(|account| !account.tls_insecure),
+        "новый ящик проверяется по умолчанию"
+    );
+    assert!(
+        loaded
+            .iter()
+            .all(|account| !account.imap.as_ref().expect("сервер получения").tls_insecure),
+        "настройки сервера получены с выключенной проверкой без решения человека"
+    );
 
-    db.set_account_tls_insecure(account.id, true)
+    db.set_account_tls_insecure(mine.id, true)
         .await
         .expect("выключить проверку");
     let loaded = db.list_accounts().await.expect("список ящиков");
-    assert!(loaded[0].tls_insecure, "решение не сохранилось в записи ящика");
+    let found = |email: &str| {
+        loaded
+            .iter()
+            .find(|account| account.email == email)
+            .expect("ящик на месте")
+    };
+
+    let mine_account = found("me@corp.test");
+    assert!(mine_account.tls_insecure, "решение не сохранилось в записи ящика");
     assert!(
-        crate::backend::tls::is_insecure("mail.corp.test"),
-        "сервер получения не попал в перечень"
+        mine_account.imap.as_ref().expect("сервер получения").tls_insecure,
+        "сервер получения своего ящика не получил решение"
     );
     assert!(
-        crate::backend::tls::is_insecure("smtp.corp.test"),
-        "сервер отправки не попал в перечень: письма уходили бы прежним путём"
-    );
-    assert!(
-        !crate::backend::tls::is_insecure("imap.yandex.com"),
-        "чужой сервер проверяется как обычно"
+        mine_account.smtp.as_ref().expect("сервер отправки").tls_insecure,
+        "сервер отправки не получил решение: письма уходили бы прежним путём"
     );
 
-    db.set_account_tls_insecure(account.id, false)
+    let colleague = found("colleague@corp.test");
+    assert!(
+        !colleague.tls_insecure,
+        "решение владельца соседнего ящика не спрашивали"
+    );
+    assert!(
+        !colleague.imap.as_ref().expect("сервер получения").tls_insecure,
+        "ящик соседа на том же сервере потерял проверку, ничего не нажимая"
+    );
+
+    db.set_account_tls_insecure(mine.id, false)
         .await
         .expect("включить проверку обратно");
+    let loaded = db.list_accounts().await.expect("список ящиков");
+    let mine_account = loaded
+        .iter()
+        .find(|account| account.email == "me@corp.test")
+        .expect("ящик на месте");
+    assert!(!mine_account.tls_insecure, "снятое решение продолжало действовать");
     assert!(
-        !crate::backend::tls::is_insecure("mail.corp.test"),
-        "снятое решение продолжало действовать"
+        !mine_account.imap.as_ref().expect("сервер получения").tls_insecure,
+        "снятое решение осталось в настройках сервера"
     );
 }

@@ -598,17 +598,6 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
-        // Решение о проверке сертификата принадлежит ящику, но спрашивает о
-        // нём слой соединения, до которого запись ящика не доходит. Перечень
-        // узлов обновляется здесь: список ящиков перечитывается и при старте,
-        // и после каждой правки настроек (issue #118).
-        crate::backend::tls::set_insecure_hosts(rows.iter().filter(|row| row.tls_insecure != 0).flat_map(
-            |row| {
-                [row.imap_host.clone(), row.smtp_host.clone()]
-                    .into_iter()
-                    .flatten()
-            },
-        ));
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -765,11 +754,10 @@ impl Db {
     /// Задать глубину локального кэша аккаунта в днях (0 - без ограничений).
     /// Включить или выключить проверку сертификата для ящика (issue #118).
     ///
-    /// Решение принадлежит ящику и переживает перезапуск. Перечень узлов
-    /// обновляется сразу же: иначе выключение начало бы действовать только
-    /// после следующего чтения списка ящиков, а включение обратно - с той же
-    /// задержкой, то есть соединение оставалось бы непроверенным дольше, чем
-    /// человек согласился.
+    /// Решение принадлежит ящику и переживает перезапуск. Оно едет к слою
+    /// соединения вместе с настройками сервера этого ящика, поэтому новое
+    /// значение действует с первого же соединения после правки, а соседний
+    /// ящик на том же сервере его не наследует.
     pub async fn set_account_tls_insecure(&self, account_id: i64, insecure: bool) -> Result<()> {
         sqlx::query(
             "UPDATE accounts SET tls_insecure=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
@@ -786,7 +774,6 @@ impl Db {
         } else {
             tracing::info!(account = account_id, "проверка сертификата включена обратно");
         }
-        self.list_accounts().await?;
         Ok(())
     }
 
@@ -7295,11 +7282,15 @@ impl From<AccountRow> for Account {
             Some("none") => Security::None,
             _ => Security::Ssl,
         };
+        // Решение о проверке сертификата хранится у ящика и раздаётся обоим
+        // его серверам: оно принято для этого ящика целиком, а не для узла.
+        let tls_insecure = r.tls_insecure != 0;
         let imap = match (r.imap_host, r.imap_port) {
             (Some(h), Some(p)) => Some(ServerConfig {
                 host: h,
                 port: p as u16,
                 security: sec(r.imap_security),
+                tls_insecure,
             }),
             _ => None,
         };
@@ -7308,6 +7299,7 @@ impl From<AccountRow> for Account {
                 host: h,
                 port: p as u16,
                 security: sec(r.smtp_security),
+                tls_insecure,
             }),
             _ => None,
         };

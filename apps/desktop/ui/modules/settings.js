@@ -129,7 +129,14 @@ function renderAccountSettings(accounts,foldersByAccount,calendars){
   // Проверка сертификата (issue #118): решение принадлежит ящику и хранится
   // в его записи. Отказ ядра возвращает переключатель в прежнее положение -
   // иначе человек думал бы, что проверка выключена, а она осталась.
-  const tlsToggle=card.querySelector('.account-tls-toggle');
+  // Выключатель показывается только там, где он действительно работает:
+  // соединения IMAP и SMTP. Транспорт Exchange (WinHTTP) такой настройки не
+  // даёт вовсе, а у JMAP и почты по OAuth серверы с настоящим сертификатом -
+  // показать переключатель, который ни на что не влияет, значит соврать.
+  const tlsRow=card.querySelector('.account-tls-row');
+  const tlsSupported=account.backend_kind==='imap';
+  if(tlsRow&&!tlsSupported)tlsRow.remove();
+  const tlsToggle=tlsSupported?card.querySelector('.account-tls-toggle'):null;
   if(tlsToggle){
     tlsToggle.classList.toggle('on',!!account.tls_insecure);
     tlsToggle.addEventListener('click',async()=>{

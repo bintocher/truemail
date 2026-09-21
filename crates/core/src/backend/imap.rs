@@ -354,7 +354,9 @@ fn tls_client_config() -> Arc<ClientConfig> {
 }
 
 async fn connect_oauth(host: &str, email: &str, access_token: &str) -> Result<OAuthSession> {
-    let client = connect_tls_client(host, 993, Security::Ssl).await?;
+    // Почта по OAuth идёт к известным серверам с настоящим сертификатом:
+    // выключать проверку тут нечему и незачем.
+    let client = connect_tls_client(host, 993, Security::Ssl, false).await?;
     let auth = OAuth2 {
         email,
         access_token,
@@ -372,8 +374,9 @@ async fn connect_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<OAuthSession> {
-    let client = connect_tls_client(host, port, security).await?;
+    let client = connect_tls_client(host, port, security, tls_insecure).await?;
     client
         .login(username, password)
         .await
@@ -432,6 +435,7 @@ async fn connect_tls_client(
     host: &str,
     port: u16,
     security: Security,
+    tls_insecure: bool,
 ) -> Result<async_imap::Client<tokio_rustls::client::TlsStream<TcpStream>>> {
     if security == Security::None {
         return Err(Error::AccountConfig(
@@ -454,9 +458,9 @@ async fn connect_tls_client(
             tracing::debug!(%error, "не удалось включить TCP keepalive для IMAP");
         }
     }
-    // Ящик, для которого человек выключил проверку, узнаётся по имени своего
-    // сервера: запись ящика до этого места не доходит (backend::tls).
-    let config = if super::tls::is_insecure(host) {
+    // Решение принял владелец ящика, и оно доехало сюда вместе с настройками
+    // его сервера: соседний ящик на том же сервере проверяется как обычно.
+    let config = if tls_insecure {
         tracing::warn!(%host, "сертификат сервера не проверяется по решению пользователя");
         insecure_tls_client_config()
     } else {
@@ -624,10 +628,11 @@ pub(crate) async fn append_password_sent(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     raw: &[u8],
 ) -> Result<()> {
     append_sent(
-        connect_password(host, port, security, username, password).await?,
+        connect_password(host, port, security, username, password, tls_insecure).await?,
         raw,
     )
     .await
@@ -650,10 +655,11 @@ pub(crate) async fn create_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     parent_path: Option<&str>,
     name: &str,
 ) -> Result<String> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     create_folder(session, parent_path, name).await
 }
 
@@ -721,10 +727,11 @@ pub(crate) async fn rename_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     remote_path: &str,
     new_name: &str,
 ) -> Result<String> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     rename_folder(session, remote_path, new_name).await
 }
 
@@ -780,9 +787,10 @@ pub(crate) async fn delete_password_folder(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     remote_path: &str,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     delete_folder(session, remote_path).await
 }
 
@@ -887,8 +895,9 @@ pub async fn validate_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<()> {
-    let mut session = connect_password(host, port, security, username, password).await?;
+    let mut session = connect_password(host, port, security, username, password, tls_insecure).await?;
     validate_session(&mut session).await?;
     let _ = session.logout().await;
     Ok(())
@@ -929,10 +938,11 @@ pub async fn apply_password_operation(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     op_kind: &str,
     payload: &str,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     apply_operation(session, op_kind, payload).await
 }
 
@@ -1163,8 +1173,9 @@ pub async fn discover_password_folders(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<Vec<DiscoveredFolder>> {
-    let mut session = connect_password(host, port, security, username, password).await?;
+    let mut session = connect_password(host, port, security, username, password, tls_insecure).await?;
     let folders = list_oauth_folders(&mut session).await?;
     let _ = session.logout().await;
     Ok(folders)
@@ -1483,6 +1494,7 @@ pub async fn discover_password_inbox(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     cursors: &HashMap<String, FolderSyncCursor>,
 ) -> Result<ImapDiscovery> {
     discover_inbox(
@@ -1492,6 +1504,7 @@ pub async fn discover_password_inbox(
             security,
             username,
             password,
+            tls_insecure,
         },
         cursors,
     )
@@ -1585,8 +1598,9 @@ pub async fn wait_for_password_change(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
 ) -> Result<()> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     wait_for_change(session).await
 }
 
@@ -1658,6 +1672,7 @@ enum ImapAuth<'a> {
         security: Security,
         username: &'a str,
         password: &'a str,
+        tls_insecure: bool,
     },
 }
 
@@ -1675,7 +1690,10 @@ impl ImapAuth<'_> {
                 security,
                 username,
                 password,
-            } => connect_password(host, *port, *security, username, password).await,
+                tls_insecure,
+            } => {
+                connect_password(host, *port, *security, username, password, *tls_insecure).await
+            }
         }
     }
 }
@@ -1744,6 +1762,7 @@ pub async fn discover_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     cursors: &HashMap<String, FolderSyncCursor>,
     retention_days: i64,
 ) -> Result<ImapDiscovery> {
@@ -1754,6 +1773,7 @@ pub async fn discover_password(
             security,
             username,
             password,
+            tls_insecure,
         },
         cursors,
         retention_days,
@@ -2067,10 +2087,11 @@ pub async fn fetch_password_message_raw(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     folder_path: &str,
     uid: u32,
 ) -> Result<Vec<u8>> {
-    let session = connect_password(host, port, security, username, password).await?;
+    let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     fetch_message_raw(session, folder_path, uid).await
 }
 
@@ -2375,6 +2396,7 @@ pub async fn fetch_older_password(
     security: Security,
     username: &str,
     password: &str,
+    tls_insecure: bool,
     folder_path: &str,
     before: &str,
     limit: usize,
@@ -2386,6 +2408,7 @@ pub async fn fetch_older_password(
             security,
             username,
             password,
+            tls_insecure,
         },
         folder_path,
         before,

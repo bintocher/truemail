@@ -44,6 +44,13 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub security: Security,
+    /// Сертификат этого сервера не проверяется (issue #118). Признак живёт
+    /// рядом с адресом сервера, а не отдельным перечнем: решение принимает
+    /// владелец ящика, и соседний ящик на том же сервере его не наследует.
+    /// Для старых записей и для всех путей, где признак не задан, проверка
+    /// остаётся включённой.
+    #[serde(default)]
+    pub tls_insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

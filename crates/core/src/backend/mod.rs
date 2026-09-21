@@ -5,7 +5,6 @@ mod gmail_api;
 mod imap;
 mod jmap;
 mod smtp;
-pub mod tls;
 
 pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
 pub use imap::{
@@ -736,6 +735,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
         )
         .await
     }
@@ -753,6 +753,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             cursors,
             retention_days,
         )
@@ -770,6 +771,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
         )
         .await
     }
@@ -786,6 +788,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             cursors,
         )
         .await
@@ -804,6 +807,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             operation,
             payload,
         )
@@ -823,6 +827,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             parent_path,
             name,
         )
@@ -842,6 +847,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             remote_path,
             new_name,
         )
@@ -855,6 +861,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             remote_path,
         )
         .await
@@ -867,6 +874,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
         )
         .await
     }
@@ -882,6 +890,7 @@ impl MailBackend for GenericImapBackend {
             &smtp.host,
             smtp.port,
             smtp.security,
+            smtp.tls_insecure,
         )
         .await?;
         Ok(SendOutcome::NeedsSentAppend(raw))
@@ -894,6 +903,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             raw,
         )
         .await
@@ -913,6 +923,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             folder_path,
             uid,
         )
@@ -933,6 +944,7 @@ impl MailBackend for GenericImapBackend {
             self.imap.security,
             &self.username,
             credential,
+            self.imap.tls_insecure,
             folder_path,
             before,
             limit,

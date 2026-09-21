@@ -166,6 +166,8 @@
   "confirmationCode": "Confirmation code",
   "confirmationCodeDesc": "Copy the code from the Yandex ID page after signing in.",
   "confirmShort": "Confirm",
+  "tlsInsecureLabel": "Do not check the server certificate",
+  "tlsInsecureHint": "Needed only for a server with a self-signed certificate. While the check is off, nothing reveals a server substituted between the app and your mail: the password and messages go to whoever substituted it.",
   "connect": "Connect",
   "connected": "Account connected: mail, calendar and contacts are ready.",
   "connecting": "Checking access and loading mail, calendar and contacts…",

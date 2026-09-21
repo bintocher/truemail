@@ -129,7 +129,7 @@ fn winhttp_failure(message: &str) -> Option<(ErrorKind, &'static str)> {
     let code = code.strip_prefix("0X").map(|rest| rest.trim_start_matches('0'))?;
     Some(match code {
         // 12002 ERROR_WINHTTP_TIMEOUT
-        "80072EE2" | "8007 2EE2" => (ErrorKind::Timeout, "сервер не ответил вовремя"),
+        "80072EE2" => (ErrorKind::Timeout, "сервер не ответил вовремя"),
         // 12005 ERROR_WINHTTP_INVALID_URL
         "80072EE5" => (ErrorKind::AccountConfig, "адрес сервера записан неверно"),
         // 12006 ERROR_WINHTTP_UNRECOGNIZED_SCHEME

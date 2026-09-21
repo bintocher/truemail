@@ -6224,6 +6224,7 @@ pub async fn begin_account_connection(
                                 host: format!("imap.{domain}"),
                                 port: 993,
                                 security: Security::Ssl,
+                                tls_insecure: false,
                             }))
                         },
                         smtp: if config.backend_kind == BackendKind::Jmap {
@@ -6234,6 +6235,7 @@ pub async fn begin_account_connection(
                                     host: format!("smtp.{domain}"),
                                     port: 465,
                                     security: Security::Ssl,
+                                    tls_insecure: false,
                                 })
                             })
                         },
@@ -6295,6 +6297,10 @@ pub async fn complete_password_imap(
     smtp_host: String,
     smtp_port: u16,
     smtp_security: String,
+    // Не проверять сертификат серверов этого ящика (issue #118). Задаётся в
+    // мастере: сервер с самоподписанным сертификатом иначе не проходит
+    // подключение вовсе, и до настроек ящика дело не доходит.
+    tls_insecure: Option<bool>,
     attempt_id: i64,
 ) -> CmdResult<ConnectedAccount> {
     let email = email.trim().to_lowercase();
@@ -6328,6 +6334,7 @@ pub async fn complete_password_imap(
                 host: imap_host.trim().to_owned(),
                 port: imap_port,
                 security: parse_security(&imap_security)?,
+                tls_insecure: tls_insecure.unwrap_or(false),
             }),
             smtp: (!smtp_host.trim().is_empty())
                 .then(|| {
@@ -6335,6 +6342,7 @@ pub async fn complete_password_imap(
                         host: smtp_host.trim().to_owned(),
                         port: smtp_port,
                         security: parse_security(&smtp_security)?,
+                            tls_insecure: false,
                     })
                 })
                 .transpose()?,

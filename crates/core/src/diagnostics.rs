@@ -398,16 +398,20 @@ fn replace_named_field(
                 None => inner,
             }
         };
-        if alias_re().is_match(inner) {
-            out.push_str(&rest[whole.start()..value.end()]);
-            rest = &rest[value.end()..];
-            continue;
-        }
         let value_end = if quoted {
             value.end()
         } else {
             value.start() + inner.len()
         };
+        // Значение уже заменено разбором выше: копируем его как есть вместе с
+        // текстом перед ним и продолжаем поиск сразу за ним. Брать конец
+        // всего совпадения нельзя - оно тянется до разделителя записи, и
+        // следующее поле с секретом осталось бы непросмотренным.
+        if alias_re().is_match(inner) {
+            out.push_str(&rest[..value_end]);
+            rest = &rest[value_end..];
+            continue;
+        }
         out.push_str(&rest[..whole.start()]);
         match Category::from_field_name(&caps[1]) {
             Some(category) => {
@@ -754,6 +758,27 @@ mod tests {
             assert!(line.starts_with("соединение с [host-"), "{line}");
             assert!(line.ends_with(" разорвано"), "{line}");
         }
+    }
+
+    #[test]
+    fn a_second_secret_after_an_authorization_header_is_replaced_too(){
+        // Заголовок авторизации разбирается раньше полей, и его значение
+        // становится псевдонимом. Шаблон поля после этого захватывает остаток
+        // строки целиком, поэтому пропуск уже обезличенного значения обязан
+        // продолжать поиск с конца этого значения, а не с конца всего
+        // совпадения: иначе следующий секрет строки уходит в архив открытым.
+        let salt = salt(26);
+        let mut counts = ReplacementCounts::default();
+        let line = anonymize_line(
+            "INFO Authorization: Bearer abcdefgh password=hunter2 op=login",
+            &salt,
+            &mut counts,
+        );
+        assert!(line.starts_with("INFO "), "текст перед полем потерян: {line}");
+        assert!(!line.contains("abcdefgh"), "{line}");
+        assert!(!line.contains("hunter2"), "второй секрет остался открытым: {line}");
+        assert!(line.contains("Bearer [secret-"), "{line}");
+        assert!(line.contains("op=login"), "соседнее поле съедено: {line}");
     }
 
     #[test]
