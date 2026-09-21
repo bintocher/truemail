@@ -360,6 +360,7 @@ const diagnosticsCategoryLabels={
   diagnosticsCategoryPath:L('пути к файлам и папкам на диске','file and folder paths on disk'),
   diagnosticsCategoryFolder:L('имена папок почтового ящика','mailbox folder names'),
   diagnosticsCategoryIds:L('внутренние идентификаторы аккаунтов, писем и папок','internal account, message and folder identifiers'),
+  diagnosticsCategorySecret:L('пароли, токены доступа и ключи','passwords, access tokens and keys'),
 };
 function openDiagnosticsDialog(){
   document.getElementById('diagTitle').textContent=L('Перед сбором диагностики','Before collecting diagnostics');

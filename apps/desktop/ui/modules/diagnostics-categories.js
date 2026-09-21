@@ -5,6 +5,8 @@
 // Порядок соответствует терминам спецификации: email и host отдельно, path,
 // folder, а перечисленные идентификаторы (account_id, message_id, folder_id,
 // uuid, uid, message_id_header) - одной понятной пользователю строкой.
+// Секреты (пароли, токены, ключи, заголовок авторизации) названы отдельной
+// строкой: человек отдаёт архив наружу и должен знать, что их там не будет.
 'use strict';
 
 const DIAGNOSTICS_CATEGORY_KEYS = Object.freeze([
@@ -13,6 +15,7 @@ const DIAGNOSTICS_CATEGORY_KEYS = Object.freeze([
   'diagnosticsCategoryPath',
   'diagnosticsCategoryFolder',
   'diagnosticsCategoryIds',
+  'diagnosticsCategorySecret',
 ]);
 
 const diagnosticsCategories = { DIAGNOSTICS_CATEGORY_KEYS };
