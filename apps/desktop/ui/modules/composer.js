@@ -117,10 +117,12 @@ const activityModel=window.activityLogModel;
 let activityLog=activityModel.createLog();
 let activityPanelOpen=false;
 let activityTimer=null;
-function activityLimit(name){return window.limitsModel?.limitValue(window.limitsModel.KEYS[name])??null;}
+// Ключи пределов пишутся явно: проверка ядра ищет место применения каждого
+// предела по имени KEYS.<ключ>.
+function activityLimit(key){return key?window.limitsModel?.limitValue(key)??null:null;}
 function activityTime(time){try{return new Date(time).toLocaleTimeString(composerLang()==='en'?'en-US':'ru-RU',{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
 function activityAccountsText(baseText,accounts,item){return window.errorPresentation.formatAccountErrorText(baseText,accounts,item.locale,item.translations);}
-function logActivity(item){const result=activityModel.addEntry(activityLog,item,Date.now(),activityLimit('activityLogEntries'),activityAccountsText);activityLog=result.log;renderActivity();return result;}
+function logActivity(item){const result=activityModel.addEntry(activityLog,item,Date.now(),activityLimit(window.limitsModel?.KEYS.activityLogEntries),activityAccountsText);activityLog=result.log;renderActivity();return result;}
 function activityActionButton(entry,className){
   if(!entry.hasAction||(entry.actionUntil!=null&&Number(entry.actionUntil)<=Date.now()))return null;
   const button=document.createElement('button');button.type='button';button.className=className;
@@ -163,7 +165,7 @@ function renderActivityStatus(){
 function renderActivityPanel(){
   const panel=document.getElementById('activityPanel');if(!panel)return;
   panel.classList.toggle('hidden',!activityPanelOpen);
-  const rows=activityLimit('activityLogVisible');
+  const rows=activityLimit(window.limitsModel?.KEYS.activityLogVisible);
   if(rows)panel.style.setProperty('--activity-rows',String(rows));
   const list=panel.querySelector('.activity-list');if(!list)return;
   // Список пересобирается и на каждом тике отсчёта отмены: раскрытые
@@ -188,7 +190,7 @@ function renderActivityPanel(){
   list.scrollTop=scroll;
 }
 function renderActivity(){
-  const capacity=activityLimit('activityLogEntries');
+  const capacity=activityLimit(window.limitsModel?.KEYS.activityLogEntries);
   if(capacity&&activityLog.entries.length>capacity)activityLog={...activityLog,entries:activityLog.entries.slice(0,capacity)};
   renderActivityStatus();renderActivityPanel();scheduleActivityRefresh();
 }
