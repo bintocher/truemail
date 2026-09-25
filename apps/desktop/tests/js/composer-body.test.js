@@ -126,7 +126,7 @@ function composerApp() {
   return app;
 }
 
-const toastTexts = app => app.document.querySelectorAll('.app-toast-line').map(node => node.textContent);
+const toastTexts = app => app.document.querySelectorAll('#activityPanel .activity-entry-text').map(node => node.textContent);
 const bodyShape = edit => edit.childNodes.map(node => (node.nodeType === 3 ? node.data : `<${node.tag}>`));
 const imageSources = edit => edit.querySelectorAll('img').map(node => node.attributes.src);
 

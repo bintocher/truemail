@@ -159,11 +159,40 @@
   .app{display:grid;grid-template-columns:var(--nav-w) var(--list-w) 1fr;flex:1;min-width:0;min-height:0;}
   .statusbar{flex:none;display:flex;align-items:center;gap:10px;height:var(--statusbar-h);padding:0 12px;background:var(--panel);border-top:1px solid var(--border);color:var(--text-3);font-size:12px;user-select:none;-webkit-user-select:none;}
   /* Ровно одна строка: длинный текст обрезается многоточием, а не ломает высоту. */
-  .statusbar-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .statusbar-right{margin-left:auto;flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .statusbar-text{flex:1;min-width:0;display:flex;align-items:center;gap:8px;height:100%;overflow:hidden;white-space:nowrap;cursor:pointer;}
+  .statusbar-text:hover .statusbar-entry-text{color:var(--text-2);}
+  .statusbar-text:focus-visible{outline:2px solid var(--accent);outline-offset:-2px;}
+  .statusbar-entry-time{flex:none;opacity:.8;}
+  .statusbar-entry-text{min-width:0;overflow:hidden;text-overflow:ellipsis;}
+  .statusbar-text[data-level="error"] .statusbar-entry-text{color:var(--danger);}
+  /* Ход загрузки: та же строка с крутилкой, без отдельной полосы поверх окна. */
+  .statusbar-text[data-level="progress"]::before{content:"";width:10px;height:10px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:tm-spin .7s linear infinite;flex:none;}
+  /* Ошибка, которую ещё не видели в журнале: метка держится, пока журнал не открыт. */
+  .statusbar.has-unseen-error .statusbar-text::after{content:"";order:-1;width:7px;height:7px;border-radius:50%;background:var(--danger);flex:none;}
+  .statusbar-entry-action,.activity-entry-action{flex:none;border:0;background:transparent;color:var(--accent);font:inherit;font-weight:600;cursor:pointer;padding:0 4px;}
+  .statusbar-entry-action:disabled,.activity-entry-action:disabled{cursor:default;opacity:.55;}
+  .activity-count{flex:none;padding:0 5px;border-radius:8px;background:var(--border);color:var(--text-2);font-size:11px;font-weight:600;}
+  .activity-panel{position:fixed;left:8px;bottom:calc(var(--statusbar-h) + 4px);z-index:1500;width:min(640px,calc(100vw - 16px));display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:8px;box-shadow:var(--shadow);font-size:12.5px;color:var(--text);}
+  .activity-panel.hidden{display:none;}
+  .activity-panel-head{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid var(--border);}
+  .activity-panel-title{flex:1;font-weight:600;}
+  .activity-panel-head button{border:0;background:transparent;color:var(--text-2);font:inherit;cursor:pointer;padding:2px 6px;border-radius:4px;}
+  .activity-panel-head button:hover{background:var(--border);}
+  /* Видно заданное пределом число строк, остальные записи - прокруткой. */
+  .activity-list{--activity-row-h:28px;max-height:calc(var(--activity-rows,10) * var(--activity-row-h));overflow-y:auto;}
+  .activity-entry{padding:5px 10px;border-bottom:1px solid var(--border);min-height:var(--activity-row-h);box-sizing:border-box;}
+  .activity-entry:last-child{border-bottom:0;}
+  .activity-entry-head{display:flex;align-items:center;gap:8px;min-width:0;}
+  .activity-entry-time{flex:none;color:var(--text-3);font-variant-numeric:tabular-nums;}
+  .activity-entry-text{flex:1;min-width:0;overflow-wrap:anywhere;}
+  .activity-entry[data-level="error"] .activity-entry-text{color:var(--danger);}
+  .activity-entry-status{margin-top:3px;color:var(--text-3);}
+  .activity-entry details{margin-top:4px;color:var(--text-2);}
+  .activity-entry summary{cursor:pointer;}
+  .activity-entry pre{max-height:120px;margin:4px 0 0;overflow:auto;white-space:pre-wrap;font:11px/1.4 ui-monospace,monospace;}
+  .activity-empty{padding:12px 10px;color:var(--text-3);}
   /* Версия в строке состояния: прижата к правому краю, читается как ссылка. */
   .statusbar-version{border:0;background:transparent;font:inherit;color:inherit;padding:0;margin-left:auto;flex:none;cursor:pointer;}
-  .statusbar-right:not(:empty)+.statusbar-version{margin-left:12px;}
   .statusbar-version:hover{color:var(--accent);text-decoration:underline;}
   .statusbar-version:empty{display:none;}
   .nav{background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;position:relative;user-select:none;-webkit-user-select:none;}
@@ -215,8 +244,6 @@
 
   .list{border-right:1px solid var(--border);display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;background:var(--bg);user-select:none;-webkit-user-select:none;position:relative;}
   .list-loading{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);z-index:6;display:flex;align-items:center;justify-content:center;width:32px;height:32px;background:var(--bg);border:1px solid var(--border);border-radius:50%;box-shadow:var(--shadow);}
-  .app-status{position:fixed;left:0;right:0;bottom:0;z-index:60;display:flex;align-items:center;gap:9px;padding:5px 14px;background:var(--panel);border-top:1px solid var(--border);font-size:12px;color:var(--text-2);}
-  .app-status::before{content:"";width:12px;height:12px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:tm-spin .7s linear infinite;flex:0 0 auto;}
   .spinner{width:16px;height:16px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:50%;animation:tm-spin .7s linear infinite;}
   @keyframes tm-spin{to{transform:rotate(360deg);}}
   .list input[type="text"],.list .search input{user-select:text;-webkit-user-select:text;}
@@ -358,7 +385,6 @@
   .blocked span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
   .blocked b{color:var(--text);font-weight:600;} .blocked button{margin-left:auto;flex:none;border:1px solid var(--border-strong);background:var(--bg);color:var(--text);border-radius:6px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px;}
   .blocked button:hover{background:var(--hover);}
-  .app-toast-stack{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:1500;display:flex;flex-direction:column;gap:8px;width:min(560px,calc(100vw - 32px))}.app-toast{display:flex;align-items:flex-start;gap:12px;padding:11px 14px;border-radius:10px;background:var(--text);color:var(--bg);box-shadow:var(--shadow);font-size:13px}.app-toast-body{min-width:0;flex:1}.app-toast-line{display:flex;align-items:center;gap:8px}.app-toast-count{flex:none;padding:1px 6px;border-radius:10px;background:color-mix(in srgb,var(--bg) 18%,transparent);font-weight:700}.app-toast details{margin-top:6px;color:color-mix(in srgb,var(--bg) 78%,transparent)}.app-toast summary{cursor:pointer}.app-toast pre{max-height:120px;margin:6px 0 0;overflow:auto;white-space:pre-wrap;font:11px/1.4 ui-monospace,monospace}.app-toast button{flex:none;border:0;background:transparent;color:#aeb4ff;font:inherit;font-weight:700;cursor:pointer;padding:2px 4px}.app-toast button:disabled{cursor:default;opacity:.55}.app-toast .app-toast-close{color:inherit;font-weight:400;opacity:.7}
   .comp-send-at{width:190px;padding:6px 8px}
   .attach{display:flex;gap:10px;margin:8px 0 4px;flex-wrap:wrap;}
   .att{display:flex;align-items:center;gap:9px;border:1px solid var(--border);border-radius:var(--radius);padding:8px 12px;background:var(--panel);min-width:190px;}
@@ -660,7 +686,6 @@
   /* Значок ожидания внутри самой кнопки подключения (S-001): .btn уже flex
      с gap - спиннер и подпись этапа встают на место обычной иконки и текста. */
   .btn .spinner{flex:none;}
-  .app-toast-action-status{margin-top:6px;color:var(--text-3);font-size:12px;}
   /* Список категорий обезличивания в предупреждении перед сбором диагностики
      (diagnostics-bundle.md, S-014). */
   .diag-categories{margin:10px 0;padding-left:20px;color:var(--text-2);font-size:13px;line-height:1.6;}

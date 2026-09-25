@@ -102,9 +102,10 @@ const rowButtons = row => row.descendants().filter(node => node.tag === 'button'
 const rowButton = (row, label) => rowButtons(row).find(node => node.textContent === label) || null;
 const rowLabels = row => rowButtons(row).map(node => node.textContent);
 
-// Показанное человеку сообщение: карточки собирает сам композер, поэтому
-// смотрим их в разметке окна, а не в переменной модуля.
-const shownMessages = ui => ui.queryAll('.app-toast-stack .app-toast-line').map(node => node.textContent);
+// Показанные человеку сообщения: журнал событий собирает сам композер, поэтому
+// смотрим его в разметке окна, а не в переменной модуля. Журнал показывает
+// новые записи первыми; здесь порядок обращён, чтобы последним шло последнее.
+const shownMessages = ui => ui.queryAll('#activityPanel .activity-entry-text').map(node => node.textContent).reverse();
 
 module.exports = {
   WINDOW_START,
