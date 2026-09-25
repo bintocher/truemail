@@ -693,5 +693,14 @@
   "limitReminderCheckSeconds": "Как часто проверять напоминания о встречах и делах",
   "limitReminderCheckSecondsDesc": "Чаще - карточка приходит точнее к сроку, реже - программа реже будит компьютер",
   "limitUpdateCheckHours": "Как часто проверять, вышла ли новая версия",
-  "limitUpdateCheckHoursDesc": "Проверка идёт в фоне и ничего не устанавливает без согласия"
+  "limitUpdateCheckHoursDesc": "Проверка идёт в фоне и ничего не устанавливает без согласия",
+  "limitActivityLogEntries": "Сколько событий хранить в журнале строки статуса",
+  "limitActivityLogEntriesDesc": "Старые записи уходят, когда приходят новые. Журнал живёт до закрытия программы",
+  "limitActivityLogVisible": "Сколько строк журнала видно без прокрутки",
+  "limitActivityLogVisibleDesc": "Остальные записи журнала доступны прокруткой",
+  "limitUnitRows": "строк",
+  "activityLogTitle": "Журнал событий",
+  "activityLogEmpty": "Событий пока нет",
+  "activityLogOpen": "Открыть журнал событий",
+  "activityLogClear": "Очистить"
 }

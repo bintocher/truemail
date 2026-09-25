@@ -1,10 +1,10 @@
 // Проверки сообщений об ошибках: выбор текста и действия по виду ошибки,
-// очередь карточек (ui/modules/error-presentation.js) и настоящий путь показа -
-// карточка в окне, кнопка действия и снятие по времени (composer.js).
+// журнал событий строки статуса (ui/modules/activity-log.js) и настоящий путь
+// показа - запись в строке и журнале, кнопка действия (composer.js).
 // Тексты берутся из ui/locales: записанное в проверке русское слово
 // расходится с интерфейсом молча, а запасная таблица внутри модуля прячет
 // пропажу ключа в каталоге переводов.
-// Спецификация: specs/error-kinds-and-messages.md.
+// Спецификации: specs/error-kinds-and-messages.md, specs/status-activity-log.md.
 // Запуск: node --test apps/desktop/tests/js/error-presentation.test.js (Node 22+).
 'use strict';
 const {test} = require('node:test');
@@ -17,11 +17,16 @@ const {
   presentError,
   formatErrorDetails,
   shouldShowSyncToast,
-  planToastQueue,
-  beginToastAction,
-  finishToastAction,
+  formatAccountErrorText,
   nextSyncToastMemo,
 } = require('../../ui/modules/error-presentation.js');
+const {
+  createLog,
+  addEntry,
+  beginAction,
+  finishAction,
+  actionAvailable,
+} = require('../../ui/modules/activity-log.js');
 const {startApp} = require('./ui-window.js');
 
 const uiRoot = path.join(__dirname, '../../ui');
@@ -153,71 +158,128 @@ test('S-007: у каждого вида ошибки и каждого дейс�
   });
 });
 
-// --- Очередь карточек ---
+// --- Журнал событий строки статуса (ui/modules/activity-log.js) ---
 
-function item(id, kind, text, accountId = 1, action = 'retry', hasAction = false) {
-  return {id, kind, text, accountId, action, hasAction};
+function item(kind, text, accountId = 1, action = 'retry', hasAction = false) {
+  return {level: 'error', kind, text, accountId, action, hasAction};
 }
+const add = (log, value, time, capacity = null) => addEntry(log, value, time, capacity).log;
 
-test('S-008: три одинаковых сообщения схлопываются в одну карточку и продлевают показ', () => {
-  let result = planToastQueue([], item('a', 'timeout', 'Ошибка'), 1000);
-  result = planToastQueue(result.cards, item('b', 'timeout', 'Ошибка'), 5000);
-  result = planToastQueue(result.cards, item('c', 'timeout', 'Ошибка'), 9000);
-  assert.equal(result.cards.length, 1);
-  assert.equal(result.cards[0].repeatCount, 3);
-  assert.equal(result.cards[0].expiresAt, 18000);
+test('S-008: три одинаковых сообщения - одна запись со счётчиком и временем последнего', () => {
+  let log = add(createLog(), item('timeout', 'Ошибка'), 1000);
+  log = add(log, item('network_unavailable', 'Другая'), 2000);
+  log = add(log, item('timeout', 'Ошибка'), 5000);
+  log = add(log, item('timeout', 'Ошибка'), 9000);
+  assert.equal(log.entries.length, 2);
+  // Повтор поднимает запись наверх: строка статуса показывает именно её.
+  assert.equal(log.entries[0].text, 'Ошибка');
+  assert.equal(log.entries[0].count, 3);
+  assert.equal(log.entries[0].time, 9000);
 });
 
-test('S-009: четыре разные ошибки оставляют три новые в исходном порядке', () => {
-  let cards = [];
-  for (let index = 1; index <= 4; index += 1) cards = planToastQueue(cards, item(String(index), `kind-${index}`, `text-${index}`), index * 1000).cards;
-  assert.deepEqual(cards.map(card => card.id), ['2', '3', '4']);
+test('S-009: переполненный журнал теряет самые старые записи, новые идут первыми', () => {
+  let log = createLog();
+  for (let index = 1; index <= 4; index += 1) log = add(log, item(`kind-${index}`, `text-${index}`), index * 1000, 3);
+  assert.deepEqual(log.entries.map(entry => entry.text), ['text-4', 'text-3', 'text-2']);
 });
 
 // S-008: ключ повтора строится из вида, аккаунта, текста и действия. Каждое
-// поле проверяется своей парой: в общей очереди лишняя карточка тут же
-// вытесняется по длине очереди, и выпадение поля из ключа остаётся незаметным.
+// поле проверяется своей парой.
 test('S-008: вид, аккаунт, текст и действие - каждое поле входит в ключ повтора', () => {
-  const base = item('a', 'timeout', 'same', 1, 'retry');
+  const base = item('timeout', 'same', 1, 'retry');
   const differences = {
-    вид: item('b', 'network_unavailable', 'same', 1, 'retry'),
-    аккаунт: item('b', 'timeout', 'same', 2, 'retry'),
-    текст: item('b', 'timeout', 'other', 1, 'retry'),
-    действие: item('b', 'timeout', 'same', 1, 'diagnostics'),
+    вид: item('network_unavailable', 'same', 1, 'retry'),
+    аккаунт: item('timeout', 'same', 2, 'retry'),
+    текст: item('timeout', 'other', 1, 'retry'),
+    действие: item('timeout', 'same', 1, 'diagnostics'),
   };
   Object.entries(differences).forEach(([field, second]) => {
-    const cards = planToastQueue(planToastQueue([], base, 1000).cards, second, 2000).cards;
-    assert.equal(cards.length, 2, `отличается ${field} - это разные сообщения`);
-    assert.deepEqual(cards.map(card => card.id), ['a', 'b'], `отличается ${field} - порядок`);
+    const log = add(add(createLog(), base, 1000), second, 2000);
+    assert.equal(log.entries.length, 2, `отличается ${field} - это разные записи`);
   });
-  // Полное совпадение всех четырёх полей - одна карточка со счётчиком.
-  const repeated = planToastQueue(planToastQueue([], base, 1000).cards, {...base, id: 'b'}, 2000).cards;
-  assert.equal(repeated.length, 1);
-  assert.equal(repeated[0].repeatCount, 2);
+  const repeated = add(add(createLog(), base, 1000), {...base}, 2000);
+  assert.equal(repeated.entries.length, 1);
+  assert.equal(repeated.entries[0].count, 2);
 });
 
-test('S-015: карточка с действием не получает времени автоматического скрытия', () => {
-  const result = planToastQueue([], item('a', 'timeout', 'Ошибка', 1, 'retry', true), 1000);
-  assert.equal(result.cards[0].expiresAt, null);
+test('S-020: действие меняет ту же запись на ожидание и исход, история остаётся', () => {
+  const start = add(createLog(), {...item('timeout', 'Ошибка', 1, 'retry', true), callback: () => {}}, 1000);
+  const id = start.entries[0].id;
+  const pending = beginAction(start, id, ru('errorActionPending'));
+  assert.equal(pending.entries[0].actionState, 'pending');
+  assert.equal(actionAvailable(pending.entries[0], 1000), false, 'повторное нажатие во время работы невозможно');
+  const success = finishAction(pending, id, {ok: true, text: ru('errorActionSucceeded')}, 2000);
+  assert.equal(success.entries[0].text, 'Ошибка', 'запись остаётся в истории как была');
+  assert.equal(success.entries[0].actionStatus, ru('errorActionSucceeded'));
+  assert.equal(success.entries[0].hasAction, false);
+  const failed = finishAction(pending, id, {ok: false, item: {text: 'Новая причина', hasAction: true}}, 2000);
+  assert.equal(failed.entries[0].id, id);
+  assert.equal(failed.entries[0].text, 'Новая причина');
+  assert.equal(failed.unseenError, true);
 });
 
-test('S-020: действие меняет ту же карточку на ожидание и исход', () => {
-  const original = [{id: 'a', text: 'Ошибка', hasAction: true, expiresAt: null}];
-  const pending = beginToastAction(original, 'a', ru('errorActionPending'));
-  assert.equal(pending[0].id, 'a');
-  assert.equal(pending[0].actionState, 'pending');
-  assert.equal(pending[0].actionStatus, ru('errorActionPending'));
-  const success = finishToastAction(pending, 'a', {ok: true, text: ru('errorActionSucceeded')}, 1000);
-  assert.equal(success[0].id, 'a');
-  assert.equal(success[0].text, ru('errorActionSucceeded'));
-  assert.equal(success[0].hasAction, false);
-  const failed = finishToastAction(pending, 'a', {ok: false, item: {text: 'Новая причина', hasAction: true}}, 1000);
-  assert.equal(failed[0].id, 'a');
-  assert.equal(failed[0].text, 'Новая причина');
-  assert.equal(failed[0].actionState, 'failed');
+test('повтор после выполненного действия снова даёт действие, во время работы - не трогает его', () => {
+  const first = () => {};
+  const second = () => {};
+  const undo = callback => ({level: 'info', kind: 'notice', text: 'Письмо перемещено в архив', action: 'Отменить', hasAction: true, callback});
+  let log = add(createLog(), undo(first), 1000);
+  const id = log.entries[0].id;
+  // Пока отмена первого переноса выполняется, повтор не снимает ожидание.
+  log = add(beginAction(log, id, 'ждём'), undo(second), 2000);
+  assert.equal(log.entries[0].actionState, 'pending');
+  assert.deepEqual(log.entries[0].callbacks, [first]);
+  assert.equal(actionAvailable(log.entries[0], 2000), false);
+  // Отмена выполнена, следующий перенос с тем же текстом снова отменяем.
+  log = finishAction(log, id, {ok: true, text: 'готово'}, 3000);
+  log = add(log, undo(second), 4000);
+  assert.equal(log.entries.length, 1);
+  assert.equal(actionAvailable(log.entries[0], 4000), true);
+  assert.deepEqual(log.entries[0].callbacks, [second]);
 });
 
-test('S-022, S-024: сразу всплывают только виды, требующие решения человека', () => {
+test('ключ предмета различает записи с одинаковым текстом: две отправки - две отмены', () => {
+  const send = key => ({level: 'info', kind: 'notice', text: 'Отправка через 5 с', action: 'undo', hasAction: true, callback: () => {}, key});
+  const log = add(add(createLog(), send('send-1-8'), 1000), send('send-1-9'), 1500);
+  assert.equal(log.entries.length, 2);
+});
+
+test('после отказа действия повтор прежней причины не склеивается с новой', () => {
+  let log = add(createLog(), {...item('timeout', 'Таймаут', 1, 'retry', true), callback: () => {}}, 1000);
+  const id = log.entries[0].id;
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: false, item: {kind: 'invalid_credentials', text: 'Нужно войти', action: 'reconnect', hasAction: true, callback: () => {}}}, 2000);
+  log = add(log, {...item('timeout', 'Таймаут', 1, 'retry', true), callback: () => {}}, 3000);
+  assert.deepEqual(log.entries.map(entry => entry.text), ['Таймаут', 'Нужно войти']);
+});
+
+test('новая причина после отказа не наследует ключ и срок прежнего действия', () => {
+  let log = add(createLog(), {level: 'info', kind: 'notice', text: 'Отправка через 3 с', action: 'undo', hasAction: true, callback: () => {}, key: 'send-1-8', actionUntil: 5000}, 1000);
+  const id = log.entries[0].id;
+  const reason = {kind: 'timeout', text: 'Сервер не ответил', action: 'retry', hasAction: true, callback: () => {}};
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: false, item: reason}, 6000);
+  assert.equal(actionAvailable(log.entries[0], 6000), true, 'истёкшее окно отмены не переходит к новой причине');
+  log = add(log, {...reason, level: 'error'}, 7000);
+  assert.equal(log.entries.length, 1, 'повтор той же причины склеивается с ней');
+});
+
+test('объединённая запись после выполненного действия берёт обработчик нового события', () => {
+  const old = () => {};
+  const fresh = () => {};
+  let log = addEntry(createLog(), grouped('one', 1, 'one@example.com', {hasAction: true, callback: old}), 1000, null, formatAccounts).log;
+  const id = log.entries[0].id;
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: true, text: 'готово'}, 2000);
+  log = addEntry(log, grouped('one', 1, 'one@example.com', {hasAction: true, callback: fresh}), 3000, null, formatAccounts).log;
+  assert.deepEqual(log.entries[0].callbacks, [fresh]);
+  assert.equal(actionAvailable(log.entries[0], 3000), true);
+});
+
+test('действие с истёкшим сроком недоступно, запись остаётся строкой истории', () => {
+  const log = add(createLog(), {level: 'info', kind: 'notice', text: 'Письмо перемещено', action: 'undo', hasAction: true, callback: () => {}, actionUntil: 5000}, 1000);
+  assert.equal(actionAvailable(log.entries[0], 4999), true);
+  assert.equal(actionAvailable(log.entries[0], 5000), false);
+  assert.equal(log.entries.length, 1);
+});
+
+test('S-022, S-024: сразу сообщаются только виды, требующие решения человека', () => {
   ['network_unavailable', 'timeout', 'server_unavailable', 'rate_limited'].forEach(kind => {
     assert.equal(shouldShowSyncToast({kind, retries_exhausted: false}), false, kind);
   });
@@ -228,41 +290,36 @@ test('S-022, S-024: сразу всплывают только виды, тре�
   assert.equal(shouldShowSyncToast({kind: 'server_unavailable', retries_exhausted: true}), true);
 });
 
-test('S-023: один вид объединяет аккаунты в одной карточке', () => {
-  const first = {...item('a', 'server_unavailable', 'one', 1), groupByKind: true, baseText: ru('errorServerUnavailable'), accounts: [{id: 1, email: 'one@example.com'}], locale: 'ru', translations};
-  const second = {...item('b', 'server_unavailable', 'two', 2), groupByKind: true, baseText: ru('errorServerUnavailable'), accounts: [{id: 2, email: 'two@example.com'}], locale: 'ru', translations};
-  let cards = planToastQueue([], first, 1000).cards;
-  cards = planToastQueue(cards, second, 2000).cards;
-  assert.equal(cards.length, 1);
-  assert.deepEqual(cards[0].accountIds, [1, 2]);
-  assert.match(cards[0].text, /one@example\.com/);
-  assert.match(cards[0].text, /two@example\.com/);
+const formatAccounts = (baseText, accounts, value) => formatAccountErrorText(baseText, accounts, value.locale, value.translations);
+const grouped = (text, accountId, email, extra = {}) => ({
+  ...item('server_unavailable', text, accountId), groupByKind: true, baseText: ru('errorServerUnavailable'),
+  accounts: [{id: accountId, email}], locale: 'ru', translations, ...extra,
+});
+
+test('S-023: один вид объединяет аккаунты в одной записи', () => {
+  let log = addEntry(createLog(), grouped('one', 1, 'one@example.com'), 1000, null, formatAccounts).log;
+  log = addEntry(log, grouped('two', 2, 'two@example.com'), 2000, null, formatAccounts).log;
+  assert.equal(log.entries.length, 1);
+  assert.deepEqual(log.entries[0].accountIds, [1, 2]);
+  assert.match(log.entries[0].text, /one@example\.com/);
+  assert.match(log.entries[0].text, /two@example\.com/);
 });
 
 test('G3: повторный сбой того же аккаунта не дублирует обработчик действия', () => {
   const callbackA1 = () => {};
   const callbackA2 = () => {};
-  const shared = {groupByKind: true, baseText: ru('errorServerUnavailable'), locale: 'ru', translations};
-  const first = {...item('a', 'server_unavailable', 'one', 1), ...shared, accounts: [{id: 1, email: 'one@example.com'}], callback: callbackA1};
-  const repeat = {...item('b', 'server_unavailable', 'one-again', 1), ...shared, accounts: [{id: 1, email: 'one@example.com'}], callback: callbackA2};
-  let cards = planToastQueue([], first, 1000).cards;
-  cards = planToastQueue(cards, repeat, 2000).cards;
-  assert.equal(cards.length, 1);
-  // Аккаунт уже учтён - второй обработчик не добавляется, иначе одно нажатие
-  // запускало бы действие дважды.
-  assert.deepEqual(cards[0].callbacks, [callbackA1]);
+  let log = addEntry(createLog(), grouped('one', 1, 'one@example.com', {callback: callbackA1}), 1000, null, formatAccounts).log;
+  log = addEntry(log, grouped('one-again', 1, 'one@example.com', {callback: callbackA2}), 2000, null, formatAccounts).log;
+  assert.equal(log.entries.length, 1);
+  assert.deepEqual(log.entries[0].callbacks, [callbackA1]);
+  assert.equal(log.entries[0].count, 2);
 });
 
-test('G4: объединение карточки очищает подробности от первого аккаунта', () => {
-  const shared = {groupByKind: true, baseText: ru('errorServerUnavailable'), locale: 'ru', translations};
-  const first = {...item('a', 'server_unavailable', 'one', 1), ...shared, accounts: [{id: 1, email: 'one@example.com'}], details: 'Код ответа: 503'};
-  const second = {...item('b', 'server_unavailable', 'two', 2), ...shared, accounts: [{id: 2, email: 'two@example.com'}], details: 'Код ответа: 500'};
-  let cards = planToastQueue([], first, 1000).cards;
-  assert.equal(cards[0].details, 'Код ответа: 503');
-  cards = planToastQueue(cards, second, 2000).cards;
-  // Подробности относились только к первому аккаунту и вводили в заблуждение
-  // насчёт второго.
-  assert.equal(cards[0].details, '');
+test('G4: объединение записи очищает подробности от первого аккаунта', () => {
+  let log = addEntry(createLog(), grouped('one', 1, 'one@example.com', {details: 'Код ответа: 503'}), 1000, null, formatAccounts).log;
+  assert.equal(log.entries[0].details, 'Код ответа: 503');
+  log = addEntry(log, grouped('two', 2, 'two@example.com', {details: 'Код ответа: 500'}), 2000, null, formatAccounts).log;
+  assert.equal(log.entries[0].details, '');
 });
 
 test('одна беда одного ящика показывается один раз, смена причины - снова', () => {
@@ -279,44 +336,48 @@ test('одна беда одного ящика показывается оди�
   assert.equal(nextSyncToastMemo(first.memo, {account_id: 1, kind: 'server_unavailable'}).show, true);
 });
 
-// --- Настоящий путь: карточка ошибки в окне ---
+// --- Настоящий путь: строка статуса и журнал в окне ---
 
 const ACCOUNT = {id: 1, email: 'me@example.test', display_name: 'Мой ящик'};
-const cards = app => app.document.querySelectorAll('.app-toast');
-const cardText = card => card.querySelector('.app-toast-line span').textContent;
+const entries = app => app.document.querySelectorAll('#activityPanel .activity-entry');
+const entryText = entry => entry.querySelector('.activity-entry-text').textContent;
+const statusText = app => app.document.querySelector('#statusbarText .statusbar-entry-text')?.textContent ?? '';
 
-async function errorApp() {
-  const app = startApp({accounts: [ACCOUNT]});
+async function errorApp(options = {}) {
+  const app = startApp({accounts: [ACCOUNT], ...options});
   await app.ready();
   await app.setLanguage('ru');
   return app;
 }
 
-test('S-005, S-019: карточка ошибки показывает текст вида, подробности и подпись действия', async () => {
+test('S-005, S-019: ошибка идёт в строку статуса и журнал с подробностями и действием', async () => {
   const app = await errorApp();
   app.sandbox.window.showApiError({
     kind: 'server_unavailable', account_id: 1, message: 'transport failed',
     server: 'mail.example.test:443', response_code: 503,
   });
-  const shown = cards(app);
+  const expected = `Мой ящик (me@example.test): ${ru('errorServerUnavailable')}`;
+  assert.equal(statusText(app), expected, 'последняя запись видна в строке статуса');
+  assert.equal(app.document.querySelectorAll('.app-toast').length, 0, 'всплывающих карточек нет');
+  const shown = entries(app);
   assert.equal(shown.length, 1);
-  assert.equal(cardText(shown[0]), `Мой ящик (me@example.test): ${ru('errorServerUnavailable')}`);
+  assert.equal(entryText(shown[0]), expected);
   // Технические подробности спрятаны под раскрытием, а не вынесены в текст.
   assert.equal(shown[0].querySelector('summary').textContent, ru('errorDetails'));
   assert.match(shown[0].querySelector('pre').textContent, /mail\.example\.test:443/);
-  assert.equal(shown[0].querySelector('button').textContent, ru('errorActionRetry'));
+  assert.equal(shown[0].querySelector('.activity-entry-action').textContent, ru('errorActionRetry'));
 });
 
-test('S-008: повтор той же ошибки показывает счётчик, а не вторую карточку', async () => {
+test('S-008: повтор той же ошибки показывает счётчик, а не вторую запись', async () => {
   const app = await errorApp();
   const failure = {kind: 'timeout', account_id: 1, message: 'raw'};
   app.sandbox.window.showApiError(failure);
   app.sandbox.window.showApiError(failure);
-  assert.equal(cards(app).length, 1);
-  assert.equal(cards(app)[0].querySelector('.app-toast-count').textContent, 'x2');
+  assert.equal(entries(app).length, 1);
+  assert.equal(app.document.querySelector('#statusbarText .activity-count').textContent, 'x2');
 });
 
-test('S-020: кнопка карточки запускает действие и сообщает о ходе и исходе', async () => {
+test('S-020: кнопка записи запускает действие и сообщает о ходе и исходе', async () => {
   const app = await errorApp();
   let started = 0;
   let finish = null;
@@ -326,45 +387,34 @@ test('S-020: кнопка карточки запускает действие �
       finish = resolve;
     }),
   });
-  const button = cards(app)[0].querySelector('button');
-  button.onclick();
+  entries(app)[0].querySelector('.activity-entry-action').onclick();
   await app.settle(3);
   assert.equal(started, 1, 'нажатие запускает действие');
-  assert.equal(cards(app)[0].querySelector('.app-toast-action-status').textContent, ru('errorActionPending'));
-  assert.equal(cards(app)[0].querySelector('button').disabled, true, 'повторное нажатие во время работы невозможно');
+  assert.equal(entries(app)[0].querySelector('.activity-entry-status').textContent, ru('errorActionPending'));
+  assert.equal(entries(app)[0].querySelector('.activity-entry-action').disabled, true, 'повторное нажатие во время работы невозможно');
   finish();
   await app.settle(3);
-  assert.equal(cardText(cards(app)[0]), ru('errorActionSucceeded'));
-  assert.equal(cards(app)[0].querySelector('.app-toast-action-status'), null);
+  assert.equal(entries(app)[0].querySelector('.activity-entry-status').textContent, ru('errorActionSucceeded'));
+  assert.equal(entries(app)[0].querySelector('.activity-entry-action'), null, 'выполненное действие снято');
 });
 
-test('S-020: отказ действия оставляет ту же карточку с новой причиной', async () => {
+test('S-020: отказ действия оставляет ту же запись с новой причиной', async () => {
   const app = await errorApp();
   app.sandbox.window.showApiError({kind: 'timeout', account_id: 1, message: 'raw'}, {
     action: () => Promise.reject({kind: 'invalid_credentials', account_id: 1}),
   });
-  cards(app)[0].querySelector('button').onclick();
+  entries(app)[0].querySelector('.activity-entry-action').onclick();
   await app.settle(5);
-  assert.equal(cards(app).length, 1, 'вторая карточка не появляется');
-  assert.equal(cardText(cards(app)[0]), `Мой ящик (me@example.test): ${ru('errorInvalidCredentials')}`);
+  assert.equal(entries(app).length, 1, 'вторая запись не появляется');
+  assert.equal(entryText(entries(app)[0]), `Мой ящик (me@example.test): ${ru('errorInvalidCredentials')}`);
 });
 
-test('S-015: сообщение без действия снимается по времени, карточка с действием остаётся', async () => {
-  const app = await errorApp();
-  app.sandbox.window.showToast('Письма отмечены прочитанными');
-  assert.equal(cards(app).length, 1);
-  await app.advanceTimers(9000);
-  assert.equal(cards(app).length, 0, 'сообщение снято по времени');
-  assert.equal(app.document.querySelector('.app-toast-stack'), null, 'пустая стопка убрана из разметки');
-  // Ошибка с действием ждёт человека и сама не исчезает.
-  app.sandbox.window.showApiError({kind: 'timeout', account_id: 1, message: 'raw'});
+test('журнал держит число записей из предела, старые уходят', async () => {
+  const app = await errorApp({limits: {limit_activity_log_entries: 3, limit_activity_log_visible: 2}});
+  for (let index = 1; index <= 5; index += 1) app.sandbox.window.showToast(`событие ${index}`);
+  assert.deepEqual(entries(app).map(entryText), ['событие 5', 'событие 4', 'событие 3']);
+  assert.equal(statusText(app), 'событие 5');
+  // Сообщение без действия не исчезает по времени - это история.
   await app.advanceTimers(60000);
-  assert.equal(cards(app).length, 1);
-});
-
-test('S-015: карточку можно снять крестиком', async () => {
-  const app = await errorApp();
-  app.sandbox.window.showApiError({kind: 'timeout', account_id: 1, message: 'raw'});
-  cards(app)[0].querySelector('.app-toast-close').onclick();
-  assert.equal(cards(app).length, 0);
+  assert.equal(entries(app).length, 3);
 });

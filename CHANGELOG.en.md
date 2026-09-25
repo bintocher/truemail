@@ -7,6 +7,16 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-25
+
+### Changed
+
+- Pop-up messages are gone. Every error and notice used to pop up as a card in the middle of the window, and a recurring error such as "There is no network connection" kept coming back and covering the message list. Now everything goes to an event journal: the bottom line of the window shows the latest entry on every screen, and clicking it opens the whole journal. A repeated entry does not add rows, it increases a counter.
+- Actions are still at hand. An entry with details has a "Retry", "Reconnect" or "Undo" button next to them, and the action of the latest entry is shown right in the bottom line, so moving and sending a message can still be undone with one click. Nothing has to be clicked: the entry simply stays in the history.
+- List loading progress ("Loading Today... 1.0 s elapsed") is shown in the same bottom line instead of a separate bar on top of it.
+- A new unseen error is marked with a red dot in the bottom line until the journal is opened.
+- The journal size and the number of visible rows are set in the "Limits" section: by default the journal keeps 20 events and shows 10 rows without scrolling.
+
 ## [0.3.3] - 2026-09-21
 
 ### Added

@@ -74,7 +74,7 @@ async function openTaskEditor(options = {}) {
 const field = (ui, selector) => ui.query(`.task-modal ${selector}`);
 // Сообщения окна смотрим там же, где их видит пользователь: карточкой в углу
 // окна. Так проверка ловит и обрыв показа сообщения, а не только его сборку.
-const noticeTexts = ui => ui.queryAll('.app-toast .app-toast-line').map(node => node.textContent.trim());
+const noticeTexts = ui => ui.queryAll('#activityPanel .activity-entry-text').map(node => node.textContent.trim());
 
 test('S-016, S-020: готовый срок в окне уходит в ядро выбранным значением', async () => {
   const {ui, reloads} = await openTaskEditor();

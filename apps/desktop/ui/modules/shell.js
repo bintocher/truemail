@@ -68,9 +68,8 @@ const ic={
 document.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i]; if(s)e.innerHTML=s;});
 
 /* ---------- status bar ---------- */
-/* Нижняя строка состояния: одна строка текста, слева основной статус, справа - дополнительный. */
-const statusbarText=document.getElementById('statusbarText'),statusbarRight=document.getElementById('statusbarRight');
-window.setStatus=function(text,right){if(statusbarText)statusbarText.textContent=text||'';if(right!==undefined&&statusbarRight)statusbarRight.textContent=right||'';};
+/* Нижняя строка состояния показывает ход загрузки, а без неё - последнюю
+   запись журнала событий (composer.js, specs/status-activity-log.md). */
 
 /* ---------- routing between top views ---------- */
 function showView(id){ document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));
@@ -372,18 +371,20 @@ const msgsEl=document.getElementById('msgs');
 function listLoadingIsEnglish(){return document.documentElement.lang==='en';}
 let listLoadTimer=null,listLoadStart=0,listLoadLabel='';
 function setListLoading(on,label){
-  const box=document.getElementById('listLoading'),status=document.getElementById('appStatus');
+  const box=document.getElementById('listLoading');
+  // Ход загрузки идёт в строку статуса, а не отдельной полосой поверх неё.
+  const showProgress=text=>{window.activityProgress=text;window.renderActivityStatus?.();};
   if(on){
     if(listLoadTimer)clearInterval(listLoadTimer);
     listLoadStart=performance.now();listLoadLabel=label||(listLoadingIsEnglish()?'data':'данные');
-    box?.classList.remove('hidden');status?.classList.remove('hidden');
-    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);if(status)status.textContent=listLoadingIsEnglish()?`Loading ${listLoadLabel}… ${s} s elapsed`:`Загружаю ${listLoadLabel}… прошло ${s} с`;};
+    box?.classList.remove('hidden');
+    const tick=()=>{const s=((performance.now()-listLoadStart)/1000).toFixed(1);showProgress(listLoadingIsEnglish()?`Loading ${listLoadLabel}… ${s} s elapsed`:`Загружаю ${listLoadLabel}… прошло ${s} с`);};
     tick();listLoadTimer=setInterval(tick,100);
     window.tm?.uiLog?.(`загрузка начата: ${listLoadLabel}`);console.log('[load start]',listLoadLabel);
   }else{
     if(listLoadTimer){clearInterval(listLoadTimer);listLoadTimer=null;}
     if(box&&!box.classList.contains('hidden')){const s=((performance.now()-listLoadStart)/1000).toFixed(1);window.tm?.uiLog?.(`загрузка завершена: ${listLoadLabel} за ${s} с`);console.log('[load done]',listLoadLabel,s+'s');}
-    box?.classList.add('hidden');status?.classList.add('hidden');
+    box?.classList.add('hidden');showProgress('');
   }
 }
 // Страницы писем по метке идут прямо из базы: раньше раздел метки показывал

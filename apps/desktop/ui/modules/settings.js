@@ -515,6 +515,9 @@ document.getElementById('limitsBody')?.addEventListener('change',async event=>{
     const saved=await limitsModel.saveLimit(window.tm,key,raw);
     field.value=String(saved);
     applyLimitsToFields();
+    // Размер журнала и число видимых строк действуют сразу, а не со
+    // следующего события.
+    window.renderActivity?.();
   }catch(error){
     // Отказ ядра объясняется его же текстом: границы одни, и объяснение одно.
     showToast(error);

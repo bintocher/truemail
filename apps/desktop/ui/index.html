@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>truemail</title>
 <script src="theme-init.js?v=20260731-1"></script>
-  <link rel="stylesheet" href="styles.css?v=20260921-1">
+  <link rel="stylesheet" href="styles.css?v=20260925-2">
 </head>
 <body>
 
@@ -138,13 +138,6 @@
     </section>
   </div>
 
-  <div class="statusbar" id="statusbar">
-    <span class="statusbar-text" id="statusbarText"></span>
-    <span class="statusbar-right" id="statusbarRight"></span>
-    <!-- Версия программы в строке состояния: номер и адрес выпуска приходят из
-         файла, который пишет сборка. Словарь подпись не трогает. -->
-    <button type="button" class="statusbar-version" id="appVersionLink" data-no-i18n data-i18n-title="tipAppVersion" title="Открыть страницу выпуска на GitHub"></button>
-  </div>
 </div>
 
 <!-- ================= SETTINGS ================= -->
@@ -796,13 +789,32 @@
   </div>
 </div>
 
-<script src="modules/app-version.js?v=0.3.3"></script>
-<script src="modules/limits.js?v=20260920-3"></script>
+<!-- Строка статуса общая для всех экранов: сообщения журнала событий видны и
+     в редакторе письма, и в настройках (specs/status-activity-log.md). -->
+<div class="statusbar" id="statusbar">
+  <!-- Последняя запись журнала событий или ход загрузки; щелчок открывает
+       журнал целиком (specs/status-activity-log.md). -->
+  <span class="statusbar-text" id="statusbarText" data-i18n-title="activityLogOpen" title="Открыть журнал событий" role="button" tabindex="0" aria-haspopup="true" aria-expanded="false" aria-controls="activityPanel"></span>
+  <!-- Версия программы в строке состояния: номер и адрес выпуска приходят из
+       файла, который пишет сборка. Словарь подпись не трогает. -->
+  <button type="button" class="statusbar-version" id="appVersionLink" data-no-i18n data-i18n-title="tipAppVersion" title="Открыть страницу выпуска на GitHub"></button>
+</div>
+<div class="activity-panel hidden" id="activityPanel" role="dialog" aria-labelledby="activityPanelTitle">
+  <div class="activity-panel-head">
+    <span class="activity-panel-title" id="activityPanelTitle" data-i18n="activityLogTitle">Журнал событий</span>
+    <button type="button" class="activity-clear" data-i18n="activityLogClear">Очистить</button>
+    <button type="button" class="activity-close" data-i18n-title="close" title="Закрыть">x</button>
+  </div>
+  <div class="activity-list"></div>
+</div>
+
+<script src="modules/app-version.js?v=0.3.4"></script>
+<script src="modules/limits.js?v=20260925-1"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
 <script src="modules/message-view.js?v=20260905-1"></script>
 <script src="modules/wizard-exit.js?v=20260916-2"></script>
-<script src="modules/shell.js?v=20260920-3"></script>
+<script src="modules/shell.js?v=20260925-1"></script>
 <script src="modules/calendar-contacts.js?v=20260920-1"></script>
 <script src="modules/person-search.js?v=20260905-1"></script>
 <script src="modules/commands-accessibility.js?v=20260920-2"></script>
@@ -812,8 +824,9 @@
 <script src="modules/quick-steps.js?v=20260920-1"></script>
 <script src="modules/sender-lists.js?v=20260918-2"></script>
 <script src="modules/smart-rules.js?v=20260920-2"></script>
-<script src="modules/i18n-onboarding.js?v=20260921-2"></script>
-<script src="modules/error-presentation.js?v=20260918-1"></script>
+<script src="modules/i18n-onboarding.js?v=20260925-1"></script>
+<script src="modules/error-presentation.js?v=20260925-1"></script>
+<script src="modules/activity-log.js?v=20260925-3"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
 <script src="modules/mail-addresses.js?v=20260905-1"></script>
@@ -825,14 +838,13 @@
 <script src="modules/outbox.js?v=20260920-1"></script>
 <script src="modules/out-of-office.js?v=20260920-1"></script>
 <script src="modules/recipient-history.js?v=20260920-1"></script>
-<script src="modules/composer.js?v=20260920-2"></script>
+<script src="modules/composer.js?v=20260925-4"></script>
 <script src="modules/account-cards.js?v=20260917-1"></script>
-<script src="modules/settings.js?v=20260921-4"></script>
+<script src="modules/settings.js?v=20260925-1"></script>
 <script src="modules/sender-actions.js?v=20260918-2"></script>
 <script src="modules/queue-sections.js?v=20260920-2"></script>
 <script src="modules/release-notes.js?v=20260919-1"></script>
 <script src="modules/window-chrome.js?v=20260919-3"></script>
 <script src="bridge.js?v=20260921-1"></script>
-<div class="app-status hidden" id="appStatus"></div>
 </body>
 </html>

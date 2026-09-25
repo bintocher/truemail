@@ -175,7 +175,7 @@ test('ядро отказало - флажок возвращается в пр�
   box.dispatch('change', {target: box});
   await app.settle(10);
   assert.equal(box.checked, true, 'состояние вернулось: источник на самом деле не выключен');
-  const toasts = app.document.querySelectorAll('.app-toast-line').map(node => node.textContent);
+  const toasts = app.document.querySelectorAll('#activityPanel .activity-entry-text').map(node => node.textContent);
   assert.equal(toasts.length, 1);
   assert.match(toasts[0], /хранилищ/i, 'отказ объяснён человеку');
 });

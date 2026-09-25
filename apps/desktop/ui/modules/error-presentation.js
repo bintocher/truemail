@@ -235,99 +235,6 @@ function errorText(error,options={}) {
   return presentError(error,options).text;
 }
 
-function toastFingerprint(item) {
-  return JSON.stringify([
-    item.kind||'notice',
-    item.accountId??null,
-    item.text||'',
-    item.action||'',
-  ]);
-}
-
-function planToastQueue(cards,item,now=Date.now()) {
-  const queue=(cards||[]).map(card=>({...card}));
-  const grouped=item.groupByKind&&item.accountId!=null
-    ?queue.find(card=>card.groupByKind&&card.kind===item.kind)
-    :null;
-  if(grouped){
-    const accounts=[...(grouped.accounts||[])];
-    const alreadyIncluded=accounts.some(account=>Number(account.id)===Number(item.accountId));
-    if(!alreadyIncluded&&item.accounts?.[0])accounts.push(item.accounts[0]);
-    grouped.accounts=accounts;
-    grouped.accountIds=[...new Set([...(grouped.accountIds||[grouped.accountId]),item.accountId])];
-    if(!alreadyIncluded){
-      // Обработчик действия добавляется только для нового аккаунта в карточке -
-      // повторный сбой уже учтённого аккаунта не должен плодить в списке
-      // ещё одну копию того же callback, которая сработает по тому же
-      // нажатию (G3, error-kinds-and-messages.md).
-      grouped.callbacks=[...(grouped.callbacks||[grouped.callback]).filter(Boolean),...(item.callbacks||[item.callback]).filter(Boolean)];
-      // Подробности относились только к первому аккаунту и вводили в
-      // заблуждение насчёт второго - при объединении общие подробности не
-      // показываем, они остаются только у карточки с одним аккаунтом (G4).
-      grouped.details='';
-    }
-    grouped.text=formatAccountErrorText(grouped.baseText||item.baseText,accounts,item.locale,item.translations);
-    if(alreadyIncluded)grouped.repeatCount=(grouped.repeatCount||1)+1;
-    grouped.lastSeen=now;
-    grouped.expiresAt=item.hasAction?null:now+9000;
-    return {cards:queue,collapsedId:grouped.id,removedIds:[]};
-  }
-  const fingerprint=toastFingerprint(item);
-  const repeated=queue.find(card=>card.fingerprint===fingerprint&&now-card.lastSeen<=10000);
-  if(repeated){
-    repeated.repeatCount=(repeated.repeatCount||1)+1;
-    repeated.lastSeen=now;
-    repeated.expiresAt=item.hasAction?null:now+9000;
-    return {cards:queue,collapsedId:repeated.id,removedIds:[]};
-  }
-  const card={
-    ...item,
-    id:item.id??`toast-${now}`,
-    fingerprint,
-    repeatCount:1,
-    lastSeen:now,
-    expiresAt:item.hasAction?null:now+9000,
-    accountIds:item.accountId==null?[]:[item.accountId],
-    callbacks:(item.callbacks||[item.callback]).filter(Boolean),
-  };
-  queue.push(card);
-  const removed=queue.length>3?queue.splice(0,queue.length-3):[];
-  return {cards:queue,collapsedId:null,removedIds:removed.map(value=>value.id)};
-}
-
-function beginToastAction(cards,id,pendingText) {
-  return (cards||[]).map(card=>card.id===id?{
-    ...card,
-    actionState:'pending',
-    actionStatus:pendingText,
-    expiresAt:null,
-  }:{...card});
-}
-
-function finishToastAction(cards,id,replacement,now=Date.now()) {
-  return (cards||[]).map(card=>{
-    if(card.id!==id)return {...card};
-    if(replacement.ok)return {
-      ...card,
-      text:replacement.text,
-      details:'',
-      hasAction:false,
-      actionState:'success',
-      actionStatus:'',
-      expiresAt:now+9000,
-    };
-    return {
-      ...card,
-      ...replacement.item,
-      id:card.id,
-      actionState:'failed',
-      actionStatus:'',
-      lastSeen:now,
-      expiresAt:replacement.item.hasAction?null:now+9000,
-    };
-  });
-}
-
 const errorPresentation={
   ERROR_KINDS,
   ACTION_KEYS,
@@ -340,10 +247,6 @@ const errorPresentation={
   shouldShowSyncToast,
   nextSyncToastMemo,
   presentConnectedWarnings,
-  toastFingerprint,
-  planToastQueue,
-  beginToastAction,
-  finishToastAction,
 };
 if(typeof window!=='undefined')window.errorPresentation=errorPresentation;
 if(typeof module!=='undefined'&&module.exports)module.exports=errorPresentation;

@@ -693,5 +693,14 @@
   "limitReminderCheckSeconds": "How often to check reminders about meetings and tasks",
   "limitReminderCheckSecondsDesc": "More often means the card arrives closer to the time, less often means the program wakes the computer less",
   "limitUpdateCheckHours": "How often to check whether a new version is out",
-  "limitUpdateCheckHoursDesc": "The check runs in the background and installs nothing without consent"
+  "limitUpdateCheckHoursDesc": "The check runs in the background and installs nothing without consent",
+  "limitActivityLogEntries": "How many events the status bar journal keeps",
+  "limitActivityLogEntriesDesc": "Old entries drop out as new ones arrive. The journal lives until the app is closed",
+  "limitActivityLogVisible": "How many journal rows are visible without scrolling",
+  "limitActivityLogVisibleDesc": "The remaining journal entries are reachable by scrolling",
+  "limitUnitRows": "rows",
+  "activityLogTitle": "Event journal",
+  "activityLogEmpty": "No events yet",
+  "activityLogOpen": "Open the event journal",
+  "activityLogClear": "Clear"
 }

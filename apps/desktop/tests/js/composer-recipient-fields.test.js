@@ -206,6 +206,7 @@ function loadComposer() {
     messages: [],
     selectedMessageIds: new Set(),
     L: (russian) => russian,
+    wt: key => key,
     showToast: () => {},
     showView: () => {},
     escapeHtml: value => String(value ?? ''),
@@ -221,6 +222,7 @@ function loadComposer() {
   context.window.addEventListener = () => {};
   context.window.recipientHistoryModel = recipientHistoryModel;
   context.window.composerBody = require('../../ui/modules/composer-body.js');
+  context.window.activityLogModel = require('../../ui/modules/activity-log.js');
   context.window.tm = {setSetting: async () => {}, listSignatures: async () => []};
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(uiDir, 'modules', 'composer.js'), 'utf8'), context);

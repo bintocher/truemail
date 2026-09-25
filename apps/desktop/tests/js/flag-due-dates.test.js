@@ -124,7 +124,7 @@ function listMessage(extra) {
 
 const rowOf = (ui, id) => ui.query(`#msgs .msg[data-message-id="${id}"]`);
 // Сообщения смотрим там же, где их видит пользователь: карточкой в углу окна.
-const noticeTexts = ui => ui.queryAll('.app-toast .app-toast-line').map(node => node.textContent.trim());
+const noticeTexts = ui => ui.queryAll('#activityPanel .activity-entry-text').map(node => node.textContent.trim());
 
 test('S-016: готовые сроки отсчитываются от текущего момента', () => {
   // Неверно посчитанный готовый срок молча ставит напоминание не на то время:

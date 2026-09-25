@@ -68,6 +68,8 @@
     sweepFullPassHours: 'limit_sweep_full_pass_hours',
     reminderCheckSeconds: 'limit_reminder_check_seconds',
     updateCheckHours: 'limit_update_check_hours',
+    activityLogEntries: 'limit_activity_log_entries',
+    activityLogVisible: 'limit_activity_log_visible',
   };
 
   let sections = [];

@@ -82,12 +82,8 @@ function recipientToken(value){return String(value||'').split(/[;,]/).at(-1).tri
 function chooseRecipient(input,contact){addRecipientEntry(input.id,recipientFormat({name:contact.name,email:contact.email}));input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus();scheduleDraftSave();}
 ['compTo','compCc','compBcc'].forEach(id=>{const input=document.getElementById(id),menu=input.parentElement.querySelector('.recipient-suggestions');let active=-1;const render=()=>{const query=recipientToken(input.value),used=new Set([...recipientModel[id].map(entry=>entry.email.toLocaleLowerCase()),...splitAddresses(input.value).map(value=>(value.match(/<([^>]+)>/)?.[1]||value).trim().toLocaleLowerCase())]),matches=window.recipientHistoryModel.historySuggestions(composerCandidates(),query,used,contact=>composerContactKeysCache.get(contact.email.toLocaleLowerCase(),()=>`${contact.name} ${contact.email}`),personSearch);active=-1;menu.innerHTML='';matches.forEach((contact,index)=>{const option=document.createElement('button');option.type='button';option.className='recipient-option';option.innerHTML='<span></span><small></small>';option.querySelector('span').textContent=window.recipientHistoryModel.historyCandidateLabel(contact);const badge=window.recipientHistoryModel.historyCandidateBadge(contact,composerLang());option.querySelector('small').textContent=badge?`${contact.email} - ${badge}`:contact.email;option.onmousedown=event=>{event.preventDefault();chooseRecipient(input,contact);menu.classList.remove('open');};option.dataset.index=index;menu.appendChild(option);});menu.classList.toggle('open',matches.length>0);};input.addEventListener('input',render);input.addEventListener('focus',render);input.addEventListener('keydown',event=>{const options=[...menu.querySelectorAll('.recipient-option')];if((event.key===','||event.key===';')&&!(active>=0&&options.length)){event.preventDefault();commitRecipientInput(id);menu.classList.remove('open');render();return;}if(event.key==='Backspace'&&!input.value&&recipientModel[id].length){event.preventDefault();removeRecipientEntry(id,recipientModel[id].length-1);return;}if(!options.length){if(event.key==='Enter'&&input.value.trim()){event.preventDefault();commitRecipientInput(id);}return;}if(event.key==='ArrowDown'||event.key==='ArrowUp'){event.preventDefault();active=(active+(event.key==='ArrowDown'?1:-1)+options.length)%options.length;options.forEach((option,index)=>option.classList.toggle('active',index===active));options[active].scrollIntoView({block:'nearest'});}else if(event.key==='Enter'){event.preventDefault();if(active>=0)options[active].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));else{commitRecipientInput(id);menu.classList.remove('open');}}else if(event.key==='Escape')menu.classList.remove('open');});input.addEventListener('blur',()=>{if(input.value.trim())commitRecipientInput(id);});});
 document.addEventListener('click',event=>{if(!event.target.closest('.recipient-input'))document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));});
-let toastCards=[];
-let toastSequence=0;
-const toastTimers=new Map();
 const syncActionWaiters=new Map();
 function errorTranslations(){return typeof wizardText==='undefined'?undefined:wizardText;}
-function removeToastCard(id){toastCards=toastCards.filter(card=>card.id!==id);renderToastCards();}
 function waitForAccountSync(accountId){
   if(accountId==null)return window.tm?.syncAccounts();
   return new Promise((resolve,reject)=>{
@@ -112,31 +108,116 @@ function errorAction(presented,context={}){
   if(presented.action==='settings')return ()=>{showView('settingsView');setSection('addacct');};
   return ()=>window.tm?.openDataDir();
 }
-function renderToastCards(){
-  toastTimers.forEach(timer=>clearTimeout(timer));toastTimers.clear();
-  let stack=document.querySelector('.app-toast-stack');
-  if(!toastCards.length){stack?.remove();return;}
-  if(!stack){stack=document.createElement('div');stack.className='app-toast-stack';document.body.appendChild(stack);}
-  stack.innerHTML='';
-  toastCards.forEach(card=>{
-    const toast=document.createElement('div');toast.className='app-toast';toast.dataset.toastId=card.id;
-    const body=document.createElement('div');body.className='app-toast-body';
-    const line=document.createElement('div');line.className='app-toast-line';
-    const text=document.createElement('span');text.textContent=card.text;line.appendChild(text);
-    if(card.repeatCount>1){const count=document.createElement('span');count.className='app-toast-count';count.textContent=`x${card.repeatCount}`;line.appendChild(count);}
-    body.appendChild(line);
-    if(card.details){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=card.details;details.append(summary,pre);body.appendChild(details);}
-    if(card.actionStatus){const status=document.createElement('div');status.className='app-toast-action-status';status.textContent=card.actionStatus;body.appendChild(status);}
-    toast.appendChild(body);
-    if(card.hasAction){const button=document.createElement('button');button.type='button';button.textContent=card.actionState==='pending'?wt('errorActionPending'):card.actionLabel;const waitUntil=card.action==='wait'&&card.retryAt?Date.parse(card.retryAt):0;button.disabled=card.actionState==='pending'||(card.action==='wait'&&(!waitUntil||waitUntil>Date.now()));button.onclick=async()=>{toastCards=window.errorPresentation.beginToastAction(toastCards,card.id,wt('errorActionPending'));renderToastCards();try{await Promise.all((card.callbacks||[card.callback]).filter(Boolean).map(callback=>callback()));toastCards=window.errorPresentation.finishToastAction(toastCards,card.id,{ok:true,text:wt('errorActionSucceeded')},Date.now());}catch(error){const item=errorToastItem(error,{connected:true});toastCards=window.errorPresentation.finishToastAction(toastCards,card.id,{ok:false,item},Date.now());}renderToastCards();};toast.appendChild(button);if(waitUntil>Date.now()){const timer=setTimeout(()=>renderToastCards(),waitUntil-Date.now());toastTimers.set(`wait-${card.id}`,timer);}}
-    const close=document.createElement('button');close.type='button';close.className='app-toast-close';close.textContent='x';close.title=wt('close');close.onclick=()=>removeToastCard(card.id);toast.appendChild(close);stack.appendChild(toast);
-    if(card.expiresAt){const timer=setTimeout(()=>removeToastCard(card.id),Math.max(0,card.expiresAt-Date.now()));toastTimers.set(card.id,timer);}
-  });
+/* ---------- журнал событий строки статуса ----------
+   Уведомления, ошибки и действия не всплывают карточками, а пишутся в журнал:
+   последняя запись всегда видна в нижней строке окна, остальные открываются
+   щелчком по ней (issue #120, specs/status-activity-log.md). Число записей и
+   видимых строк - пределы limit_activity_log_entries и limit_activity_log_visible. */
+const activityModel=window.activityLogModel;
+let activityLog=activityModel.createLog();
+let activityPanelOpen=false;
+let activityTimer=null;
+// Ключи пределов пишутся явно: проверка ядра ищет место применения каждого
+// предела по имени KEYS.<ключ>.
+function activityLimit(key){return key?window.limitsModel?.limitValue(key)??null:null;}
+function activityTime(time){try{return new Date(time).toLocaleTimeString(composerLang()==='en'?'en-US':'ru-RU',{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
+function activityAccountsText(baseText,accounts,item){return window.errorPresentation.formatAccountErrorText(baseText,accounts,item.locale,item.translations);}
+function logActivity(item){const result=activityModel.addEntry(activityLog,item,Date.now(),activityLimit(window.limitsModel?.KEYS.activityLogEntries),activityAccountsText);activityLog=result.log;renderActivity();return result;}
+function activityActionButton(entry,className){
+  if(!entry.hasAction||(entry.actionUntil!=null&&Number(entry.actionUntil)<=Date.now()))return null;
+  const button=document.createElement('button');button.type='button';button.className=className;
+  button.textContent=entry.actionState==='pending'?wt('errorActionPending'):entry.actionLabel;
+  button.disabled=!activityModel.actionAvailable(entry,Date.now());
+  button.onclick=event=>{event?.stopPropagation?.();return runActivityAction(entry.id);};
+  return button;
 }
-function enqueueToast(item){item.id=`toast-${++toastSequence}`;const result=window.errorPresentation.planToastQueue(toastCards,item,Date.now());toastCards=result.cards;renderToastCards();return result;}
-function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,locale:presented.locale,translations};}
-function showApiError(error,context={}){return enqueueToast(errorToastItem(error,context));}
-function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return enqueueToast({kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action});}
+async function runActivityAction(id){
+  const entry=activityLog.entries.find(item=>item.id===id);
+  if(!entry||!activityModel.actionAvailable(entry,Date.now()))return;
+  activityLog=activityModel.beginAction(activityLog,id,wt('errorActionPending'));renderActivity();
+  try{await Promise.all(entry.callbacks.map(callback=>callback()));activityLog=activityModel.finishAction(activityLog,id,{ok:true,text:wt('errorActionSucceeded')},Date.now());}
+  catch(error){activityLog=activityModel.finishAction(activityLog,id,{ok:false,item:errorToastItem(error,{connected:true})},Date.now());}
+  renderActivity();
+}
+// Перерисовка к ближайшему сроку: истекает окно отмены или наступает время,
+// после которого действие "Повторить позже" становится доступным.
+function scheduleActivityRefresh(){
+  if(activityTimer){clearTimeout(activityTimer);activityTimer=null;}
+  const now=Date.now();
+  const deadlines=activityLog.entries.flatMap(entry=>[entry.actionUntil!=null?Number(entry.actionUntil):NaN,entry.action==='wait'&&entry.retryAt?Date.parse(entry.retryAt):NaN]).filter(time=>Number.isFinite(time)&&time>now);
+  if(deadlines.length)activityTimer=setTimeout(renderActivity,Math.min(...deadlines)-now+50);
+}
+function renderActivityStatus(){
+  const line=document.getElementById('statusbarText');if(!line)return;
+  line.innerHTML='';
+  document.getElementById('statusbar')?.classList.toggle('has-unseen-error',activityLog.unseenError);
+  const progress=window.activityProgress;
+  if(progress){line.dataset.level='progress';const text=document.createElement('span');text.className='statusbar-entry-text';text.textContent=progress;line.appendChild(text);return;}
+  const entry=activityModel.latestEntry(activityLog);
+  if(!entry){delete line.dataset.level;return;}
+  line.dataset.level=entry.level;
+  const time=document.createElement('span');time.className='statusbar-entry-time';time.textContent=activityTime(entry.time);
+  const text=document.createElement('span');text.className='statusbar-entry-text';text.textContent=entry.text;
+  line.append(time,text);
+  if(entry.count>1){const count=document.createElement('span');count.className='activity-count';count.textContent=`x${entry.count}`;line.appendChild(count);}
+  const button=activityActionButton(entry,'statusbar-entry-action');if(button)line.appendChild(button);
+}
+function renderActivityPanel(){
+  const panel=document.getElementById('activityPanel');if(!panel)return;
+  panel.classList.toggle('hidden',!activityPanelOpen);
+  const rows=activityLimit(window.limitsModel?.KEYS.activityLogVisible);
+  if(rows)panel.style.setProperty('--activity-rows',String(rows));
+  const list=panel.querySelector('.activity-list');if(!list)return;
+  // Список пересобирается и на каждом тике отсчёта отмены: раскрытые
+  // подробности и прокрутка переносятся, иначе их нельзя было бы дочитать.
+  const opened=new Set([...list.querySelectorAll('.activity-entry')].filter(row=>row.querySelector('details')?.open).map(row=>row.dataset.activityId));
+  const scroll=list.scrollTop;
+  list.innerHTML='';
+  if(!activityLog.entries.length){const empty=document.createElement('div');empty.className='activity-empty';empty.textContent=wt('activityLogEmpty');list.appendChild(empty);return;}
+  activityLog.entries.forEach(entry=>{
+    const row=document.createElement('div');row.className='activity-entry';row.dataset.level=entry.level;row.dataset.activityId=entry.id;
+    const head=document.createElement('div');head.className='activity-entry-head';
+    const time=document.createElement('span');time.className='activity-entry-time';time.textContent=activityTime(entry.time);
+    const text=document.createElement('span');text.className='activity-entry-text';text.textContent=entry.text;
+    head.append(time,text);
+    if(entry.count>1){const count=document.createElement('span');count.className='activity-count';count.textContent=`x${entry.count}`;head.appendChild(count);}
+    const button=activityActionButton(entry,'activity-entry-action');if(button)head.appendChild(button);
+    row.appendChild(head);
+    if(entry.actionStatus){const status=document.createElement('div');status.className='activity-entry-status';status.textContent=entry.actionStatus;row.appendChild(status);}
+    if(entry.details){const details=document.createElement('details');details.open=opened.has(entry.id);const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=entry.details;details.append(summary,pre);row.appendChild(details);}
+    list.appendChild(row);
+  });
+  list.scrollTop=scroll;
+}
+function renderActivity(){
+  const capacity=activityLimit(window.limitsModel?.KEYS.activityLogEntries);
+  if(capacity&&activityLog.entries.length>capacity)activityLog={...activityLog,entries:activityLog.entries.slice(0,capacity)};
+  renderActivityStatus();renderActivityPanel();scheduleActivityRefresh();
+}
+function setActivityPanel(open){activityPanelOpen=open;if(open)activityLog=activityModel.markSeen(activityLog);document.getElementById('statusbarText')?.setAttribute('aria-expanded',String(open));renderActivity();}
+window.renderActivityStatus=renderActivityStatus;
+window.renderActivity=renderActivity;
+window.logActivity=logActivity;
+(function bindActivityPanel(){
+  const line=document.getElementById('statusbarText'),panel=document.getElementById('activityPanel');
+  if(!line||!panel)return;
+  line.addEventListener('click',()=>setActivityPanel(!activityPanelOpen));
+  // Только нажатие на самой строке: Enter на вложенной кнопке действия
+  // должен выполнить действие, а не открыть журнал.
+  line.addEventListener('keydown',event=>{if(event.target!==line)return;if(event.key==='Enter'||event.key===' '){event.preventDefault();setActivityPanel(!activityPanelOpen);}});
+  panel.querySelector('.activity-close')?.addEventListener('click',()=>setActivityPanel(false));
+  panel.querySelector('.activity-clear')?.addEventListener('click',()=>{activityLog=activityModel.clearLog(activityLog);renderActivity();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape'&&activityPanelOpen)setActivityPanel(false);});
+  document.addEventListener('click',event=>{if(activityPanelOpen&&!event.target?.closest?.('#activityPanel,#statusbarText'))setActivityPanel(false);});
+  renderActivity();
+})();
+function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {level:'error',kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,locale:presented.locale,translations};}
+function showApiError(error,context={}){return logActivity(errorToastItem(error,context));}
+// Сообщение с действием - это отдельная операция со своим обработчиком: два
+// переноса с одинаковым текстом дают две отмены, а не одну. Поэтому у него
+// собственный ключ предмета, и склеиваются только сообщения без действия.
+let activityActionSequence=0;
+function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action,key:action?`action-${++activityActionSequence}`:null});}
 window.showApiError=showApiError;
 // Одна беда одного ящика - одно сообщение: без этого при каждом проходе
 // счётчик повторов рос до десятков, а нового человеку не сообщалось (issue #77).
@@ -529,15 +610,25 @@ function showUndoSendCard(queued,request){
       showToast(window.outboxModel.cancelOutcomeText(outcome,composerLang()));
       if(outcome==='cancelled')await restoreCancelledSend(queued.account_id,queued.operation_id);
     }};
-  enqueueToast(item);
-  const cardId=item.id;
+  // Срок - сам cancel_until очереди, а не округлённый отсчёт: иначе кнопка
+  // жила бы до секунды дольше настоящего окна отмены. Ключ операции не даёт
+  // склеить две отправки с одинаковым текстом в одну отмену.
+  const until=window.outboxModel.parseQueueTime(queued.cancel_until);
+  item.actionUntil=Number.isFinite(until)?until:Date.now()+seconds*1000;
+  item.key=`send-${queued.account_id}-${queued.operation_id}`;
+  const entryId=logActivity(item).id;
   const timer=setInterval(()=>{
-    const card=toastCards.find(value=>value.id===cardId);
+    const entry=activityLog.entries.find(value=>value.id===entryId);
     const left=window.outboxModel.remainingUndoSeconds(queued.cancel_until,Date.now());
-    if(!card||left<=0){clearInterval(timer);if(card)removeToastCard(cardId);return;}
-    card.text=window.outboxModel.undoCardText(request,left,composerLang());
-    card.baseText=card.text;
-    renderToastCards();
+    if(!entry||entry.actionState){clearInterval(timer);return;}
+    if(left<=0){
+      // Окно отмены вышло: запись остаётся в журнале историей, без действия.
+      clearInterval(timer);
+      activityLog=activityModel.updateEntry(activityLog,entryId,{text:L('Письмо передано на отправку','The message was handed over for sending'),hasAction:false});
+      renderActivity();return;
+    }
+    activityLog=activityModel.updateEntry(activityLog,entryId,{text:window.outboxModel.undoCardText(request,left,composerLang())});
+    renderActivity();
   },1000);
 }
 /* Возврат отменённого письма в композер целиком: адресаты, тема, оформленное

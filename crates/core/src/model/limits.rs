@@ -134,6 +134,8 @@ pub const LIMIT_SWEEP_MAX_WAITS: &str = "limit_sweep_max_waits";
 pub const LIMIT_SWEEP_FULL_PASS_HOURS: &str = "limit_sweep_full_pass_hours";
 pub const LIMIT_REMINDER_CHECK_SECONDS: &str = "limit_reminder_check_seconds";
 pub const LIMIT_UPDATE_CHECK_HOURS: &str = "limit_update_check_hours";
+pub const LIMIT_ACTIVITY_LOG_ENTRIES: &str = "limit_activity_log_entries";
+pub const LIMIT_ACTIVITY_LOG_VISIBLE: &str = "limit_activity_log_visible";
 
 /// Перечень настраиваемых пределов. Порядок - порядок показа внутри раздела.
 pub const LIMITS: &[LimitSpec] = &[
@@ -684,6 +686,28 @@ pub const LIMITS: &[LimitSpec] = &[
         default: 6,
         min: 1,
         max: 8760,
+    },
+    // Журнал событий в строке статуса живёт только в памяти окна; ядро его не
+    // читает, предел нужен интерфейсу (specs/status-activity-log.md).
+    LimitSpec {
+        key: LIMIT_ACTIVITY_LOG_ENTRIES,
+        section: "maintenance",
+        title_key: "limitActivityLogEntries",
+        hint_key: "limitActivityLogEntriesDesc",
+        unit_key: "limitUnitEntries",
+        default: 20,
+        min: 1,
+        max: 500,
+    },
+    LimitSpec {
+        key: LIMIT_ACTIVITY_LOG_VISIBLE,
+        section: "maintenance",
+        title_key: "limitActivityLogVisible",
+        hint_key: "limitActivityLogVisibleDesc",
+        unit_key: "limitUnitRows",
+        default: 10,
+        min: 1,
+        max: 100,
     },
 ];
 
