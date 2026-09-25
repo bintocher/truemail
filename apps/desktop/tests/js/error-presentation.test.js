@@ -218,6 +218,39 @@ test('S-020: действие меняет ту же запись на ожид�
   assert.equal(failed.unseenError, true);
 });
 
+test('повтор после выполненного действия снова даёт действие, во время работы - не трогает его', () => {
+  const first = () => {};
+  const second = () => {};
+  const undo = callback => ({level: 'info', kind: 'notice', text: 'Письмо перемещено в архив', action: 'Отменить', hasAction: true, callback});
+  let log = add(createLog(), undo(first), 1000);
+  const id = log.entries[0].id;
+  // Пока отмена первого переноса выполняется, повтор не снимает ожидание.
+  log = add(beginAction(log, id, 'ждём'), undo(second), 2000);
+  assert.equal(log.entries[0].actionState, 'pending');
+  assert.deepEqual(log.entries[0].callbacks, [first]);
+  assert.equal(actionAvailable(log.entries[0], 2000), false);
+  // Отмена выполнена, следующий перенос с тем же текстом снова отменяем.
+  log = finishAction(log, id, {ok: true, text: 'готово'}, 3000);
+  log = add(log, undo(second), 4000);
+  assert.equal(log.entries.length, 1);
+  assert.equal(actionAvailable(log.entries[0], 4000), true);
+  assert.deepEqual(log.entries[0].callbacks, [second]);
+});
+
+test('ключ предмета различает записи с одинаковым текстом: две отправки - две отмены', () => {
+  const send = key => ({level: 'info', kind: 'notice', text: 'Отправка через 5 с', action: 'undo', hasAction: true, callback: () => {}, key});
+  const log = add(add(createLog(), send('send-1-8'), 1000), send('send-1-9'), 1500);
+  assert.equal(log.entries.length, 2);
+});
+
+test('после отказа действия повтор прежней причины не склеивается с новой', () => {
+  let log = add(createLog(), {...item('timeout', 'Таймаут', 1, 'retry', true), callback: () => {}}, 1000);
+  const id = log.entries[0].id;
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: false, item: {kind: 'invalid_credentials', text: 'Нужно войти', action: 'reconnect', hasAction: true, callback: () => {}}}, 2000);
+  log = add(log, {...item('timeout', 'Таймаут', 1, 'retry', true), callback: () => {}}, 3000);
+  assert.deepEqual(log.entries.map(entry => entry.text), ['Таймаут', 'Нужно войти']);
+});
+
 test('действие с истёкшим сроком недоступно, запись остаётся строкой истории', () => {
   const log = add(createLog(), {level: 'info', kind: 'notice', text: 'Письмо перемещено', action: 'undo', hasAction: true, callback: () => {}, actionUntil: 5000}, 1000);
   assert.equal(actionAvailable(log.entries[0], 4999), true);

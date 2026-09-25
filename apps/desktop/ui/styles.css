@@ -69,7 +69,7 @@
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;-webkit-font-smoothing:antialiased;}
   @media (prefers-reduced-motion:no-preference){ .msg,.navitem,.btn,.iconbtn,.cmdrow,.seg button,.dot-accent,.setnav div,.acc-h{transition:background .12s,color .12s,border-color .12s;} }
   i[data-i]{display:inline-flex;} svg{display:block;}
-  .view{display:none;height:calc(100vh - var(--titlebar-h));} .view.active{display:block;}
+  .view{display:none;height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));} .view.active{display:block;}
 
   /* Своя строка заголовка. Системную убрали (decorations: false), поэтому здесь
      же живут перетаскивание окна, кнопки управления и кнопка обновления. */
@@ -445,7 +445,7 @@
   .cgrid.table-view .ccard .ce{flex:1;min-width:0;font-size:13px;}
 
   /* settings */
-  .settings{display:grid;grid-template-columns:236px minmax(0,1fr);height:calc(100vh - var(--titlebar-h));min-height:0;background:var(--bg);user-select:none;-webkit-user-select:none;}
+  .settings{display:grid;grid-template-columns:236px minmax(0,1fr);height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));min-height:0;background:var(--bg);user-select:none;-webkit-user-select:none;}
   .settings input,.settings textarea,.settings [contenteditable="true"]{user-select:text;-webkit-user-select:text;}
   #smartOverlay{user-select:none;-webkit-user-select:none;}
   #smartOverlay input,#smartOverlay textarea{user-select:text;-webkit-user-select:text;}
@@ -500,7 +500,7 @@
   .theme-prev .bar{height:8px;border-radius:4px;background:var(--hover);margin-bottom:6px;} .theme-prev .bar.a{background:var(--accent);width:60%;}
 
   /* compose full */
-  .compose{display:none;height:calc(100vh - var(--titlebar-h));flex-direction:column;background:var(--bg);}
+  .compose{display:none;height:calc(100vh - var(--titlebar-h) - var(--statusbar-h));flex-direction:column;background:var(--bg);}
   .view#composeView.active{display:block;} .view#composeView.active .compose{display:flex;}
   .comphead{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--border);}
   .msg .l1{display:flex;align-items:center;gap:6px}

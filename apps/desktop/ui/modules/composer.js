@@ -165,7 +165,12 @@ function renderActivityPanel(){
   panel.classList.toggle('hidden',!activityPanelOpen);
   const rows=activityLimit('activityLogVisible');
   if(rows)panel.style.setProperty('--activity-rows',String(rows));
-  const list=panel.querySelector('.activity-list');if(!list)return;list.innerHTML='';
+  const list=panel.querySelector('.activity-list');if(!list)return;
+  // Список пересобирается и на каждом тике отсчёта отмены: раскрытые
+  // подробности и прокрутка переносятся, иначе их нельзя было бы дочитать.
+  const opened=new Set([...list.querySelectorAll('.activity-entry')].filter(row=>row.querySelector('details')?.open).map(row=>row.dataset.activityId));
+  const scroll=list.scrollTop;
+  list.innerHTML='';
   if(!activityLog.entries.length){const empty=document.createElement('div');empty.className='activity-empty';empty.textContent=wt('activityLogEmpty');list.appendChild(empty);return;}
   activityLog.entries.forEach(entry=>{
     const row=document.createElement('div');row.className='activity-entry';row.dataset.level=entry.level;row.dataset.activityId=entry.id;
@@ -177,9 +182,10 @@ function renderActivityPanel(){
     const button=activityActionButton(entry,'activity-entry-action');if(button)head.appendChild(button);
     row.appendChild(head);
     if(entry.actionStatus){const status=document.createElement('div');status.className='activity-entry-status';status.textContent=entry.actionStatus;row.appendChild(status);}
-    if(entry.details){const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=entry.details;details.append(summary,pre);row.appendChild(details);}
+    if(entry.details){const details=document.createElement('details');details.open=opened.has(entry.id);const summary=document.createElement('summary');summary.textContent=wt('errorDetails');const pre=document.createElement('pre');pre.textContent=entry.details;details.append(summary,pre);row.appendChild(details);}
     list.appendChild(row);
   });
+  list.scrollTop=scroll;
 }
 function renderActivity(){
   const capacity=activityLimit('activityLogEntries');
@@ -188,12 +194,15 @@ function renderActivity(){
 }
 function setActivityPanel(open){activityPanelOpen=open;if(open)activityLog=activityModel.markSeen(activityLog);document.getElementById('statusbarText')?.setAttribute('aria-expanded',String(open));renderActivity();}
 window.renderActivityStatus=renderActivityStatus;
+window.renderActivity=renderActivity;
 window.logActivity=logActivity;
 (function bindActivityPanel(){
   const line=document.getElementById('statusbarText'),panel=document.getElementById('activityPanel');
   if(!line||!panel)return;
   line.addEventListener('click',()=>setActivityPanel(!activityPanelOpen));
-  line.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();setActivityPanel(!activityPanelOpen);}});
+  // Только нажатие на самой строке: Enter на вложенной кнопке действия
+  // должен выполнить действие, а не открыть журнал.
+  line.addEventListener('keydown',event=>{if(event.target!==line)return;if(event.key==='Enter'||event.key===' '){event.preventDefault();setActivityPanel(!activityPanelOpen);}});
   panel.querySelector('.activity-close')?.addEventListener('click',()=>setActivityPanel(false));
   panel.querySelector('.activity-clear')?.addEventListener('click',()=>{activityLog=activityModel.clearLog(activityLog);renderActivity();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&activityPanelOpen)setActivityPanel(false);});
@@ -595,7 +604,12 @@ function showUndoSendCard(queued,request){
       showToast(window.outboxModel.cancelOutcomeText(outcome,composerLang()));
       if(outcome==='cancelled')await restoreCancelledSend(queued.account_id,queued.operation_id);
     }};
-  item.actionUntil=Date.now()+seconds*1000;
+  // Срок - сам cancel_until очереди, а не округлённый отсчёт: иначе кнопка
+  // жила бы до секунды дольше настоящего окна отмены. Ключ операции не даёт
+  // склеить две отправки с одинаковым текстом в одну отмену.
+  const until=window.outboxModel.parseQueueTime(queued.cancel_until);
+  item.actionUntil=Number.isFinite(until)?until:Date.now()+seconds*1000;
+  item.key=`send-${queued.account_id}-${queued.operation_id}`;
   const entryId=logActivity(item).id;
   const timer=setInterval(()=>{
     const entry=activityLog.entries.find(value=>value.id===entryId);

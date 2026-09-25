@@ -16,7 +16,9 @@
   }
 
   // Одинаковой считается запись того же вида, того же ящика, с тем же текстом
-  // и тем же действием - повтор такой записи новой строки не заводит.
+  // и тем же действием - повтор такой записи новой строки не заводит. Ключ key
+  // различает записи с одинаковым текстом, но разным предметом действия: две
+  // отправки с одной темой - это две отмены, а не одна.
   function fingerprint(item) {
     return JSON.stringify([
       item.level || 'info',
@@ -24,7 +26,27 @@
       item.accountId ?? null,
       item.text || '',
       item.action || '',
+      item.key ?? null,
     ]);
+  }
+
+  // Действие повторной записи. Пока прежнее действие выполняется, его не
+  // трогаем: иначе повтор сообщения снял бы ожидание и разрешил второе нажатие.
+  // Иначе действие берётся из нового события - в том числе заново появляется у
+  // записи, чьё прежнее действие уже выполнено.
+  function repeatAction(entry, item, callbacks) {
+    if (entry.actionState === 'pending') return {};
+    return {
+      level: item.level || entry.level,
+      hasAction: Boolean(item.hasAction),
+      action: item.action,
+      actionLabel: item.actionLabel,
+      retryAt: item.retryAt ?? null,
+      actionUntil: item.actionUntil ?? null,
+      callbacks,
+      actionState: '',
+      actionStatus: '',
+    };
   }
 
   function trim(entries, capacity) {
@@ -63,9 +85,8 @@
           : grouped.text,
         count: included ? grouped.count + 1 : grouped.count,
         time: now,
-        actionState: '',
-        actionStatus: '',
       };
+      Object.assign(merged, repeatAction(grouped, item, merged.callbacks));
       const rest = entries.filter(entry => entry.id !== grouped.id);
       return {log: {entries: trim([merged, ...rest], capacity), sequence, unseenError}, id: merged.id, merged: true};
     }
@@ -75,12 +96,9 @@
       const merged = {
         ...repeated,
         details: item.details || repeated.details,
-        callbacks: (item.callbacks || [item.callback]).filter(Boolean),
-        actionUntil: item.actionUntil ?? null,
         count: repeated.count + 1,
         time: now,
-        actionState: '',
-        actionStatus: '',
+        ...repeatAction(repeated, item, (item.callbacks || [item.callback]).filter(Boolean)),
       };
       const rest = entries.filter(entry => entry.id !== repeated.id);
       return {log: {entries: trim([merged, ...rest], capacity), sequence, unseenError}, id: merged.id, merged: true};
@@ -139,9 +157,14 @@
           actionState: 'success', actionStatus: outcome.text, time: now};
       }
       const item = outcome.item || {};
-      return {...entry, ...item, id: entry.id, level: item.level || 'error',
+      const failed = {...entry, ...item, id: entry.id, level: item.level || 'error',
         callbacks: (item.callbacks || [item.callback]).filter(Boolean),
         actionState: 'failed', actionStatus: '', time: now};
+      delete failed.callback;
+      // Запись сменила текст и вид - ключ повтора считается заново, иначе
+      // повтор прежней причины склеился бы с записью уже другой причины.
+      failed.fingerprint = fingerprint(failed);
+      return failed;
     });
     if (!outcome.ok) next.unseenError = true;
     return next;
