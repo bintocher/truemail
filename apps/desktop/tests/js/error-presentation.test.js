@@ -251,6 +251,27 @@ test('после отказа действия повтор прежней пр�
   assert.deepEqual(log.entries.map(entry => entry.text), ['Таймаут', 'Нужно войти']);
 });
 
+test('новая причина после отказа не наследует ключ и срок прежнего действия', () => {
+  let log = add(createLog(), {level: 'info', kind: 'notice', text: 'Отправка через 3 с', action: 'undo', hasAction: true, callback: () => {}, key: 'send-1-8', actionUntil: 5000}, 1000);
+  const id = log.entries[0].id;
+  const reason = {kind: 'timeout', text: 'Сервер не ответил', action: 'retry', hasAction: true, callback: () => {}};
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: false, item: reason}, 6000);
+  assert.equal(actionAvailable(log.entries[0], 6000), true, 'истёкшее окно отмены не переходит к новой причине');
+  log = add(log, {...reason, level: 'error'}, 7000);
+  assert.equal(log.entries.length, 1, 'повтор той же причины склеивается с ней');
+});
+
+test('объединённая запись после выполненного действия берёт обработчик нового события', () => {
+  const old = () => {};
+  const fresh = () => {};
+  let log = addEntry(createLog(), grouped('one', 1, 'one@example.com', {hasAction: true, callback: old}), 1000, null, formatAccounts).log;
+  const id = log.entries[0].id;
+  log = finishAction(beginAction(log, id, 'ждём'), id, {ok: true, text: 'готово'}, 2000);
+  log = addEntry(log, grouped('one', 1, 'one@example.com', {hasAction: true, callback: fresh}), 3000, null, formatAccounts).log;
+  assert.deepEqual(log.entries[0].callbacks, [fresh]);
+  assert.equal(actionAvailable(log.entries[0], 3000), true);
+});
+
 test('действие с истёкшим сроком недоступно, запись остаётся строкой истории', () => {
   const log = add(createLog(), {level: 'info', kind: 'notice', text: 'Письмо перемещено', action: 'undo', hasAction: true, callback: () => {}, actionUntil: 5000}, 1000);
   assert.equal(actionAvailable(log.entries[0], 4999), true);

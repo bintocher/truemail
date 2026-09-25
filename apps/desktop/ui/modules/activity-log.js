@@ -74,9 +74,14 @@
         ...grouped,
         accounts,
         accountIds: included ? grouped.accountIds : [...grouped.accountIds, item.accountId],
-        callbacks: included
-          ? grouped.callbacks
-          : [...grouped.callbacks, ...(item.callbacks || [item.callback]).filter(Boolean)],
+        // После завершённого действия прежние обработчики своё отработали:
+        // новое событие приносит свой. Иначе - обработчик нового ящика
+        // дописывается, а повтор уже учтённого ящика второй не заводит (G3).
+        callbacks: grouped.actionState && grouped.actionState !== 'pending'
+          ? (item.callbacks || [item.callback]).filter(Boolean)
+          : included
+            ? grouped.callbacks
+            : [...grouped.callbacks, ...(item.callbacks || [item.callback]).filter(Boolean)],
         // Подробности относились к первому ящику и вводили бы в заблуждение
         // насчёт второго - у объединённой записи их нет (G4).
         details: included ? grouped.details : '',
@@ -157,7 +162,11 @@
           actionState: 'success', actionStatus: outcome.text, time: now};
       }
       const item = outcome.item || {};
+      // Ключ предмета и сроки относились к прежнему действию: у новой причины
+      // свои, иначе она не склеилась бы со своим повтором и получила бы чужое
+      // истёкшее окно отмены.
       const failed = {...entry, ...item, id: entry.id, level: item.level || 'error',
+        key: item.key ?? null, actionUntil: item.actionUntil ?? null, retryAt: item.retryAt ?? null,
         callbacks: (item.callbacks || [item.callback]).filter(Boolean),
         actionState: 'failed', actionStatus: '', time: now};
       delete failed.callback;

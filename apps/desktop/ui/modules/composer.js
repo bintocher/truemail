@@ -211,7 +211,11 @@ window.logActivity=logActivity;
 })();
 function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {level:'error',kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,locale:presented.locale,translations};}
 function showApiError(error,context={}){return logActivity(errorToastItem(error,context));}
-function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action});}
+// Сообщение с действием - это отдельная операция со своим обработчиком: два
+// переноса с одинаковым текстом дают две отмены, а не одну. Поэтому у него
+// собственный ключ предмета, и склеиваются только сообщения без действия.
+let activityActionSequence=0;
+function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action,key:action?`action-${++activityActionSequence}`:null});}
 window.showApiError=showApiError;
 // Одна беда одного ящика - одно сообщение: без этого при каждом проходе
 // счётчик повторов рос до десятков, а нового человеку не сообщалось (issue #77).
