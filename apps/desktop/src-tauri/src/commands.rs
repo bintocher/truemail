@@ -90,6 +90,12 @@ pub struct AppState {
     // Arc - ConnectAttemptGuard клонирует ссылку на реестр, чтобы снять свою
     // запись из отдельной задачи в Drop (async-освобождение при синхронном drop).
     pub connecting_addresses: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    // Отправители отмены ожидания OAuth-кода (доработка к S-009): ключ -
+    // адрес почты. Позволяет пользователю прервать ожидание в браузере, не
+    // дожидаясь внутреннего предела receive_oauth_callback - раньше закрытие
+    // вкладки браузера никак не сообщалось программе, и адрес оставался
+    // занят ConnectAttemptGuard до истечения этого предела.
+    pub oauth_cancel: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
     // Сколько проходов синхронизации почты подряд закончились сбоем у каждого
     // аккаунта (error-kinds-and-messages.md, S-022, S-024). Пока повторы не
     // исчерпаны, временный сбой не всплывает: программа сама переподключается,
@@ -5593,12 +5599,50 @@ fn microsoft_client_id() -> CmdResult<String> {
     })
 }
 
+/// Регистрирует отправитель отмены на время ожидания OAuth-кода и снимает
+/// его при завершении (успех, ошибка, предел времени или сама отмена) -
+/// иначе отменённая или истёкшая попытка оставила бы в реестре "мёртвый"
+/// отправитель, который cancel_account_connect молча нашёл бы и дёрнул бы
+/// впустую при следующей попытке того же адреса.
+struct OAuthCancelSlot {
+    registry: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+    email: String,
+}
+
+impl OAuthCancelSlot {
+    async fn register(
+        registry: &Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>,
+        email: &str,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        registry.lock().await.insert(email.to_owned(), sender);
+        (
+            Self {
+                registry: registry.clone(),
+                email: email.to_owned(),
+            },
+            receiver,
+        )
+    }
+}
+
+impl Drop for OAuthCancelSlot {
+    fn drop(&mut self) {
+        let registry = self.registry.clone();
+        let email = std::mem::take(&mut self.email);
+        tokio::spawn(async move {
+            registry.lock().await.remove(&email);
+        });
+    }
+}
+
 async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
     provider: &str,
+    cancel: tokio::sync::oneshot::Receiver<()>,
 ) -> CmdResult<String> {
-    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+    let accept_loop = tokio::time::timeout(std::time::Duration::from_secs(300), async {
         loop {
             let (mut stream, _) = listener.accept().await.map_err(|error| ApiError {
                 message: format!("не удалось принять OAuth callback: {error}"),
@@ -5658,11 +5702,18 @@ async fn receive_oauth_callback(
                 return Ok(code);
             }
         }
-    })
-    .await
-    .map_err(|_| ApiError {
-        message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
-    })?
+    });
+    tokio::select! {
+        result = accept_loop => result.map_err(|_| ApiError {
+            message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
+        })?,
+        // Пользователь нажал "Отмена", не дождавшись входа в браузере (или
+        // закрыл его вкладку и не стал продолжать) - останавливаем ожидание
+        // немедленно, не дожидаясь предела в 300 секунд выше.
+        _ = cancel => Err(ApiError {
+            message: format!("Подключение {provider} отменено."),
+        }),
+    }
 }
 
 fn connected_response(connected: truemail_core::account::ConnectedAccountSync) -> ConnectedAccount {
@@ -6051,11 +6102,15 @@ pub async fn begin_account_connection(
                 open_in_yandex_browser(&app, &url)?;
                 // S-009: время, пока пользователь входит в браузере, не считается
                 // в общий предел команды - у ожидания свой предел (300 секунд)
-                // внутри receive_oauth_callback.
+                // внутри receive_oauth_callback, а до этого предела позволяет
+                // прерваться cancel_account_connect.
                 stage.set("waiting_code");
                 emit_connect_stage(&app, &email, "waiting_code", attempt_id);
-                let code =
-                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+                let (_cancel_slot, cancel_rx) =
+                    OAuthCancelSlot::register(&state.oauth_cancel, &email).await;
+                let code = Zeroizing::new(
+                    receive_oauth_callback(listener, &oauth_state, "Яндекс", cancel_rx).await?,
+                );
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
@@ -6112,8 +6167,11 @@ pub async fn begin_account_connection(
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
                 emit_connect_stage(&app, &email, "waiting_code", attempt_id);
-                let code =
-                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
+                let (_cancel_slot, cancel_rx) =
+                    OAuthCancelSlot::register(&state.oauth_cancel, &email).await;
+                let code = Zeroizing::new(
+                    receive_oauth_callback(listener, &oauth_state, "Google", cancel_rx).await?,
+                );
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
@@ -6172,8 +6230,10 @@ pub async fn begin_account_connection(
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
                 emit_connect_stage(&app, &email, "waiting_code", attempt_id);
+                let (_cancel_slot, cancel_rx) =
+                    OAuthCancelSlot::register(&state.oauth_cancel, &email).await;
                 let code = Zeroizing::new(
-                    receive_oauth_callback(listener, &oauth_state, "Microsoft").await?,
+                    receive_oauth_callback(listener, &oauth_state, "Microsoft", cancel_rx).await?,
                 );
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
@@ -6516,6 +6576,21 @@ pub async fn complete_yandex_oauth(
         log_connect_failure("yandex_oauth", "checking_server", started, &email, error);
     }
     outcome
+}
+
+/// Прерывает ожидание OAuth-кода в браузере для указанного адреса, если оно
+/// ещё активно - освобождает занятый локальный порт и запись в
+/// connecting_addresses (S-015) немедленно, не дожидаясь внутреннего предела
+/// receive_oauth_callback. Если ожидание уже завершилось (успех, ошибка,
+/// предел времени) или не запускалось, тихо ничего не делает: отправитель к
+/// этому моменту уже снят из реестра самим OAuthCancelSlot.
+#[tauri::command]
+pub async fn cancel_account_connect(state: State<'_, AppState>, email: String) -> CmdResult<()> {
+    let email = email.trim().to_lowercase();
+    if let Some(sender) = state.oauth_cancel.lock().await.remove(&email) {
+        let _ = sender.send(());
+    }
+    Ok(())
 }
 
 /// Список инструментов внешнего API (для справки/настроек).

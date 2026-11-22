@@ -1115,9 +1115,9 @@ window.setConnectBusy=setConnectBusy;
 // и к тому же номеру попытки (F7) - иначе поздний или чужой (другой адрес,
 // другое окно, прежняя попытка того же адреса) этап тронул бы не тот экран.
 const CONNECT_STAGE_TARGETS=[
-  {emailField:'wzEmail',button:'wzConnect',status:'wzConnectStatus'},
+  {emailField:'wzEmail',button:'wzConnect',status:'wzConnectStatus',cancel:'wzConnectCancel'},
   {emailField:'wzEmail',button:'wzConfirm',status:'wzConnectStatus'},
-  {emailField:'accountEmail',button:'accountOauthStart',status:'accountOauthStatus'},
+  {emailField:'accountEmail',button:'accountOauthStart',status:'accountOauthStatus',cancel:'accountOauthCancel'},
   {emailField:'accountEmail',button:'accountPasswordConfirm',status:'accountOauthStatus'},
   {emailField:'accountEmail',button:'accountOauthConfirm',status:'accountOauthStatus'},
 ];
@@ -1125,7 +1125,7 @@ window.handleConnectStage=function(payload){
   if(!payload||!payload.stage)return;
   const email=String(payload.email||'').trim().toLowerCase();
   if(!email)return;
-  CONNECT_STAGE_TARGETS.forEach(({emailField,button,status})=>{
+  CONNECT_STAGE_TARGETS.forEach(({emailField,button,status,cancel})=>{
     const buttonEl=document.getElementById(button);
     // dataset.connectLabel стоит только пока кнопка в состоянии ожидания
     // (setConnectBusy) - иначе эта попытка на этой кнопке уже не активна.
@@ -1136,8 +1136,33 @@ window.handleConnectStage=function(payload){
     const fieldEl=document.getElementById(emailField);
     if(!fieldEl||fieldEl.value.trim().toLowerCase()!==email)return;
     setConnectBusy(buttonEl,document.getElementById(status),payload.stage,true,payload.attempt_id);
+    // Кнопка отмены видна только на этапе ожидания кода OAuth в браузере -
+    // именно он не ограничен общим пределом команды (S-009) и может
+    // затянуться на весь внутренний предел receive_oauth_callback, если
+    // пользователь закрыл вкладку браузера без входа.
+    if(cancel){
+      const cancelEl=document.getElementById(cancel);
+      if(cancelEl){
+        cancelEl.classList.toggle('hidden',payload.stage!=='waiting_code');
+        cancelEl.disabled=false;
+        cancelEl.dataset.connectEmail=email;
+      }
+    }
   });
 };
+// Останавливает ожидание кода OAuth в Rust и сразу освобождает занятый порт
+// и адрес почты (cancel_account_connect) - без этого попытку того же адреса
+// нельзя было начать повторно до истечения внутреннего предела в 300 секунд.
+async function cancelPendingOauth(cancelId){
+  const el=document.getElementById(cancelId);
+  const email=el?.dataset.connectEmail;
+  if(!email)return;
+  el.disabled=true;
+  try{await window.tm?.cancelAccountConnect?.(email);}
+  finally{el.classList.add('hidden');}
+}
+document.getElementById('wzConnectCancel').onclick=()=>cancelPendingOauth('wzConnectCancel');
+document.getElementById('accountOauthCancel').onclick=()=>cancelPendingOauth('accountOauthCancel');
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));document.getElementById('accountTlsField')?.classList.toggle('hidden',exchange||jmap);if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
@@ -1159,7 +1184,7 @@ document.getElementById('accountOauthStart').onclick=async()=>{
     // экране, а не только когда попытка ещё актуальна.
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);
+    setConnectBusy(button,null,null,false);document.getElementById('accountOauthCancel').classList.add('hidden');
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
     if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается, а
@@ -1169,7 +1194,7 @@ document.getElementById('accountOauthStart').onclick=async()=>{
   catch(e){
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+    setConnectBusy(button,null,null,false);document.getElementById('accountOauthCancel').classList.add('hidden');status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
 document.getElementById('accountPasswordConfirm').onclick=async()=>{
@@ -1230,7 +1255,7 @@ document.getElementById('wzConnect').onclick=async()=>{
     // переоткрыться с другим номером попытки.
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);
+    setConnectBusy(button,null,null,false);document.getElementById('wzConnectCancel').classList.add('hidden');
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
     if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается (уже
@@ -1239,7 +1264,7 @@ document.getElementById('wzConnect').onclick=async()=>{
   }catch(e){
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+    setConnectBusy(button,null,null,false);document.getElementById('wzConnectCancel').classList.add('hidden');status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
 document.getElementById('wzConfirm').onclick=async()=>{
