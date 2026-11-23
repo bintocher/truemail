@@ -357,12 +357,12 @@ type MessageContentCacheRow = (
     i64,
 );
 
-/// Addresses of a parsed header, groups included; an address is listed once.
-fn parsed_addresses(value: Option<&mail_parser::Address<'_>>) -> Vec<Addr> {
+/// Addresses of parsed header fields with one name, groups included; an
+/// address is listed once.
+fn parsed_address_list<'a>(
+    values: impl Iterator<Item = &'a mail_parser::Address<'a>>,
+) -> Vec<Addr> {
     let mut out: Vec<Addr> = Vec::new();
-    let Some(value) = value else {
-        return out;
-    };
     let mut push = |addr: &mail_parser::Addr<'_>| {
         let Some(address) = addr
             .address
@@ -388,12 +388,14 @@ fn parsed_addresses(value: Option<&mail_parser::Address<'_>>) -> Vec<Addr> {
             email: address.to_owned(),
         });
     };
-    match value {
-        mail_parser::Address::List(list) => list.iter().for_each(&mut push),
-        mail_parser::Address::Group(groups) => groups
-            .iter()
-            .flat_map(|group| group.addresses.iter())
-            .for_each(&mut push),
+    for value in values {
+        match value {
+            mail_parser::Address::List(list) => list.iter().for_each(&mut push),
+            mail_parser::Address::Group(groups) => groups
+                .iter()
+                .flat_map(|group| group.addresses.iter())
+                .for_each(&mut push),
+        }
     }
     out
 }
@@ -3800,9 +3802,15 @@ impl Db {
                     );
                     // Only the source of a picture tag counts: the letter builder
                     // takes pictures from there and from nowhere else.
+                    // Only a picture the letter builder can embed goes into the
+                    // body: any other part stays an attachment.
+                    let embeddable = mime_type
+                        .as_deref()
+                        .is_some_and(crate::backend::is_inline_image_type);
                     let (linked, replaced) = crate::backend::replace_img_sources(html, |source| {
-                        (source.eq_ignore_ascii_case(&format!("cid:{id}"))
-                            || source.eq_ignore_ascii_case(&format!("cid:<{id}>")))
+                        (embeddable
+                            && (source.eq_ignore_ascii_case(&format!("cid:{id}"))
+                                || source.eq_ignore_ascii_case(&format!("cid:<{id}>"))))
                         .then(|| data.clone())
                     });
                     embedded = replaced > 0;
@@ -3894,7 +3902,7 @@ impl Db {
             .await?;
         }
         let bcc = if is_draft {
-            parsed_addresses(parsed.as_ref().and_then(|message| message.bcc()))
+            parsed_address_list(parsed.iter().flat_map(|message| message.all_bcc()))
         } else {
             Vec::new()
         };
@@ -3924,8 +3932,8 @@ impl Db {
         let parsed = normalized
             .as_deref()
             .and_then(|bytes| MessageParser::default().parse_headers(bytes));
-        Ok(parsed_addresses(
-            parsed.as_ref().and_then(|message| message.bcc()),
+        Ok(parsed_address_list(
+            parsed.iter().flat_map(|message| message.all_bcc()),
         ))
     }
 

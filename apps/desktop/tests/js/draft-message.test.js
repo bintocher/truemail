@@ -25,7 +25,8 @@ const DRAFT = {id: 21, account_id: 2, folder_id: 3, subject: 'Не отправ�
 const INCOMING2 = {...INCOMING, id: 12, subject: 'Тема B', from: {name: 'Bob', email: 'bob@example.test'}, date: '2026-11-23T11:00:00Z'};
 // No draft flag and no recipient: the folder alone tells that it is a draft.
 const UNADDRESSED = {...DRAFT, id: 22, to: [], flags: {seen: true, flagged: false, draft: false}};
-const LETTERS = {11: INCOMING, 12: INCOMING2, 21: DRAFT, 22: UNADDRESSED};
+const INCOMING3 = {...INCOMING, id: 13, subject: 'Тема C', date: '2026-11-23T08:00:00Z'};
+const LETTERS = {11: INCOMING, 12: INCOMING2, 13: INCOMING3, 21: DRAFT, 22: UNADDRESSED};
 
 const fullOf = id => ({
   meta: LETTERS[id],
@@ -637,6 +638,9 @@ test('S-029: the editor keeps the text outside elements, plain styles and plain 
   const clean = html => ui.evaluate(`window.editorSafeHtml(${JSON.stringify(html)})`);
   assert.equal(clean('Позвоните в пятницу'), 'Позвоните в пятницу', 'the text outside elements was lost');
   assert.equal(clean('До<p>Середина</p>После'), 'До<p>Середина</p>После', 'the text next to elements was lost');
+  // A form, a button and the like are shells around ordinary text: the shell goes, the text stays.
+  assert.equal(clean('До<form><p>Номер заказа 42</p></form>После<button>Отправить</button>'), 'До<p>Номер заказа 42</p>ПослеОтправить', 'the text inside a form was lost with the form');
+  assert.equal(clean('<p contenteditable="false" tabindex="5" draggable="true">x</p>'), '<p>x</p>', 'an attribute that changes the work of the editor stayed');
   // A style that names an outside picture, hides a property behind an escape or lays the body over the program goes;
   // the look of the text, of its frame and of the space around it stays.
   const styled = '<p style="color:red;list-style-image:url(https://tracker.example.test/p.png);position:fixed;top:0">x</p>'
@@ -851,4 +855,183 @@ test('S-017: a late show of the accepted draft does not bring it back', async ()
   await settle();
   assert.equal(ui.byId('tbody').innerHTML, '', 'the accepted draft came back over the empty subject');
   assert.equal(ui.evaluate('paneLetter()'), null, 'the accepted draft is the shown letter again');
+});
+
+test('S-002: an empty reading pane has no active letter for the buttons to act on', async () => {
+  const ui = await openMail();
+  await openLetter(ui, 21);
+  // Another folder: the shown draft is not in its list, and the pane is cleared.
+  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
+  ui.query('.thead [data-act="archive"]').dispatch('click');
+  await settle();
+  assert.equal(ui.callsOf('messageAction').length, 0, 'a button of the empty pane acted on a letter that is not on the screen');
+  // With a selection in the list the same button acts on the selection, as it always did.
+  ui.evaluate('selectedMessageIds.add(11);selectedMessageIds.add(12)');
+  ui.query('.thead [data-act="archive"]').dispatch('click');
+  await settle();
+  assert.deepEqual(trashed(ui), [[[11, 12], 'archive']], 'the button lost the selection of the list');
+});
+
+test('S-019: a late answer for another letter does not open the scheduled letter again', async () => {
+  let releaseSend = null;
+  const ui = await openMail({
+    sendMessage: () => new Promise(resolve => { releaseSend = resolve; }),
+    scheduleMessage: () => 77,
+  });
+  await openLetter(ui, 22);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  ui.evaluate("setRecipients('compTo',['mate@example.test'])");
+  ui.byId('compSend').onclick();
+  await settle();
+  // Another letter of the editor is scheduled while the queue answers the first one.
+  ui.evaluate("document.getElementById('composeBtn').onclick()");
+  await settle();
+  ui.evaluate("setRecipients('compTo',['other@example.test']);document.getElementById('compSubj').value='Другое';const at=document.getElementById('compSendAt');at.classList.remove('hidden');at.value='2030-01-01T09:00';");
+  ui.byId('compSendLater').onclick();
+  await settle();
+  releaseSend({account_id: 1, operation_id: 501, cancel_until: null});
+  await settle();
+  ui.byId('compSend').onclick();
+  ui.byId('compSendLater').onclick();
+  await settle();
+  assert.equal(ui.callsOf('sendMessage').length, 1, 'the scheduled letter went to the queue a second time');
+  assert.equal(ui.callsOf('scheduleMessage').length, 1, 'the scheduled letter was scheduled a second time');
+  assert.equal(ui.byId('compSubj').value, 'Другое', 'the answer for the old letter wiped the new one');
+});
+
+test('S-019: the answer for an old letter does not cancel the saving of a new one', async () => {
+  let releaseSend = null;
+  const ui = await openMail({sendMessage: () => new Promise(resolve => { releaseSend = resolve; })});
+  await openLetter(ui, 22);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  ui.evaluate("setRecipients('compTo',['mate@example.test'])");
+  ui.byId('compSend').onclick();
+  await settle();
+  // A new letter is being written, and its saving is due in half a second.
+  ui.evaluate("document.getElementById('composeBtn').onclick()");
+  await settle();
+  ui.evaluate("setRecipients('compTo',['other@example.test']);document.getElementById('compSubj').value='Письмо B';scheduleDraftSave();");
+  releaseSend({account_id: 1, operation_id: 501, cancel_until: null});
+  await settle();
+  const savedCopy = () => {
+    const call = ui.callsOf('setSetting').filter(item => item.args[0] === 'composer_draft').at(-1);
+    return call ? call.args[1] : null;
+  };
+  const rightAfter = JSON.parse(savedCopy());
+  assert.equal(rightAfter.subject, 'Письмо B', 'the copy of the sent letter stayed in place of the new one');
+  await ui.clock.advance(600);
+  const later = JSON.parse(savedCopy());
+  assert.equal(later.subject, 'Письмо B', 'the saving of the new letter was cancelled by the answer for the old one');
+});
+
+test('S-033: a letter opened while an action of the menu runs stays the one on the screen', async () => {
+  let release = null;
+  const ui = await openMail({messageAction: () => new Promise(resolve => { release = resolve; })});
+  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
+  await openLetter(ui, 11);
+  openListMenu(ui, 12);
+  ui.query('#ctxmenu [data-context-action="trash"]').dispatch('click');
+  await settle();
+  await openLetter(ui, 13);
+  release({operation_ids: [1012], skipped: 0});
+  await settle();
+  assert.equal(ui.evaluate('paneLetter()?.id'), 13, 'the letter on the screen was cleared by the action on another letter');
+  assert.equal(ui.evaluate('activeMessage.id'), 13, 'the letter shown before the action became the active one again');
+});
+
+test('S-012: the link of a restored letter goes only to a letter that is still a draft', async () => {
+  const ui = await openMail();
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:1,to:[{name:'Mate',email:'mate@example.test'}],cc:[],bcc:[],subject:'Письмо',body_html:'<p>Текст письма</p>',attachments:[],draft_message_id:11};renderAccountSettings(coreAccounts,[],[])");
+  await settle();
+  await ui.byId('compSend').onclick();
+  await settle();
+  assert.equal(sent(ui).length, 1);
+  assert.equal(trashed(ui).length, 0, 'an incoming letter was moved to Trash as if it were the draft');
+
+  // Nothing is sent before the check of the draft has answered.
+  let release = null;
+  const slow = await openMail({getMessage: id => (id === 22 ? new Promise(resolve => { release = resolve; }) : fullOf(id))});
+  slow.evaluate("resetComposer();window.pendingComposerDraft={account_id:2,to:[{name:'Mate',email:'mate@example.test'}],cc:[],bcc:[],subject:'Не отправлено',body_html:'<p>Текст письма</p>',attachments:[],draft_message_id:22};renderAccountSettings(coreAccounts,[],[])");
+  slow.byId('compSend').onclick();
+  await settle();
+  assert.equal(sent(slow).length, 0, 'the letter went out before the check of its draft answered');
+  release(fullOf(22));
+  await settle();
+  assert.deepEqual(trashed(slow), [[[22], 'trash']], 'the draft stayed in its folder');
+});
+
+test('S-010: a restored letter keeps the empty text part until the body is typed into', async () => {
+  const ui = await openMail();
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:2,to:[{name:'Mate',email:'mate@example.test'}],cc:[],bcc:[],subject:'Письмо',body_html:'<p>Только HTML</p>',attachments:[],text_missing:true};renderAccountSettings(coreAccounts,[],[])");
+  assert.equal(ui.evaluate('composerRequest().body_text'), '', 'the restored letter got a text part made from the markup');
+  ui.byId('compEdit').dispatch('input');
+  assert.equal(ui.evaluate('composerRequest().body_text'), 'Только HTML', 'the typed letter lost its text part');
+});
+
+test('S-025: the fields of the copy stay hidden after the restore when they hold no address', async () => {
+  const ui = await openMail();
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:1,to:[{name:'',email:'a@example.test'}],cc:[],bcc:[{name:'',email:'b@example.test'}],subject:'',body_html:'',attachments:[]};renderAccountSettings(coreAccounts,[],[])");
+  assert.equal(ui.query('[data-recipient-field="compCc"]').classes.has('hidden'), true, 'the empty field of the copy was shown');
+  assert.equal(ui.query('[data-recipient-field="compBcc"]').classes.has('hidden'), false, 'the field of the hidden copy with an address stayed hidden');
+});
+
+test('S-024: a name with a bracket survives the way through the editor', async () => {
+  const ui = await openMail({
+    getMessage: id => ({...fullOf(id), meta: {...LETTERS[id], to: [{name: 'Dev (East', email: 'mate@example.test'}]}, attachments: [part(0)]}),
+    attachmentContent: () => Promise.reject(new Error('вложение не читается')),
+  });
+  await openLetter(ui, 21);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  assert.equal(ui.evaluate('recipientModel.compTo[0]?.name'), 'Dev (East', 'the name with a bracket was cut into a wrong address');
+  assert.equal(ui.evaluate('recipientModel.compTo[0]?.email'), 'mate@example.test', 'the address next to a name with a bracket was damaged');
+  await ui.byId('compSend').onclick();
+  await settle();
+  assert.deepEqual([...sent(ui)[0].to], ['"Dev (East" <mate@example.test>'], 'the name with a bracket is not sent as one address');
+});
+
+test('S-036: snoozing from the list menu takes the letter under the cursor, not another selection', async () => {
+  const ui = await openMail({snoozeMessages: () => ({})});
+  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
+  await openLetter(ui, 11);
+  ui.evaluate('selectedMessageIds.add(11)');
+  openListMenu(ui, 12);
+  ui.query('#ctxmenu [data-context-action="snooze"]').dispatch('click');
+  await settle();
+  ui.query('.snooze-modal [data-offset="hour"]').dispatch('click');
+  await settle();
+  assert.deepEqual(ui.callsOf('snoozeMessages').map(call => [[...call.args[0]]]), [[[12]]], 'the selection was snoozed instead of the letter under the cursor');
+  assert.equal(ui.evaluate('paneLetter()?.id'), 11, 'the letter that was not snoozed left the screen');
+});
+
+test('S-036: the list menu of a row acts on the letter of that row and on nothing else', async () => {
+  const ui = await openMail();
+  await openLetter(ui, 21);
+  // The letter of the row is forgotten by the list, the row itself is still drawn.
+  ui.evaluate('window.forgetMessages?.([22])');
+  openListMenu(ui, 22);
+  ui.query('#ctxmenu [data-context-action="trash"]').dispatch('click');
+  await settle();
+  assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the menu of the forgotten letter acted on the shown one');
+  // The letter is gone from every list of the program: the menu does not open for its row.
+  ui.evaluate('messages=messages.filter(message=>message.id!==21);currentMessageRows=currentMessageRows.filter(message=>message?.id!==21);lastListRows=lastListRows.filter(message=>message?.id!==21);');
+  const before = ui.callsOf('messageAction').length;
+  ui.query('#msgs .msg[data-message-id="21"]').dispatch('contextmenu', {clientX: 20, clientY: 20});
+  assert.equal(ui.byId('ctxmenu').classes.has('open'), false, 'the menu opened for a letter that is gone');
+  assert.equal(ui.callsOf('messageAction').length, before, 'a command went to another letter from the menu of a letter that is gone');
+});
+
+test('S-014: a failure to clear the saved copy after the ordinary sending is written to the log', async () => {
+  const ui = await openMail({setSetting: (key, value) => (key === 'composer_draft' && value === '' ? Promise.reject(new Error('хранилище недоступно')) : null)});
+  await openLetter(ui, 22);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  ui.evaluate("setRecipients('compTo',['mate@example.test'])");
+  await ui.byId('compSend').onclick();
+  await settle();
+  assert.equal(sent(ui).length, 1);
+  assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the draft stayed in its folder');
+  assert.ok(ui.callsOf('uiLog').some(call => /was not cleared/.test(call.args[0])), 'the failure to clear the saved copy is not written to the log');
 });

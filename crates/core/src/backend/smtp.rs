@@ -38,13 +38,19 @@ pub struct OutgoingMessage {
 
 /// Поддерживаемые типы встроенных картинок (S-004, S-035): svg+xml намеренно
 /// не входит - это разметка, которая может содержать исполняемый код.
-const SUPPORTED_INLINE_IMAGE_TYPES: [&str; 5] = [
+pub(crate) const SUPPORTED_INLINE_IMAGE_TYPES: [&str; 5] = [
     "image/png",
     "image/jpeg",
     "image/gif",
     "image/webp",
     "image/bmp",
 ];
+
+/// Whether the letter builder can put a picture of this type into the letter
+/// as an embedded part.
+pub fn is_inline_image_type(mime_type: &str) -> bool {
+    SUPPORTED_INLINE_IMAGE_TYPES.contains(&mime_type.to_ascii_lowercase().as_str())
+}
 
 /// Картинка, вынесенная из текста письма в отдельную часть (S-028).
 struct InlineImagePart {
@@ -55,20 +61,85 @@ struct InlineImagePart {
 
 /// Ищет следующий тег `<img` начиная с `from`, независимо от регистра букв
 /// (S-041). Возвращает байтовое смещение символа `<`.
+/// The elements whose content is text for the parser, not markup: a tag named
+/// inside them is not a tag.
+const RAW_TEXT_TAGS: [&[u8]; 4] = [b"script", b"style", b"textarea", b"title"];
+
+fn starts_with(bytes: &[u8], at: usize, text: &[u8]) -> bool {
+    bytes
+        .get(at..at + text.len())
+        .is_some_and(|part| part.eq_ignore_ascii_case(text))
+}
+
+fn find_bytes(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes[from.min(bytes.len())..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| from + position)
+}
+
+/// The name of a tag that opens a raw text element starts at `name_start`:
+/// the position after the `>` of its closing tag, or `None` when the element is
+/// not one of them or is never closed.
+fn raw_text_end(bytes: &[u8], name_start: usize) -> Option<Option<usize>> {
+    let name = RAW_TEXT_TAGS.iter().find(|name| {
+        starts_with(bytes, name_start, name)
+            && bytes
+                .get(name_start + name.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+    })?;
+    let mut from = name_start;
+    loop {
+        let close = find_bytes(bytes, from + 1, b"</")?;
+        if starts_with(bytes, close + 2, name) {
+            let end = find_bytes(bytes, close + 2, b">")?;
+            return Some(Some(end));
+        }
+        from = close;
+    }
+}
+
+/// Ищет начало `<img` тега: за ним идёт пробел, `/` или `>`. Комментарий,
+/// содержимое script, style, textarea и title и другой тег целиком пропускаются,
+/// поэтому имя тега в них или в значении атрибута тегом не считается.
 pub(crate) fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
-    while i + 4 <= bytes.len() {
-        if bytes[i] == b'<'
-            && bytes[i + 1].eq_ignore_ascii_case(&b'i')
-            && bytes[i + 2].eq_ignore_ascii_case(&b'm')
-            && bytes[i + 3].eq_ignore_ascii_case(&b'g')
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let next = bytes.get(i + 1).copied().unwrap_or(0);
+        if next == b'!' {
+            // A comment that is never closed hides the rest of the markup.
+            i = find_bytes(bytes, i + 2, b"-->")? + 3;
+            continue;
+        }
+        if next != b'/' && !next.is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let name_start = if next == b'/' { i + 2 } else { i + 1 };
+        let is_img = starts_with(bytes, name_start, b"img")
             && bytes
-                .get(i + 4)
-                .is_some_and(|b| b.is_ascii_whitespace() || *b == b'/' || *b == b'>')
-        {
+                .get(name_start + 3)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>');
+        if is_img && next != b'/' {
             return Some(i);
         }
-        i += 1;
+        if next != b'/' {
+            match raw_text_end(bytes, name_start) {
+                Some(Some(end)) => {
+                    i = end + 1;
+                    continue;
+                }
+                Some(None) => return None,
+                None => {}
+            }
+        }
+        // Another tag is skipped whole: a tag named inside the value of one of
+        // its attributes is not a tag.
+        i = find_tag_end(bytes, i)? + 1;
     }
     None
 }

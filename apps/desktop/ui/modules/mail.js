@@ -565,8 +565,8 @@ function renderMessageList(rows,title,resetScroll=false){
   renderMessageWindow(true);updateSelectionUi();
   // Панель письма очищена - поколение показа растёт вместе с ней: ответ на
   // запрос, начатый до очистки, рисовать уже некуда (S-001).
-  if(!rows.length){document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;messageViewGeneration++;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();}
-  else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id)){document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;messageViewGeneration++;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();}
+  if(!rows.length){document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'No messages':'Писем нет'}</h2></div>`;messageViewGeneration++;activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();}
+  else if(!activeMessage||!rows.some(message=>message.id===activeMessage.id)){document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;messageViewGeneration++;activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();}
 }
 // Общий строитель строк "Кому"/"Копия" шапки письма: тот же отбор адресов, та же
 // свёртка и независимое состояние раскрытия у каждой строки. Возвращает null,
