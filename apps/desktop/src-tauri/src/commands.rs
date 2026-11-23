@@ -2494,12 +2494,10 @@ async fn event_start_from_db(core: &Core, event_id: i64) -> Option<String> {
 /// Кнопка "Закрыть"/пустая очередь: спрятать окно уведомлений.
 #[tauri::command]
 pub fn notify_close(app: AppHandle, has_more: bool) -> CmdResult<()> {
-    if !has_more {
-        if let Some(window) = app.get_webview_window("notify") {
-            let _ = window.hide();
-            // Скрытое прозрачное окно поверх всех не должно ловить курсор.
-            let _ = window.set_ignore_cursor_events(true);
-        }
+    if !has_more && let Some(window) = app.get_webview_window("notify") {
+        let _ = window.hide();
+        // Скрытое прозрачное окно поверх всех не должно ловить курсор.
+        let _ = window.set_ignore_cursor_events(true);
     }
     Ok(())
 }

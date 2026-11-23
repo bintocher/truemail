@@ -12,7 +12,8 @@ edition = "2024"
 license = "AGPL-3.0-or-later"
 authors = ["chernov <bintocher@yandex.com>"]
 repository = "https://github.com/bintocher/truemail"
-rust-version = "1.85"
+# Set by sqlx 0.9.1.
+rust-version = "1.94"
 
 [workspace.dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
@@ -24,7 +25,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.3"
 socket2 = "0.6.5"
-rfd = "0.17.2"
+# rfd's default backend (xdg-portal) cannot be combined with the gtk3 backend
+# enabled by tauri-plugin-dialog.
+rfd = { version = "0.17.2", default-features = false, features = ["gtk3"] }
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite", "macros", "migrate", "chrono"] }
 # SQLx 0.9 требует libsqlite3-sys <0.38. Локальный patch сохраняет совместимый
 # Rust API 0.37.0, но собирает SQLCipher 4.17.0 / SQLite 3.53.3 из vendor.

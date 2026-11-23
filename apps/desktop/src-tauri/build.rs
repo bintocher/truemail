@@ -29,10 +29,10 @@ fn write_ui_version() {
     }
 
     let index = ui.join("index.html");
-    if let Ok(html) = std::fs::read_to_string(&index) {
-        if let Some(updated) = with_version_tag(&html, version) {
-            let _ = std::fs::write(&index, updated);
-        }
+    if let Ok(html) = std::fs::read_to_string(&index)
+        && let Some(updated) = with_version_tag(&html, version)
+    {
+        let _ = std::fs::write(&index, updated);
     }
     println!("cargo:rerun-if-changed=../ui/index.html");
 }
