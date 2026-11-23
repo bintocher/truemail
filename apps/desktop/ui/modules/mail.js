@@ -327,7 +327,7 @@ function expandConversationIds(ids){
 window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.refreshToolbarForMessage?.();window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 // Метки письма в списке (issue #86, specs/message-labels-visible.md). Разбор
 // вынесен в messageLabels: там чистые функции без DOM, их покрывают проверки.
 // Метка "открыта" только когда не открыты папка и умная папка: переход по
@@ -664,6 +664,7 @@ async function showMessage(message){
   let discarded=false;
   const stillCurrent=()=>{const current=messageView.isCurrentView(generation,messageViewGeneration);if(!current&&!discarded){discarded=true;window.tm?.uiLog?.(`показ письма ${message.id} отброшен: поколение ${generation} против ${messageViewGeneration}`);}return current;};
   activeMessage=message;
+  window.refreshToolbarForMessage?.();
   document.getElementById('tSubject').textContent=message.subject||'';const body=document.getElementById('tbody');
   body.innerHTML=`<div class="mail-loading">${L('Загрузка письма…','Loading message…')}</div>`;
   // Признак активной строки и остановка Tab идут вместе: сюда приходят и клик,
@@ -1037,7 +1038,7 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
     // прокрутки.
     currentTagName=previousTag;currentFolderId=null;currentSmartIndex=null;renderTagsNav();window.resetTagPaging?.(previousTag);applyListOptions(false,previousTag);window.loadNextTagPage?.();
   }else filterSmart(previousSmart??0,false);
-  if(previousMessageId&&messages.some(message=>message.id===previousMessageId)){activeMessage=messages.find(message=>message.id===previousMessageId);document.querySelector(`.msg[data-message-id="${previousMessageId}"]`)?.classList.add('active');}else if(previousMessageId){activeMessage=null;activeFullMessage=null;document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;}
+  if(previousMessageId&&messages.some(message=>message.id===previousMessageId)){activeMessage=messages.find(message=>message.id===previousMessageId);window.refreshToolbarForMessage?.();document.querySelector(`.msg[data-message-id="${previousMessageId}"]`)?.classList.add('active');}else if(previousMessageId){activeMessage=null;activeFullMessage=null;window.refreshToolbarForMessage?.();document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML=`<div class="mail-empty"><h2>${wizardLocale==='en'?'Select a message':'Выберите письмо'}</h2></div>`;}
   if(messages.length)document.querySelector('.thread .actions')?.classList.remove('hidden');
   renderContacts(contacts);
   renderCalendarData(calendarData);

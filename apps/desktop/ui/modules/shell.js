@@ -520,6 +520,7 @@ msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=
 /* thread action buttons -> compose */
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
+  else if(b.dataset.act==='send-draft')sendDraftMessage();
   else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
   /* Шапка письма ведёт флажок тем же путём, что строка списка и контекстное
      меню: второй путь спрашивал бы про сроки по-своему (S-005, S-006). */

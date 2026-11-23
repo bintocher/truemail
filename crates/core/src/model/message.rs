@@ -83,6 +83,10 @@ pub struct Attachment {
     pub fetched: bool,
 }
 
+fn body_fetched_by_default() -> bool {
+    true
+}
+
 /// Полное письмо с телом (для просмотра).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageFull {
@@ -90,6 +94,13 @@ pub struct MessageFull {
     pub body_html: Option<String>,
     pub body_text: Option<String>,
     pub attachments: Vec<Attachment>,
+    /// Hidden copy of a draft, read from the letter headers; empty otherwise.
+    #[serde(default)]
+    pub bcc: Vec<Addr>,
+    /// False when only the headers and the preview of the letter are stored;
+    /// answers without the field are treated as complete.
+    #[serde(default = "body_fetched_by_default")]
+    pub body_fetched: bool,
     /// True, если письмо содержит внешние ресурсы (для плашки блокировки).
     pub has_remote_content: bool,
     /// True, если это рассылка (есть заголовок List-Unsubscribe).

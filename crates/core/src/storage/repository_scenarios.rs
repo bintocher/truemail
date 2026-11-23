@@ -417,6 +417,111 @@ async fn a_saved_letter_keeps_its_attachment_body_and_search_entry() {
     db.close().await;
 }
 
+const DRAFT_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nBcc: Hidden One <hidden@example.test>, Friends: friend@example.test;, second@example.test\r\nSubject: Draft\r\n\r\nNot sent yet";
+
+/// A draft keeps its hidden copy on every opening, from a fresh parse and from
+/// the cached one alike, with the flag and by its folder alone; an ordinary
+/// letter reports none. A letter stored as headers only says so.
+#[tokio::test]
+async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
+    let db: TestDb = open_test_db("repo-draft-bcc").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    seed_folder(&db, account, "Drafts", Some("drafts")).await;
+    let letter = |path: &str, uid: u32, draft: bool| DiscoveredMessage {
+        folder_path: path.into(),
+        uid,
+        remote_id: Some(format!("letter-{uid}")),
+        size: Some(DRAFT_LETTER.len() as u32),
+        seen: false,
+        flagged: false,
+        answered: false,
+        draft,
+        raw: DRAFT_LETTER.to_vec(),
+        body_fetched: true,
+        has_attachments: None,
+    };
+    db.save_discovered_messages(
+        account,
+        &[
+            letter("INBOX", 4, false),
+            letter("Drafts", 7, true),
+            letter("Drafts", 8, false),
+        ],
+        false,
+    )
+    .await
+    .expect("save the letters");
+    let hidden = |full: &MessageFull| {
+        full.bcc
+            .iter()
+            .map(|addr| addr.email.clone())
+            .collect::<Vec<_>>()
+    };
+    let reader = db.clone();
+    let bcc_of = |uid: u32| {
+        let reader = reader.clone();
+        async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=?")
+                .bind(uid)
+                .fetch_one(&reader.pool)
+                .await
+                .expect("find the saved letter");
+            hidden(&reader.get_message(id).await.expect("read the letter"))
+        }
+    };
+    let expected = [
+        "hidden@example.test",
+        "friend@example.test",
+        "second@example.test",
+    ];
+
+    assert_eq!(
+        bcc_of(4).await,
+        Vec::<String>::new(),
+        "an ordinary letter has no hidden copy"
+    );
+    assert_eq!(bcc_of(7).await, expected, "first opening parses the header");
+    assert_eq!(
+        bcc_of(7).await,
+        expected,
+        "cached opening keeps the hidden copy"
+    );
+    assert_eq!(
+        bcc_of(8).await,
+        expected,
+        "a draft without the flag lost its hidden copy"
+    );
+    let stored_whole = |uid: u32| {
+        let reader = db.clone();
+        async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=?")
+                .bind(uid)
+                .fetch_one(&reader.pool)
+                .await
+                .expect("find the saved letter");
+            reader
+                .get_message(id)
+                .await
+                .expect("read the letter")
+                .body_fetched
+        }
+    };
+    assert!(
+        stored_whole(4).await,
+        "a whole letter is reported as incomplete"
+    );
+    sqlx::query("UPDATE messages SET body_fetched=0 WHERE uid=7")
+        .execute(&db.write_pool)
+        .await
+        .expect("mark the letter as headers only");
+    assert!(
+        !stored_whole(7).await,
+        "a letter stored as headers only is reported as whole"
+    );
+    db.close().await;
+}
+
 /// Лёгкая проекция письма (сервер отдал только заголовки) не затирает уже
 /// загруженное тело, вложения и отметку полноты. Затерев их, программа
 /// показала бы вместо письма обрывок и потеряла бы вложения. Письмо, которое

@@ -356,6 +356,47 @@ type MessageContentCacheRow = (
     Option<String>,
 );
 
+/// Addresses of a parsed header, groups included; an address is listed once.
+fn parsed_addresses(value: Option<&mail_parser::Address<'_>>) -> Vec<Addr> {
+    let mut out: Vec<Addr> = Vec::new();
+    let Some(value) = value else {
+        return out;
+    };
+    let mut push = |addr: &mail_parser::Addr<'_>| {
+        let Some(address) = addr
+            .address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        if out
+            .iter()
+            .any(|known| known.email.eq_ignore_ascii_case(address))
+        {
+            return;
+        }
+        out.push(Addr {
+            name: addr
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            email: address.to_owned(),
+        });
+    };
+    match value {
+        mail_parser::Address::List(list) => list.iter().for_each(&mut push),
+        mail_parser::Address::Group(groups) => groups
+            .iter()
+            .flat_map(|group| group.addresses.iter())
+            .for_each(&mut push),
+    }
+    out
+}
+
 /// Заголовки правил молчания одного письма: их читает стадия автоответа
 /// (specs/out-of-office.md, S-063).
 struct SilenceHeaders {
@@ -3652,11 +3693,17 @@ impl Db {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::Other("письмо не найдено".into()))?;
-        let (raw_ref,): (Option<String>,) =
-            sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let (raw_ref, body_fetched, folder_role): (Option<String>, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT m.raw_blob_ref, m.body_fetched, f.role
+                   FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
+                  WHERE m.id = ?",
+            )
+            .bind(message_id)
+            .fetch_one(&self.pool)
+            .await?;
+        // The same rule as the interface: a draft is known by its flag or by its folder.
+        let is_draft = meta.flags.draft || folder_role.as_deref() == Some("drafts");
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
@@ -3671,11 +3718,18 @@ impl Db {
             if let Some((body_html, body_text, attachments, remote, newsletter, unsubscribe)) =
                 cached
             {
+                let bcc = if is_draft {
+                    self.draft_bcc(raw_ref.as_deref()).await?
+                } else {
+                    Vec::new()
+                };
                 return Ok(MessageFull {
                     meta,
                     body_html,
                     body_text,
                     attachments: serde_json::from_str(&attachments)?,
+                    bcc,
+                    body_fetched: body_fetched != 0,
                     has_remote_content: remote != 0,
                     is_newsletter: newsletter != 0,
                     unsubscribe: unsubscribe
@@ -3809,15 +3863,39 @@ impl Db {
             .execute(&self.write_pool)
             .await?;
         }
+        let bcc = if is_draft {
+            parsed_addresses(parsed.as_ref().and_then(|message| message.bcc()))
+        } else {
+            Vec::new()
+        };
         Ok(MessageFull {
             meta,
             has_remote_content,
             body_html,
             body_text,
             attachments,
+            bcc,
+            body_fetched: body_fetched != 0,
             is_newsletter,
             unsubscribe,
         })
+    }
+
+    /// The hidden copy of a draft is not cached with the parsed letter, so a
+    /// cached draft reads it from the stored letter again. Only the headers
+    /// of the letter are parsed for it.
+    async fn draft_bcc(&self, raw_ref: Option<&str>) -> Result<Vec<Addr>> {
+        use mail_parser::MessageParser;
+        let raw = raw_ref
+            .map(|reference| self.blobs.get(reference))
+            .transpose()?;
+        let normalized = raw.as_deref().map(encoded_words::join_split_encoded_words);
+        let parsed = normalized
+            .as_deref()
+            .and_then(|bytes| MessageParser::default().parse_headers(bytes));
+        Ok(parsed_addresses(
+            parsed.as_ref().and_then(|message| message.bcc()),
+        ))
     }
 
     /// Метаданные письма по локальному id для карточки уведомления:
