@@ -105,6 +105,10 @@ pub struct MessageFull {
     /// answers without the field are treated as complete.
     #[serde(default = "body_fetched_by_default")]
     pub body_fetched: bool,
+    /// True when the letter has a text/plain part of its own; false when its text
+    /// is taken from the markup. Answers without the field count as true.
+    #[serde(default = "body_fetched_by_default")]
+    pub has_text_part: bool,
     /// True, если письмо содержит внешние ресурсы (для плашки блокировки).
     pub has_remote_content: bool,
     /// True, если это рассылка (есть заголовок List-Unsubscribe).

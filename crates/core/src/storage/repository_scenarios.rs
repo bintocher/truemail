@@ -522,7 +522,7 @@ async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
     db.close().await;
 }
 
-const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Picture <img src=\"cid:pic1\"></p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
+const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Picture <img src=\"cid:pic1\"></p><p>Code cid:report</p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
 
 /// A part the core has put into the body says so; a part with an identifier but
 /// without a link in the body stays an attachment.
@@ -574,6 +574,98 @@ async fn only_a_part_put_into_the_body_is_marked_embedded() {
         embedded(&db.get_message(id).await.expect("cached opening")),
         expected,
         "the cached opening lost the mark"
+    );
+
+    // A mention of the identifier in the text is not a picture link, and a
+    // letter of markup alone has no text of its own.
+    let full = db.get_message(id).await.expect("read again");
+    assert!(
+        full.body_html
+            .as_deref()
+            .is_some_and(|html| html.contains("Code cid:report")),
+        "the text was rewritten as if it were a picture link"
+    );
+    assert!(
+        !full.has_text_part,
+        "a letter of markup alone is reported as having text of its own"
+    );
+
+    // A parse result stored before parts were marked is parsed again and stored.
+    sqlx::query(
+        "UPDATE message_content_cache SET attachments_json=replace(replace(attachments_json, ',\"embedded\":true', ''), ',\"embedded\":false', '') WHERE message_id=?",
+    )
+    .bind(id)
+    .execute(&db.write_pool)
+    .await
+    .expect("strip the marks of the stored parse result");
+    assert_eq!(
+        embedded(
+            &db.get_message(id)
+                .await
+                .expect("opening of an old parse result")
+        ),
+        expected,
+        "an old parse result is not parsed again"
+    );
+    let (stored,): (String,) =
+        sqlx::query_as("SELECT attachments_json FROM message_content_cache WHERE message_id=?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the stored parse result");
+    assert!(
+        stored.contains("embedded"),
+        "the parsed again result is not stored"
+    );
+    db.close().await;
+}
+
+const PLAIN_LETTER: &[u8] =
+    b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Plain\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nText of the letter";
+
+/// A letter with a text part of its own says so on a fresh parse and on a cached one.
+#[tokio::test]
+async fn a_letter_with_its_own_text_part_says_so_on_every_opening() {
+    let db: TestDb = open_test_db("repo-text-part").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 10,
+            remote_id: Some("plain-letter".into()),
+            size: Some(PLAIN_LETTER.len() as u32),
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: PLAIN_LETTER.to_vec(),
+            body_fetched: true,
+            has_attachments: None,
+        }],
+        false,
+    )
+    .await
+    .expect("save the letter");
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=10")
+        .fetch_one(&db.pool)
+        .await
+        .expect("find the saved letter");
+
+    assert!(
+        db.get_message(id)
+            .await
+            .expect("first opening")
+            .has_text_part,
+        "a letter with a text part is reported as markup only"
+    );
+    assert!(
+        db.get_message(id)
+            .await
+            .expect("cached opening")
+            .has_text_part,
+        "the cached opening lost the text part mark"
     );
     db.close().await;
 }

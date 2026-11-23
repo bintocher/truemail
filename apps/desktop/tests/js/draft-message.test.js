@@ -148,11 +148,10 @@ test('S-002, S-003, S-004, S-009: the pane and both menus follow the letter, an 
 test('S-002, S-005, S-007: the button above the text sends the letter below it, the editor stays closed', async () => {
   const ui = await openMail();
   await openLetter(ui, 21);
-  // The list menu makes another letter active; the button above the shown text
+  // The list menu makes another draft active; the button above the shown text
   // still sends the shown letter.
-  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
-  openListMenu(ui, 11);
-  assert.equal(ui.evaluate('activeMessage.id'), 11);
+  openListMenu(ui, 22);
+  assert.equal(ui.evaluate('activeMessage.id'), 22);
   assert.equal(paneActions(ui).includes('send-draft'), true, 'Send left the shown draft after the menu of another letter');
 
   ui.byId('threadSendDraft').onclick();
@@ -168,6 +167,69 @@ test('S-002, S-005, S-007: the button above the text sends the letter below it, 
   assert.equal(paneActions(ui).includes('send-draft'), false, 'Send stays on the pane after the draft went out');
   assert.equal(ui.byId('composeView').classes.has('active'), false, 'the editor opened for a ready draft');
   assert.equal(ui.evaluate('composerHasContent()'), false, 'the editor was touched by the sending of a ready draft');
+});
+
+test('S-002, S-003: the buttons above the text act on the shown draft after the list menu of another letter', async () => {
+  const ui = await openMail();
+  await openLetter(ui, 21);
+  // The menu of another draft is closed without a choice.
+  openListMenu(ui, 22);
+  ui.document.dispatch('click', {target: ui.document.body});
+  assert.equal(ui.evaluate('activeMessage.id'), 21, 'the letter of the closed menu stays active');
+
+  // An item of the menu still belongs to the letter under the cursor, and the
+  // shown letter is active again once the item has run.
+  openListMenu(ui, 22);
+  ui.query('#ctxmenu [data-context-action="trash"]').dispatch('click');
+  await settle();
+  assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the item of the menu acted on the shown letter');
+  await openLetter(ui, 21);
+  openListMenu(ui, 22);
+  ui.query('#ctxmenu [data-context-action="raw"]').dispatch('click');
+  assert.equal(ui.evaluate('activeMessage.id'), 21, 'the letter of the menu stays active after its item has run');
+
+  // A click reaches the button before the document closes the menu.
+  openListMenu(ui, 22);
+  ui.query('.thead [data-act="trash"]').dispatch('click');
+  await settle();
+  assert.deepEqual(trashed(ui).at(-1), [[21], 'trash'], 'the button above the shown draft acted on the letter of the list menu');
+});
+
+test('S-002: the "more" menu of the pane acts on the shown draft after the list menu of another letter', async () => {
+  const ui = await openMail({messageRaw: () => 'raw letter'});
+  await openLetter(ui, 21);
+  openListMenu(ui, 22);
+  ui.byId('threadMoreButton').dispatch('click');
+  assert.equal(ui.evaluate('activeMessage.id'), 21, 'the "more" menu of the pane took the letter of the list menu');
+  ui.query('#threadMoreMenu [data-thread-action="raw"]').dispatch('click');
+  await settle();
+  assert.equal(ui.callsOf('messageRaw').at(-1).args[0], 21, 'the source of another letter was opened');
+});
+
+test('S-002: an empty reading pane offers nothing to send', async () => {
+  const ui = await openMail();
+  await openLetter(ui, 21);
+  // The folder changes: the shown draft is not in the list, and the pane is cleared.
+  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
+  assert.equal(ui.evaluate('paneLetter()'), null, 'the cleared pane still names a letter');
+  assert.equal(paneActions(ui).includes('send-draft'), false, 'Send stays above an empty pane');
+  ui.evaluate('sendDraftMessage(paneLetter())');
+  await settle();
+  assert.equal(sent(ui).length, 0, 'a letter went out from an empty pane');
+});
+
+test('S-017: the next draft gets its Send button after a draft that is already on its way', async () => {
+  const ui = await openMail({messageAction: () => ({operation_ids: [], skipped: 1, skipped_no_folder: 1})});
+  await openLetter(ui, 21);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  // The refresh brings the sent draft back, and the user opens another draft.
+  ui.evaluate(`messages=${JSON.stringify(Object.values(LETTERS))};showMessage(messages.find(message=>message.id===22))`);
+  await settle();
+  assert.equal(paneActions(ui).includes('send-draft'), true, 'the next draft lost Send behind a draft that is on its way');
+  ui.evaluate('showMessage(messages.find(message=>message.id===21))');
+  await settle();
+  assert.equal(paneActions(ui).includes('send-draft'), false, 'Send came back for the draft whose letter is on its way');
 });
 
 test('S-005, S-006: a draft without a recipient opens the editor and goes out from it', async () => {
@@ -199,6 +261,40 @@ test('S-005, S-006: a letter scheduled from the editor also takes its draft out 
   await settle();
   assert.equal(ui.callsOf('scheduleMessage').length, 1, 'the letter was not scheduled');
   assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the scheduled letter left its draft in Drafts');
+});
+
+test('S-012, S-019: a letter scheduled from the editor is queued once and does not touch another letter', async () => {
+  let answer = null;
+  const ui = await openMail({scheduleMessage: () => new Promise(resolve => { answer = resolve; })});
+  await openLetter(ui, 22);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  ui.evaluate("setRecipients('compTo',['mate@example.test']);const at=document.getElementById('compSendAt');at.classList.remove('hidden');at.value='2030-01-01T09:00';");
+  const scheduling = ui.byId('compSendLater').onclick();
+  await ui.byId('compSendLater').onclick();
+  await settle();
+  assert.equal(ui.callsOf('scheduleMessage').length, 1, 'a second click queued the letter twice');
+  // Another letter takes the editor while the queue answers.
+  ui.evaluate("document.getElementById('composeBtn').onclick()");
+  await settle();
+  ui.evaluate("document.getElementById('compSubj').value='Другое письмо'");
+  answer(77);
+  await scheduling;
+  await settle();
+  assert.equal(ui.byId('compSubj').value, 'Другое письмо', 'the answer of the queue wiped another letter');
+  assert.equal(ui.byId('composeView').classes.has('active'), true, 'the user was pulled away from the letter being written');
+  assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the scheduled letter left its draft in Drafts');
+});
+
+test('S-031: the sender chosen in the editor survives a refresh of the account list', async () => {
+  const ui = await openMail();
+  ui.evaluate("resetComposer();const from=document.querySelector('.from-sel');from.value='2';window.rememberComposerFrom();");
+  // Every refresh of the data clears the list of the accounts and draws it again.
+  ui.evaluate('clearDemoData();renderAccountSettings(coreAccounts,[],[])');
+  assert.equal(ui.evaluate("document.querySelector('.from-sel').value"), '2', 'the refresh returned the sender to the first account');
+  // The same holds for the letter that comes back from the saved state at start.
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:2,to:[],cc:[],bcc:[],subject:'',body_html:'',attachments:[]};renderAccountSettings(coreAccounts,[],[]);clearDemoData();renderAccountSettings(coreAccounts,[],[])");
+  assert.equal(ui.evaluate("document.querySelector('.from-sel').value"), '2', 'the first refresh returned the restored letter to the first account');
 });
 
 test('S-007, S-008: another unsent letter in the editor is not touched by a draft that has to be finished', async () => {
@@ -382,7 +478,7 @@ test('S-014, S-015: attachments go along once, a name with a comma is one addres
   const ui = await openMail({
     getMessage: id => ({
       ...fullOf(id),
-      meta: {...LETTERS[id], to: [{name: 'Ivanov, Petr', email: 'p@example.test'}]},
+      meta: {...LETTERS[id], to: [{name: 'Ivanov, Petr', email: 'p@example.test'}, {name: 'Иванов "Пётр"', email: 'q@example.test'}]},
       attachments: [
         part(0),
         part(1, {filename: 'pic.png', mime_type: 'image/png', is_inline: true, content_id: 'pic@example.test', embedded: true}),
@@ -395,22 +491,60 @@ test('S-014, S-015: attachments go along once, a name with a comma is one addres
   ui.byId('threadSendDraft').onclick();
   await settle();
   const request = sent(ui)[0];
-  assert.deepEqual([...request.to], ['"Ivanov, Petr" <p@example.test>'], 'a name with a comma is not quoted as one address');
+  assert.deepEqual([...request.to], ['"Ivanov, Petr" <p@example.test>', '"Иванов \\"Пётр\\"" <q@example.test>'], 'a name with a comma or a quote is not quoted as one address');
   assert.deepEqual([...request.attachments].map(item => item.filename), ['a.pdf', 'a.pdf'], 'an embedded picture was attached again or a file with an identifier was dropped');
   assert.equal(ui.callsOf('attachmentContent').length, 2);
 });
 
-test('S-014: a part with an identifier of an old parse result is skipped by the rule of the core', async () => {
-  const {embedded, ...unmarked} = part(0, {is_inline: true, content_id: 'pic@example.test'});
+test('S-024: a name with quotes is not escaped a second time on the way back', async () => {
+  const ui = await openMail();
+  const address = '"Иванов \\"Пётр\\"" <p@example.test>';
+  ui.evaluate(`resetComposer();setRecipients('compTo',[${JSON.stringify(address)}])`);
+  assert.deepEqual([...ui.evaluate('composerRequest()').to], [address], 'the quotes of the name were escaped a second time');
+});
+
+test('S-010: a letter of markup alone does not get a text part written for it', async () => {
+  const ui = await openMail({getMessage: id => ({...fullOf(id), has_text_part: false})});
+  await openLetter(ui, 21);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  assert.equal(sent(ui)[0].body_text, '', 'the text of the letter was made from its markup');
+});
+
+test('S-012: a letter the core refuses opens the editor with the reason', async () => {
+  const ui = await openMail({sendMessage: () => Promise.reject({kind: 'account_config', message: 'некорректный адрес "long@example.test"'})});
+  await openLetter(ui, 21);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  assert.equal(ui.byId('composeView').classes.has('active'), true, 'the refused letter did not open in the editor');
+  assert.equal(ui.byId('compSubj').value, 'Не отправлено', 'the refused letter is not in the editor');
+  assert.match(ui.byId('composeStatus').textContent, /некорректный адрес/, 'the editor does not say why the core refused the letter');
+  assert.equal(trashed(ui).length, 0, 'the refused draft was removed from Drafts');
+});
+
+test('S-022: a size the core already knows is checked before the file is read', async () => {
   const ui = await openMail({
-    getMessage: id => ({...fullOf(id), attachments: [unmarked]}),
+    getMessage: id => ({...fullOf(id), attachments: [part(0), part(1, {size: 30 * 1024 * 1024})]}),
     attachmentContent: () => CONTENT,
   });
   await openLetter(ui, 21);
   ui.byId('threadSendDraft').onclick();
   await settle();
-  // Before the mark existed, the core had put such a part into the HTML body.
-  assert.equal(ui.callsOf('attachmentContent').length, 0, 'an embedded picture of an old parse result was read as an attachment');
+  assert.equal(ui.callsOf('attachmentContent').length, 1, 'the file that does not fit was read');
+  assert.equal(ui.byId('composeView').classes.has('active'), true, 'the editor did not open for an oversized letter');
+  assert.match(ui.byId('composeStatus').textContent, /помещается/, 'the user is not told why the letter was not sent');
+});
+
+test('S-022: a letter of pictures alone that is too large opens the editor', async () => {
+  // Four different pictures: the same picture is counted once, as the core sends it.
+  const pictures = [0, 1, 2, 3].map(index => `<img src="data:image/png;base64,${'A'.repeat(9 * 1024 * 1024 + index * 4)}">`).join('');
+  const ui = await openMail({getMessage: id => ({...fullOf(id), body_html: `<p>${pictures}</p>`})});
+  await openLetter(ui, 21);
+  ui.byId('threadSendDraft').onclick();
+  await settle();
+  assert.equal(sent(ui).length, 0, 'an oversized letter was queued');
+  assert.equal(ui.byId('composeView').classes.has('active'), true, 'the editor did not open for an oversized letter');
+  assert.match(ui.byId('composeStatus').textContent, /встроенные картинки/, 'the user is not told why the letter was not sent');
 });
 
 test('S-014: a letter above the size limit opens the editor instead of going to the queue', async () => {
@@ -472,6 +606,14 @@ test('S-004, S-009: a late refresh of quick steps does not put their items into 
   ui.evaluate('reloadQuickSteps()');
   await settle();
   assert.equal(menuActions(ui).includes('quick-step:5'), false, 'a quick step got into the open menu of a draft');
+});
+
+test('S-029: a saved letter returns to the editor cleaned', async () => {
+  const ui = await openMail();
+  ui.evaluate(`resetComposer();window.pendingComposerDraft={account_id:1,to:[],cc:[],bcc:[],subject:'',body_html:'<p onclick="x()" style="position:fixed;top:0">Текст</p><img src="https://tracker.example.test/p.png">',attachments:[]};renderAccountSettings(coreAccounts,[],[])`);
+  const html = ui.byId('compEdit').innerHTML;
+  assert.equal(/onclick|tracker\.example|position/.test(html), false, `the saved letter came back to the editor uncleaned: ${html}`);
+  assert.match(html, /Текст/, 'the text of the saved letter was lost');
 });
 
 test('S-025: an address with a comma in its name survives the saved state of the editor', async () => {

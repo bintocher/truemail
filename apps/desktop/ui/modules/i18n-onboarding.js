@@ -323,7 +323,7 @@ window.clearDemoData=function(preserveMessage=false){
   // между прижатием и отпусканием съедает нажатие, и письмо не открывается
   // (specs/message-click-not-lost.md). Список перестроится после нажатия.
   if(!window.messageListRenderHeld?.())document.getElementById('msgs').innerHTML='';
-  if(!preserveMessage){document.getElementById('tSubject').textContent='';const actions=document.querySelector('.thread .actions');if(actions)actions.classList.add('hidden');document.getElementById('tbody').innerHTML='';}
+  if(!preserveMessage){window.forgetShownLetter?.();document.getElementById('tSubject').textContent='';const actions=document.querySelector('.thread .actions');if(actions)actions.classList.add('hidden');document.getElementById('tbody').innerHTML='';}
   ['calgrid','calweek','calday','cgrid'].forEach(id=>{const el=document.getElementById(id);if(el)el.innerHTML='';});
   const contactCount=document.querySelector('.ct-count');if(contactCount)contactCount.textContent=wizardLocale==='en'?'0 contacts':'0 контактов';
   document.getElementById('acctDetail')?.remove();

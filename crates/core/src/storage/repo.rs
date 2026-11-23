@@ -354,6 +354,7 @@ type MessageContentCacheRow = (
     i64,
     i64,
     Option<String>,
+    i64,
 );
 
 /// Addresses of a parsed header, groups included; an address is listed once.
@@ -3707,7 +3708,7 @@ impl Db {
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
-                        is_newsletter, unsubscribe_json
+                        is_newsletter, unsubscribe_json, has_text_part
                    FROM message_content_cache
                   WHERE message_id = ? AND raw_blob_ref = ?",
             )
@@ -3715,28 +3716,41 @@ impl Db {
             .bind(reference)
             .fetch_optional(&self.pool)
             .await?;
-            if let Some((body_html, body_text, attachments, remote, newsletter, unsubscribe)) =
-                cached
+            if let Some((
+                body_html,
+                body_text,
+                attachments,
+                remote,
+                newsletter,
+                unsubscribe,
+                has_text_part,
+            )) = cached
             {
-                let bcc = if is_draft {
-                    self.draft_bcc(raw_ref.as_deref()).await?
-                } else {
-                    Vec::new()
-                };
-                return Ok(MessageFull {
-                    meta,
-                    body_html,
-                    body_text,
-                    attachments: serde_json::from_str(&attachments)?,
-                    bcc,
-                    body_fetched: body_fetched != 0,
-                    has_remote_content: remote != 0,
-                    is_newsletter: newsletter != 0,
-                    unsubscribe: unsubscribe
-                        .as_deref()
-                        .map(serde_json::from_str)
-                        .transpose()?,
-                });
+                let attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
+                // A parse result stored before parts were marked as embedded is
+                // parsed again below.
+                if attachments.iter().all(|part| part.embedded.is_some()) {
+                    let bcc = if is_draft {
+                        self.draft_bcc(raw_ref.as_deref()).await?
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(MessageFull {
+                        meta,
+                        body_html,
+                        body_text,
+                        attachments,
+                        bcc,
+                        body_fetched: body_fetched != 0,
+                        has_text_part: has_text_part != 0,
+                        has_remote_content: remote != 0,
+                        is_newsletter: newsletter != 0,
+                        unsubscribe: unsubscribe
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()?,
+                    });
+                }
             }
         }
         let raw = raw_ref
@@ -3784,10 +3798,19 @@ impl Db {
                         mime_type.as_deref().unwrap_or("application/octet-stream"),
                         base64::engine::general_purpose::STANDARD.encode(bytes)
                     );
-                    let linked = html
-                        .replace(&format!("cid:{id}"), &data)
-                        .replace(&format!("cid:<{id}>"), &data);
-                    embedded = linked != *html;
+                    // Only a picture link counts: the letter builder takes pictures
+                    // from the src of an img tag and from nowhere else.
+                    let original_len = html.len();
+                    let mut linked = std::mem::take(html);
+                    for quote in ['"', '\''] {
+                        for reference in [format!("cid:{id}"), format!("cid:<{id}>")] {
+                            linked = linked.replace(
+                                &format!("src={quote}{reference}{quote}"),
+                                &format!("src={quote}{data}{quote}"),
+                            );
+                        }
+                    }
+                    embedded = linked.len() != original_len;
                     *html = linked;
                 }
                 attachments.push(Attachment {
@@ -3835,6 +3858,12 @@ impl Db {
                 http,
             })
         });
+        // A letter of markup alone has no text of its own: its text is derived from
+        // the markup and is not sent as if it were written.
+        let has_text_part = parsed
+            .as_ref()
+            .and_then(|message| message.text_part(0))
+            .is_some_and(|part| matches!(part.body, PartType::Text(_)));
         let has_remote_content = body_html
             .as_deref()
             .is_some_and(|html| html.contains("http://") || html.contains("https://"));
@@ -3842,13 +3871,14 @@ impl Db {
             sqlx::query(
                 "INSERT INTO message_content_cache(
                     message_id, raw_blob_ref, body_html, body_text, attachments_json,
-                    has_remote_content, is_newsletter, unsubscribe_json, parsed_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    has_remote_content, is_newsletter, unsubscribe_json, has_text_part, parsed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                  ON CONFLICT(message_id) DO UPDATE SET
                     raw_blob_ref=excluded.raw_blob_ref, body_html=excluded.body_html,
                     body_text=excluded.body_text, attachments_json=excluded.attachments_json,
                     has_remote_content=excluded.has_remote_content,
                     is_newsletter=excluded.is_newsletter,
+                    has_text_part=excluded.has_text_part,
                     unsubscribe_json=excluded.unsubscribe_json, parsed_at=datetime('now')",
             )
             .bind(message_id)
@@ -3864,6 +3894,7 @@ impl Db {
                     .map(serde_json::to_string)
                     .transpose()?,
             )
+            .bind(has_text_part as i64)
             .execute(&self.write_pool)
             .await?;
         }
@@ -3880,6 +3911,7 @@ impl Db {
             attachments,
             bcc,
             body_fetched: body_fetched != 0,
+            has_text_part,
             is_newsletter,
             unsubscribe,
         })

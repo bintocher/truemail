@@ -241,11 +241,16 @@ function persistToolbar(){const state=toolbarState();window.tm?.setSetting('tool
 let toolbarShowsDraft=null;
 // The letter shown in the reading pane. The list menu makes another letter
 // active without showing it, and the buttons above the text stay with the text.
-let shownMessageId=null;
-function paneLetter(){return activeMessage?.id===shownMessageId?activeMessage:(messages||[]).find(message=>message.id===shownMessageId)||null;}
+let shownMessageId=null,shownLetter=null;
+// The letter the reading pane shows: its fresh copy from the list, or the copy
+// that was shown when the list no longer has it.
+function paneLetter(){return activeMessage?.id===shownMessageId?activeMessage:(messages||[]).find(message=>message.id===shownMessageId)||shownLetter;}
 window.paneLetter=paneLetter;
-window.rememberShownLetter=message=>{shownMessageId=message?.id??null;};
-window.forgetShownLetter=()=>{shownMessageId=null;};
+window.rememberShownLetter=message=>{shownMessageId=message?.id??null;shownLetter=message||null;};
+window.forgetShownLetter=()=>{shownMessageId=null;shownLetter=null;};
+// The list and its context menu name another letter as active. The reading
+// pane goes on acting on the letter it shows.
+window.restoreActiveToShown=()=>{const letter=paneLetter();if(letter&&activeMessage!==letter)activeMessage=letter;};
 function applyToolbar(){const state=toolbarState(),bar=document.querySelector('.thread .actions');if(!bar)return;
   // A draft is an unsent letter: actions of an incoming letter do not apply to it.
   const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders),actions=draftMessageModel.actionsForMessage(letter,coreFolders,state.actions);
@@ -253,9 +258,14 @@ function applyToolbar(){const state=toolbarState(),bar=document.querySelector('.
   // The draft whose letter is already on its way has nothing left to send.
   document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
   document.querySelectorAll('#threadMoreMenu [data-thread-action]').forEach(item=>item.classList.toggle('hidden',draft&&!draftMessageModel.DRAFT_ACTIONS.has(item.dataset.threadAction)));bar.classList.toggle('toolbar-right',state.align==='right');bar.querySelectorAll('[data-toolbar-generated]').forEach(el=>el.remove());const anchor=bar.querySelector('.sp');actions.filter(action=>action.visible).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.className=`${action.key==='reply'?'btn primary':'btn'}${action.labels==='icons'?' toolbar-action-icons':''}`;button.dataset.toolbarGenerated='1';button.dataset.act=action.key;button.title=tbLabel(meta);button.innerHTML=`<i data-i="${escapeHtml(meta.i||action.key)}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;renderIcons(button);bar.insertBefore(button,anchor);});bar.querySelectorAll(':scope > button:not([data-toolbar-generated]):not([data-toolbar-persistent])').forEach(button=>button.classList.add('toolbar-original-hidden'));
-  // Меню "Ещё" показывает только те действия, что скрыты из панели - без дублей.
-// Rebuilds the pane only when the letter changed between a draft and the rest.
-function refreshToolbarForMessage(){if(toolbarShowsDraft!==draftMessageModel.isDraftMessage(paneLetter(),coreFolders))applyToolbar();}
+  // The sending button follows the letter that is shown: one draft may be on
+  // its way already while the next one still has to be sent. The pane itself
+  // is rebuilt only when the letter changed between a draft and the rest.
+function refreshToolbarForMessage(){
+  const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders);
+  document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
+  if(toolbarShowsDraft!==draft)applyToolbar();
+}
 window.refreshToolbarForMessage=refreshToolbarForMessage;
   const menuDyn=document.getElementById('threadMenuDynamic');
   if(menuDyn){menuDyn.innerHTML='';quickStepsModel.toolbarMoreMenu(actions).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.type='button';button.dataset.toolbarMenu=action.key;button.innerHTML=`<i data-i="${escapeHtml(meta.i||action.key)}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;menuDyn.appendChild(button);});renderIcons(menuDyn);const sep=document.getElementById('threadMenuDynSep');if(sep)sep.style.display=menuDyn.children.length?'':'none';}}
@@ -290,7 +300,9 @@ function quickStepRunContext(){
 async function executeQuickStep(id){const step=quickStepSnapshot.find(item=>item.id===Number(id));if(!step)return;try{return await quickStepsModel.runQuickStep(step,quickStepRunContext());}catch(error){showToast(error);return null;}}
 window.executeQuickStep=executeQuickStep;
 window.executeQuickStepSlot=slot=>quickStepsModel.handleSlotPress(`quick_step_${slot}`,quickStepRunContext()).catch(showToast);
-async function executeToolbarAction(action){if(action==='send-draft'){await sendDraftMessage(activeMessage);return;}const toolbarStepId=quickStepsModel.toolbarStepId(action);if(toolbarStepId!==null){await executeQuickStep(toolbarStepId);return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog();return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
+// fromList: the action comes from the context menu of the list and belongs to
+// the letter that menu was opened for.
+async function executeToolbarAction(action,fromList=false){if(!fromList)window.restoreActiveToShown?.();if(action==='send-draft'){await sendDraftMessage(activeMessage);return;}const toolbarStepId=quickStepsModel.toolbarStepId(action);if(toolbarStepId!==null){await executeQuickStep(toolbarStepId);return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog();return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
   if(uns?.one_click_url){showToast(L('Отправляю запрос на отписку…','Sending unsubscribe request…'));const fallback=()=>window.tm?.openExternal(uns.http||uns.one_click_url).catch(error=>showToast(error));try{const status=await window.tm.unsubscribeOneClick(uns.one_click_url);if(status>=200&&status<300)showToast(L('Готово: вы отписаны от рассылки (сервер подтвердил, код '+status+')','Done: you have been unsubscribed (server confirmed, code '+status+')'));else{showToast(L('Сервер отписки ответил кодом '+status+'. Открываю страницу отписки…','The unsubscribe server responded with code '+status+'. Opening the unsubscribe page…'));fallback();}}catch(error){showToast(error);fallback();}return;}
   const target=uns?.http||embeddedUnsubscribeUrl(activeFullMessage);if(target){try{await window.tm.openExternal(target);showToast(L('Открыл страницу отписки в браузере — завершите отписку там','Opened the unsubscribe page in your browser — finish there'));}catch(error){showToast(error);}return;}
   const mailto=uns?.mailto;if(mailto){resetComposer();setRecipients('compTo',[String(mailto).replace(/^mailto:/i,'').split('?')[0]]);document.getElementById('compSubj').value=L('Отписаться','Unsubscribe');showView('composeView');showToast(L('Отправьте это письмо, чтобы отписаться','Send this message to unsubscribe'));return;}
@@ -299,7 +311,7 @@ document.querySelector('.thread .actions').addEventListener('click',e=>{const bu
 const threadMoreButton=document.getElementById('threadMoreButton'),threadMoreMenu=document.getElementById('threadMoreMenu');
 function closeThreadMore(){closePopupMenus(['more']);}
 threadMoreButton.onclick=event=>{event.stopPropagation();if(threadMoreMenu.classList.contains('open')){closeThreadMore();return;}openPopupMenu('more','more');threadMoreMenu.classList.add('open');threadMoreButton.setAttribute('aria-expanded','true');};
-threadMoreMenu.onclick=async event=>{const toolbarItem=event.target.closest('[data-toolbar-menu]');if(toolbarItem){closeThreadMore();executeToolbarAction(toolbarItem.dataset.toolbarMenu);return;}const button=event.target.closest('[data-thread-action]');if(!button)return;closeThreadMore();const action=button.dataset.threadAction;if(action==='settings'){showView('settingsView');setSection('toolbar');return;}if(action==='rules'){showView('settingsView');setSection('rules');return;}if(action==='raw'){openRawViewer(activeMessage?.id);return;}if(action==='export-eml'){exportActiveMessageEml();return;}if(action==='create-rule'){openRuleEditor(activeMessage);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(['archive','trash'].includes(action))performMessageAction(action);};
+threadMoreMenu.onclick=async event=>{window.restoreActiveToShown?.();const toolbarItem=event.target.closest('[data-toolbar-menu]');if(toolbarItem){closeThreadMore();executeToolbarAction(toolbarItem.dataset.toolbarMenu);return;}const button=event.target.closest('[data-thread-action]');if(!button)return;closeThreadMore();const action=button.dataset.threadAction;if(action==='settings'){showView('settingsView');setSection('toolbar');return;}if(action==='rules'){showView('settingsView');setSection('rules');return;}if(action==='raw'){openRawViewer(activeMessage?.id);return;}if(action==='export-eml'){exportActiveMessageEml();return;}if(action==='create-rule'){openRuleEditor(activeMessage);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(['archive','trash'].includes(action))performMessageAction(action);};
 
 
 /* Правила обработки почты: группы условий, группы исключений и цепочка

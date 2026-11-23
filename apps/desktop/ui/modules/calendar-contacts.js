@@ -193,8 +193,13 @@ function popupMenuNodes(id){return (POPUP_MENU_REGISTRY[id]?.find()||[]).filter(
 function popupMenuIsOpen(id){const entry=POPUP_MENU_REGISTRY[id];return popupMenuNodes(id).some(node=>entry.isOpen(node));}
 function openPopupMenuIds(){return POPUP_MENU_IDS.filter(popupMenuIsOpen);}
 // Отсутствующий узел не мешает закрыть остальные меню (S-019).
+// The letter the context menu of the list was opened for. It is active only
+// while the menu is open: the reading pane acts on the letter it shows.
+let contextLetter=null;
 function closePopupMenus(ids){
-  withDependentMenus(ids).forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
+  const closing=withDependentMenus(ids);
+  closing.forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
+  if(closing.includes('message'))window.restoreActiveToShown?.();
 }
 function applyPopupMenuAction(action){const plan=planPopupMenus(openPopupMenuIds(),action);closePopupMenus(plan.close);return plan;}
 // Вызывается перед показом любого меню семейства: закрывает все прочие (S-002).
@@ -225,7 +230,7 @@ document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,
   // списка, но письмом не являются: без номера письма меню открывалось бы для
   // ранее выбранного письма с пунктами удаления и снятия флажка.
   const msg=e.target.closest('.msg[data-message-id]'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
-  if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
+  if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);contextLetter=messages.find(item=>item.id===id)||null;if(contextLetter)activeMessage=contextLetter;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
 // Меню, которые остаются открытыми при клике внутри них: в фильтре стоят поле
 // ввода и переключатели, в подменю меток за одно открытие отмечают несколько
 // меток (S-015). Остальные закрываются выбранным пунктом (S-022) - на своих
@@ -352,7 +357,10 @@ function buildContextMenu(){
   renderIcons(ctxmenu);
 }
 // Пункт меню письма закрывает и само меню, и открытое подменю меток (S-008).
-ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;closePopupMenus(['message']);const action=item.dataset.contextAction;
+// An item acts on the letter the menu was opened for; once the item has run,
+// the letter of the reading pane is active again.
+ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;const letter=contextLetter;closePopupMenus(['message']);if(letter)activeMessage=letter;const action=item.dataset.contextAction;
+  try{
   if(action==='raw'){openRawViewer(activeMessage?.id);return;}
   if(action==='eml'){saveMessageAsEml(activeMessage?.id);return;}
   if(action==='create-rule'){openRuleEditor(activeMessage);return;}
@@ -364,7 +372,8 @@ ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('
   if(action==='task-edit'&&activeMessage){window.openMessageTaskEditor?.(activeMessage);return;}
   if(action.startsWith('quick-step:')){window.executeQuickStep?.(Number(action.slice(11)));return;}
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
-  executeToolbarAction(action);
+  executeToolbarAction(action,true);
+  }finally{window.restoreActiveToShown?.();}
 });
 ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='count-total'||action==='count-unread'){const key=action==='count-total'?'t':'u';const set=new Set((folderCounterModes[contextFolder.id]||'u').split('').filter(c=>c==='u'||c==='t'));set.has(key)?set.delete(key):set.add(key);folderCounterModes[contextFolder.id]=['u','t'].filter(k=>set.has(k)).join('')||'n';window.tm.setSetting('folder_counters',JSON.stringify(folderCounterModes)).catch(console.error);item.classList.toggle('on',set.has(key));updateFolderBadge(document.querySelector(`.folder-row[data-folder-id="${contextFolder.id}"]`),contextFolder);return;}if(action==='create'){const name=prompt(L(`Имя новой папки внутри «${contextFolder.display_name}»`,`New folder name inside "${contextFolder.display_name}"`),'');if(!name||!name.trim())return;try{await window.tm.createFolder(contextFolder.account_id,contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка создана на сервере','Folder created on the server'));}catch(error){showToast(error);}return;}
   if(action==='rename'){const name=prompt(L('Новое имя папки','New folder name'),contextFolder.display_name);if(!name||name.trim()===contextFolder.display_name)return;try{await window.tm.renameFolder(contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка переименована на сервере','Folder renamed on the server'));}catch(error){showToast(error);}return;}if(action==='delete'){if(!await confirmAction(L(`Удалить папку «${contextFolder.display_name}» на сервере? Письма внутри также будут удалены.`,`Delete the folder "${contextFolder.display_name}" on the server? Messages inside will also be deleted.`)))return;try{await window.tm.deleteFolder(contextFolder.id);await window.reloadCoreData();showToast(L('Папка удалена на сервере','Folder deleted on the server'));}catch(error){showToast(error);}}}));

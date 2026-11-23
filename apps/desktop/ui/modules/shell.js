@@ -518,7 +518,10 @@ msgsEl.addEventListener('scroll',()=>{if(!messageWindowFrame)messageWindowFrame=
   if(msgsEl.scrollTop+msgsEl.clientHeight>=msgsEl.scrollHeight-240){resetAutoFill();loadNextMessagePage(true);}},{passive:true});
 
 /* thread action buttons -> compose */
+// The buttons of the reading pane belong to the letter it shows, whatever the
+// list and its context menu name as active.
 document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
+  window.restoreActiveToShown?.();
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
   else if(b.dataset.act==='send-draft')sendDraftMessage(window.paneLetter?.());
   else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
