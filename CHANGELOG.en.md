@@ -7,6 +7,18 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-23
+
+### Fixed
+
+- The browser sign-in wait can be cancelled. If you changed your mind or closed the sign-in tab, the account stayed "connecting" for almost five minutes and a new attempt for the same address was rejected. At the "Waiting for confirmation" stage there is now a "Cancel waiting" button: it releases the address at once, so the account can be connected again. When the wait runs from another window, the same button appears next to the rejection.
+- The message "This address is already being connected in another window" follows the interface language. It used to be always in Russian.
+
+### Other
+
+- Libraries updated: Tauri 2.11 -> 2.12, rustls 0.23.42 -> 0.23.46 and zip 8.6 -> 9.8. This closes four dependency security alerts.
+- The minimum Rust version for building from sources is 1.94, as required by the updated libraries.
+
 ## [0.3.4] - 2026-09-25
 
 ### Changed
