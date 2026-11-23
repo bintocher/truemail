@@ -55,7 +55,7 @@ struct InlineImagePart {
 
 /// Ищет следующий тег `<img` начиная с `from`, независимо от регистра букв
 /// (S-041). Возвращает байтовое смещение символа `<`.
-fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
+pub(crate) fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 4 <= bytes.len() {
         if bytes[i] == b'<'
@@ -75,7 +75,7 @@ fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
 
 /// Ищет закрывающий `>` тега, начатого в `start`, не обрывая тег на `>`
 /// внутри значения атрибута в кавычках (одинарных или двойных, S-041).
-fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
@@ -96,7 +96,11 @@ fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// независимо от регистра имени атрибута, при одинарных и двойных кавычках
 /// и при других атрибутах в том же теге (S-041). Возвращает байтовые границы
 /// значения без кавычек.
-fn find_src_attr(bytes: &[u8], tag_start: usize, tag_end: usize) -> Option<(usize, usize)> {
+pub(crate) fn find_src_attr(
+    bytes: &[u8],
+    tag_start: usize,
+    tag_end: usize,
+) -> Option<(usize, usize)> {
     let mut i = tag_start + 4;
     while i < tag_end {
         if bytes[i].is_ascii_whitespace() || bytes[i] == b'/' {
@@ -249,6 +253,46 @@ fn extract_inline_images(html: &str) -> (String, Vec<InlineImagePart>) {
         pos = tag_end + 1;
     }
     (out, parts)
+}
+
+/// Goes over the `img` tags of the markup and gives the source of each one to
+/// `replace`. A source gets the returned text in its place; `None` leaves it.
+/// Returns the new markup and the number of replaced sources. The scan is the
+/// one of the letter builder, so a link named in the text or in another
+/// attribute is left alone.
+pub fn replace_img_sources(
+    html: &str,
+    mut replace: impl FnMut(&str) -> Option<String>,
+) -> (String, usize) {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut replaced = 0usize;
+    let mut pos = 0usize;
+    loop {
+        let Some(tag_start) = find_img_tag_start(bytes, pos) else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let Some(tag_end) = find_tag_end(bytes, tag_start) else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let source = find_src_attr(bytes, tag_start, tag_end).and_then(|(start, end)| {
+            let value = replace(html.get(start..end)?.trim())?;
+            Some((start, end, value))
+        });
+        match source {
+            Some((start, end, value)) => {
+                out.push_str(&html[pos..start]);
+                out.push_str(&value);
+                out.push_str(&html[end..=tag_end]);
+                replaced += 1;
+            }
+            None => out.push_str(&html[pos..=tag_end]),
+        }
+        pos = tag_end + 1;
+    }
+    (out, replaced)
 }
 
 // Вид ошибки отправки определяется по типу исключения lettre и коду ответа

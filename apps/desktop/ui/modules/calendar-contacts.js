@@ -196,6 +196,7 @@ function openPopupMenuIds(){return POPUP_MENU_IDS.filter(popupMenuIsOpen);}
 // The letter the context menu of the list was opened for. It is active only
 // while the menu is open: the reading pane acts on the letter it shows.
 let contextLetter=null;
+window.contextMenuLetter=()=>contextLetter;
 function closePopupMenus(ids){
   const closing=withDependentMenus(ids);
   closing.forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
@@ -360,18 +361,22 @@ function buildContextMenu(){
 // An item acts on the letter the menu was opened for; once the item has run,
 // the letter of the reading pane is active again.
 ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;const letter=contextLetter;closePopupMenus(['message']);if(letter)activeMessage=letter;const action=item.dataset.contextAction;
+  // The selection of the list counts only when the letter under the cursor is one of the selected.
+  const targets=letter&&!selectedMessageIds.has(letter.id)?[letter.id]:null;
+  const idsOf=()=>targets||(selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[]);
   try{
   if(action==='raw'){openRawViewer(activeMessage?.id);return;}
   if(action==='eml'){saveMessageAsEml(activeMessage?.id);return;}
   if(action==='create-rule'){openRuleEditor(activeMessage);return;}
   // S-013: безвозвратное удаление доступно только этим явно названным пунктом
   // и только с подтверждением - из переноса в корзину оно не получается.
-  if(action==='delete-forever'){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];window.deleteMessagesForever?.(ids);return;}
-  if(action==='important-toggle'&&activeMessage){const ids=selectedMessageIds.size?[...selectedMessageIds]:[activeMessage.id];window.setMessagesFlaggedFromUi?.(ids,!activeMessage.flags?.flagged,activeMessage);return;}
-  if(action==='pin-message'&&activeMessage){const ids=selectedMessageIds.size?[...selectedMessageIds]:[activeMessage.id];window.setMessagesPinnedFromUi?.(ids,!activeMessage.pinned_at);return;}
+  if(action==='delete-forever'){const ids=idsOf();window.deleteMessagesForever?.(ids);return;}
+  if(action==='important-toggle'&&activeMessage){const ids=idsOf();window.setMessagesFlaggedFromUi?.(ids,!activeMessage.flags?.flagged,activeMessage);return;}
+  if(action==='pin-message'&&activeMessage){const ids=idsOf();window.setMessagesPinnedFromUi?.(ids,!activeMessage.pinned_at);return;}
   if(action==='task-edit'&&activeMessage){window.openMessageTaskEditor?.(activeMessage);return;}
   if(action.startsWith('quick-step:')){window.executeQuickStep?.(Number(action.slice(11)));return;}
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
+  if(targets&&['archive','trash','spam'].includes(action)){performMessageActionForIds(action,targets);return;}
   executeToolbarAction(action,true);
   }finally{window.restoreActiveToShown?.();}
 });

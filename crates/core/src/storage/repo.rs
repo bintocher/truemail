@@ -3798,19 +3798,14 @@ impl Db {
                         mime_type.as_deref().unwrap_or("application/octet-stream"),
                         base64::engine::general_purpose::STANDARD.encode(bytes)
                     );
-                    // Only a picture link counts: the letter builder takes pictures
-                    // from the src of an img tag and from nowhere else.
-                    let original_len = html.len();
-                    let mut linked = std::mem::take(html);
-                    for quote in ['"', '\''] {
-                        for reference in [format!("cid:{id}"), format!("cid:<{id}>")] {
-                            linked = linked.replace(
-                                &format!("src={quote}{reference}{quote}"),
-                                &format!("src={quote}{data}{quote}"),
-                            );
-                        }
-                    }
-                    embedded = linked.len() != original_len;
+                    // Only the source of a picture tag counts: the letter builder
+                    // takes pictures from there and from nowhere else.
+                    let (linked, replaced) = crate::backend::replace_img_sources(html, |source| {
+                        (source.eq_ignore_ascii_case(&format!("cid:{id}"))
+                            || source.eq_ignore_ascii_case(&format!("cid:<{id}>")))
+                        .then(|| data.clone())
+                    });
+                    embedded = replaced > 0;
                     *html = linked;
                 }
                 attachments.push(Attachment {

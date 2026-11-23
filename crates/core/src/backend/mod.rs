@@ -17,7 +17,8 @@ pub use imap::{
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{
-    OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex, validate_outgoing,
+    OutgoingAttachment, OutgoingMessage, replace_img_sources, send_gmail, send_password,
+    send_yandex, validate_outgoing,
 };
 
 #[derive(Debug)]

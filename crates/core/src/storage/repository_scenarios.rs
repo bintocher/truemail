@@ -522,7 +522,7 @@ async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
     db.close().await;
 }
 
-const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Picture <img src=\"cid:pic1\"></p><p>Code cid:report</p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
+const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Picture <img src=cid:pic1><IMG SRC = 'cid:pic1'><img src=\"cid:pic1\"></p><p data-src=\"cid:report\">Code cid:report</p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
 
 /// A part the core has put into the body says so; a part with an identifier but
 /// without a link in the body stays an attachment.
@@ -576,13 +576,22 @@ async fn only_a_part_put_into_the_body_is_marked_embedded() {
         "the cached opening lost the mark"
     );
 
-    // A mention of the identifier in the text is not a picture link, and a
+    // Every way of writing the source of a picture is a picture link. The
+    // identifier named in the text or in another attribute is not one, and a
     // letter of markup alone has no text of its own.
     let full = db.get_message(id).await.expect("read again");
+    let html = full.body_html.as_deref().unwrap_or_default();
     assert!(
-        full.body_html
-            .as_deref()
-            .is_some_and(|html| html.contains("Code cid:report")),
+        !html.contains("cid:pic1"),
+        "a picture link was left as it was: {html}"
+    );
+    assert_eq!(
+        html.matches("data:image/png;base64,").count(),
+        3,
+        "a way of writing the picture link was not replaced: {html}"
+    );
+    assert!(
+        html.contains("data-src=\"cid:report\">Code cid:report"),
         "the text was rewritten as if it were a picture link"
     );
     assert!(

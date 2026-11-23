@@ -371,7 +371,9 @@ document.getElementById('threadMoreMenu')?.addEventListener('click',event=>{
 /* Те же действия в контекстном меню строки списка писем (S-028). */
 document.getElementById('ctxmenu')?.addEventListener('click',event=>{
   const item=event.target.closest('[data-context-action]');if(!item)return;
-  const action=item.dataset.contextAction,message=senderActionMessage();
+  // The item belongs to the letter the menu was opened for. By this time the
+  // first handler has made the letter of the reading pane active again.
+  const action=item.dataset.contextAction,message=window.contextMenuLetter?.()||senderActionMessage();
   if(action==='block-sender')openBlockSenderDialog(message);
   else if(action==='sweep-sender')openSweepSenderDialog(message);
   else if(action==='ignore-conversation')toggleIgnoreConversation(message);

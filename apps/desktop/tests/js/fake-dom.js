@@ -432,6 +432,11 @@ class FakeNode {
   }
 
   removeAttribute(name) {
+    if (name === 'class') {
+      // Как в браузере: без атрибута у элемента нет и классов.
+      this.classes = new Set();
+      return;
+    }
     delete this.attributes[name];
   }
 
