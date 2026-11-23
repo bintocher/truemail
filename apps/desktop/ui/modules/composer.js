@@ -8,7 +8,12 @@ function splitAddresses(value){return String(value||'').split(/[;,\n]+/).map(ite
 const recipientModel={compTo:[],compCc:[],compBcc:[]};
 function parseRecipient(raw){const value=String(raw||'').trim();if(!value)return null;const m=value.match(/^(.*?)[<(]([^>)]+)[>)]\s*$/);if(m){const email=m[2].trim(),name=m[1].trim().replace(/^["']|["']$/g,'').trim();return {name:name&&name.toLowerCase()!==email.toLowerCase()?name:'',email};}return {name:'',email:value};}
 function recipientDisplay(entry){return entry.name&&entry.name.toLowerCase()!==entry.email.toLowerCase()?entry.name:entry.email;}
-function recipientFormat(entry){return entry.name&&entry.name.toLowerCase()!==entry.email.toLowerCase()?`${entry.name} <${entry.email}>`:entry.email;}
+function recipientFormat(entry){
+  const name=String(entry.name||'').trim(),email=String(entry.email||'');
+  if(!name||name.toLowerCase()===email.toLowerCase())return email;
+  // A name with a comma, a quote and the like is one address only in quotes.
+  return /[^ A-Za-z0-9\u0080-\uFFFF'.\-]/.test(name)?`"${name.replace(/["\\]/g,'\\$&')}" <${email}>`:`${name} <${email}>`;
+}
 function recipientChipTitle(entry){const contact=coreContacts.find(c=>(c.emails||[]).some(item=>String(item.email||'').toLowerCase()===entry.email.toLowerCase()));const parts=[];const name=contact?.display_name||entry.name;if(name)parts.push(name);parts.push(entry.email);if(contact){(contact.phones||[]).forEach(p=>{const num=p.number||p.phone||p;if(num)parts.push(String(num));});if(contact.org)parts.push(contact.org);}return parts.join('\n');}
 function renderRecipientChips(id){const input=document.getElementById(id),box=input.parentElement.querySelector('.recipient-chips');if(!box)return;box.innerHTML='';recipientModel[id].forEach((entry,index)=>{const chip=document.createElement('span');chip.className='rcpt-chip'+(validAddress(entry.email)?'':' invalid');chip.title=recipientChipTitle(entry);const label=document.createElement('span');label.className='rcpt-chip-t';label.textContent=recipientDisplay(entry);const close=document.createElement('button');close.type='button';close.className='rcpt-x';close.setAttribute('aria-label',L('Удалить получателя','Remove recipient'));close.innerHTML='&times;';close.onclick=()=>removeRecipientEntry(id,index);chip.appendChild(label);chip.appendChild(close);box.appendChild(chip);});}
 function addRecipientEntry(id,raw){const entry=parseRecipient(raw);if(!entry||!entry.email)return false;if(recipientModel[id].some(e=>e.email.toLowerCase()===entry.email.toLowerCase()))return false;recipientModel[id].push(entry);renderRecipientChips(id);return true;}
@@ -261,7 +266,7 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   let nextId=null;
   if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
-  try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;window.refreshToolbarForMessage?.();window.forgetMessages?.(ids);await window.reloadCoreData();
+  try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();window.forgetMessages?.(ids);await window.reloadCoreData();
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
     if(action==='delete'){showToast(L('Письмо удаляется навсегда','The message is being deleted permanently'));return;}
     // Письмо, по которому уже стоит незавершённая операция увода, пропущено
@@ -581,7 +586,8 @@ document.getElementById('linkApply').onclick=applyLinkDialog;
 document.getElementById('linkOverlay').addEventListener('click',e=>{if(e.target.id==='linkOverlay')closeLinkDialog();});
 document.getElementById('linkHref').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();applyLinkDialog();}});
 let draftSaveTimer=null;
-function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:recipientFieldAddresses('compTo').join(', '),cc:recipientFieldAddresses('compCc').join(', '),bcc:recipientFieldAddresses('compBcc').join(', '),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:compEditEl.innerText,attachments:composerAttachments};}
+function typedAddresses(id){return [...recipientModel[id],...splitAddresses(document.getElementById(id).value).map(email=>({name:'',email}))];}
+function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:typedAddresses('compTo'),cc:typedAddresses('compCc'),bcc:typedAddresses('compBcc'),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:compEditEl.innerText,attachments:composerAttachments};}
 function scheduleDraftSave(){
   // S-053: письмо изменилось - прежний ключ запроса к нему уже не относится.
   composerRequestKey='';
@@ -692,30 +698,77 @@ async function restoreUndoWindows(){
 let outboxEntriesForCard=[];
 window.setOutboxEntriesForCard=entries=>{outboxEntriesForCard=entries||[];};
 window.restoreUndoWindows=restoreUndoWindows;
-/* A draft goes out by the composer path, so address checks, size limits and the
-   undo window stay the same as for any letter (draft-message-actions.md). */
+/* A draft goes out by the same queue as any letter from the editor, so address
+   checks, the size limit and the undo window stay the same
+   (draft-message-actions.md). One click never touches the editor: the letter is
+   read into a snapshot first, and the editor opens only when the user has to
+   finish the letter. */
 function bytesFromBase64(base64){const binary=atob(base64),bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);return bytes;}
-/* Fills the composer with the draft. Returns null when the composer was taken
-   by another letter while the attachments were being read. */
-async function applyDraftToComposer(full){
-  resetComposer();
-  const own=composerGeneration;
-  const fromSel=document.querySelector('.from-sel');
-  if(Array.from(fromSel?.options||[]).some(option=>option.value===String(full.meta.account_id)))fromSel.value=String(full.meta.account_id);
-  setRecipients('compTo',full.meta.to);setRecipients('compCc',full.meta.cc);setRecipients('compBcc',full.bcc||[]);
-  setRecipientFieldVisible('compCc',recipientModel.compCc.length>0);setRecipientFieldVisible('compBcc',recipientModel.compBcc.length>0);
-  document.getElementById('compSubj').value=full.meta.subject||'';
-  compEditEl.innerHTML=full.body_html||escapeHtml(full.body_text||'').replace(/\n/g,'<br>');
-  const attachments=[];
+// Sources of the pictures inside a letter body, without the document.
+function htmlImageSources(html){
+  const host=document.createElement('div'),sources=[];
+  host.innerHTML=String(html||'');
+  (function walk(node){for(const child of [...(node.children||[])]){
+    if(String(child.tagName).toUpperCase()==='IMG')sources.push(child.getAttribute('src')||'');
+    walk(child);
+  }})(host);
+  return sources;
+}
+// What has no place in an editable letter body that comes from a letter.
+const EDITOR_DROP_TAGS=new Set(['SCRIPT','STYLE','LINK','META','BASE','TITLE','IFRAME','FRAME','FRAMESET','OBJECT','EMBED','APPLET','FORM','INPUT','BUTTON','TEXTAREA','SELECT','OPTION','TEMPLATE','NOSCRIPT','VIDEO','AUDIO','SOURCE','TRACK','CANVAS','SVG','MATH']);
+const EDITOR_DROP_ATTRIBUTES=new Set(['srcdoc','srcset','formaction','action','background','poster','ping']);
+const EDITOR_SAFE_IMAGE=/^(data:image\/|cid:)/i;
+function editorSafeHtml(html){
+  const host=document.createElement('div');host.innerHTML=String(html||'');
+  (function clean(node){for(const child of [...(node.children||[])]){
+    const tag=String(child.tagName).toUpperCase();
+    if(EDITOR_DROP_TAGS.has(tag)){child.remove();continue;}
+    for(const name of Object.keys(child.attributes||{})){
+      const value=String(child.attributes[name]??'');
+      if(/^on/i.test(name)||EDITOR_DROP_ATTRIBUTES.has(name)||/^xlink:/i.test(name)
+        ||(tag==='IMG'&&name==='src'&&!EDITOR_SAFE_IMAGE.test(value))
+        ||(name==='href'&&/^\s*(javascript|vbscript|data)\s*:/i.test(value)))child.removeAttribute(name);
+    }
+    clean(child);
+  }})(host);
+  return host.innerHTML;
+}
+function draftLetterProblem(request){
+  const addresses=[...request.to,...request.cc,...request.bcc];
+  if(!addresses.length)return L('Укажите хотя бы одного получателя','Add at least one recipient');
+  const invalid=addresses.find(address=>!validAddress(address));
+  return invalid?L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`):null;
+}
+/* The draft as a request for the sending queue, with the attachments that could
+   be read. `problem` explains why the letter cannot go out as it is. */
+async function readDraftLetter(full){
+  const request={account_id:full.meta.account_id,to:full.meta.to.map(recipientFormat),cc:full.meta.cc.map(recipientFormat),bcc:(full.bcc||[]).map(recipientFormat),
+    subject:full.meta.subject||'',body_text:full.body_text||'',
+    body_html:full.body_html||escapeHtml(full.body_text||'').replace(/\n/g,'<br>'),attachments:[]};
+  let bytes=composerBody.totalMessageBytes([],htmlImageSources(request.body_html));
   for(const att of full.attachments||[]){
-    // The core has already put inline pictures into the body.
-    if(att.is_inline&&att.content_id)continue;
-    const content=await window.tm.attachmentContent(full.meta.id,att.id);
-    attachments.push({filename:content.filename||att.filename||'attachment',mime_type:content.mime_type||att.mime_type||'application/octet-stream',data:bytesFromBase64(content.base64)});
+    // A picture the core has put into the body is not attached a second time.
+    if(att.embedded??(Boolean(request.body_html)&&att.is_inline&&Boolean(att.content_id)&&att.fetched))continue;
+    let content;
+    try{content=await window.tm.attachmentContent(full.meta.id,att.id);}
+    catch(error){
+      // The letter is not sent with a part of its attachments; the editor gets what was read.
+      return {request,problem:window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText})};
+    }
+    const name=content.filename||att.filename||'attachment';
+    const size=Math.floor(content.base64.length*3/4);
+    if(!composerBody.fitsMessageLimit(bytes,size)){
+      return {request,problem:L(`Не добавлено: ${name} не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,
+        `Not attached: ${name} does not fit, the whole letter together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`)};
+    }
+    bytes+=size;
+    request.attachments.push({filename:name,mime_type:content.mime_type||att.mime_type||'application/octet-stream',data:bytesFromBase64(content.base64)});
   }
-  if(own!==composerGeneration)return null;
-  attachments.forEach(item=>{ensureMessageFits(item.data.length,item.filename);composerAttachments.push(item);renderComposerAttachment(item);});
-  return own;
+  return {request,problem:null};
+}
+async function queueLetter(request){
+  const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  showUndoSendCard(queued,request);
 }
 function showDraftComposer(hint){
   document.getElementById('compTitle').textContent=L('Черновик','Draft');
@@ -723,36 +776,65 @@ function showDraftComposer(hint){
   status.textContent=hint||'';status.dataset.kind=hint?'error':'';
   scheduleDraftSave();showView('composeView');
 }
+/* The editor takes the letter as it was read. Nothing is awaited between the
+   reset and the last field, so no other letter can get in between. */
+function applyDraftToComposer(request){
+  resetComposer();
+  const fromSel=document.querySelector('.from-sel');
+  if(Array.from(fromSel?.options||[]).some(option=>option.value===String(request.account_id)))fromSel.value=String(request.account_id);
+  setRecipients('compTo',request.to);setRecipients('compCc',request.cc);setRecipients('compBcc',request.bcc);
+  setRecipientFieldVisible('compCc',recipientModel.compCc.length>0);setRecipientFieldVisible('compBcc',recipientModel.compBcc.length>0);
+  document.getElementById('compSubj').value=request.subject||'';
+  compEditEl.innerHTML=editorSafeHtml(request.body_html);
+  request.attachments.forEach(item=>{composerAttachments.push(item);renderComposerAttachment(item);});
+}
 /* The draft has served its purpose once the letter is queued. It leaves the
    screen at once, so that a second click finds nothing to send. */
 function forgetSentDraft(messageId){
-  if(activeMessage?.id===messageId){activeMessage=null;activeFullMessage=null;window.refreshToolbarForMessage?.();document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML='';}
+  if(activeMessage?.id===messageId){activeMessage=null;activeFullMessage=null;}
+  if(window.paneLetter?.()?.id===messageId){
+    window.forgetShownLetter?.();
+    document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML='';
+  }
   window.forgetMessages?.([messageId]);
+  window.refreshToolbarForMessage?.();
 }
 async function discardSentDraft(messageId){
   const failed=()=>{
     window.tm?.uiLog?.(`draft ${messageId} was not moved to Trash after sending`);
     showToast(L('Письмо отправляется, но убрать черновик из папки не удалось. Удалите его вручную.','The letter is being sent, but the draft could not be removed from its folder. Delete it by hand.'));
   };
-  try{
-    const queued=await window.tm.messageAction([messageId],'trash');
-    showSkippedMessages(queued);
-    if(!queued?.operation_ids?.length)failed();
-    await window.reloadCoreData?.();
-  }catch(error){failed();}
+  let queued;
+  try{queued=await window.tm.messageAction([messageId],'trash');}
+  catch(error){
+    window.tm?.uiLog?.(`draft ${messageId} was not moved to Trash after sending: ${error?.message||error}`);
+    failed();return;
+  }
+  showSkippedMessages(queued);
+  if(!queued?.operation_ids?.length&&queued?.skipped)failed();
+  try{await window.reloadCoreData?.();}
+  catch(error){window.tm?.uiLog?.(`the list was not reloaded after sending draft ${messageId}: ${error?.message||error}`);}
+}
+// Drafts whose letter the queue has already taken in this session: a draft that
+// stayed in its folder must not be sent a second time.
+const sentDrafts=new Set();
+window.sentDrafts=sentDrafts;
+function draftQueued(messageId){
+  sentDrafts.add(messageId);
+  forgetSentDraft(messageId);
+  discardSentDraft(messageId);
 }
 let draftSendInFlight=false;
 async function sendDraftMessage(message=activeMessage){
   if(!draftMessageModel.isDraftMessage(message,coreFolders))return;
+  if(sentDrafts.has(message.id)){
+    showToast(L('Письмо из этого черновика уже отправляется. Сам черновик можно удалить.','The letter from this draft is already on its way. The draft itself can be deleted.'));
+    return;
+  }
   // One sending at a time: a second click must not queue the letter twice.
   if(draftSendInFlight)return;
-  if(composerHasContent()){
-    showToast(L('В редакторе есть другое неотправленное письмо. Отправьте или удалите его, затем отправьте черновик.','The editor holds another unsent letter. Send or delete it, then send the draft.'));
-    showView('composeView');return;
-  }
   draftSendInFlight=true;
   try{
-    const before=composerGeneration;
     let full;
     try{full=await window.tm.getMessage(message.id);}
     catch(error){showToast(error);return;}
@@ -760,26 +842,30 @@ async function sendDraftMessage(message=activeMessage){
       showToast(L('Тело черновика ещё не загружено. Проверьте связь и повторите','The draft is not downloaded yet. Check the connection and try again'));
       return;
     }
-    // Another letter was started while the draft was being read: it stays.
-    if(before!==composerGeneration){showToast(L('Черновик не отправлен: вы начали другое письмо','The draft was not sent: you started another letter'));return;}
-    let own;
-    try{own=await applyDraftToComposer(full);}
-    catch(error){
-      showToast(error);
-      if(before+1===composerGeneration){draftBeingSent=message.id;showDraftComposer();}
+    let letter;
+    try{letter=await readDraftLetter(full);}
+    catch(error){letter={request:null,problem:window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText})};}
+    if(!letter.request){showToast(letter.problem);return;}
+    const problem=letter.problem||draftLetterProblem(letter.request)
+      // A hidden copy alone is not enough to send in one click: the user sees no addressee on the letter.
+      ||(!letter.request.to.length&&!letter.request.cc.length?L('Укажите получателя в поле "Кому" и отправьте письмо','Add a recipient to To and send the letter'):null);
+    if(!problem){
+      try{await queueLetter(letter.request);}
+      catch(error){showToast(error);return;}
+      draftQueued(message.id);
       return;
     }
-    if(own===null){showToast(L('Черновик не отправлен: вы начали другое письмо','The draft was not sent: you started another letter'));return;}
-    draftBeingSent=message.id;
-    // A hidden copy alone is not enough to send in one click: the user sees no addressee on the letter.
-    if(!recipientModel.compTo.length&&!recipientModel.compCc.length){
-      showDraftComposer(L('Укажите получателя в поле "Кому" и отправьте письмо','Add a recipient to To and send the letter'));
-      document.getElementById('compTo')?.focus();return;
+    // The user has to finish the letter: it goes to the editor.
+    // The same draft left in the editor is not another letter.
+    if(composerHasContent()&&draftBeingSent===message.id){showView('composeView');return;}
+    if(composerHasContent()){
+      showToast(L('В редакторе есть другое неотправленное письмо. Отправьте или удалите его, затем отправьте черновик.','The editor holds another unsent letter. Send or delete it, then send the draft.'));
+      showView('composeView');return;
     }
-    await document.getElementById('compSend').onclick();
-    // The composer is cleared only when the letter was accepted.
-    if(draftBeingSent===null)return;
-    showDraftComposer();
+    applyDraftToComposer(letter.request);
+    draftBeingSent=message.id;
+    showDraftComposer(problem);
+    if(!recipientModel.compTo.length)document.getElementById('compTo')?.focus();
   }finally{draftSendInFlight=false;}
 }
 window.sendDraftMessage=sendDraftMessage;
@@ -794,6 +880,9 @@ document.getElementById('compSend').onclick=async()=>{
   // S-005: адресаты проверяются до записи операции.
   try{request=composerRequest();}catch(error){showToast(error);return;}
   if(!composerRequestKey)composerRequestKey=`send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  // The draft of this letter is captured before the wait: another letter may
+  // take the editor while the queue is answering.
+  const sentDraft=draftBeingSent;
   let queued;
   try{queued=await window.tm.sendMessage(request,composerRequestKey);}
   catch(error){
@@ -801,11 +890,11 @@ document.getElementById('compSend').onclick=async()=>{
     showToast(error);return;
   }
   // S-002: композер очищается только после подтверждённой записи в очередь;
-  // очистка снимает и ключ запроса - следующее письмо получит свой.
-  const sentDraft=draftBeingSent;
-  resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
+  // очистка снимает и ключ запроса - следующее письмо получит свой. Другое
+  // письмо, начатое за время ожидания, остаётся.
+  if(generation===composerGeneration){resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});}
   showUndoSendCard(queued,request);
-  if(sentDraft!==null){forgetSentDraft(sentDraft);discardSentDraft(sentDraft);}
+  if(sentDraft!==null)draftQueued(sentDraft);
 };
-document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());const sentDraft=draftBeingSent;draftBeingSent=null;if(sentDraft!==null)draftQueued(sentDraft);await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};

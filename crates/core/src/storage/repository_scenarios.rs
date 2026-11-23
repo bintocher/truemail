@@ -522,6 +522,62 @@ async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
     db.close().await;
 }
 
+const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Picture <img src=\"cid:pic1\"></p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
+
+/// A part the core has put into the body says so; a part with an identifier but
+/// without a link in the body stays an attachment.
+#[tokio::test]
+async fn only_a_part_put_into_the_body_is_marked_embedded() {
+    let db: TestDb = open_test_db("repo-embedded-parts").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 9,
+            remote_id: Some("inline-letter".into()),
+            size: Some(INLINE_LETTER.len() as u32),
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: INLINE_LETTER.to_vec(),
+            body_fetched: true,
+            has_attachments: None,
+        }],
+        false,
+    )
+    .await
+    .expect("save the letter");
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=9")
+        .fetch_one(&db.pool)
+        .await
+        .expect("find the saved letter");
+    let embedded = |full: &MessageFull| {
+        full.attachments
+            .iter()
+            .map(|part| (part.filename.clone(), part.embedded))
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        ("pic.png".to_owned(), Some(true)),
+        ("report.pdf".to_owned(), Some(false)),
+    ];
+
+    assert_eq!(
+        embedded(&db.get_message(id).await.expect("first opening")),
+        expected,
+        "a part is not marked by the fact of being put into the body"
+    );
+    assert_eq!(
+        embedded(&db.get_message(id).await.expect("cached opening")),
+        expected,
+        "the cached opening lost the mark"
+    );
+    db.close().await;
+}
+
 /// Лёгкая проекция письма (сервер отдал только заголовки) не затирает уже
 /// загруженное тело, вложения и отметку полноты. Затерев их, программа
 /// показала бы вместо письма обрывок и потеряла бы вложения. Письмо, которое

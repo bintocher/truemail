@@ -81,6 +81,10 @@ pub struct Attachment {
     pub is_inline: bool,
     pub content_id: Option<String>,
     pub fetched: bool,
+    /// True when the core has put this part into the body as a data URL.
+    /// None in parse results stored before the field existed.
+    #[serde(default)]
+    pub embedded: Option<bool>,
 }
 
 fn body_fetched_by_default() -> bool {

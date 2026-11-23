@@ -293,6 +293,16 @@ fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::
 }
 
 pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
+    build_letter(message, false)
+}
+
+/// The letter for a server interface that takes the whole MIME text (Gmail,
+/// EWS, JMAP): the hidden copy travels inside the letter, so its header stays.
+pub(crate) fn build_message_with_bcc(message: OutgoingMessage) -> Result<Message> {
+    build_letter(message, true)
+}
+
+fn build_letter(message: OutgoingMessage, keep_bcc: bool) -> Result<Message> {
     let extra_headers = message.headers.clone();
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
@@ -316,7 +326,7 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
             .iter()
             .map(|item| item.data.len())
             .sum::<usize>();
-    if total_size > 25 * 1024 * 1024 {
+    if total_size > MAX_ATTACHMENTS_BYTES {
         return Err(Error::AccountConfig(
             "суммарный размер вложений и встроенных картинок превышает 25 МБ".into(),
         ));
@@ -324,10 +334,15 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     // S-045: закреплённый идентификатор письма приходит из очереди отправки.
     // Без него повторная попытка собрала бы письмо с новым Message-ID, и
     // сервер получателя принял бы его как второе письмо.
-    let mut builder = Message::builder()
+    let builder = Message::builder()
         .from(mailbox(&message.from)?)
         .message_id(message.message_id.clone())
         .subject(message.subject);
+    let mut builder = if keep_bcc {
+        builder.keep_bcc()
+    } else {
+        builder
+    };
     for address in &message.to {
         builder = builder.to(mailbox(address)?);
     }
@@ -388,12 +403,40 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
 
 /// Проверить адресатов письма до записи операции отправки: непригодный адрес
 /// не должен создавать ожидающее письмо вовсе (specs/undo-send.md, S-005).
+/// Предел размера проверяется здесь же: письмо, которое не собрать, не должно
+/// попадать в очередь.
 pub fn validate_outgoing(message: &OutgoingMessage) -> Result<()> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
     for address in message.to.iter().chain(&message.cc).chain(&message.bcc) {
         mailbox(address)?;
+    }
+    check_outgoing_size(message)
+}
+
+const MAX_ATTACHMENTS_BYTES: usize = 25 * 1024 * 1024;
+
+fn check_outgoing_size(message: &OutgoingMessage) -> Result<()> {
+    let inline_bytes: usize = message
+        .body_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+        .map(|html| extract_inline_images(html).1)
+        .unwrap_or_default()
+        .iter()
+        .map(|item| item.data.len())
+        .sum();
+    let total_size: usize = message
+        .attachments
+        .iter()
+        .map(|item| item.data.len())
+        .sum::<usize>()
+        + inline_bytes;
+    if total_size > MAX_ATTACHMENTS_BYTES {
+        return Err(Error::AccountConfig(
+            "суммарный размер вложений и встроенных картинок превышает 25 МБ".into(),
+        ));
     }
     Ok(())
 }
@@ -491,7 +534,7 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
-    send_gmail_raw(&build_message(message)?.formatted(), access_token).await
+    send_gmail_raw(&build_message_with_bcc(message)?.formatted(), access_token).await
 }
 
 /// Запрос отправки Gmail по уже собранным байтам письма. Сборка письма отделена
@@ -647,6 +690,56 @@ mod tests {
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         )
+    }
+
+    // A server interface that takes the whole MIME text gets the hidden copy
+    // inside the letter; SMTP keeps it in the envelope only.
+    #[test]
+    fn a_hidden_copy_stays_inside_the_letter_for_server_interfaces() {
+        let mut message = sample_message(None, vec![]);
+        message.bcc = vec!["hidden@example.com".into()];
+        let for_server = build_message_with_bcc(message.clone())
+            .expect("letter for a server interface")
+            .formatted();
+        assert!(
+            String::from_utf8_lossy(&for_server).contains("Bcc: hidden@example.com"),
+            "the hidden copy is lost between the queue and the server request"
+        );
+        let for_smtp = build_message(message).expect("letter for SMTP").formatted();
+        assert!(
+            !String::from_utf8_lossy(&for_smtp).contains("Bcc:"),
+            "SMTP carries the hidden copy in the envelope, not in the letter"
+        );
+    }
+
+    // A letter that cannot be assembled by its size must not reach the queue.
+    #[test]
+    fn an_oversized_letter_is_refused_before_the_queue() {
+        let big = |fill: u8| OutgoingAttachment {
+            filename: "big.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            data: vec![fill; 13 * 1024 * 1024],
+        };
+        let fits = sample_message(None, vec![big(0)]);
+        assert!(
+            validate_outgoing(&fits).is_ok(),
+            "a letter within the limit is refused"
+        );
+        let mut too_big = sample_message(None, vec![big(0), big(1)]);
+        assert!(
+            validate_outgoing(&too_big).is_err(),
+            "attachments above the limit are accepted into the queue"
+        );
+        too_big.attachments.clear();
+        too_big.body_html = Some(format!(
+            "<p>text</p><img src=\"{}\"><img src=\"{}\">",
+            data_url("image/png", &vec![0u8; 13 * 1024 * 1024]),
+            data_url("image/png", &vec![1u8; 13 * 1024 * 1024])
+        ));
+        assert!(
+            validate_outgoing(&too_big).is_err(),
+            "inline pictures above the limit are accepted into the queue"
+        );
     }
 
     // extract_inline_images - юнит-проверки чистого разбора текста (без сети и MIME).

@@ -555,7 +555,7 @@ impl MailBackend for GmailBackend {
     async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
         // Сборка письма отказывает до запроса, поэтому она отделена от самого
         // запроса: их отказы означают разное.
-        let raw = smtp::build_message(message)?.formatted();
+        let raw = smtp::build_message_with_bcc(message)?.formatted();
         smtp::send_gmail_raw(&raw, credential)
             .await
             .map_err(request_failure)?;

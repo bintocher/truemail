@@ -3775,6 +3775,7 @@ impl Db {
                     PartType::Text(text) | PartType::Html(text) => Some(text.as_bytes()),
                     _ => None,
                 };
+                let mut embedded = false;
                 if let (Some(html), Some(id), Some(bytes)) =
                     (body_html.as_mut(), content_id.as_deref(), bytes)
                 {
@@ -3783,9 +3784,11 @@ impl Db {
                         mime_type.as_deref().unwrap_or("application/octet-stream"),
                         base64::engine::general_purpose::STANDARD.encode(bytes)
                     );
-                    *html = html
+                    let linked = html
                         .replace(&format!("cid:{id}"), &data)
                         .replace(&format!("cid:<{id}>"), &data);
+                    embedded = linked != *html;
+                    *html = linked;
                 }
                 attachments.push(Attachment {
                     id: index as i64,
@@ -3798,6 +3801,7 @@ impl Db {
                     is_inline: content_id.is_some(),
                     content_id,
                     fetched: bytes.is_some(),
+                    embedded: Some(embedded),
                 });
             }
         }
