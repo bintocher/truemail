@@ -1115,9 +1115,9 @@ window.setConnectBusy=setConnectBusy;
 // и к тому же номеру попытки (F7) - иначе поздний или чужой (другой адрес,
 // другое окно, прежняя попытка того же адреса) этап тронул бы не тот экран.
 const CONNECT_STAGE_TARGETS=[
-  {emailField:'wzEmail',button:'wzConnect',status:'wzConnectStatus'},
+  {emailField:'wzEmail',button:'wzConnect',status:'wzConnectStatus',cancel:'wzConnectCancel'},
   {emailField:'wzEmail',button:'wzConfirm',status:'wzConnectStatus'},
-  {emailField:'accountEmail',button:'accountOauthStart',status:'accountOauthStatus'},
+  {emailField:'accountEmail',button:'accountOauthStart',status:'accountOauthStatus',cancel:'accountOauthCancel'},
   {emailField:'accountEmail',button:'accountPasswordConfirm',status:'accountOauthStatus'},
   {emailField:'accountEmail',button:'accountOauthConfirm',status:'accountOauthStatus'},
 ];
@@ -1125,7 +1125,7 @@ window.handleConnectStage=function(payload){
   if(!payload||!payload.stage)return;
   const email=String(payload.email||'').trim().toLowerCase();
   if(!email)return;
-  CONNECT_STAGE_TARGETS.forEach(({emailField,button,status})=>{
+  CONNECT_STAGE_TARGETS.forEach(({emailField,button,status,cancel})=>{
     const buttonEl=document.getElementById(button);
     // dataset.connectLabel стоит только пока кнопка в состоянии ожидания
     // (setConnectBusy) - иначе эта попытка на этой кнопке уже не активна.
@@ -1136,8 +1136,39 @@ window.handleConnectStage=function(payload){
     const fieldEl=document.getElementById(emailField);
     if(!fieldEl||fieldEl.value.trim().toLowerCase()!==email)return;
     setConnectBusy(buttonEl,document.getElementById(status),payload.stage,true,payload.attempt_id);
+    if(cancel)setConnectWaitCancellable(cancel,payload.stage==='waiting_code'?email:null);
   });
 };
+// The cancel button belongs to the OAuth sign-in wait of one address.
+function setConnectWaitCancellable(cancelId,email){
+  const cancelEl=document.getElementById(cancelId);
+  if(!cancelEl)return;
+  if(email){cancelEl.dataset.connectEmail=email;cancelEl.classList.remove('hidden');}
+  else{delete cancelEl.dataset.connectEmail;cancelEl.classList.add('hidden');}
+}
+window.setConnectWaitCancellable=setConnectWaitCancellable;
+const CONNECT_CANCEL_TARGETS=[
+  {cancel:'wzConnectCancel',status:'wzConnectStatus',button:'wzConnect'},
+  {cancel:'accountOauthCancel',status:'accountOauthStatus',button:'accountOauthStart'},
+];
+async function cancelConnectWait(cancelId){
+  const target=CONNECT_CANCEL_TARGETS.find(item=>item.cancel===cancelId);
+  const cancelEl=document.getElementById(cancelId),email=cancelEl?.dataset.connectEmail;
+  if(!target||!email||cancelEl.disabled)return;
+  cancelEl.disabled=true;
+  let stopped=false;
+  try{stopped=await window.tm.cancelAccountConnect?.(email)===true;}catch(error){console.error(error);}
+  cancelEl.disabled=false;
+  if(cancelEl.dataset.connectEmail!==email)return;
+  setConnectWaitCancellable(cancelId,null);
+  // The attempt running on this screen reports the cancellation itself.
+  if(stopped&&!document.getElementById(target.button)?.dataset.connectLabel){
+    const status=document.getElementById(target.status);
+    if(status){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';}
+  }
+}
+document.getElementById('wzConnectCancel').onclick=()=>cancelConnectWait('wzConnectCancel');
+document.getElementById('accountOauthCancel').onclick=()=>cancelConnectWait('accountOauthCancel');
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));document.getElementById('accountTlsField')?.classList.toggle('hidden',exchange||jmap);if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
@@ -1160,6 +1191,8 @@ document.getElementById('accountOauthStart').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
+    setConnectWaitCancellable('accountOauthCancel',null);
+    if(pending.mode==='cancelled'){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';return;}
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
     if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается, а
@@ -1169,7 +1202,9 @@ document.getElementById('accountOauthStart').onclick=async()=>{
   catch(e){
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+    setConnectBusy(button,null,null,false);
+    setConnectWaitCancellable('accountOauthCancel',accountError(e).kind==='connect_in_progress'?email:null);
+    status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
 document.getElementById('accountPasswordConfirm').onclick=async()=>{
@@ -1231,6 +1266,8 @@ document.getElementById('wzConnect').onclick=async()=>{
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
+    setConnectWaitCancellable('wzConnectCancel',null);
+    if(pending.mode==='cancelled'){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';return;}
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
     if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается (уже
@@ -1239,7 +1276,9 @@ document.getElementById('wzConnect').onclick=async()=>{
   }catch(e){
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
-    setConnectBusy(button,null,null,false);status.textContent=connectFailureText(e);status.dataset.kind='error';
+    setConnectBusy(button,null,null,false);
+    setConnectWaitCancellable('wzConnectCancel',accountError(e).kind==='connect_in_progress'?email:null);
+    status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
 document.getElementById('wzConfirm').onclick=async()=>{

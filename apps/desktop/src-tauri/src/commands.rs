@@ -90,6 +90,7 @@ pub struct AppState {
     // Arc - ConnectAttemptGuard клонирует ссылку на реестр, чтобы снять свою
     // запись из отдельной задачи в Drop (async-освобождение при синхронном drop).
     pub connecting_addresses: Arc<tokio::sync::Mutex<HashSet<String>>>,
+    pub oauth_waits: Arc<OAuthWaitRegistry>,
     // Сколько проходов синхронизации почты подряд закончились сбоем у каждого
     // аккаунта (error-kinds-and-messages.md, S-022, S-024). Пока повторы не
     // исчерпаны, временный сбой не всплывает: программа сама переподключается,
@@ -273,6 +274,17 @@ pub struct PendingOAuthResponse {
     state: Option<String>,
     connected: Option<ConnectedAccount>,
     password_config: Option<PasswordConnectionInfo>,
+}
+
+impl PendingOAuthResponse {
+    fn cancelled() -> Self {
+        Self {
+            mode: "cancelled".into(),
+            state: None,
+            connected: None,
+            password_config: None,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -5591,12 +5603,101 @@ fn microsoft_client_id() -> CmdResult<String> {
     })
 }
 
+type CancelSignal = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+/// Email address -> cancellation signal of its running OAuth sign-in wait.
+pub type OAuthWaitRegistry = std::sync::Mutex<HashMap<String, CancelSignal>>;
+
+const OAUTH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const OAUTH_CANCEL_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+struct OAuthWait {
+    registry: Arc<OAuthWaitRegistry>,
+    email: String,
+    signal: CancelSignal,
+}
+
+impl OAuthWait {
+    fn register(
+        registry: &Arc<OAuthWaitRegistry>,
+        email: &str,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let signal = Arc::new(std::sync::Mutex::new(Some(sender)));
+        lock_or_recover(registry).insert(email.to_owned(), Arc::clone(&signal));
+        (
+            Self {
+                registry: Arc::clone(registry),
+                email: email.to_owned(),
+                signal,
+            },
+            receiver,
+        )
+    }
+}
+
+impl Drop for OAuthWait {
+    fn drop(&mut self) {
+        let mut waits = lock_or_recover(&self.registry);
+        // A newer wait may own the entry already: remove only the own one.
+        if waits
+            .get(&self.email)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.signal))
+        {
+            waits.remove(&self.email);
+        }
+    }
+}
+
+/// Stops the OAuth sign-in wait of `email` when it is running, then waits for
+/// the attempt to release the address so that a new attempt can start at once.
+async fn cancel_oauth_wait(
+    registry: &OAuthWaitRegistry,
+    connecting: &tokio::sync::Mutex<HashSet<String>>,
+    email: &str,
+) -> bool {
+    let signal = lock_or_recover(registry).get(email).cloned();
+    let sender = signal.and_then(|signal| lock_or_recover(&signal).take());
+    let Some(sender) = sender else {
+        return false;
+    };
+    if sender.send(()).is_err() {
+        return false;
+    }
+    let _ = tokio::time::timeout(OAUTH_CANCEL_RELEASE_TIMEOUT, async {
+        while connecting.lock().await.contains(email) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    true
+}
+
+#[derive(Debug)]
+enum OAuthCallback {
+    Code(String),
+    Cancelled,
+}
+
+/// A dropped sender is not a cancellation: the wait keeps its own deadline.
+async fn user_cancelled(cancel: tokio::sync::oneshot::Receiver<()>) {
+    if cancel.await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
     provider: &str,
-) -> CmdResult<String> {
-    tokio::time::timeout(std::time::Duration::from_secs(300), async {
+    cancel: tokio::sync::oneshot::Receiver<()>,
+) -> CmdResult<OAuthCallback> {
+    let accept = tokio::time::timeout(OAUTH_WAIT_TIMEOUT, async {
         loop {
             let (mut stream, _) = listener.accept().await.map_err(|error| ApiError {
                 message: format!("не удалось принять OAuth callback: {error}"),
@@ -5616,7 +5717,9 @@ async fn receive_oauth_callback(
                 .ok()
                 .map(|url| url.query_pairs().into_owned().collect::<HashMap<_, _>>())
                 .unwrap_or_default();
-            let valid_state = params.get("state").is_some_and(|state| state == expected_state);
+            let valid_state = params
+                .get("state")
+                .is_some_and(|state| state == expected_state);
             let code = params.get("code").cloned();
             let error = params.get("error").cloned();
             let success = valid_state && code.is_some();
@@ -5644,7 +5747,9 @@ async fn receive_oauth_callback(
             let _ = stream.shutdown().await;
             if !valid_state {
                 return Err(ApiError {
-                    message: format!("{provider} OAuth вернул неверный state; подключение отменено"),
+                    message: format!(
+                        "{provider} OAuth вернул неверный state; подключение отменено"
+                    ),
                 });
             }
             if let Some(error) = error {
@@ -5653,14 +5758,42 @@ async fn receive_oauth_callback(
                 });
             }
             if let Some(code) = code {
-                return Ok(code);
+                return Ok(OAuthCallback::Code(code));
             }
         }
-    })
-    .await
-    .map_err(|_| ApiError {
-        message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
-    })?
+    });
+    tokio::select! {
+        biased;
+        result = accept => result.map_err(|_| ApiError {
+            message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
+        })?,
+        _ = user_cancelled(cancel) => Ok(OAuthCallback::Cancelled),
+    }
+}
+
+/// Returns `None` when the user cancels the wait.
+async fn wait_for_oauth_code(
+    registry: &Arc<OAuthWaitRegistry>,
+    app: &AppHandle,
+    email: &str,
+    attempt_id: i64,
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+    provider: &str,
+) -> CmdResult<Option<Zeroizing<String>>> {
+    let (_wait, cancel) = OAuthWait::register(registry, email);
+    emit_connect_stage(app, email, "waiting_code", attempt_id);
+    match receive_oauth_callback(listener, expected_state, provider, cancel).await? {
+        OAuthCallback::Code(code) => Ok(Some(Zeroizing::new(code))),
+        OAuthCallback::Cancelled => {
+            tracing::info!(
+                provider,
+                email = %truemail_core::logging::mask_email(email),
+                "OAuth wait cancelled by user"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn connected_response(connected: truemail_core::account::ConnectedAccountSync) -> ConnectedAccount {
@@ -5906,8 +6039,11 @@ impl ConnectAttemptGuard {
     ) -> CmdResult<Self> {
         let mut active = registry.lock().await;
         if !active.insert(email.to_owned()) {
-            return Err(api_error(
+            return Err(ApiError::from_parts(
                 "Подключение этого адреса уже выполняется в другом окне. Дождитесь его завершения.",
+                "connect_in_progress",
+                None,
+                None,
             ));
         }
         Ok(Self {
@@ -6051,9 +6187,19 @@ pub async fn begin_account_connection(
                 // в общий предел команды - у ожидания свой предел (300 секунд)
                 // внутри receive_oauth_callback.
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
-                let code =
-                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Яндекс").await?);
+                let Some(code) = wait_for_oauth_code(
+                    &state.oauth_waits,
+                    &app,
+                    &email,
+                    attempt_id,
+                    listener,
+                    &oauth_state,
+                    "Яндекс",
+                )
+                .await?
+                else {
+                    return Ok(PendingOAuthResponse::cancelled());
+                };
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
@@ -6109,9 +6255,19 @@ pub async fn begin_account_connection(
                 )?;
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
-                let code =
-                    Zeroizing::new(receive_oauth_callback(listener, &oauth_state, "Google").await?);
+                let Some(code) = wait_for_oauth_code(
+                    &state.oauth_waits,
+                    &app,
+                    &email,
+                    attempt_id,
+                    listener,
+                    &oauth_state,
+                    "Google",
+                )
+                .await?
+                else {
+                    return Ok(PendingOAuthResponse::cancelled());
+                };
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
@@ -6169,10 +6325,19 @@ pub async fn begin_account_connection(
                 )?;
                 open_in_yandex_browser(&app, &url)?;
                 stage.set("waiting_code");
-                emit_connect_stage(&app, &email, "waiting_code", attempt_id);
-                let code = Zeroizing::new(
-                    receive_oauth_callback(listener, &oauth_state, "Microsoft").await?,
-                );
+                let Some(code) = wait_for_oauth_code(
+                    &state.oauth_waits,
+                    &app,
+                    &email,
+                    attempt_id,
+                    listener,
+                    &oauth_state,
+                    "Microsoft",
+                )
+                .await?
+                else {
+                    return Ok(PendingOAuthResponse::cancelled());
+                };
                 stage.set("checking_server");
                 emit_connect_stage(&app, &email, "checking_server", attempt_id);
                 let connected = with_connect_timeout_remaining(phase1_elapsed, async {
@@ -6268,6 +6433,13 @@ pub async fn begin_account_connection(
         log_connect_failure(connection_kind.get(), stage.get(), started, &email, error);
     }
     outcome
+}
+
+/// Stops the OAuth sign-in wait of the address; `false` when no wait is running.
+#[tauri::command]
+pub async fn cancel_account_connect(state: State<'_, AppState>, email: String) -> CmdResult<bool> {
+    let email = email.trim().to_lowercase();
+    Ok(cancel_oauth_wait(&state.oauth_waits, &state.connecting_addresses, &email).await)
 }
 
 fn parse_security(value: &str) -> CmdResult<Security> {
@@ -7340,11 +7512,11 @@ mod connect_progress_tests {
     async fn second_attempt_for_the_same_address_is_rejected() {
         let registry = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         let first = expect_ok(ConnectAttemptGuard::acquire(&registry, "user@example.com").await);
-        assert!(
-            ConnectAttemptGuard::acquire(&registry, "user@example.com")
-                .await
-                .is_err(),
-            "вторая попытка того же адреса обязана быть отклонена"
+        let rejected = ConnectAttemptGuard::acquire(&registry, "user@example.com").await;
+        assert_eq!(
+            expect_err_kind(rejected),
+            "connect_in_progress",
+            "second attempt for the same address must be rejected with its own kind"
         );
         let other = expect_ok(ConnectAttemptGuard::acquire(&registry, "other@example.com").await);
         drop(other);
@@ -7371,6 +7543,82 @@ mod connect_progress_tests {
         assert!(
             again.is_ok(),
             "после завершения попытки адрес снова доступен"
+        );
+    }
+
+    /// Cancellation stops the sign-in wait at once and leaves the port, the
+    /// address and the registry free for the next attempt.
+    #[tokio::test]
+    async fn cancelled_oauth_wait_frees_port_address_and_registry() {
+        let waits = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let connecting = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener bound");
+        let address = listener.local_addr().expect("address known");
+
+        let mut wait = tokio::spawn({
+            let waits = Arc::clone(&waits);
+            let connecting = Arc::clone(&connecting);
+            async move {
+                let guard =
+                    expect_ok(ConnectAttemptGuard::acquire(&connecting, "user@example.com").await);
+                let (_wait, cancel) = OAuthWait::register(&waits, "user@example.com");
+                let outcome = receive_oauth_callback(listener, "state", "Test", cancel).await;
+                drop(guard);
+                outcome
+            }
+        });
+
+        assert!(
+            !cancel_oauth_wait(&waits, &connecting, "other@example.com").await,
+            "another address reported a stopped wait"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut wait)
+                .await
+                .is_err(),
+            "wait ended without a cancellation"
+        );
+
+        assert!(
+            cancel_oauth_wait(&waits, &connecting, "user@example.com").await,
+            "running wait was not stopped"
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .expect("wait did not finish after the cancellation")
+            .expect("wait task panicked");
+        assert!(
+            matches!(outcome, Ok(OAuthCallback::Cancelled)),
+            "{outcome:?}"
+        );
+        assert!(
+            !connecting.lock().await.contains("user@example.com"),
+            "address is still busy after the cancellation"
+        );
+        tokio::net::TcpListener::bind(address)
+            .await
+            .expect("port is still busy after the cancellation");
+        assert!(
+            !cancel_oauth_wait(&waits, &connecting, "user@example.com").await,
+            "stopped wait is still registered"
+        );
+
+        // A replaced wait must not remove the current entry when dropped.
+        let (older, _older_cancel) = OAuthWait::register(&waits, "user@example.com");
+        let (newer, newer_cancel) = OAuthWait::register(&waits, "user@example.com");
+        drop(older);
+        assert!(
+            lock_or_recover(&waits).contains_key("user@example.com"),
+            "dropping a replaced wait removed the current one"
+        );
+        assert!(cancel_oauth_wait(&waits, &connecting, "user@example.com").await);
+        assert_eq!(newer_cancel.await, Ok(()));
+        drop(newer);
+        assert!(
+            lock_or_recover(&waits).is_empty(),
+            "registry is not empty after the wait ended"
         );
     }
 }

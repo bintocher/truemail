@@ -15,6 +15,7 @@ const ERROR_KINDS = Object.freeze({
   storage_error: {messageKey:'errorStorage', action:'diagnostics'},
   secret_store_error: {messageKey:'errorSecretStore', action:'diagnostics'},
   crypto_error: {messageKey:'errorCrypto', action:'diagnostics'},
+  connect_in_progress: {messageKey:'errorConnectInProgress', action:'wait'},
   unknown: {messageKey:'errorUnknown', action:'diagnostics'},
 });
 
@@ -55,6 +56,7 @@ const FALLBACK = Object.freeze({
     errorStorage:'Не удалось обратиться к локальному хранилищу.',
     errorSecretStore:'Не удалось обратиться к системному хранилищу секретов.',
     errorCrypto:'Не удалось расшифровать локальные данные.',
+    errorConnectInProgress:'Этот адрес уже подключается в другом окне. Дождитесь завершения.',
     errorUnknown:'Не удалось выполнить действие.',
     errorActionReconnect:'Переподключить',
     errorActionCheckAndRetry:'Проверить данные и повторить',
@@ -85,6 +87,7 @@ const FALLBACK = Object.freeze({
     errorStorage:'Local storage could not be accessed.',
     errorSecretStore:'The system secret store could not be accessed.',
     errorCrypto:'Local data could not be decrypted.',
+    errorConnectInProgress:'This address is already being connected in another window. Wait for it to finish.',
     errorUnknown:'The action could not be completed.',
     errorActionReconnect:'Reconnect',
     errorActionCheckAndRetry:'Check details and retry',

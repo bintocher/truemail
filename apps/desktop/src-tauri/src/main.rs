@@ -277,6 +277,7 @@ fn run() -> anyhow::Result<()> {
         installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         diagnostics_running: std::sync::atomic::AtomicBool::new(false),
         connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -671,6 +672,7 @@ fn run() -> anyhow::Result<()> {
             commands::complete_exchange_ews,
             commands::complete_jmap,
             commands::complete_yandex_oauth,
+            commands::cancel_account_connect,
             commands::api_tools,
             commands::external_api_status,
             commands::start_external_api,

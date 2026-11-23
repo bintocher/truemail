@@ -104,3 +104,82 @@ test('S-006: истечение общего предела времени об�
     assert.equal(connectErrorText(kind, fallback, timeoutText), expected, `${why}: вид ошибки ${kind}`);
   });
 });
+
+const settle = async () => {
+  for (let round = 0; round < 10; round += 1) await new Promise(resolve => setImmediate(resolve));
+};
+
+test('S-018, S-019, S-020, S-021: the sign-in wait is cancelled through the real screen path', async () => {
+  let finishAttempt = null;
+  const ui = createUiWindow({
+    answers: {
+      allSettings: () => ({}),
+      getSetting: key => (key === 'onboarding_completed' ? 'true' : null),
+      beginAccountConnection: () => new Promise((resolve, reject) => { finishAttempt = {resolve, reject}; }),
+      cancelAccountConnect: () => true,
+    },
+  });
+  await ui.clock.drain();
+  await ui.evaluate('window.localizationReady');
+  ui.evaluate('applyWizardLanguage("ru",false)');
+  ui.evaluate('showWizard(5)');
+  await settle();
+
+  const email = 'me@example.test';
+  const attempt = ui.evaluate('window.currentWizardAttempt()');
+  const start = ui.byId('wzConnect');
+  const status = ui.byId('wzConnectStatus');
+  const cancel = ui.byId('wzConnectCancel');
+  const shown = node => !node.classList.contains('hidden');
+  const stage = name => ui.evaluate(
+    `window.handleConnectStage({email:'${email}',stage:'${name}',attempt_id:${attempt}})`);
+  const cancellations = () => ui.callsOf('cancelAccountConnect').map(call => call.args);
+
+  ui.byId('wzEmail').value = email;
+  start.onclick();
+  await settle();
+  assert.equal(typeof finishAttempt, 'object', 'the attempt did not reach the core');
+  assert.equal(shown(cancel), false, 'cancel is offered before the sign-in wait');
+
+  stage('waiting_code');
+  assert.equal(shown(cancel), true, 'cancel is not offered during the sign-in wait');
+  stage('checking_server');
+  assert.equal(shown(cancel), false, 'cancel stays offered on a network stage');
+  stage('waiting_code');
+  ui.evaluate(
+    `window.handleConnectStage({email:'${email}',stage:'detecting',attempt_id:${attempt - 1}})`);
+  assert.equal(shown(cancel), true, 'a stale attempt changed the cancel button');
+
+  cancel.onclick();
+  await settle();
+  assert.deepEqual(cancellations(), [[email]], 'cancel was not sent to the core for the address');
+  assert.equal(shown(cancel), false, 'cancel stays on the screen after the click');
+  assert.equal(start.disabled, true, 'the running attempt is still in progress');
+  assert.equal(status.textContent, ru.connectStageWaitingCode, 'the stage text changed before the core answered');
+
+  finishAttempt.resolve({mode: 'cancelled'});
+  await settle();
+  assert.equal(start.disabled, false, 'the connect button stays disabled after the cancellation');
+  assert.equal(status.textContent, ru.connectWaitCancelled, 'the cancelled wait is not explained');
+  assert.notEqual(status.dataset.kind, 'error', 'the user decision is shown as an error');
+
+  // The wait started from another screen: the rejection offers the same cancel.
+  start.onclick();
+  await settle();
+  finishAttempt.reject({kind: 'connect_in_progress', message: 'raw'});
+  await settle();
+  assert.equal(status.textContent, ru.errorConnectInProgress, 'the busy address is not explained');
+  assert.equal(status.dataset.kind, 'error');
+  assert.equal(shown(cancel), true, 'the busy address leaves the user without a way out');
+  cancel.onclick();
+  await settle();
+  assert.equal(cancellations().length, 2);
+  assert.equal(status.textContent, ru.connectWaitCancelled, 'the stopped wait is not reported');
+  assert.notEqual(status.dataset.kind, 'error', 'the stopped wait is shown as an error');
+
+  ui.evaluate(`window.setConnectWaitCancellable('wzConnectCancel','${email}');window.setConnectWaitCancellable('accountOauthCancel','${email}');`);
+  ui.evaluate(`window.showAccountWizard('${email}')`);
+  assert.equal(shown(ui.byId('accountOauthCancel')), false, 'a reopened screen offers a cancel of the previous one');
+  ui.evaluate('showWizard(5)');
+  assert.equal(shown(cancel), false, 'a reopened wizard offers a cancel of the previous one');
+});
