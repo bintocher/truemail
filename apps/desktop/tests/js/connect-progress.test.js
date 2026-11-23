@@ -200,9 +200,43 @@ test('S-018, S-019, S-020, S-021: the sign-in wait is cancelled through the real
   assert.equal(status.textContent, ru.connectWaitCancelled, 'the stopped wait is not reported');
   assert.notEqual(status.dataset.kind, 'error', 'the stopped wait is shown as an error');
 
-  ui.evaluate(`window.setConnectWaitCancellable('wzConnectCancel','${email}');window.setConnectWaitCancellable('accountOauthCancel','${email}');`);
+  // The same address in another case is the same address for the cancel.
+  ui.byId('wzEmail').value = email.toUpperCase();
+  start.onclick();
+  await settle();
+  finishAttempt.reject({kind: 'connect_in_progress', message: 'raw'});
+  await settle();
+  assert.equal(shown(cancel), true, 'the busy address in another case is not offered a cancel');
+  ui.byId('wzEmail').dispatch('input');
+  assert.equal(shown(cancel), true, 'the cancel was hidden although the address did not change');
+
+  // Nothing to cancel: the stale rejection goes away.
+  ui.bridge.answer('cancelAccountConnect', () => false);
+  cancel.onclick();
+  await settle();
+  assert.equal(shown(cancel), false);
+  assert.equal(status.textContent, '', 'the stale rejection stays when there was nothing to cancel');
+  assert.notEqual(status.dataset.kind, 'error');
+  ui.bridge.answer('cancelAccountConnect', () => true);
+
+  // The account settings wizard follows the same path.
   ui.evaluate(`window.showAccountWizard('${email}')`);
-  assert.equal(shown(ui.byId('accountOauthCancel')), false, 'a reopened screen offers a cancel of the previous one');
+  const settingsStart = ui.byId('accountOauthStart');
+  const settingsStatus = ui.byId('accountOauthStatus');
+  const settingsCancel = ui.byId('accountOauthCancel');
+  assert.equal(shown(settingsCancel), false, 'a reopened screen offers a cancel of the previous one');
+  settingsStart.onclick();
+  await settle();
+  finishAttempt.reject({kind: 'connect_in_progress', message: 'raw'});
+  await settle();
+  assert.equal(settingsStatus.textContent, ru.errorConnectInProgress,
+    'the settings wizard does not explain the busy address');
+  assert.equal(shown(settingsCancel), true, 'the settings wizard leaves the user without a way out');
+  settingsCancel.onclick();
+  await settle();
+  assert.deepEqual(cancellations().at(-1), [email], 'the settings wizard cancelled another address');
+  assert.equal(settingsStatus.textContent, ru.connectWaitCancelled, 'the settings wizard does not report the stopped wait');
+
   ui.evaluate('showWizard(5)');
   assert.equal(shown(cancel), false, 'a reopened wizard offers a cancel of the previous one');
 });

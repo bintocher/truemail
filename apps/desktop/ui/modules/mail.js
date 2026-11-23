@@ -1143,7 +1143,7 @@ window.handleConnectStage=function(payload){
 function setConnectWaitCancellable(cancelId,email){
   const cancelEl=document.getElementById(cancelId);
   if(!cancelEl)return;
-  if(email){cancelEl.dataset.connectEmail=email;cancelEl.classList.remove('hidden');}
+  if(email){cancelEl.dataset.connectEmail=email.trim().toLowerCase();cancelEl.classList.remove('hidden');}
   else{delete cancelEl.dataset.connectEmail;cancelEl.classList.add('hidden');}
 }
 window.setConnectWaitCancellable=setConnectWaitCancellable;
@@ -1154,18 +1154,19 @@ const CONNECT_CANCEL_TARGETS=[
 async function cancelConnectWait(cancelId){
   const target=CONNECT_CANCEL_TARGETS.find(item=>item.cancel===cancelId);
   const cancelEl=document.getElementById(cancelId),email=cancelEl?.dataset.connectEmail;
+  const attempt=window.currentWizardAttempt?.();
   if(!target||!email||cancelEl.disabled)return;
   cancelEl.disabled=true;
   let stopped=false;
   try{stopped=await window.tm.cancelAccountConnect?.(email)===true;}catch(error){console.error(error);}
   cancelEl.disabled=false;
-  if(cancelEl.dataset.connectEmail!==email)return;
+  if(cancelEl.dataset.connectEmail!==email||attempt!==window.currentWizardAttempt?.())return;
   setConnectWaitCancellable(cancelId,null);
   // The attempt running on this screen reports the cancellation itself.
-  if(stopped&&!document.getElementById(target.button)?.dataset.connectLabel){
-    const status=document.getElementById(target.status);
-    if(status){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';}
-  }
+  if(document.getElementById(target.button)?.dataset.connectLabel)return;
+  const status=document.getElementById(target.status);
+  // Without a running wait the stale rejection goes away.
+  if(status){status.textContent=stopped?wt('connectWaitCancelled'):'';status.dataset.kind='';}
 }
 document.getElementById('wzConnectCancel').onclick=()=>cancelConnectWait('wzConnectCancel');
 document.getElementById('accountOauthCancel').onclick=()=>cancelConnectWait('accountOauthCancel');
