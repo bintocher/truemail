@@ -2487,8 +2487,10 @@ fn decode_modified_utf7(value: &str) -> Option<String> {
                 return None;
             }
             let units = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_be_bytes([pair[0], pair[1]]));
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair));
             out.extend(
                 char::decode_utf16(units).map(|ch| ch.unwrap_or(char::REPLACEMENT_CHARACTER)),
             );

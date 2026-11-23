@@ -277,6 +277,7 @@ fn run() -> anyhow::Result<()> {
         installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         diagnostics_running: std::sync::atomic::AtomicBool::new(false),
         connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
@@ -363,14 +364,12 @@ fn run() -> anyhow::Result<()> {
                 let state = app.state::<AppState>();
                 // Куда показывать уведомления - читаем до создания окна:
                 // позиционирование синхронное.
-                if let Some(core) = core.as_ref() {
-                    if let Ok(Some(value)) =
+                if let Some(core) = core.as_ref()
+                    && let Ok(Some(value)) =
                         tauri::async_runtime::block_on(core.db.setting("notify_position"))
-                    {
-                        if let Ok(mut anchor) = state.notify_anchor.lock() {
-                            *anchor = commands::NotifyAnchor::parse(&value);
-                        }
-                    }
+                    && let Ok(mut anchor) = state.notify_anchor.lock()
+                {
+                    *anchor = commands::NotifyAnchor::parse(&value);
                 }
                 // Разовая фоновая починка кодировок уже сохранённой почты
                 // (issue #41, specs/message-charset-decoding.md, S-009).
@@ -444,10 +443,10 @@ fn run() -> anyhow::Result<()> {
             // аргументы прежнего процесса, и --hidden от автозапуска прятал бы
             // обновлённую программу обратно в трей.
             let after_update = commands::take_show_window_after_update(app.handle());
-            if after_update || !std::env::args().any(|arg| arg == "--hidden") {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                }
+            if (after_update || !std::env::args().any(|arg| arg == "--hidden"))
+                && let Some(window) = app.get_webview_window("main")
+            {
+                let _ = window.show();
             }
 
             // Скрытое окно собственных уведомлений (frameless, поверх всех окон,
@@ -673,6 +672,7 @@ fn run() -> anyhow::Result<()> {
             commands::complete_exchange_ews,
             commands::complete_jmap,
             commands::complete_yandex_oauth,
+            commands::cancel_account_connect,
             commands::api_tools,
             commands::external_api_status,
             commands::start_external_api,

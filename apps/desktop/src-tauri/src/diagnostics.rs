@@ -600,7 +600,14 @@ mod tests {
         let file = File::open(path).expect("архив открыт");
         let mut archive = zip::ZipArchive::new(file).expect("это zip");
         (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_owned())
+            .map(|i| {
+                archive
+                    .by_index(i)
+                    .unwrap()
+                    .name()
+                    .expect("entry name is readable")
+                    .into_owned()
+            })
             .collect()
     }
 

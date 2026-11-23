@@ -230,6 +230,7 @@
             </div>
           </div>
           <div class="wz-connect-status" id="accountOauthStatus" role="status" aria-live="polite"></div>
+          <button class="btn mt-8 hidden" id="accountOauthCancel" type="button" data-i18n="connectCancelWait">Отменить ожидание</button>
         </div></div>
         <div class="btn-row"><button class="btn" id="accountWizardCancel" data-i18n="cancel">Отмена</button></div>
       </div>
@@ -753,6 +754,7 @@
           <div id="wzCodeBox" class="hidden"><p class="note-muted" data-i18n="confirmationCodeDesc">Скопируйте код со страницы Яндекс ID после входа.</p><input class="inp mb-10" id="wzOauthCode" autocomplete="one-time-code" data-i18n-placeholder="codePlaceholder" placeholder="Код подтверждения">
             <button class="btn primary btn-full" id="wzConfirm"><i data-i="check"></i><span data-i18n="confirm">Подтвердить подключение</span></button></div>
           <div class="wz-connect-status" id="wzConnectStatus" role="status" aria-live="polite"></div>
+          <button class="btn mt-8 hidden" id="wzConnectCancel" type="button" data-i18n="connectCancelWait">Отменить ожидание</button>
         </div>
         <div class="wznav"><button class="btn" data-wz="4"><i data-i="back"></i><span data-i18n="back">Назад</span></button><button class="btn primary" id="wzAccountNext" data-wz="6" disabled data-i18n="next">Далее</button><button class="wz-skip-btn" data-wz="6" data-i18n="skip">Пропустить</button></div>
       </div>
@@ -808,7 +810,7 @@
   <div class="activity-list"></div>
 </div>
 
-<script src="modules/app-version.js?v=0.3.4"></script>
+<script src="modules/app-version.js?v=0.3.5"></script>
 <script src="modules/limits.js?v=20260925-1"></script>
 <script src="modules/popup-menus.js?v=20260909-1"></script>
 <script src="modules/list-render-hold.js?v=20260910-1"></script>
@@ -824,8 +826,8 @@
 <script src="modules/quick-steps.js?v=20260920-1"></script>
 <script src="modules/sender-lists.js?v=20260918-2"></script>
 <script src="modules/smart-rules.js?v=20260920-2"></script>
-<script src="modules/i18n-onboarding.js?v=20260925-1"></script>
-<script src="modules/error-presentation.js?v=20260925-1"></script>
+<script src="modules/i18n-onboarding.js?v=20261123-1"></script>
+<script src="modules/error-presentation.js?v=20261123-1"></script>
 <script src="modules/activity-log.js?v=20260925-3"></script>
 <script src="modules/mail-sync-indicator.js?v=20260916-2"></script>
 <script src="modules/folder-names.js?v=20260905-1"></script>
@@ -833,7 +835,7 @@
 <script src="modules/message-labels.js?v=20260918-1"></script>
 <script src="modules/connect-progress.js?v=20260916-1"></script>
 <script src="modules/diagnostics-categories.js?v=20260921-1"></script>
-<script src="modules/mail.js?v=20260921-1"></script>
+<script src="modules/mail.js?v=20261123-3"></script>
 <script src="modules/composer-body.js?v=20260904-1"></script>
 <script src="modules/outbox.js?v=20260920-1"></script>
 <script src="modules/out-of-office.js?v=20260920-1"></script>
@@ -845,6 +847,6 @@
 <script src="modules/queue-sections.js?v=20260920-2"></script>
 <script src="modules/release-notes.js?v=20260919-1"></script>
 <script src="modules/window-chrome.js?v=20260919-3"></script>
-<script src="bridge.js?v=20260921-1"></script>
+<script src="bridge.js?v=20261123-1"></script>
 </body>
 </html>

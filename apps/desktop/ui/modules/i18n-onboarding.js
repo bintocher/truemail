@@ -1,7 +1,7 @@
 // truemail UI module: i18n-onboarding.js
 /* welcome wizard */
 let wizardText={ru:{},en:{}};
-window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20260925-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
+window.localizationReady=Promise.all(['ru','en'].map(async locale=>{const response=await fetch(`locales/${locale}.json?v=20261123-1`);if(!response.ok)throw new Error(`locale ${locale}: HTTP ${response.status}`);wizardText[locale]=await response.json();}));
 let wizardLocale='';
 let pendingOauthState='';
 function wt(key){return (wizardText[wizardLocale]||wizardText.en)[key]||key;}
@@ -135,6 +135,7 @@ function clearWizardTransientMessages(){
   document.querySelectorAll('#welcomeView .wz-connect-status').forEach(el=>{el.textContent='';delete el.dataset.kind;});
   const connectButton=document.getElementById('wzConnect');if(connectButton)window.setConnectBusy?.(connectButton,null,null,false);
   const confirmButton=document.getElementById('wzConfirm');if(confirmButton)window.setConnectBusy?.(confirmButton,null,null,false);
+  window.setConnectWaitCancellable?.('wzConnectCancel',null);
   document.getElementById('wzCodeBox')?.classList.add('hidden');
   const oauthCode=document.getElementById('wzOauthCode');if(oauthCode)oauthCode.value='';
   pendingOauthState='';
@@ -305,7 +306,7 @@ function showAccountWizard(prefillEmail=''){
   wizardAttemptGeneration++;
   accountOauthState='';accountPasswordProvider='generic';
   const status=document.getElementById('accountOauthStatus'),start=document.getElementById('accountOauthStart'),confirm=document.getElementById('accountOauthConfirm'),code=document.getElementById('accountOauthCode');
-  status.textContent='';status.dataset.kind='';window.setConnectBusy?.(start,null,null,false);window.setConnectBusy?.(confirm,null,null,false);window.setConnectBusy?.(document.getElementById('accountPasswordConfirm'),null,null,false);code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
+  status.textContent='';status.dataset.kind='';window.setConnectBusy?.(start,null,null,false);window.setConnectBusy?.(confirm,null,null,false);window.setConnectBusy?.(document.getElementById('accountPasswordConfirm'),null,null,false);window.setConnectWaitCancellable?.('accountOauthCancel',null);code.value='';document.getElementById('accountEmail').value=typeof prefillEmail==='string'?prefillEmail:'';document.getElementById('accountConnectionDetectRow').classList.remove('hidden');document.getElementById('accountCodeRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.add('hidden');document.getElementById('accountPassword').value='';
   document.querySelector('.settings').classList.add('account-wizard-mode');showView('settingsView');setSection('addacct');
 }
 function closeAccountWizard(){document.querySelector('.settings').classList.remove('account-wizard-mode');setSection('accounts');}

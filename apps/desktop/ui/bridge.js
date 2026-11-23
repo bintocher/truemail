@@ -219,6 +219,7 @@ window.corePageSize = null;
     completeJmap: (config) => invoke("complete_jmap", config),
     beginYandexOauth: (email, attemptId) => invoke("begin_account_connection", { email, attemptId }),
     completeYandexOauth: (state, code, attemptId) => invoke("complete_yandex_oauth", { oauthState: state, code, attemptId }),
+    cancelAccountConnect: (email) => invoke("cancel_account_connect", { email }),
     apiTools: () => invoke("api_tools"),
     externalApiStatus: () => invoke("external_api_status"),
     startExternalApi: (port) => invoke("start_external_api", { port }),
