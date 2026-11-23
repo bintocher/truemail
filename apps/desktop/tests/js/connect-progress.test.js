@@ -118,6 +118,9 @@ test('S-018, S-019, S-020, S-021: the sign-in wait is cancelled through the real
       beginAccountConnection: () => new Promise((resolve, reject) => { finishAttempt = {resolve, reject}; }),
       cancelAccountConnect: () => true,
     },
+    // The reload of mail data never finishes: a cancelled wait and a rejected
+    // start must not wait for it.
+    globals: {reloadCoreData: () => new Promise(() => {})},
   });
   await ui.clock.drain();
   await ui.evaluate('window.localizationReady');
@@ -171,9 +174,29 @@ test('S-018, S-019, S-020, S-021: the sign-in wait is cancelled through the real
   assert.equal(status.textContent, ru.errorConnectInProgress, 'the busy address is not explained');
   assert.equal(status.dataset.kind, 'error');
   assert.equal(shown(cancel), true, 'the busy address leaves the user without a way out');
+
+  // The cancel follows the address: another one typed in the field hides it,
+  // and a new attempt does not keep it either.
+  ui.byId('wzEmail').value = 'other@example.test';
+  ui.byId('wzEmail').dispatch('input');
+  assert.equal(shown(cancel), false, 'the cancel of the previous address stays after the field changed');
+  ui.evaluate(`window.setConnectWaitCancellable('wzConnectCancel','${email}');`);
+  start.onclick();
+  await settle();
+  assert.equal(shown(cancel), false, 'a new attempt kept the cancel of the previous rejection');
+  finishAttempt.resolve({mode: 'cancelled'});
+  await settle();
+  assert.equal(cancellations().length, 1, 'a cancel of the previous address was sent');
+
+  ui.byId('wzEmail').value = email;
+  start.onclick();
+  await settle();
+  finishAttempt.reject({kind: 'connect_in_progress', message: 'raw'});
+  await settle();
+  assert.equal(shown(cancel), true, 'the busy address is not offered a cancel again');
   cancel.onclick();
   await settle();
-  assert.equal(cancellations().length, 2);
+  assert.deepEqual(cancellations(), [[email], [email]], 'the cancels went for other addresses');
   assert.equal(status.textContent, ru.connectWaitCancelled, 'the stopped wait is not reported');
   assert.notEqual(status.dataset.kind, 'error', 'the stopped wait is shown as an error');
 

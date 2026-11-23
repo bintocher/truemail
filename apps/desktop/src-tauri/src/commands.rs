@@ -5603,7 +5603,19 @@ fn microsoft_client_id() -> CmdResult<String> {
     })
 }
 
-type CancelSignal = Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+#[derive(PartialEq)]
+enum WaitState {
+    Pending,
+    Cancelled,
+    Finished,
+}
+
+pub struct CancelSlot {
+    state: WaitState,
+    sender: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+type CancelSignal = Arc<std::sync::Mutex<CancelSlot>>;
 /// Email address -> cancellation signal of its running OAuth sign-in wait.
 pub type OAuthWaitRegistry = std::sync::Mutex<HashMap<String, CancelSignal>>;
 
@@ -5622,21 +5634,26 @@ struct OAuthWait {
     signal: CancelSignal,
 }
 
+struct OAuthCancel {
+    signal: CancelSignal,
+    receiver: tokio::sync::oneshot::Receiver<()>,
+}
+
 impl OAuthWait {
-    fn register(
-        registry: &Arc<OAuthWaitRegistry>,
-        email: &str,
-    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+    fn register(registry: &Arc<OAuthWaitRegistry>, email: &str) -> (Self, OAuthCancel) {
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        let signal = Arc::new(std::sync::Mutex::new(Some(sender)));
+        let signal = Arc::new(std::sync::Mutex::new(CancelSlot {
+            state: WaitState::Pending,
+            sender: Some(sender),
+        }));
         lock_or_recover(registry).insert(email.to_owned(), Arc::clone(&signal));
         (
             Self {
                 registry: Arc::clone(registry),
                 email: email.to_owned(),
-                signal,
+                signal: Arc::clone(&signal),
             },
-            receiver,
+            OAuthCancel { signal, receiver },
         )
     }
 }
@@ -5654,6 +5671,30 @@ impl Drop for OAuthWait {
     }
 }
 
+/// Returns false when the wait is over or cancelled already.
+fn signal_cancel(signal: &CancelSignal) -> bool {
+    let mut slot = lock_or_recover(signal);
+    if slot.state != WaitState::Pending {
+        return false;
+    }
+    slot.state = WaitState::Cancelled;
+    if let Some(sender) = slot.sender.take() {
+        let _ = sender.send(());
+    }
+    true
+}
+
+/// Returns false when the wait was cancelled: its answer must be dropped then.
+fn finish_wait(signal: &CancelSignal) -> bool {
+    let mut slot = lock_or_recover(signal);
+    if slot.state == WaitState::Cancelled {
+        return false;
+    }
+    slot.state = WaitState::Finished;
+    slot.sender.take();
+    true
+}
+
 /// Stops the OAuth sign-in wait of `email` when it is running, then waits for
 /// the attempt to release the address so that a new attempt can start at once.
 async fn cancel_oauth_wait(
@@ -5662,11 +5703,10 @@ async fn cancel_oauth_wait(
     email: &str,
 ) -> bool {
     let signal = lock_or_recover(registry).get(email).cloned();
-    let sender = signal.and_then(|signal| lock_or_recover(&signal).take());
-    let Some(sender) = sender else {
+    let Some(signal) = signal else {
         return false;
     };
-    if sender.send(()).is_err() {
+    if !signal_cancel(&signal) {
         return false;
     }
     let _ = tokio::time::timeout(OAUTH_CANCEL_RELEASE_TIMEOUT, async {
@@ -5695,8 +5735,9 @@ async fn receive_oauth_callback(
     listener: tokio::net::TcpListener,
     expected_state: &str,
     provider: &str,
-    cancel: tokio::sync::oneshot::Receiver<()>,
+    cancel: OAuthCancel,
 ) -> CmdResult<OAuthCallback> {
+    let OAuthCancel { signal, receiver } = cancel;
     let accept = tokio::time::timeout(OAUTH_WAIT_TIMEOUT, async {
         loop {
             let (mut stream, _) = listener.accept().await.map_err(|error| ApiError {
@@ -5745,12 +5786,9 @@ async fn receive_oauth_callback(
             );
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.shutdown().await;
+            // A stale sign-in tab must not end the wait of a newer attempt.
             if !valid_state {
-                return Err(ApiError {
-                    message: format!(
-                        "{provider} OAuth вернул неверный state; подключение отменено"
-                    ),
-                });
+                continue;
             }
             if let Some(error) = error {
                 return Err(ApiError {
@@ -5764,10 +5802,17 @@ async fn receive_oauth_callback(
     });
     tokio::select! {
         biased;
-        result = accept => result.map_err(|_| ApiError {
-            message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
-        })?,
-        _ = user_cancelled(cancel) => Ok(OAuthCallback::Cancelled),
+        _ = user_cancelled(receiver) => Ok(OAuthCallback::Cancelled),
+        result = accept => {
+            let answered = result.map_err(|_| ApiError {
+                message: format!("Время ожидания входа в {provider} истекло. Нажмите «Подключить» ещё раз."),
+            });
+            if finish_wait(&signal) {
+                answered?
+            } else {
+                Ok(OAuthCallback::Cancelled)
+            }
+        }
     }
 }
 
@@ -7574,11 +7619,31 @@ mod connect_progress_tests {
             !cancel_oauth_wait(&waits, &connecting, "other@example.com").await,
             "another address reported a stopped wait"
         );
+
+        // An answer of a stale tab is rejected and does not end the wait.
+        let mut stale = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("stale tab connected");
+        stale
+            .write_all(
+                b"GET /oauth/callback?state=stale&code=old HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+            .await
+            .expect("stale answer sent");
+        let mut response = Vec::new();
+        stale
+            .read_to_end(&mut response)
+            .await
+            .expect("stale answer responded");
+        assert!(
+            String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400"),
+            "stale answer was accepted"
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), &mut wait)
                 .await
                 .is_err(),
-            "wait ended without a cancellation"
+            "stale answer ended the wait"
         );
 
         assert!(
@@ -7591,7 +7656,7 @@ mod connect_progress_tests {
             .expect("wait task panicked");
         assert!(
             matches!(outcome, Ok(OAuthCallback::Cancelled)),
-            "{outcome:?}"
+            "cancelled wait did not end as cancelled"
         );
         assert!(
             !connecting.lock().await.contains("user@example.com"),
@@ -7614,11 +7679,22 @@ mod connect_progress_tests {
             "dropping a replaced wait removed the current one"
         );
         assert!(cancel_oauth_wait(&waits, &connecting, "user@example.com").await);
-        assert_eq!(newer_cancel.await, Ok(()));
+        assert_eq!(newer_cancel.receiver.await, Ok(()));
         drop(newer);
         assert!(
             lock_or_recover(&waits).is_empty(),
             "registry is not empty after the wait ended"
         );
+
+        // A cancelled wait cannot accept an answer that arrived meanwhile.
+        let (wait, cancel) = OAuthWait::register(&waits, "user@example.com");
+        assert!(signal_cancel(&wait.signal));
+        assert!(
+            !finish_wait(&wait.signal),
+            "cancelled wait accepted an answer"
+        );
+        assert!(!signal_cancel(&wait.signal));
+        drop(wait);
+        drop(cancel);
     }
 }

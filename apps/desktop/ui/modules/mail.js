@@ -1169,6 +1169,13 @@ async function cancelConnectWait(cancelId){
 }
 document.getElementById('wzConnectCancel').onclick=()=>cancelConnectWait('wzConnectCancel');
 document.getElementById('accountOauthCancel').onclick=()=>cancelConnectWait('accountOauthCancel');
+// The cancel button follows the address: another one typed in the field hides it.
+for(const [fieldId,cancelId] of [['accountEmail','accountOauthCancel'],['wzEmail','wzConnectCancel']]){
+  document.getElementById(fieldId).addEventListener('input',()=>{
+    const cancelEl=document.getElementById(cancelId),field=document.getElementById(fieldId);
+    if(cancelEl.dataset.connectEmail&&cancelEl.dataset.connectEmail!==field.value.trim().toLowerCase())setConnectWaitCancellable(cancelId,null);
+  });
+}
 function updateAccountConnectionType(){const type=document.getElementById('accountConnectionType').value,exchange=type==='exchange',jmap=type==='jmap',title=document.getElementById('accountPasswordTitle'),desc=document.getElementById('accountPasswordDesc');document.getElementById('accountEwsField').classList.toggle('hidden',!exchange);document.getElementById('accountJmapField').classList.toggle('hidden',!jmap);document.querySelectorAll('#accountPasswordRow .server-pair').forEach(row=>row.classList.toggle('hidden',exchange||jmap));document.getElementById('accountTlsField')?.classList.toggle('hidden',exchange||jmap);if(exchange){title.dataset.i18n='exchangeConnectionTitle';desc.dataset.i18n='exchangeConnectionDesc';title.textContent=L('Подключение Exchange','Connect Exchange');desc.textContent=L('Введите пароль доменной учётной записи. Адрес EWS уже определён автоматически — меняйте его только если сервер использует другой путь. Пароль хранится только в системном хранилище Windows.','Enter the domain account password. The EWS address was detected automatically; change it only if the server uses a different path. The password is stored only in Windows Credential Manager.');}else if(jmap){title.dataset.i18n='jmapConnectionTitle';desc.dataset.i18n='jmapConnectionDesc';title.textContent=L('Подключение JMAP','Connect JMAP');desc.textContent=L('Введите отдельный пароль приложения и проверьте адрес JMAP Session. Пароль хранится только в системном хранилище.','Enter an app password and check the JMAP Session address. The password is stored only in the system credential store.');}else{title.dataset.i18n='imapConnectionTitle';desc.dataset.i18n='imapConnectionDesc';title.textContent=L('Подключение IMAP / SMTP','Connect IMAP / SMTP');desc.textContent=L('Проверьте серверы входящей и исходящей почты. Для Mail.ru и iCloud используйте отдельный пароль приложения.','Check the incoming and outgoing mail servers. Use an app password for Mail.ru and iCloud.');}}
 document.getElementById('accountConnectionType').onchange=updateAccountConnectionType;
 function showPasswordConnection(config){accountPasswordProvider=config.provider;document.getElementById('accountConnectionType').value=config.backend_kind==='ews'?'exchange':config.backend_kind==='jmap'?'jmap':'imap';document.getElementById('accountUsername').value=config.username||document.getElementById('accountEmail').value.trim();document.getElementById('accountEwsServer').value=config.ews_url||'';document.getElementById('accountJmapServer').value=config.jmap_url||'';document.getElementById('accountImapHost').value=config.imap?.host||'';document.getElementById('accountImapPort').value=config.imap?.port||993;document.getElementById('accountImapSecurity').value=config.imap?.security||'ssl';document.getElementById('accountSmtpHost').value=config.smtp?.host||'';document.getElementById('accountSmtpPort').value=config.smtp?.port||465;document.getElementById('accountSmtpSecurity').value=config.smtp?.security||'ssl';updateAccountConnectionType();document.getElementById('accountConnectionDetectRow').classList.add('hidden');document.getElementById('accountPasswordRow').classList.remove('hidden');document.getElementById('accountPassword').focus();}
@@ -1182,9 +1189,18 @@ document.getElementById('accountOauthStart').onclick=async()=>{
   const attempt=window.currentWizardAttempt?.();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=L('Введите корректный адрес почты.','Enter a valid email address.');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=L('OAuth доступен внутри приложения truemail.','OAuth is available inside the truemail app.');status.dataset.kind='error';return;}
+  setConnectWaitCancellable('accountOauthCancel',null);
   try{
     setConnectBusy(button,status,'detecting',true,attempt);
     const pending=await window.tm.beginAccountConnection(email,attempt);
+    if(pending.mode==='cancelled'){
+      // Nothing was saved, so the screen returns to work without reloading data.
+      if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+      setConnectBusy(button,null,null,false);
+      setConnectWaitCancellable('accountOauthCancel',null);
+      status.textContent=wt('connectWaitCancelled');status.dataset.kind='';
+      return;
+    }
     // F5: данные аккаунтов и готовность композера обновляем при любом
     // завершении команды - до решения, показывать ли результат на этом
     // экране, а не только когда попытка ещё актуальна.
@@ -1192,7 +1208,6 @@ document.getElementById('accountOauthStart').onclick=async()=>{
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
     setConnectWaitCancellable('accountOauthCancel',null);
-    if(pending.mode==='cancelled'){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';return;}
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):L('Аккаунт подключён.','Account connected.');status.dataset.kind=connected.warnings?.length?'warning':'success';setTimeout(async()=>{closeAccountWizard();await window.reloadCoreData?.();await window.tm?.startRealtime();showView('mailView');},connected.warnings?.length?2500:300);return;}
     if(pending.mode==='password'){showPasswordConnection(pending.password_config);status.textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается, а
@@ -1200,10 +1215,18 @@ document.getElementById('accountOauthStart').onclick=async()=>{
     accountOauthState=pending.state;document.getElementById('accountCodeRow').classList.remove('hidden');status.textContent=wt('connectStageWaitingCode');document.getElementById('accountOauthCode').focus();
   }
   catch(e){
+    // The rejected start saved nothing: the screen reacts before any reload.
+    if(accountError(e).kind==='connect_in_progress'){
+      if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
+      setConnectBusy(button,null,null,false);
+      setConnectWaitCancellable('accountOauthCancel',email);
+      status.textContent=connectFailureText(e);status.dataset.kind='error';
+      return;
+    }
     await refreshAccountsAndComposerReadiness();
     if(!window.isSettingsConnectAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    setConnectWaitCancellable('accountOauthCancel',accountError(e).kind==='connect_in_progress'?email:null);
+    setConnectWaitCancellable('accountOauthCancel',null);
     status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
@@ -1256,9 +1279,18 @@ document.getElementById('wzConnect').onclick=async()=>{
   const attempt=window.currentWizardAttempt?.();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){status.textContent=wt('invalidEmail');status.dataset.kind='error';return;}
   if(!window.tm?.beginAccountConnection){status.textContent=wt('oauthUnavailable');status.dataset.kind='error';return;}
+  setConnectWaitCancellable('wzConnectCancel',null);
   try{
     setConnectBusy(button,status,'detecting',true,attempt);
     const pending=await window.tm.beginAccountConnection(email,attempt);
+    if(pending.mode==='cancelled'){
+      // Nothing was saved, so the wizard returns to work without reloading data.
+      if(!window.isWizardAttemptCurrent?.(attempt))return;
+      setConnectBusy(button,null,null,false);
+      setConnectWaitCancellable('wzConnectCancel',null);
+      status.textContent=wt('connectWaitCancelled');status.dataset.kind='';
+      return;
+    }
     // F5, S-009, S-012: данные аккаунтов и готовность композера обновляем при
     // любом завершении команды, до решения, показывать ли результат в
     // мастере - мастер этой попытки мог тем временем уже закрыться или
@@ -1267,17 +1299,24 @@ document.getElementById('wzConnect').onclick=async()=>{
     if(!window.isWizardAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
     setConnectWaitCancellable('wzConnectCancel',null);
-    if(pending.mode==='cancelled'){status.textContent=wt('connectWaitCancelled');status.dataset.kind='';return;}
     if(pending.mode==='connected'&&pending.connected){const connected=pending.connected;status.textContent=connected.warnings?.length?connectedWarningText(connected):wt('connected');status.dataset.kind=connected.warnings?.length?'warning':'success';document.getElementById('wzAccountNext').disabled=false;return;}
     if(pending.mode==='password'){showAccountWizard(email);showPasswordConnection(pending.password_config);document.getElementById('accountOauthStart').disabled=true;document.getElementById('accountOauthStatus').textContent=L('Проверьте серверы и введите пароль приложения или почтовый пароль.','Check the servers and enter an app password or mail password.');return;}
     // S-009: команда перешла к ожиданию кода - кнопка освобождается (уже
     // сделано выше), а заметная область показывает отдельное состояние.
     pendingOauthState=pending.state;document.getElementById('wzCodeBox').classList.remove('hidden');status.textContent=wt('connectStageWaitingCode');document.getElementById('wzOauthCode').focus();
   }catch(e){
+    // The rejected start saved nothing: the wizard reacts before any reload.
+    if(accountError(e).kind==='connect_in_progress'){
+      if(!window.isWizardAttemptCurrent?.(attempt))return;
+      setConnectBusy(button,null,null,false);
+      setConnectWaitCancellable('wzConnectCancel',email);
+      status.textContent=connectFailureText(e);status.dataset.kind='error';
+      return;
+    }
     await refreshAccountsAndComposerReadiness();
     if(!window.isWizardAttemptCurrent?.(attempt))return;
     setConnectBusy(button,null,null,false);
-    setConnectWaitCancellable('wzConnectCancel',accountError(e).kind==='connect_in_progress'?email:null);
+    setConnectWaitCancellable('wzConnectCancel',null);
     status.textContent=connectFailureText(e);status.dataset.kind='error';
   }
 };
