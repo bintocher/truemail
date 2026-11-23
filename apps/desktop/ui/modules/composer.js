@@ -578,7 +578,14 @@ async function insertClipboardImages(files,initialRange,generation){
 document.getElementById('compAttach').onclick=()=>document.getElementById('compFile').click();
 document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};
-  const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{document.getElementById('compSubj').value=template.subject||'';compEditEl.innerHTML=template.body_html||'';await applyComposerSignature(composerSignatureKind);scheduleDraftSave();close();};const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
+  const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{
+      document.getElementById('compSubj').value=template.subject||'';
+      composerTextMissing=false;
+      compEditEl.innerHTML=template.body_html||'';
+      await applyComposerSignature(composerSignatureKind);
+      scheduleDraftSave();
+      close();
+    };const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
   overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error);}};try{await render();}catch(error){close();showToast(error);}}
 document.getElementById('compTemplates').onclick=openTemplateDialog;
 document.querySelectorAll('[data-format]').forEach(button=>button.onclick=()=>{compEditEl.focus();document.execCommand(button.dataset.format,false);scheduleDraftSave();});
@@ -830,7 +837,7 @@ function editorSafeHtml(html){
     if(EDITOR_DROP_TAGS.has(tag)){child.remove();continue;}
     if(EDITOR_UNWRAP_TAGS.has(tag)){
       clean(child);
-      child.before(...[...child.childNodes]);
+      while(child.firstChild)child.before(child.firstChild);
       child.remove();
       continue;
     }
@@ -1063,6 +1070,7 @@ function clearSavedLetter(){
 // new one is saved at once, so that the copy of the sent one does not come back
 // after a restart.
 function saveLetterOfEditor(){
+  if(letterHandedOver(composerGeneration))return;
   saveDraftNow().catch(error=>{window.tm?.uiLog?.(`the letter of the editor was not saved after another letter went out: ${error?.message||error}`);});
 }
 // The generation of the editor whose letter the queue has already taken, and the
@@ -1075,8 +1083,8 @@ document.getElementById('compSend').onclick=async()=>{
   // а вложение легло бы в уже очищенный композер. Если за это время открыли
   // другое письмо, нажатие относилось к прежнему - отправлять нечего.
   const generation=composerGeneration;
-  await settleAttachments();
   await settleDraftLink();
+  await settleAttachments();
   if(generation!==composerGeneration||letterHandedOver(generation))return;
   let request;
   // S-005: адресаты проверяются до записи операции.
@@ -1110,8 +1118,8 @@ document.getElementById('compSendLater').onclick=async()=>{
   if(letterHandedOver(generation))return;
   handingOverGeneration=generation;
   try{
-    await settleAttachments();
     await settleDraftLink();
+    await settleAttachments();
     if(generation!==composerGeneration)return;
     const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');
     if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}

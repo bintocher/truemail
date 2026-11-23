@@ -898,6 +898,8 @@ test('S-019: a late answer for another letter does not open the scheduled letter
   assert.equal(ui.callsOf('sendMessage').length, 1, 'the scheduled letter went to the queue a second time');
   assert.equal(ui.callsOf('scheduleMessage').length, 1, 'the scheduled letter was scheduled a second time');
   assert.equal(ui.byId('compSubj').value, 'Другое', 'the answer for the old letter wiped the new one');
+  const saved = ui.callsOf('setSetting').filter(call => call.args[0] === 'composer_draft').at(-1);
+  assert.equal(saved?.args[1], '', 'the answer for the old letter saved the scheduled letter again');
 });
 
 test('S-019: the answer for an old letter does not cancel the saving of a new one', async () => {
@@ -1034,4 +1036,53 @@ test('S-014: a failure to clear the saved copy after the ordinary sending is wri
   assert.equal(sent(ui).length, 1);
   assert.deepEqual(trashed(ui), [[[22], 'trash']], 'the draft stayed in its folder');
   assert.ok(ui.callsOf('uiLog').some(call => /was not cleared/.test(call.args[0])), 'the failure to clear the saved copy is not written to the log');
+});
+
+test('S-036: unsubscribing by email from the list menu preserves the unsent letter', async () => {
+  const ui = await openMail({
+    getMessage: id => id === 12
+      ? {...fullOf(id), body_html: null, unsubscribe: {one_click_url: null, http: null, mailto: 'mailto:stop@example.test'}}
+      : fullOf(id),
+  });
+  ui.evaluate("currentFolderId=2;applyListOptions(true,'Входящие')");
+  await openLetter(ui, 11);
+  ui.evaluate("resetComposer();setRecipients('compTo',['other@example.test']);document.getElementById('compSubj').value='Моё письмо';showView('mailView');");
+  openListMenu(ui, 12);
+  ui.query('#ctxmenu [data-context-action="unsub"]').dispatch('click');
+  await settle();
+  assert.equal(ui.byId('compSubj').value, 'Моё письмо');
+  assert.ok(notices(ui).some(text => text.includes('неотправленное письмо')));
+});
+
+test('S-012: a file chosen while the draft link is checked goes with the letter', async () => {
+  let releaseLink, releaseFile;
+  const ui = await openMail({
+    getMessage: () => new Promise(resolve => { releaseLink = resolve; }),
+    readLocalFile: () => new Promise(resolve => { releaseFile = resolve; }),
+  });
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:2,to:[{name:'Mate',email:'mate@example.test'}],cc:[],bcc:[],subject:'Письмо',body_html:'<p>Текст письма</p>',attachments:[],draft_message_id:22};renderAccountSettings(coreAccounts,[],[])");
+  const sending = ui.byId('compSend').onclick();
+  await settle();
+  const attaching = ui.evaluate("window.composeWithFiles(['C:/tmp/plan.pdf'])");
+  await settle();
+  releaseLink(fullOf(22));
+  await settle();
+  assert.equal(sent(ui).length, 0, 'the letter went out before the file was read');
+  releaseFile({filename: 'plan.pdf', mime_type: 'application/pdf', base64: 'QQ=='});
+  await attaching;
+  await sending;
+  assert.equal(sent(ui).length, 1);
+  assert.equal(sent(ui)[0].attachments.length, 1);
+  assert.equal(sent(ui)[0].attachments[0].filename, 'plan.pdf');
+});
+
+test('S-010: applying a template supplies the text part of a restored letter', async () => {
+  const ui = await openMail({
+    listMessageTemplates: () => [{id: 1, name: 'Шаблон', subject: 'Тема', body_html: '<p>Текст шаблона</p>'}],
+  });
+  ui.evaluate("resetComposer();window.pendingComposerDraft={account_id:2,to:[{name:'Mate',email:'mate@example.test'}],cc:[],bcc:[],subject:'Письмо',body_html:'<p>Только HTML</p>',attachments:[],text_missing:true};renderAccountSettings(coreAccounts,[],[])");
+  assert.equal(ui.evaluate('composerRequest().body_text'), '');
+  await ui.byId('compTemplates').onclick();
+  await ui.query('.template-row .btn').onclick();
+  assert.equal(ui.evaluate('composerRequest().body_text'), 'Текст шаблона');
 });

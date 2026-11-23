@@ -4,8 +4,16 @@
 - Утвердил: владелец проекта (по обращению 2026-11-23, issue #133)
 - Задача: issue #133
 - Зависит от: undo-send.md
-- Обновлено: 2026-11-23
-- Ревизия: 6
+- Обновлено: 2026-11-24
+- Ревизия: 7
+
+## Изменения требований в ревизии 7
+
+- Изменено S-008 и S-021. Поиск картинок продолжается после объявления типа документа, а содержимое незакрытого script пропускается до конца разметки. Причина изменений - повторная проверка Codex и DeepSeek.
+- Изменено S-012. Обычная и запланированная отправка ждут чтения вложений после проверки связи с черновиком. Причина изменений - повторная проверка Codex и DeepSeek.
+- Изменено S-014 и S-019. Поздний ответ по другому письму не возвращает уже принятое очередью письмо в автосохранение. Причина изменений - повторная проверка Codex и DeepSeek.
+- Изменено S-036. Отписка по почте сохраняет открытое в редакторе неотправленное письмо и показывает подсказку. Причина изменений - повторная проверка Codex и DeepSeek.
+- Изменено S-010. Вставка шаблона восстанавливает формирование текстовой части письма. Причина изменений - повторная проверка Codex и DeepSeek.
 
 ## Изменения требований в ревизии 6
 
@@ -145,6 +153,8 @@ WHEN пользователь нажимает "Отправить" на чер�
 
 Скрытая копия - не повод отправлять в один клик: на письме не видно ни одного адресата, поэтому такой черновик открывается в редакторе (S-011).
 
+При сборке письма ядро ищет встроенные картинки и после объявления типа документа. Разметка внутри незакрытого `script` не считается картинкой (S-021).
+
 ### S-009. Отправка без редактора
 
 WHILE черновик отправляется одним нажатием, система SHALL NOT изменять содержимое редактора.
@@ -153,7 +163,7 @@ WHILE черновик отправляется одним нажатием, с�
 
 WHEN черновик отправляется без правок, система SHALL передать его исходную текстовую часть, а не строить её из разметки.
 
-У письма без собственной текстовой части (только разметка) текстовая часть уходит пустой, в том числе после пути через редактор, пока пользователь не ввёл текст в тело. Признак отсутствия собственной текстовой части хранится в автосохранении редактора и возвращается после перезапуска.
+У письма без собственной текстовой части (только разметка) текстовая часть уходит пустой, в том числе после пути через редактор, пока пользователь не ввёл текст в тело или не вставил шаблон. После вставки шаблона текстовая часть формируется из тела письма. Признак отсутствия собственной текстовой части хранится в автосохранении редактора и возвращается после перезапуска.
 
 ### S-011. Черновик без получателя
 
@@ -163,7 +173,7 @@ IF у черновика нет получателя в поле "Кому" ил
 
 WHEN письмо уходит в очередь из редактора, в который открыт черновик, система SHALL считать исходный черновик отправленным (S-014).
 
-Связь редактора с исходным письмом хранится в автосохранении и возвращается при восстановлении, только если письмо по-прежнему является черновиком. Обычная и запланированная отправка из редактора ждут завершения этой проверки.
+Связь редактора с исходным письмом хранится в автосохранении и возвращается при восстановлении, только если письмо по-прежнему является черновиком. Обычная и запланированная отправка из редактора ждут завершения этой проверки, затем ждут чтения вложений, в том числе выбранных во время проверки.
 
 ### S-013. Другое письмо в редакторе
 
@@ -175,7 +185,7 @@ IF в редакторе есть другое неотправленное пи
 
 WHEN письмо принято в очередь отправки, в том числе с отправкой на выбранное время, система SHALL переместить исходный черновик из папки "Черновики" в корзину.
 
-Перемещение начинается сразу после ответа ядра. Сбой очистки автосохранения записывается в журнал программы при обычной и запланированной отправке. Если к моменту ответа в редакторе уже другое письмо, оно сохраняется сразу.
+Перемещение начинается сразу после ответа ядра. Сбой очистки автосохранения записывается в журнал программы при обычной и запланированной отправке. Если к моменту ответа в редакторе уже другое письмо, оно сохраняется сразу при условии, что его ещё не передают в очередь и очередь его не приняла.
 
 ### S-015. Повторная отправка
 
@@ -201,7 +211,7 @@ IF пользователь начинает другое письмо, пока
 
 WHEN очередь отвечает на отправку или запланированную отправку из редактора, система SHALL очистить редактор только если в нём всё ещё отправленное письмо.
 
-Письмо, начатое за время ожидания, остаётся нетронутым, а черновик отправленного письма всё равно убирается из папки. После принятия письма очередью ни "Отправить", ни "Запланировать" не передают его в очередь второй раз, в том числе пока редактор ещё не очищен. Поздний ответ по другому письму сохраняет запрет повторной отправки запланированного письма и оставляет в силе автосохранение нового письма.
+Письмо, начатое за время ожидания, остаётся нетронутым, а черновик отправленного письма всё равно убирается из папки. После принятия письма очередью ни "Отправить", ни "Запланировать" не передают его в очередь второй раз, в том числе пока редактор ещё не очищен. Поздний ответ по другому письму сохраняет запрет повторной отправки запланированного письма и не возвращает принятое очередью письмо в автосохранение. Автосохранение нового письма остаётся в силе.
 
 ### S-020. Неполное тело
 
@@ -211,7 +221,7 @@ IF черновик хранится только в виде заголовко
 
 WHEN черновик переносится в редактор или в очередь, система SHALL переносить обычные вложения вложениями, не добавляя второй раз части, встроенные в тело.
 
-Вложением второй раз не становится только часть, которую ядро пометило как встроенную в тело. Ядро отмечает часть после замены источника картинки в теге `img` на данные части. Допустимы кавычки, их отсутствие, пробелы и любой регистр имени атрибута. При поиске тега ядро пропускает комментарии, текстовое содержимое элементов и значения атрибутов других элементов. Ядро встраивает только картинки тех типов, которые поддерживает сборщик письма. Остальные части остаются вложениями.
+Вложением второй раз не становится только часть, которую ядро пометило как встроенную в тело. Ядро отмечает часть после замены источника картинки в теге `img` на данные части. Допустимы кавычки, их отсутствие, пробелы и любой регистр имени атрибута. При поиске тега ядро пропускает комментарии, объявления типа документа, текстовое содержимое элементов и значения атрибутов других элементов. Если у `script` нет закрывающего тега или его знака `>`, ядро пропускает содержимое до конца разметки. Ядро встраивает только картинки тех типов, которые поддерживает сборщик письма. Остальные части остаются вложениями.
 
 ### S-022. Предел размера при чтении
 
@@ -291,6 +301,8 @@ WHEN контекстное меню списка открывается на п
 
 Это правило действует также для откладывания и быстрых действий. Печать и отписка сначала показывают письмо строки. Меню открывается только для письма, которое есть в данных списка.
 
+Если отписка требует отправить письмо, а в редакторе уже есть неотправленное письмо, система сохраняет его содержимое и предлагает отправить или удалить его, а затем повторить отписку.
+
 ## Интерфейсы и данные
 
 - `MessageFull` получает поле `bcc` (список адресов, по умолчанию пустой). Для черновика оно заполняется из заголовка Bcc при каждом чтении, в том числе когда разобранное письмо берётся из кэша; для остальных писем остаётся пустым. Для чтения разбираются только заголовки письма.
@@ -357,30 +369,30 @@ WHEN контекстное меню списка открывается на п
 | --- | --- |
 | S-001 | `draft-message.test.js`: "S-001" |
 | S-002, S-003 | `draft-message.test.js`: "S-002, S-003, S-004, S-009" - панель черновика и обычного письма; "S-002, S-005, S-007" - кнопка над текстом после меню другого письма; "the buttons above the text act on the shown draft"; "the 'more' menu of the pane acts on the shown draft"; "an empty reading pane offers nothing to send"; [действия панели над пустой областью](../apps/desktop/tests/js/draft-message.test.js#L860) |
-| S-033 | `draft-message.test.js`: "the buttons above the text act on the shown draft" - удаление из меню другого письма; [открытие другого письма во время действия](../apps/desktop/tests/js/draft-message.test.js#L929) |
+| S-033 | `draft-message.test.js`: "the buttons above the text act on the shown draft" - удаление из меню другого письма; [открытие другого письма во время действия](../apps/desktop/tests/js/draft-message.test.js#L931) |
 | S-034 | `draft-message.test.js`: "a reply from the list menu takes the address, the subject and the quote of the letter under the cursor" |
 | S-035 | `draft-message.test.js`: "the sender commands of the list menu take the letter under the cursor" |
-| S-036 | `draft-message.test.js`: "an item of the list menu takes the letter under the cursor, not another selection"; [откладывание письма строки](../apps/desktop/tests/js/draft-message.test.js#L995); [действие на письме строки и отсутствующее письмо](../apps/desktop/tests/js/draft-message.test.js#L1009) |
+| S-036 | `draft-message.test.js`: "an item of the list menu takes the letter under the cursor, not another selection"; [откладывание письма строки](../apps/desktop/tests/js/draft-message.test.js#L997); [действие на письме строки и отсутствующее письмо](../apps/desktop/tests/js/draft-message.test.js#L1011); [сохранение письма в редакторе при отписке по почте](../apps/desktop/tests/js/draft-message.test.js#L1041) |
 | S-004 | `draft-message.test.js`: "S-002, S-003, S-004, S-009" - меню "Ещё" черновика и обычного письма |
 | S-005, S-006 | `draft-message.test.js`: "S-002, S-003, S-004, S-009" - контекстные меню черновика и обычного письма |
 | S-007 | `draft-message.test.js`: "a late refresh of quick steps does not put their items into the open menu of a draft" |
-| S-008, S-010 | `draft-message.test.js`: "S-002, S-005, S-007" - содержимое запроса отправки; "S-010: a letter of markup alone does not get a text part written for it"; "S-010: a letter of markup alone keeps an empty text part on the way through the editor"; [восстановление письма без собственной текстовой части](../apps/desktop/tests/js/draft-message.test.js#L965) |
+| S-008, S-010 | `draft-message.test.js`: "S-002, S-005, S-007" - содержимое запроса отправки; "S-010: a letter of markup alone does not get a text part written for it"; "S-010: a letter of markup alone keeps an empty text part on the way through the editor"; [восстановление письма без собственной текстовой части](../apps/desktop/tests/js/draft-message.test.js#L967); [текстовая часть после вставки шаблона](../apps/desktop/tests/js/draft-message.test.js#L1079); [картинка после объявления типа документа](../crates/core/src/backend/smtp.rs#L986); [пропуск объявления и разметки в атрибуте](../crates/core/src/backend/smtp.rs#L993); [пропуск незакрытого script](../crates/core/src/backend/smtp.rs#L1001) |
 | S-009 | `draft-message.test.js`: "S-002, S-005, S-007" - редактор не тронут; "S-012" - редактор во время чтения, файл из проводника |
 | S-011 | `draft-message.test.js`: "S-005, S-006: a draft without a recipient opens the editor" |
-| S-012 | `draft-message.test.js`: "S-005, S-006: a draft without a recipient opens the editor and goes out from it"; "S-006: when an attachment cannot be read"; "S-012: a letter the core refuses opens the editor with the reason"; "a letter restored from the saved state still takes its draft out of the folder"; [проверка исходного письма перед отправкой](../apps/desktop/tests/js/draft-message.test.js#L944) |
+| S-012 | `draft-message.test.js`: "S-005, S-006: a draft without a recipient opens the editor and goes out from it"; "S-006: when an attachment cannot be read"; "S-012: a letter the core refuses opens the editor with the reason"; "a letter restored from the saved state still takes its draft out of the folder"; [проверка исходного письма перед отправкой](../apps/desktop/tests/js/draft-message.test.js#L946); [вложение, выбранное во время проверки черновика](../apps/desktop/tests/js/draft-message.test.js#L1057) |
 | S-013 | `draft-message.test.js`: "S-007, S-008: another unsent letter in the editor is not touched"; "S-008: a draft left in the editor is offered again" |
-| S-014 | `draft-message.test.js`: "S-002, S-005, S-007"; "S-005, S-006: a letter scheduled from the editor"; "S-012, S-019: a letter scheduled from the editor is queued once"; "a failure to clear the saved copy does not undo the scheduling of a draft"; [запись сбоя очистки после обычной отправки](../apps/desktop/tests/js/draft-message.test.js#L1026); [немедленное сохранение нового письма](../apps/desktop/tests/js/draft-message.test.js#L903) |
+| S-014 | `draft-message.test.js`: "S-002, S-005, S-007"; "S-005, S-006: a letter scheduled from the editor"; "S-012, S-019: a letter scheduled from the editor is queued once"; "a failure to clear the saved copy does not undo the scheduling of a draft"; [запись сбоя очистки после обычной отправки](../apps/desktop/tests/js/draft-message.test.js#L1028); [немедленное сохранение нового письма](../apps/desktop/tests/js/draft-message.test.js#L905); [очистка автосохранения запланированного письма при позднем ответе](../apps/desktop/tests/js/draft-message.test.js#L875) |
 | S-015 | `draft-message.test.js`: "S-011, S-007: a draft that stayed in its folder" |
 | S-016 | `draft-message.test.js`: "S-011: a second click on Send"; "another draft is sent while the first one is being read" |
 | S-017 | `draft-message.test.js`: "S-011: the draft leaves the screen"; "S-017: the next draft gets its Send button"; "a late show of the accepted draft does not bring it back" |
 | S-018 | `draft-message.test.js`: "S-012: the editor is not touched while a draft that has to be finished is being read"; "S-012: a file handed over from the file manager" |
-| S-019 | `draft-message.test.js`: "S-012: a letter started while the queue answers"; "S-012: a letter started in the editor while the editor sends"; "S-012, S-019: a letter scheduled from the editor is queued once"; "a letter taken by the queue is not sent again by either button"; [защита запланированного письма при позднем ответе](../apps/desktop/tests/js/draft-message.test.js#L875); [автосохранение нового письма при позднем ответе](../apps/desktop/tests/js/draft-message.test.js#L903) |
+| S-019 | `draft-message.test.js`: "S-012: a letter started while the queue answers"; "S-012: a letter started in the editor while the editor sends"; "S-012, S-019: a letter scheduled from the editor is queued once"; "a letter taken by the queue is not sent again by either button"; [защита запланированного письма от повторной отправки и автосохранения](../apps/desktop/tests/js/draft-message.test.js#L875); [автосохранение нового письма при позднем ответе](../apps/desktop/tests/js/draft-message.test.js#L905) |
 | S-020 | `draft-message.test.js`: "S-013"; `repository_scenarios.rs`: `a_draft_keeps_its_hidden_copy_on_every_opening` - признак полноты тела |
-| S-021 | `draft-message.test.js`: "S-014, S-015"; [only_a_part_put_into_the_body_is_marked_embedded](../crates/core/src/storage/repository_scenarios.rs#L532) - разные записи источника картинки, пропуск комментариев, текста элементов и значений других атрибутов, переразбор результата без пометок |
+| S-021 | `draft-message.test.js`: "S-014, S-015"; [only_a_part_put_into_the_body_is_marked_embedded](../crates/core/src/storage/repository_scenarios.rs#L532) - разные записи источника картинки, пропуск объявления типа документа, комментариев, текста элементов и значений других атрибутов, переразбор результата без пометок; [пропуск незакрытого script](../crates/core/src/backend/smtp.rs#L1001) |
 | S-022 | `draft-message.test.js`: "S-014: a letter above the size limit"; "S-022: a size the core already knows is checked before the file is read"; "S-022: a letter of pictures alone that is too large opens the editor" |
 | S-023 | `smtp.rs`: `an_oversized_letter_is_refused_before_the_queue` |
-| S-024 | `draft-message.test.js`: "S-014, S-015" - имя с запятой и с кавычкой в кавычках; "S-024: a name with quotes is not escaped a second time"; [скобка в имени получателя](../apps/desktop/tests/js/draft-message.test.js#L980) |
-| S-025 | `draft-message.test.js`: "S-025: an address with a comma in its name survives the saved state of the editor"; [видимость полей копии после восстановления](../apps/desktop/tests/js/draft-message.test.js#L973) |
+| S-024 | `draft-message.test.js`: "S-014, S-015" - имя с запятой и с кавычкой в кавычках; "S-024: a name with quotes is not escaped a second time"; [скобка в имени получателя](../apps/desktop/tests/js/draft-message.test.js#L982) |
+| S-025 | `draft-message.test.js`: "S-025: an address with a comma in its name survives the saved state of the editor"; [видимость полей копии после восстановления](../apps/desktop/tests/js/draft-message.test.js#L975) |
 | S-026 | [a_draft_keeps_its_hidden_copy_on_every_opening](../crates/core/src/storage/repository_scenarios.rs#L426) - чтение нескольких полей скрытой копии; `draft-message.test.js` - скрытая копия в запросе отправки |
 | S-027 | `smtp.rs`: `a_hidden_copy_stays_inside_the_letter_for_server_interfaces` |
 | S-028 | `smtp.rs`: `a_hidden_copy_stays_inside_the_letter_for_server_interfaces` |

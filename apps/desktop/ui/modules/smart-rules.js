@@ -322,7 +322,19 @@ async function executeToolbarAction(action,fromList=false,targets=null){
   const toolbarStepId=quickStepsModel.toolbarStepId(action);if(toolbarStepId!==null){await executeQuickStep(toolbarStepId,targets);return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog(targets);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
   if(uns?.one_click_url){showToast(L('Отправляю запрос на отписку…','Sending unsubscribe request…'));const fallback=()=>window.tm?.openExternal(uns.http||uns.one_click_url).catch(error=>showToast(error));try{const status=await window.tm.unsubscribeOneClick(uns.one_click_url);if(status>=200&&status<300)showToast(L('Готово: вы отписаны от рассылки (сервер подтвердил, код '+status+')','Done: you have been unsubscribed (server confirmed, code '+status+')'));else{showToast(L('Сервер отписки ответил кодом '+status+'. Открываю страницу отписки…','The unsubscribe server responded with code '+status+'. Opening the unsubscribe page…'));fallback();}}catch(error){showToast(error);fallback();}return;}
   const target=uns?.http||embeddedUnsubscribeUrl(activeFullMessage);if(target){try{await window.tm.openExternal(target);showToast(L('Открыл страницу отписки в браузере — завершите отписку там','Opened the unsubscribe page in your browser — finish there'));}catch(error){showToast(error);}return;}
-  const mailto=uns?.mailto;if(mailto){resetComposer();setRecipients('compTo',[String(mailto).replace(/^mailto:/i,'').split('?')[0]]);document.getElementById('compSubj').value=L('Отписаться','Unsubscribe');showView('composeView');showToast(L('Отправьте это письмо, чтобы отписаться','Send this message to unsubscribe'));return;}
+  const mailto=uns?.mailto;
+  if(mailto){
+    if(composerHasContent()){
+      showToast(L('В редакторе есть неотправленное письмо. Отправьте или удалите его, затем отписитесь.','The editor holds an unsent letter. Send or delete it, then unsubscribe.'));
+      return;
+    }
+    resetComposer();
+    setRecipients('compTo',[String(mailto).replace(/^mailto:/i,'').split('?')[0]]);
+    document.getElementById('compSubj').value=L('Отписаться','Unsubscribe');
+    showView('composeView');
+    showToast(L('Отправьте это письмо, чтобы отписаться','Send this message to unsubscribe'));
+    return;
+  }
   showToast(L('В письме нет ссылки для автоматической отписки','This message has no automatic unsubscribe link'));}}
 document.querySelector('.thread .actions').addEventListener('click',e=>{const button=e.target.closest('[data-toolbar-generated]');if(button)executeToolbarAction(button.dataset.act);});
 const threadMoreButton=document.getElementById('threadMoreButton'),threadMoreMenu=document.getElementById('threadMoreMenu');

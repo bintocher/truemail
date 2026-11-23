@@ -78,9 +78,8 @@ fn find_bytes(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
         .map(|position| from + position)
 }
 
-/// The name of a tag that opens a raw text element starts at `name_start`:
-/// the position after the `>` of its closing tag, or `None` when the element is
-/// not one of them or is never closed.
+/// Returns the position of the closing tag's `>`, wrapped in `Some` for a raw
+/// text element. An unclosed raw text element returns `Some(None)`.
 fn raw_text_end(bytes: &[u8], name_start: usize) -> Option<Option<usize>> {
     let name = RAW_TEXT_TAGS.iter().find(|name| {
         starts_with(bytes, name_start, name)
@@ -90,10 +89,11 @@ fn raw_text_end(bytes: &[u8], name_start: usize) -> Option<Option<usize>> {
     })?;
     let mut from = name_start;
     loop {
-        let close = find_bytes(bytes, from + 1, b"</")?;
+        let Some(close) = find_bytes(bytes, from + 1, b"</") else {
+            return Some(None);
+        };
         if starts_with(bytes, close + 2, name) {
-            let end = find_bytes(bytes, close + 2, b">")?;
-            return Some(Some(end));
+            return Some(find_bytes(bytes, close + 2, b">"));
         }
         from = close;
     }
@@ -111,8 +111,11 @@ pub(crate) fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
         }
         let next = bytes.get(i + 1).copied().unwrap_or(0);
         if next == b'!' {
-            // A comment that is never closed hides the rest of the markup.
-            i = find_bytes(bytes, i + 2, b"-->")? + 3;
+            i = if starts_with(bytes, i + 2, b"--") {
+                find_bytes(bytes, i + 2, b"-->")? + 3
+            } else {
+                find_tag_end(bytes, i)? + 1
+            };
             continue;
         }
         if next != b'/' && !next.is_ascii_alphabetic() {
@@ -977,6 +980,29 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert!(replaced.starts_with("<p>Привет, мир!</p>"));
         assert!(replaced.ends_with("<p>Ещё текст.</p>"));
+    }
+
+    #[test]
+    fn extract_inline_images_finds_image_after_document_type() {
+        let html = r#"<!DOCTYPE html><body><img src="data:image/png;base64,AA=="> </body>"#;
+        let (_, parts) = extract_inline_images(html);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn extract_inline_images_skips_document_type_and_quoted_markup() {
+        let html = r#"<p>Сначала</p><!DOCTYPE html><img src="data:image/png;base64,AA=="><p title="<img src='x'>">t</p>"#;
+        let (replaced, parts) = extract_inline_images(html);
+        assert_eq!(parts.len(), 1);
+        assert!(replaced.ends_with(r#"<p title="<img src='x'>">t</p>"#));
+    }
+
+    #[test]
+    fn extract_inline_images_ignores_unclosed_script() {
+        let html = r#"<script>var s="<img src='data:image/png;base64,AA=='>";"#;
+        let (replaced, parts) = extract_inline_images(html);
+        assert!(parts.is_empty());
+        assert_eq!(replaced, html);
     }
 
     #[test]
