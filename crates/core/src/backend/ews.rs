@@ -3459,7 +3459,7 @@ impl MailBackend for EwsBackend {
     }
 
     async fn send(&self, message: OutgoingMessage, credential: &str) -> super::SendResult {
-        let mime = super::smtp::build_message(message)?.formatted();
+        let mime = super::smtp::build_message_with_bcc(message)?.formatted();
         let encoded = base64::engine::general_purpose::STANDARD.encode(mime);
         let item = format!(
             "<t:Message><t:MimeContent CharacterSet=\"UTF-8\">{encoded}</t:MimeContent></t:Message>"

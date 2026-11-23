@@ -354,7 +354,51 @@ type MessageContentCacheRow = (
     i64,
     i64,
     Option<String>,
+    i64,
 );
+
+/// Addresses of parsed header fields with one name, groups included; an
+/// address is listed once.
+fn parsed_address_list<'a>(
+    values: impl Iterator<Item = &'a mail_parser::Address<'a>>,
+) -> Vec<Addr> {
+    let mut out: Vec<Addr> = Vec::new();
+    let mut push = |addr: &mail_parser::Addr<'_>| {
+        let Some(address) = addr
+            .address
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return;
+        };
+        if out
+            .iter()
+            .any(|known| known.email.eq_ignore_ascii_case(address))
+        {
+            return;
+        }
+        out.push(Addr {
+            name: addr
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            email: address.to_owned(),
+        });
+    };
+    for value in values {
+        match value {
+            mail_parser::Address::List(list) => list.iter().for_each(&mut push),
+            mail_parser::Address::Group(groups) => groups
+                .iter()
+                .flat_map(|group| group.addresses.iter())
+                .for_each(&mut push),
+        }
+    }
+    out
+}
 
 /// Заголовки правил молчания одного письма: их читает стадия автоответа
 /// (specs/out-of-office.md, S-063).
@@ -3652,15 +3696,21 @@ impl Db {
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::Other("письмо не найдено".into()))?;
-        let (raw_ref,): (Option<String>,) =
-            sqlx::query_as("SELECT raw_blob_ref FROM messages WHERE id = ?")
-                .bind(message_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let (raw_ref, body_fetched, folder_role): (Option<String>, i64, Option<String>) =
+            sqlx::query_as(
+                "SELECT m.raw_blob_ref, m.body_fetched, f.role
+                   FROM messages m LEFT JOIN folders f ON f.id = m.folder_id
+                  WHERE m.id = ?",
+            )
+            .bind(message_id)
+            .fetch_one(&self.pool)
+            .await?;
+        // The same rule as the interface: a draft is known by its flag or by its folder.
+        let is_draft = meta.flags.draft || folder_role.as_deref() == Some("drafts");
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
-                        is_newsletter, unsubscribe_json
+                        is_newsletter, unsubscribe_json, has_text_part
                    FROM message_content_cache
                   WHERE message_id = ? AND raw_blob_ref = ?",
             )
@@ -3668,21 +3718,41 @@ impl Db {
             .bind(reference)
             .fetch_optional(&self.pool)
             .await?;
-            if let Some((body_html, body_text, attachments, remote, newsletter, unsubscribe)) =
-                cached
+            if let Some((
+                body_html,
+                body_text,
+                attachments,
+                remote,
+                newsletter,
+                unsubscribe,
+                has_text_part,
+            )) = cached
             {
-                return Ok(MessageFull {
-                    meta,
-                    body_html,
-                    body_text,
-                    attachments: serde_json::from_str(&attachments)?,
-                    has_remote_content: remote != 0,
-                    is_newsletter: newsletter != 0,
-                    unsubscribe: unsubscribe
-                        .as_deref()
-                        .map(serde_json::from_str)
-                        .transpose()?,
-                });
+                let attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
+                // A parse result stored before parts were marked as embedded is
+                // parsed again below.
+                if attachments.iter().all(|part| part.embedded.is_some()) {
+                    let bcc = if is_draft {
+                        self.draft_bcc(raw_ref.as_deref()).await?
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(MessageFull {
+                        meta,
+                        body_html,
+                        body_text,
+                        attachments,
+                        bcc,
+                        body_fetched: body_fetched != 0,
+                        has_text_part: has_text_part != 0,
+                        has_remote_content: remote != 0,
+                        is_newsletter: newsletter != 0,
+                        unsubscribe: unsubscribe
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()?,
+                    });
+                }
             }
         }
         let raw = raw_ref
@@ -3721,6 +3791,7 @@ impl Db {
                     PartType::Text(text) | PartType::Html(text) => Some(text.as_bytes()),
                     _ => None,
                 };
+                let mut embedded = false;
                 if let (Some(html), Some(id), Some(bytes)) =
                     (body_html.as_mut(), content_id.as_deref(), bytes)
                 {
@@ -3729,9 +3800,21 @@ impl Db {
                         mime_type.as_deref().unwrap_or("application/octet-stream"),
                         base64::engine::general_purpose::STANDARD.encode(bytes)
                     );
-                    *html = html
-                        .replace(&format!("cid:{id}"), &data)
-                        .replace(&format!("cid:<{id}>"), &data);
+                    // Only the source of a picture tag counts: the letter builder
+                    // takes pictures from there and from nowhere else.
+                    // Only a picture the letter builder can embed goes into the
+                    // body: any other part stays an attachment.
+                    let embeddable = mime_type
+                        .as_deref()
+                        .is_some_and(crate::backend::is_inline_image_type);
+                    let (linked, replaced) = crate::backend::replace_img_sources(html, |source| {
+                        (embeddable
+                            && (source.eq_ignore_ascii_case(&format!("cid:{id}"))
+                                || source.eq_ignore_ascii_case(&format!("cid:<{id}>"))))
+                        .then(|| data.clone())
+                    });
+                    embedded = replaced > 0;
+                    *html = linked;
                 }
                 attachments.push(Attachment {
                     id: index as i64,
@@ -3744,6 +3827,7 @@ impl Db {
                     is_inline: content_id.is_some(),
                     content_id,
                     fetched: bytes.is_some(),
+                    embedded: Some(embedded),
                 });
             }
         }
@@ -3777,6 +3861,12 @@ impl Db {
                 http,
             })
         });
+        // A letter of markup alone has no text of its own: its text is derived from
+        // the markup and is not sent as if it were written.
+        let has_text_part = parsed
+            .as_ref()
+            .and_then(|message| message.text_part(0))
+            .is_some_and(|part| matches!(part.body, PartType::Text(_)));
         let has_remote_content = body_html
             .as_deref()
             .is_some_and(|html| html.contains("http://") || html.contains("https://"));
@@ -3784,13 +3874,14 @@ impl Db {
             sqlx::query(
                 "INSERT INTO message_content_cache(
                     message_id, raw_blob_ref, body_html, body_text, attachments_json,
-                    has_remote_content, is_newsletter, unsubscribe_json, parsed_at
-                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    has_remote_content, is_newsletter, unsubscribe_json, has_text_part, parsed_at
+                 ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                  ON CONFLICT(message_id) DO UPDATE SET
                     raw_blob_ref=excluded.raw_blob_ref, body_html=excluded.body_html,
                     body_text=excluded.body_text, attachments_json=excluded.attachments_json,
                     has_remote_content=excluded.has_remote_content,
                     is_newsletter=excluded.is_newsletter,
+                    has_text_part=excluded.has_text_part,
                     unsubscribe_json=excluded.unsubscribe_json, parsed_at=datetime('now')",
             )
             .bind(message_id)
@@ -3806,18 +3897,44 @@ impl Db {
                     .map(serde_json::to_string)
                     .transpose()?,
             )
+            .bind(has_text_part as i64)
             .execute(&self.write_pool)
             .await?;
         }
+        let bcc = if is_draft {
+            parsed_address_list(parsed.iter().flat_map(|message| message.all_bcc()))
+        } else {
+            Vec::new()
+        };
         Ok(MessageFull {
             meta,
             has_remote_content,
             body_html,
             body_text,
             attachments,
+            bcc,
+            body_fetched: body_fetched != 0,
+            has_text_part,
             is_newsletter,
             unsubscribe,
         })
+    }
+
+    /// The hidden copy of a draft is not cached with the parsed letter, so a
+    /// cached draft reads it from the stored letter again. Only the headers
+    /// of the letter are parsed for it.
+    async fn draft_bcc(&self, raw_ref: Option<&str>) -> Result<Vec<Addr>> {
+        use mail_parser::MessageParser;
+        let raw = raw_ref
+            .map(|reference| self.blobs.get(reference))
+            .transpose()?;
+        let normalized = raw.as_deref().map(encoded_words::join_split_encoded_words);
+        let parsed = normalized
+            .as_deref()
+            .and_then(|bytes| MessageParser::default().parse_headers(bytes));
+        Ok(parsed_address_list(
+            parsed.iter().flat_map(|message| message.all_bcc()),
+        ))
     }
 
     /// Метаданные письма по локальному id для карточки уведомления:

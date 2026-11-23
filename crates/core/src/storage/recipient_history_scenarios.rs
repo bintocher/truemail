@@ -601,6 +601,11 @@ async fn hiding_and_clearing_hold_within_the_same_day() {
         "новое письмо не вернуло адрес"
     );
 
+    // The letter above is dated two seconds ahead so that it is newer than the
+    // user's decision. The clock must reach that date before the history is
+    // cleared, otherwise the letter stays newer than the clearing border.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+
     // Очистка держит ту же границу: прежние письма - и сегодняшнее, и давнее -
     // историю заново не наполняют.
     db.clear_recipient_history(account)

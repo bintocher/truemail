@@ -417,6 +417,292 @@ async fn a_saved_letter_keeps_its_attachment_body_and_search_entry() {
     db.close().await;
 }
 
+const DRAFT_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nBcc: Hidden One <hidden@example.test>, Friends: friend@example.test;, second@example.test\r\nBcc: third@example.test, Hidden One <hidden@example.test>\r\nSubject: Draft\r\n\r\nNot sent yet";
+
+/// A draft keeps its hidden copy on every opening, from a fresh parse and from
+/// the cached one alike, with the flag and by its folder alone; an ordinary
+/// letter reports none. A letter stored as headers only says so.
+#[tokio::test]
+async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
+    let db: TestDb = open_test_db("repo-draft-bcc").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    seed_folder(&db, account, "Drafts", Some("drafts")).await;
+    let letter = |path: &str, uid: u32, draft: bool| DiscoveredMessage {
+        folder_path: path.into(),
+        uid,
+        remote_id: Some(format!("letter-{uid}")),
+        size: Some(DRAFT_LETTER.len() as u32),
+        seen: false,
+        flagged: false,
+        answered: false,
+        draft,
+        raw: DRAFT_LETTER.to_vec(),
+        body_fetched: true,
+        has_attachments: None,
+    };
+    db.save_discovered_messages(
+        account,
+        &[
+            letter("INBOX", 4, false),
+            letter("Drafts", 7, true),
+            letter("Drafts", 8, false),
+        ],
+        false,
+    )
+    .await
+    .expect("save the letters");
+    let hidden = |full: &MessageFull| {
+        full.bcc
+            .iter()
+            .map(|addr| addr.email.clone())
+            .collect::<Vec<_>>()
+    };
+    let reader = db.clone();
+    let bcc_of = |uid: u32| {
+        let reader = reader.clone();
+        async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=?")
+                .bind(uid)
+                .fetch_one(&reader.pool)
+                .await
+                .expect("find the saved letter");
+            hidden(&reader.get_message(id).await.expect("read the letter"))
+        }
+    };
+    // Both fields of the hidden copy; an address named twice is listed once.
+    let expected = [
+        "hidden@example.test",
+        "friend@example.test",
+        "second@example.test",
+        "third@example.test",
+    ];
+
+    assert_eq!(
+        bcc_of(4).await,
+        Vec::<String>::new(),
+        "an ordinary letter has no hidden copy"
+    );
+    assert_eq!(bcc_of(7).await, expected, "first opening parses the header");
+    assert_eq!(
+        bcc_of(7).await,
+        expected,
+        "cached opening keeps the hidden copy"
+    );
+    assert_eq!(
+        bcc_of(8).await,
+        expected,
+        "a draft without the flag lost its hidden copy"
+    );
+    let stored_whole = |uid: u32| {
+        let reader = db.clone();
+        async move {
+            let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=?")
+                .bind(uid)
+                .fetch_one(&reader.pool)
+                .await
+                .expect("find the saved letter");
+            reader
+                .get_message(id)
+                .await
+                .expect("read the letter")
+                .body_fetched
+        }
+    };
+    assert!(
+        stored_whole(4).await,
+        "a whole letter is reported as incomplete"
+    );
+    sqlx::query("UPDATE messages SET body_fetched=0 WHERE uid=7")
+        .execute(&db.write_pool)
+        .await
+        .expect("mark the letter as headers only");
+    assert!(
+        !stored_whole(7).await,
+        "a letter stored as headers only is reported as whole"
+    );
+    db.close().await;
+}
+
+const INLINE_LETTER: &[u8] = b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<!DOCTYPE html><p>Picture <img src=cid:pic1><IMG SRC = 'cid:pic1'><img src=\"cid:pic1\"></p><p data-src=\"cid:report\">Code cid:report</p><!-- <img data-hidden src=\"cid:pic1\"> --><script>var a=\"<img data-hidden src='cid:pic1'>\";</script><p title=\"<img data-hidden src='cid:pic1'>\">Text</p>\r\n--inner--\r\n--outer\r\nContent-Type: image/png\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <pic1>\r\nContent-Disposition: inline; filename=\"pic.png\"\r\n\r\niVBORw0KGgo=\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Transfer-Encoding: base64\r\nContent-ID: <report>\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\n\r\nJVBERi0=\r\n--outer--\r\n";
+
+/// A part the core has put into the body says so; a part with an identifier but
+/// without a link in the body stays an attachment.
+#[tokio::test]
+async fn only_a_part_put_into_the_body_is_marked_embedded() {
+    let db: TestDb = open_test_db("repo-embedded-parts").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 9,
+            remote_id: Some("inline-letter".into()),
+            size: Some(INLINE_LETTER.len() as u32),
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: INLINE_LETTER.to_vec(),
+            body_fetched: true,
+            has_attachments: None,
+        }],
+        false,
+    )
+    .await
+    .expect("save the letter");
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=9")
+        .fetch_one(&db.pool)
+        .await
+        .expect("find the saved letter");
+    let embedded = |full: &MessageFull| {
+        full.attachments
+            .iter()
+            .map(|part| (part.filename.clone(), part.embedded))
+            .collect::<Vec<_>>()
+    };
+    let expected = [
+        ("pic.png".to_owned(), Some(true)),
+        ("report.pdf".to_owned(), Some(false)),
+    ];
+
+    assert_eq!(
+        embedded(&db.get_message(id).await.expect("first opening")),
+        expected,
+        "a part is not marked by the fact of being put into the body"
+    );
+    assert_eq!(
+        embedded(&db.get_message(id).await.expect("cached opening")),
+        expected,
+        "the cached opening lost the mark"
+    );
+
+    // Every way of writing the source of a picture is a picture link. The
+    // identifier named in the text, in another attribute, in a comment or in raw
+    // text is not one, and a letter of markup alone has no text of its own.
+    let full = db.get_message(id).await.expect("read again");
+    let html = full.body_html.as_deref().unwrap_or_default();
+    for (visible, way) in [
+        ("<img src=cid:pic1>", "without quotes"),
+        ("<IMG SRC = 'cid:pic1'>", "with blanks and in upper case"),
+        ("<img src=\"cid:pic1\">", "with quotes"),
+    ] {
+        assert!(
+            !html.contains(visible),
+            "the picture link written {way} was left as it was: {html}"
+        );
+    }
+    assert_eq!(
+        html.matches("data:image/png;base64,").count(),
+        3,
+        "a way of writing the picture link was not replaced: {html}"
+    );
+    // A tag named in a comment, in raw text or in the value of another
+    // attribute is not a picture.
+    assert!(
+        !html.contains("data-hidden src=data:"),
+        "a tag named in a comment, in raw text or in the value of an attribute was taken for a picture: {html}"
+    );
+    for (place, beginning) in [
+        ("a comment", "<!-- <img data-hidden"),
+        ("script text", "<script>var a=\"<img data-hidden"),
+        ("an attribute value", "<p title=\"<img data-hidden"),
+    ] {
+        assert!(
+            html.contains(beginning),
+            "the tag named in {place} is not where it was: {html}"
+        );
+    }
+    assert!(
+        html.contains("data-src=\"cid:report\">Code cid:report"),
+        "the text was rewritten as if it were a picture link"
+    );
+    assert!(
+        !full.has_text_part,
+        "a letter of markup alone is reported as having text of its own"
+    );
+
+    // A parse result stored before parts were marked is parsed again and stored.
+    sqlx::query(
+        "UPDATE message_content_cache SET attachments_json=replace(replace(attachments_json, ',\"embedded\":true', ''), ',\"embedded\":false', '') WHERE message_id=?",
+    )
+    .bind(id)
+    .execute(&db.write_pool)
+    .await
+    .expect("strip the marks of the stored parse result");
+    assert_eq!(
+        embedded(
+            &db.get_message(id)
+                .await
+                .expect("opening of an old parse result")
+        ),
+        expected,
+        "an old parse result is not parsed again"
+    );
+    let (stored,): (String,) =
+        sqlx::query_as("SELECT attachments_json FROM message_content_cache WHERE message_id=?")
+            .bind(id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the stored parse result");
+    assert!(
+        stored.contains("embedded"),
+        "the parsed again result is not stored"
+    );
+    db.close().await;
+}
+
+const PLAIN_LETTER: &[u8] =
+    b"From: repo@example.test\r\nTo: visible@example.test\r\nSubject: Plain\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nText of the letter";
+
+/// A letter with a text part of its own says so on a fresh parse and on a cached one.
+#[tokio::test]
+async fn a_letter_with_its_own_text_part_says_so_on_every_opening() {
+    let db: TestDb = open_test_db("repo-text-part").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.save_discovered_messages(
+        account,
+        &[DiscoveredMessage {
+            folder_path: "INBOX".into(),
+            uid: 10,
+            remote_id: Some("plain-letter".into()),
+            size: Some(PLAIN_LETTER.len() as u32),
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            raw: PLAIN_LETTER.to_vec(),
+            body_fetched: true,
+            has_attachments: None,
+        }],
+        false,
+    )
+    .await
+    .expect("save the letter");
+    let (id,): (i64,) = sqlx::query_as("SELECT id FROM messages WHERE uid=10")
+        .fetch_one(&db.pool)
+        .await
+        .expect("find the saved letter");
+
+    assert!(
+        db.get_message(id)
+            .await
+            .expect("first opening")
+            .has_text_part,
+        "a letter with a text part is reported as markup only"
+    );
+    assert!(
+        db.get_message(id)
+            .await
+            .expect("cached opening")
+            .has_text_part,
+        "the cached opening lost the text part mark"
+    );
+    db.close().await;
+}
+
 /// Лёгкая проекция письма (сервер отдал только заголовки) не затирает уже
 /// загруженное тело, вложения и отметку полноты. Затерев их, программа
 /// показала бы вместо письма обрывок и потеряла бы вложения. Письмо, которое

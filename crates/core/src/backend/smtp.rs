@@ -38,13 +38,19 @@ pub struct OutgoingMessage {
 
 /// Поддерживаемые типы встроенных картинок (S-004, S-035): svg+xml намеренно
 /// не входит - это разметка, которая может содержать исполняемый код.
-const SUPPORTED_INLINE_IMAGE_TYPES: [&str; 5] = [
+pub(crate) const SUPPORTED_INLINE_IMAGE_TYPES: [&str; 5] = [
     "image/png",
     "image/jpeg",
     "image/gif",
     "image/webp",
     "image/bmp",
 ];
+
+/// Whether the letter builder can put a picture of this type into the letter
+/// as an embedded part.
+pub fn is_inline_image_type(mime_type: &str) -> bool {
+    SUPPORTED_INLINE_IMAGE_TYPES.contains(&mime_type.to_ascii_lowercase().as_str())
+}
 
 /// Картинка, вынесенная из текста письма в отдельную часть (S-028).
 struct InlineImagePart {
@@ -55,27 +61,95 @@ struct InlineImagePart {
 
 /// Ищет следующий тег `<img` начиная с `from`, независимо от регистра букв
 /// (S-041). Возвращает байтовое смещение символа `<`.
-fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + 4 <= bytes.len() {
-        if bytes[i] == b'<'
-            && bytes[i + 1].eq_ignore_ascii_case(&b'i')
-            && bytes[i + 2].eq_ignore_ascii_case(&b'm')
-            && bytes[i + 3].eq_ignore_ascii_case(&b'g')
+/// The elements whose content is text for the parser, not markup: a tag named
+/// inside them is not a tag.
+const RAW_TEXT_TAGS: [&[u8]; 4] = [b"script", b"style", b"textarea", b"title"];
+
+fn starts_with(bytes: &[u8], at: usize, text: &[u8]) -> bool {
+    bytes
+        .get(at..at + text.len())
+        .is_some_and(|part| part.eq_ignore_ascii_case(text))
+}
+
+fn find_bytes(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes[from.min(bytes.len())..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| from + position)
+}
+
+/// Returns the position of the closing tag's `>`, wrapped in `Some` for a raw
+/// text element. An unclosed raw text element returns `Some(None)`.
+fn raw_text_end(bytes: &[u8], name_start: usize) -> Option<Option<usize>> {
+    let name = RAW_TEXT_TAGS.iter().find(|name| {
+        starts_with(bytes, name_start, name)
             && bytes
-                .get(i + 4)
-                .is_some_and(|b| b.is_ascii_whitespace() || *b == b'/' || *b == b'>')
-        {
+                .get(name_start + name.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+    })?;
+    let mut from = name_start;
+    loop {
+        let Some(close) = find_bytes(bytes, from + 1, b"</") else {
+            return Some(None);
+        };
+        if starts_with(bytes, close + 2, name) {
+            return Some(find_bytes(bytes, close + 2, b">"));
+        }
+        from = close;
+    }
+}
+
+/// Ищет начало `<img` тега: за ним идёт пробел, `/` или `>`. Комментарий,
+/// содержимое script, style, textarea и title и другой тег целиком пропускаются,
+/// поэтому имя тега в них или в значении атрибута тегом не считается.
+pub(crate) fn find_img_tag_start(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let next = bytes.get(i + 1).copied().unwrap_or(0);
+        if next == b'!' {
+            i = if starts_with(bytes, i + 2, b"--") {
+                find_bytes(bytes, i + 2, b"-->")? + 3
+            } else {
+                find_tag_end(bytes, i)? + 1
+            };
+            continue;
+        }
+        if next != b'/' && !next.is_ascii_alphabetic() {
+            i += 1;
+            continue;
+        }
+        let name_start = if next == b'/' { i + 2 } else { i + 1 };
+        let is_img = starts_with(bytes, name_start, b"img")
+            && bytes
+                .get(name_start + 3)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'/' || *byte == b'>');
+        if is_img && next != b'/' {
             return Some(i);
         }
-        i += 1;
+        if next != b'/' {
+            match raw_text_end(bytes, name_start) {
+                Some(Some(end)) => {
+                    i = end + 1;
+                    continue;
+                }
+                Some(None) => return None,
+                None => {}
+            }
+        }
+        // Another tag is skipped whole: a tag named inside the value of one of
+        // its attributes is not a tag.
+        i = find_tag_end(bytes, i)? + 1;
     }
     None
 }
 
 /// Ищет закрывающий `>` тега, начатого в `start`, не обрывая тег на `>`
 /// внутри значения атрибута в кавычках (одинарных или двойных, S-041).
-fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut i = start;
     let mut quote: Option<u8> = None;
     while i < bytes.len() {
@@ -96,7 +170,11 @@ fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// независимо от регистра имени атрибута, при одинарных и двойных кавычках
 /// и при других атрибутах в том же теге (S-041). Возвращает байтовые границы
 /// значения без кавычек.
-fn find_src_attr(bytes: &[u8], tag_start: usize, tag_end: usize) -> Option<(usize, usize)> {
+pub(crate) fn find_src_attr(
+    bytes: &[u8],
+    tag_start: usize,
+    tag_end: usize,
+) -> Option<(usize, usize)> {
     let mut i = tag_start + 4;
     while i < tag_end {
         if bytes[i].is_ascii_whitespace() || bytes[i] == b'/' {
@@ -251,6 +329,46 @@ fn extract_inline_images(html: &str) -> (String, Vec<InlineImagePart>) {
     (out, parts)
 }
 
+/// Goes over the `img` tags of the markup and gives the source of each one to
+/// `replace`. A source gets the returned text in its place; `None` leaves it.
+/// Returns the new markup and the number of replaced sources. The scan is the
+/// one of the letter builder, so a link named in the text or in another
+/// attribute is left alone.
+pub fn replace_img_sources(
+    html: &str,
+    mut replace: impl FnMut(&str) -> Option<String>,
+) -> (String, usize) {
+    let bytes = html.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut replaced = 0usize;
+    let mut pos = 0usize;
+    loop {
+        let Some(tag_start) = find_img_tag_start(bytes, pos) else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let Some(tag_end) = find_tag_end(bytes, tag_start) else {
+            out.push_str(&html[pos..]);
+            break;
+        };
+        let source = find_src_attr(bytes, tag_start, tag_end).and_then(|(start, end)| {
+            let value = replace(html.get(start..end)?.trim())?;
+            Some((start, end, value))
+        });
+        match source {
+            Some((start, end, value)) => {
+                out.push_str(&html[pos..start]);
+                out.push_str(&value);
+                out.push_str(&html[end..=tag_end]);
+                replaced += 1;
+            }
+            None => out.push_str(&html[pos..=tag_end]),
+        }
+        pos = tag_end + 1;
+    }
+    (out, replaced)
+}
+
 // Вид ошибки отправки определяется по типу исключения lettre и коду ответа
 // сервера, а не по тексту: 535 и 534 - отказ входа, 4xx - сервер занят или
 // временно недоступен, обрыв соединения и таймаут - проблема связи
@@ -293,6 +411,16 @@ fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::
 }
 
 pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
+    build_letter(message, false)
+}
+
+/// The letter for a server interface that takes the whole MIME text (Gmail,
+/// EWS, JMAP): the hidden copy travels inside the letter, so its header stays.
+pub(crate) fn build_message_with_bcc(message: OutgoingMessage) -> Result<Message> {
+    build_letter(message, true)
+}
+
+fn build_letter(message: OutgoingMessage, keep_bcc: bool) -> Result<Message> {
     let extra_headers = message.headers.clone();
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
@@ -316,7 +444,7 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
             .iter()
             .map(|item| item.data.len())
             .sum::<usize>();
-    if total_size > 25 * 1024 * 1024 {
+    if total_size > MAX_ATTACHMENTS_BYTES {
         return Err(Error::AccountConfig(
             "суммарный размер вложений и встроенных картинок превышает 25 МБ".into(),
         ));
@@ -324,10 +452,15 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
     // S-045: закреплённый идентификатор письма приходит из очереди отправки.
     // Без него повторная попытка собрала бы письмо с новым Message-ID, и
     // сервер получателя принял бы его как второе письмо.
-    let mut builder = Message::builder()
+    let builder = Message::builder()
         .from(mailbox(&message.from)?)
         .message_id(message.message_id.clone())
         .subject(message.subject);
+    let mut builder = if keep_bcc {
+        builder.keep_bcc()
+    } else {
+        builder
+    };
     for address in &message.to {
         builder = builder.to(mailbox(address)?);
     }
@@ -388,12 +521,40 @@ pub(crate) fn build_message(message: OutgoingMessage) -> Result<Message> {
 
 /// Проверить адресатов письма до записи операции отправки: непригодный адрес
 /// не должен создавать ожидающее письмо вовсе (specs/undo-send.md, S-005).
+/// Предел размера проверяется здесь же: письмо, которое не собрать, не должно
+/// попадать в очередь.
 pub fn validate_outgoing(message: &OutgoingMessage) -> Result<()> {
     if message.to.is_empty() && message.cc.is_empty() && message.bcc.is_empty() {
         return Err(Error::AccountConfig("не указан получатель".into()));
     }
     for address in message.to.iter().chain(&message.cc).chain(&message.bcc) {
         mailbox(address)?;
+    }
+    check_outgoing_size(message)
+}
+
+const MAX_ATTACHMENTS_BYTES: usize = 25 * 1024 * 1024;
+
+fn check_outgoing_size(message: &OutgoingMessage) -> Result<()> {
+    let inline_bytes: usize = message
+        .body_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+        .map(|html| extract_inline_images(html).1)
+        .unwrap_or_default()
+        .iter()
+        .map(|item| item.data.len())
+        .sum();
+    let total_size: usize = message
+        .attachments
+        .iter()
+        .map(|item| item.data.len())
+        .sum::<usize>()
+        + inline_bytes;
+    if total_size > MAX_ATTACHMENTS_BYTES {
+        return Err(Error::AccountConfig(
+            "суммарный размер вложений и встроенных картинок превышает 25 МБ".into(),
+        ));
     }
     Ok(())
 }
@@ -491,7 +652,7 @@ pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result
 }
 
 pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<()> {
-    send_gmail_raw(&build_message(message)?.formatted(), access_token).await
+    send_gmail_raw(&build_message_with_bcc(message)?.formatted(), access_token).await
 }
 
 /// Запрос отправки Gmail по уже собранным байтам письма. Сборка письма отделена
@@ -649,6 +810,56 @@ mod tests {
         )
     }
 
+    // A server interface that takes the whole MIME text gets the hidden copy
+    // inside the letter; SMTP keeps it in the envelope only.
+    #[test]
+    fn a_hidden_copy_stays_inside_the_letter_for_server_interfaces() {
+        let mut message = sample_message(None, vec![]);
+        message.bcc = vec!["hidden@example.com".into()];
+        let for_server = build_message_with_bcc(message.clone())
+            .expect("letter for a server interface")
+            .formatted();
+        assert!(
+            String::from_utf8_lossy(&for_server).contains("Bcc: hidden@example.com"),
+            "the hidden copy is lost between the queue and the server request"
+        );
+        let for_smtp = build_message(message).expect("letter for SMTP").formatted();
+        assert!(
+            !String::from_utf8_lossy(&for_smtp).contains("Bcc:"),
+            "SMTP carries the hidden copy in the envelope, not in the letter"
+        );
+    }
+
+    // A letter that cannot be assembled by its size must not reach the queue.
+    #[test]
+    fn an_oversized_letter_is_refused_before_the_queue() {
+        let big = |fill: u8| OutgoingAttachment {
+            filename: "big.bin".into(),
+            mime_type: "application/octet-stream".into(),
+            data: vec![fill; 13 * 1024 * 1024],
+        };
+        let fits = sample_message(None, vec![big(0)]);
+        assert!(
+            validate_outgoing(&fits).is_ok(),
+            "a letter within the limit is refused"
+        );
+        let mut too_big = sample_message(None, vec![big(0), big(1)]);
+        assert!(
+            validate_outgoing(&too_big).is_err(),
+            "attachments above the limit are accepted into the queue"
+        );
+        too_big.attachments.clear();
+        too_big.body_html = Some(format!(
+            "<p>text</p><img src=\"{}\"><img src=\"{}\">",
+            data_url("image/png", &vec![0u8; 13 * 1024 * 1024]),
+            data_url("image/png", &vec![1u8; 13 * 1024 * 1024])
+        ));
+        assert!(
+            validate_outgoing(&too_big).is_err(),
+            "inline pictures above the limit are accepted into the queue"
+        );
+    }
+
     // extract_inline_images - юнит-проверки чистого разбора текста (без сети и MIME).
 
     #[test]
@@ -769,6 +980,29 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert!(replaced.starts_with("<p>Привет, мир!</p>"));
         assert!(replaced.ends_with("<p>Ещё текст.</p>"));
+    }
+
+    #[test]
+    fn extract_inline_images_finds_image_after_document_type() {
+        let html = r#"<!DOCTYPE html><body><img src="data:image/png;base64,AA=="> </body>"#;
+        let (_, parts) = extract_inline_images(html);
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
+    fn extract_inline_images_skips_document_type_and_quoted_markup() {
+        let html = r#"<p>Сначала</p><!DOCTYPE html><img src="data:image/png;base64,AA=="><p title="<img src='x'>">t</p>"#;
+        let (replaced, parts) = extract_inline_images(html);
+        assert_eq!(parts.len(), 1);
+        assert!(replaced.ends_with(r#"<p title="<img src='x'>">t</p>"#));
+    }
+
+    #[test]
+    fn extract_inline_images_ignores_unclosed_script() {
+        let html = r#"<script>var s="<img src='data:image/png;base64,AA=='>";"#;
+        let (replaced, parts) = extract_inline_images(html);
+        assert!(parts.is_empty());
+        assert_eq!(replaced, html);
     }
 
     #[test]

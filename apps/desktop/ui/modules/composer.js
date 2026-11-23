@@ -6,9 +6,14 @@ const composerFieldIds=['compTo','compCc','compBcc','compSubj'];
 function splitAddresses(value){return String(value||'').split(/[;,\n]+/).map(item=>item.trim()).filter(Boolean);}
 /* получатели в виде плашек: модель на каждое поле, X удаляет, hover показывает контакт */
 const recipientModel={compTo:[],compCc:[],compBcc:[]};
-function parseRecipient(raw){const value=String(raw||'').trim();if(!value)return null;const m=value.match(/^(.*?)[<(]([^>)]+)[>)]\s*$/);if(m){const email=m[2].trim(),name=m[1].trim().replace(/^["']|["']$/g,'').trim();return {name:name&&name.toLowerCase()!==email.toLowerCase()?name:'',email};}return {name:'',email:value};}
+function parseRecipient(raw){const value=String(raw||'').trim();if(!value)return null;const quoted=value.match(/^"((?:[^"\\]|\\.)*)"\s*<([^<>\s]+)>\s*$/);if(quoted)return {name:quoted[1].replace(/\\(["\\])/g,'$1'),email:quoted[2]};const m=value.match(/^(.*?)[<(]([^>)]+)[>)]\s*$/);if(m){const email=m[2].trim(),name=m[1].trim().replace(/^["']|["']$/g,'').trim();return {name:name&&name.toLowerCase()!==email.toLowerCase()?name.replace(/\\([\"\\])/g,'$1'):'',email};}return {name:'',email:value};}
 function recipientDisplay(entry){return entry.name&&entry.name.toLowerCase()!==entry.email.toLowerCase()?entry.name:entry.email;}
-function recipientFormat(entry){return entry.name&&entry.name.toLowerCase()!==entry.email.toLowerCase()?`${entry.name} <${entry.email}>`:entry.email;}
+function recipientFormat(entry){
+  const name=String(entry.name||'').trim(),email=String(entry.email||'');
+  if(!name||name.toLowerCase()===email.toLowerCase())return email;
+  // A name with a comma, a quote and the like is one address only in quotes.
+  return /[^ A-Za-z0-9\u0080-\uFFFF'.\-]/.test(name)?`"${name.replace(/["\\]/g,'\\$&')}" <${email}>`:`${name} <${email}>`;
+}
 function recipientChipTitle(entry){const contact=coreContacts.find(c=>(c.emails||[]).some(item=>String(item.email||'').toLowerCase()===entry.email.toLowerCase()));const parts=[];const name=contact?.display_name||entry.name;if(name)parts.push(name);parts.push(entry.email);if(contact){(contact.phones||[]).forEach(p=>{const num=p.number||p.phone||p;if(num)parts.push(String(num));});if(contact.org)parts.push(contact.org);}return parts.join('\n');}
 function renderRecipientChips(id){const input=document.getElementById(id),box=input.parentElement.querySelector('.recipient-chips');if(!box)return;box.innerHTML='';recipientModel[id].forEach((entry,index)=>{const chip=document.createElement('span');chip.className='rcpt-chip'+(validAddress(entry.email)?'':' invalid');chip.title=recipientChipTitle(entry);const label=document.createElement('span');label.className='rcpt-chip-t';label.textContent=recipientDisplay(entry);const close=document.createElement('button');close.type='button';close.className='rcpt-x';close.setAttribute('aria-label',L('Удалить получателя','Remove recipient'));close.innerHTML='&times;';close.onclick=()=>removeRecipientEntry(id,index);chip.appendChild(label);chip.appendChild(close);box.appendChild(chip);});}
 function addRecipientEntry(id,raw){const entry=parseRecipient(raw);if(!entry||!entry.email)return false;if(recipientModel[id].some(e=>e.email.toLowerCase()===entry.email.toLowerCase()))return false;recipientModel[id].push(entry);renderRecipientChips(id);return true;}
@@ -37,14 +42,38 @@ let composerGeneration=0;
    открытия нового письма он сбрасывается, иначе ядро вернуло бы прежнюю
    операцию, а новое содержимое пропало бы вместе с очищенным композером. */
 let composerRequestKey='';
-function resetComposer(){composerGeneration++;composerRequestKey='';['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+/* The draft being sent from its reading pane: once the letter is queued, the
+   draft has served its purpose. Every reset starts another letter. */
+let draftBeingSent=null;
+// True while the letter in the editor came from a letter without a text part of
+// its own and nobody has typed into the body since.
+let composerTextMissing=false;
+// The account the From list shows for the letter in the editor. It is kept
+// apart from the list: the list is rebuilt on every refresh of the data.
+let composerFromAccount=null;
+window.rememberComposerFrom=()=>{composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;};
+window.composerFromValue=()=>composerFromAccount==null?'':String(composerFromAccount);
+function resetComposer(){composerGeneration++;composerRequestKey='';draftBeingSent=null;composerTextMissing=false;composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
-async function openComposerForMessage(action){if(!activeMessage)return;resetComposer();
+async function openComposerForMessage(action){
+  const message=activeMessage;
+  if(!message)return;
+  // The letter of the command is the letter that goes to the editor. When the
+  // command comes from the list menu of another letter, its full letter is read first.
+  let full=activeFullMessage?.meta?.id===message.id?activeFullMessage:null;
+  if(!full){
+    const generation=composerGeneration;
+    try{full=await window.tm.getMessage(message.id);}
+    catch(error){full=null;}
+    // Another letter took the editor while this one was being read.
+    if(generation!==composerGeneration)return;
+  }
+  resetComposer();
   // Отвечаем/пересылаем с того ящика, на который пришло письмо.
-  const fromSel=document.querySelector('.from-sel');if(fromSel&&activeMessage.account_id&&[...fromSel.options].some(opt=>opt.value===String(activeMessage.account_id)))fromSel.value=String(activeMessage.account_id);
-  const reply=action!=='forward',from=activeFullMessage?.meta?.from?.email||activeMessage.from?.email||'',subject=activeMessage.subject||'',prefix=action==='forward'?'Fwd: ':'Re: ';document.getElementById('compTitle').textContent=action==='forward'?L('Переслать','Forward'):L('Ответить','Reply');document.getElementById('compSubj').value=new RegExp(`^${prefix}`,'i').test(subject)?subject:prefix+subject;if(reply&&from)setRecipients('compTo',[{name:activeFullMessage?.meta?.from?.name||'',email:from}]);if(action==='replyall'){const own=new Set(coreAccounts.map(account=>account.email.toLowerCase()));const others=[...(activeFullMessage?.meta?.to||[]),...(activeFullMessage?.meta?.cc||[])].filter(address=>address.email&&!own.has(address.email.toLowerCase())&&address.email.toLowerCase()!==from.toLowerCase());const seen=new Set();const uniq=others.filter(a=>{const k=a.email.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});setRecipients('compCc',uniq.map(a=>({name:a.name||'',email:a.email})));setRecipientFieldVisible('compCc',uniq.length>0);}const dateStr=activeMessage.date?new Date(activeMessage.date).toLocaleString(document.documentElement.lang):'';const bodyHtml=activeFullMessage?.body_html,bodyText=activeFullMessage?.body_text||activeMessage.preview||'';const quote=bodyHtml?bodyHtml:escapeHtml(bodyText).replace(/\n/g,'<br>');const header=`${escapeHtml(dateStr)}${dateStr?', ':''}${escapeHtml(activeFullMessage?.meta?.from?.name||from)} &lt;${escapeHtml(from)}&gt;:`;compEditEl.innerHTML=`<p><br></p><div class="mail-quote-head" style="color:var(--text-3,#888)">${header}</div><blockquote style="margin:6px 0 0;padding:0 0 0 12px;border-left:2px solid var(--border,#ccc)">${quote}</blockquote>`;showView('composeView');await applyComposerSignature('reply');const range=document.createRange(),sel=window.getSelection();range.setStart(compEditEl.firstChild,0);range.collapse(true);sel.removeAllRanges();sel.addRange(range);compEditEl.focus();}
+  const fromSel=document.querySelector('.from-sel');if(fromSel&&message.account_id&&[...fromSel.options].some(opt=>opt.value===String(message.account_id))){fromSel.value=String(message.account_id);window.rememberComposerFrom?.();}
+  const reply=action!=='forward',from=full?.meta?.from?.email||message.from?.email||'',subject=message.subject||'',prefix=action==='forward'?'Fwd: ':'Re: ';document.getElementById('compTitle').textContent=action==='forward'?L('Переслать','Forward'):L('Ответить','Reply');document.getElementById('compSubj').value=new RegExp(`^${prefix}`,'i').test(subject)?subject:prefix+subject;if(reply&&from)setRecipients('compTo',[{name:full?.meta?.from?.name||'',email:from}]);if(action==='replyall'){const own=new Set(coreAccounts.map(account=>account.email.toLowerCase()));const others=[...(full?.meta?.to||[]),...(full?.meta?.cc||[])].filter(address=>address.email&&!own.has(address.email.toLowerCase())&&address.email.toLowerCase()!==from.toLowerCase());const seen=new Set();const uniq=others.filter(a=>{const k=a.email.toLowerCase();if(seen.has(k))return false;seen.add(k);return true;});setRecipients('compCc',uniq.map(a=>({name:a.name||'',email:a.email})));setRecipientFieldVisible('compCc',uniq.length>0);}const dateStr=message.date?new Date(message.date).toLocaleString(document.documentElement.lang):'';const bodyHtml=full?.body_html,bodyText=full?.body_text||message.preview||'';const quote=bodyHtml?bodyHtml:escapeHtml(bodyText).replace(/\n/g,'<br>');const header=`${escapeHtml(dateStr)}${dateStr?', ':''}${escapeHtml(full?.meta?.from?.name||from)} &lt;${escapeHtml(from)}&gt;:`;compEditEl.innerHTML=`<p><br></p><div class="mail-quote-head" style="color:var(--text-3,#888)">${header}</div><blockquote style="margin:6px 0 0;padding:0 0 0 12px;border-left:2px solid var(--border,#ccc)">${quote}</blockquote>`;showView('composeView');await applyComposerSignature('reply');const range=document.createRange(),sel=window.getSelection();range.setStart(compEditEl.firstChild,0);range.collapse(true);sel.removeAllRanges();sel.addRange(range);compEditEl.focus();}
 function contactAddresses(){const seen=new Set(),result=[];coreContacts.forEach(contact=>(contact.emails||[]).forEach(item=>{const email=String(item.email||'').trim(),key=email.toLocaleLowerCase();if(!email||seen.has(key))return;seen.add(key);result.push({name:contact.display_name||'',email});}));return result;}
 /* Кандидаты подсказки получателей: ядро объединяет историю выбранного ящика с
    контактами и упорядочивает их по частоте и давности переписки
@@ -256,9 +285,17 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
   // имеет.
   if(action==='delete'){const hasActiveTask=ids.some(id=>(currentMessageRows.find(item=>item.id===id)||messages.find(item=>item.id===id))?.task_state==='active');const warning=hasActiveTask?L(`Удалить навсегда писем: ${ids.length}? Среди них есть невыполненное дело. Отмены не будет.`,`Delete ${ids.length} message(s) permanently? An unfinished task will be deleted. There is no undo.`):L(`Удалить навсегда писем: ${ids.length}? Отмены не будет.`,`Delete ${ids.length} message(s) permanently? There is no undo.`);if(!await confirmAction(warning))return;}
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
+  // The letter of the reading pane is remembered as well: an action on other
+  // letters, such as an item of the list menu, does not take it off the screen.
+  const shownId=window.paneLetter?.()?.id??null,shownAffected=shownId!==null&&ids.includes(shownId);
   let nextId=null;
-  if(activeMessage&&ids.length===1){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
-  try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();activeMessage=null;activeFullMessage=null;window.forgetMessages?.(ids);await window.reloadCoreData();
+  if(activeMessage&&ids.length===1&&shownAffected){const index=currentMessageRows.findIndex(message=>message.id===activeMessage.id);nextId=currentMessageRows[index+1]?.id??currentMessageRows[index-1]?.id??null;}
+  try{const queued=await window.tm.messageAction(ids,action);selectedMessageIds.clear();
+    // The letter shown now is looked at again: the user may have opened another one meanwhile.
+    const shown=window.paneLetter?.()||null;
+    if(shown&&!ids.includes(shown.id))activeMessage=shown;
+    else{activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();}
+    window.refreshToolbarForMessage?.();window.forgetMessages?.(ids);await window.reloadCoreData();
     if(nextId!=null){const message=messages.find(item=>item.id===nextId);if(message)showMessage(message);}
     if(action==='delete'){showToast(L('Письмо удаляется навсегда','The message is being deleted permanently'));return;}
     // Письмо, по которому уже стоит незавершённая операция увода, пропущено
@@ -541,7 +578,14 @@ async function insertClipboardImages(files,initialRange,generation){
 document.getElementById('compAttach').onclick=()=>document.getElementById('compFile').click();
 document.getElementById('compFile').onchange=e=>{queueCompFiles([...e.target.files||[]]);e.target.value='';};
 async function openTemplateDialog(){const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId){showToast(L('Сначала выберите аккаунт','Select an account first'));return;}const overlay=document.createElement('div');overlay.className='overlay open';overlay.innerHTML=`<div class="modal template-modal"><div class="mh"><i data-i="edit"></i><h3>${L('Шаблоны писем','Message templates')}</h3><button class="iconbtn x" type="button"><i data-i="close"></i></button></div><div class="mb"><div class="template-list"></div><div class="template-empty"></div></div><div class="mf"><button class="btn template-save">${L('Сохранить текущее письмо как шаблон','Save current message as template')}</button><span class="sp"></span><button class="btn template-close">${L('Закрыть','Close')}</button></div></div>`;document.body.appendChild(overlay);renderIcons(overlay);const close=()=>overlay.remove();overlay.querySelectorAll('.x,.template-close').forEach(button=>button.onclick=close);overlay.onclick=event=>{if(event.target===overlay)close();};
-  const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{document.getElementById('compSubj').value=template.subject||'';compEditEl.innerHTML=template.body_html||'';await applyComposerSignature(composerSignatureKind);scheduleDraftSave();close();};const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
+  const render=async()=>{const values=await window.tm.listMessageTemplates(accountId),list=overlay.querySelector('.template-list'),empty=overlay.querySelector('.template-empty');list.innerHTML='';empty.textContent=values.length?'':L('Шаблонов пока нет.','No templates yet.');values.forEach(template=>{const row=document.createElement('div');row.className='template-row';const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='t';name.textContent=template.name;const subject=document.createElement('div');subject.className='d';subject.textContent=template.subject||L('Без темы','No subject');text.append(name,subject);const apply=document.createElement('button');apply.className='btn sm';apply.textContent=L('Вставить','Apply');apply.onclick=async()=>{
+      document.getElementById('compSubj').value=template.subject||'';
+      composerTextMissing=false;
+      compEditEl.innerHTML=template.body_html||'';
+      await applyComposerSignature(composerSignatureKind);
+      scheduleDraftSave();
+      close();
+    };const remove=document.createElement('button');remove.className='iconbtn';remove.title=L('Удалить шаблон','Delete template');remove.innerHTML=ic.trash;remove.onclick=async()=>{if(!await confirmAction(L(`Удалить шаблон «${template.name}»?`,`Delete template "${template.name}"?`)))return;await window.tm.deleteMessageTemplate(template.id,accountId);await render();};row.append(text,apply,remove);list.appendChild(row);});};
   overlay.querySelector('.template-save').onclick=async()=>{const name=prompt(L('Название шаблона','Template name'),document.getElementById('compSubj').value.trim());if(!name?.trim())return;const body=compEditEl.cloneNode(true);body.querySelector('.composer-signature')?.remove();try{await window.tm.saveMessageTemplate({id:null,accountId,name:name.trim(),subject:document.getElementById('compSubj').value,bodyHtml:body.innerHTML});await render();showToast(L('Шаблон сохранён','Template saved'));}catch(error){showToast(error);}};try{await render();}catch(error){close();showToast(error);}}
 document.getElementById('compTemplates').onclick=openTemplateDialog;
 document.querySelectorAll('[data-format]').forEach(button=>button.onclick=()=>{compEditEl.focus();document.execCommand(button.dataset.format,false);scheduleDraftSave();});
@@ -578,8 +622,11 @@ document.getElementById('linkApply').onclick=applyLinkDialog;
 document.getElementById('linkOverlay').addEventListener('click',e=>{if(e.target.id==='linkOverlay')closeLinkDialog();});
 document.getElementById('linkHref').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();applyLinkDialog();}});
 let draftSaveTimer=null;
-function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:recipientFieldAddresses('compTo').join(', '),cc:recipientFieldAddresses('compCc').join(', '),bcc:recipientFieldAddresses('compBcc').join(', '),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:compEditEl.innerText,attachments:composerAttachments};}
+function typedAddresses(id){return [...recipientModel[id],...splitAddresses(document.getElementById(id).value).map(email=>({name:'',email}))];}
+function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:typedAddresses('compTo'),cc:typedAddresses('compCc'),bcc:typedAddresses('compBcc'),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:composerTextMissing?'':compEditEl.innerText,attachments:composerAttachments,draft_message_id:draftBeingSent,text_missing:composerTextMissing};}
 function scheduleDraftSave(){
+  // The letter of a generation already taken by the queue is not saved again.
+  if(composerGeneration===handedOverGeneration)return;
   // S-053: письмо изменилось - прежний ключ запроса к нему уже не относится.
   composerRequestKey='';
   clearTimeout(draftSaveTimer);
@@ -590,7 +637,8 @@ function scheduleDraftSave(){
    письма (S-003, S-042). */
 async function saveDraftNow(){clearTimeout(draftSaveTimer);await window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload()));}
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
-function composerRequest(){const draft=draftPayload(),to=splitAddresses(draft.to),cc=splitAddresses(draft.cc),bcc=splitAddresses(draft.bcc),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
+compEditEl.addEventListener('input',()=>{composerTextMissing=false;});
+function composerRequest(){const draft=draftPayload(),to=recipientFieldAddresses('compTo'),cc=recipientFieldAddresses('compCc'),bcc=recipientFieldAddresses('compBcc'),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
 function composerLang(){return wizardLocale==='en'?'en':'ru';}
 /* Карточка окна отмены с обратным отсчётом (S-017, S-018). Срок карточки
    определяет срок отмены, а не общий срок исчезновения карточек. */
@@ -655,14 +703,14 @@ function applyCancelledSendToComposer(message){
   const draft=window.outboxModel.composerDraftFromCancelled(message);
   resetComposer();
   const fromSel=document.querySelector('.from-sel');
-  if(fromSel&&draft.account_id&&[...fromSel.options].some(option=>option.value===String(draft.account_id)))fromSel.value=String(draft.account_id);
+  if(fromSel&&draft.account_id&&[...fromSel.options].some(option=>option.value===String(draft.account_id))){fromSel.value=String(draft.account_id);window.rememberComposerFrom?.();}
   setRecipients('compTo',draft.to);
   setRecipients('compCc',draft.cc);
   setRecipients('compBcc',draft.bcc);
   setRecipientFieldVisible('compCc',draft.cc.length>0);
   setRecipientFieldVisible('compBcc',draft.bcc.length>0);
   document.getElementById('compSubj').value=draft.subject;
-  compEditEl.innerHTML=draft.body_html||escapeHtml(draft.body_text).replace(/\n/g,'<br>');
+  compEditEl.innerHTML=editorSafeHtml(draft.body_html||escapeHtml(draft.body_text).replace(/\n/g,'<br>'));
   composerAttachments=draft.attachments.map(item=>({filename:item.filename,mime_type:item.mime_type,data:item.data}));
   compAtt.innerHTML='';composerAttachments.forEach(renderComposerAttachment);
   scheduleDraftSave();
@@ -689,27 +737,411 @@ async function restoreUndoWindows(){
 let outboxEntriesForCard=[];
 window.setOutboxEntriesForCard=entries=>{outboxEntriesForCard=entries||[];};
 window.restoreUndoWindows=restoreUndoWindows;
+/* A draft goes out by the same queue as any letter from the editor, so address
+   checks, the size limit and the undo window stay the same
+   (draft-message-actions.md). One click never touches the editor: the letter is
+   read into a snapshot first, and the editor opens only when the user has to
+   finish the letter. */
+function bytesFromBase64(base64){const binary=atob(base64),bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);return bytes;}
+// The size of what a base64 text carries, without its padding.
+function decodedSize(base64){const padding=base64.endsWith('==')?2:base64.endsWith('=')?1:0;return Math.floor(base64.length*3/4)-padding;}
+// Parses letter markup into an inert tree: while it is there, nothing in it
+// loads or runs. The test window has no template content and keeps the nodes.
+function parseInert(html){
+  const template=document.createElement('template');
+  template.innerHTML=String(html||'');
+  return template.content||template;
+}
+function inertHtml(root){
+  const host=document.createElement('div');
+  // Text nodes of the top level are part of the letter as much as elements.
+  for(const node of [...(root.childNodes||[])])host.appendChild(node);
+  return host.innerHTML;
+}
+// Sources of the pictures inside a letter body, without the document.
+function htmlImageSources(html){
+  const sources=[];
+  (function walk(node){for(const child of [...(node.children||[])]){
+    if(String(child.tagName).toUpperCase()==='IMG')sources.push(child.getAttribute('src')||'');
+    walk(child);
+  }})(parseInert(html));
+  return sources;
+}
+// What has no place in an editable letter body that comes from a letter.
+const EDITOR_DROP_TAGS=new Set(['SCRIPT','STYLE','LINK','META','BASE','TITLE','IFRAME','FRAME','FRAMESET','OBJECT','EMBED','APPLET','INPUT','TEXTAREA','SELECT','OPTION','TEMPLATE','NOSCRIPT','VIDEO','AUDIO','SOURCE','TRACK','CANVAS','SVG','MATH']);
+// The shells whose content is ordinary text of the letter: the shell goes, the content stays.
+const EDITOR_UNWRAP_TAGS=new Set(['FORM','FIELDSET','LABEL','DIALOG','OUTPUT','DETAILS','SUMMARY','BUTTON']);
+const EDITOR_DROP_ATTRIBUTES=new Set(['srcdoc','srcset','formaction','action','background','poster','ping','id','contenteditable','tabindex','autofocus','accesskey','draggable','is','slot']);
+// Classes of the editor itself stay: a letter returned from the queue keeps the place of its signature.
+const EDITOR_OWN_CLASSES=new Set(['composer-signature','mail-quote-head']);
+// Styles of the letter that stay in the editor: the look of the text, of its
+// frame and of the space around it. Everything else goes, above all what can
+// name an outside picture or lay the body over the program.
+const EDITOR_STYLE_PROPERTIES=new Set(['background-color','border','border-bottom','border-bottom-color','border-bottom-left-radius','border-bottom-right-radius','border-bottom-style','border-bottom-width','border-collapse','border-color','border-left','border-left-color','border-left-style','border-left-width','border-radius','border-right','border-right-color','border-right-style','border-right-width','border-spacing','border-style','border-top','border-top-color','border-top-left-radius','border-top-right-radius','border-top-style','border-top-width','border-width','caption-side','color','direction','empty-cells','font','font-family','font-size','font-style','font-variant','font-weight','hyphens','letter-spacing','line-height','list-style-position','list-style-type','margin','margin-bottom','margin-left','margin-right','margin-top','padding','padding-bottom','padding-left','padding-right','padding-top','table-layout','text-align','text-decoration','text-decoration-color','text-decoration-line','text-decoration-style','text-indent','text-transform','unicode-bidi','vertical-align','white-space','word-break','word-spacing','word-wrap','overflow-wrap']);
+// Functions allowed inside a kept style value: they make a plain value out of
+// plain values and name no resource.
+const EDITOR_STYLE_FUNCTIONS=new Set(['abs','calc','clamp','color','hsl','hsla','hwb','lab','lch','local','max','min','mod','oklab','oklch','rgb','rgba','rem','round','var']);
+const EDITOR_SAFE_LINK=new Set(['http','https','mailto','tel']);
+// The browser drops control characters and blanks before it reads the scheme
+// of a link, so they are dropped before the check as well.
+function normalizedLink(value){return String(value||'').replace(/[\u0000- \u007f]+/g,'');}
+function schemeOf(value){
+  const match=normalizedLink(value).match(/^([a-z][a-z0-9+.-]*):/i);
+  return match?match[1].toLowerCase():'';
+}
+function safeLink(value){const text=String(value||'').trim();return text.startsWith('#')||EDITOR_SAFE_LINK.has(schemeOf(text));}
+function safeImageSource(value){return /^(data:image\/|cid:)/i.test(normalizedLink(value));}
+// Declarations of a style attribute, split on the semicolons outside quotes and brackets.
+function styleDeclarations(style){
+  const declarations=[];let current='',quote='',depth=0,previous='';
+  for(const char of String(style||'')){
+    if(quote){
+      current+=char;
+      if(char===quote&&previous!=='\\')quote='';
+    }else if(char==='"'||char==="'"){
+      quote=char;current+=char;
+    }else{
+      if(char==='(')depth+=1;else if(char===')')depth=Math.max(0,depth-1);
+      if(char===';'&&!depth){declarations.push(current);current='';previous=char;continue;}
+      current+=char;
+    }
+    previous=char;
+  }
+  if(current.trim())declarations.push(current);
+  return declarations;
+}
+function safeStyle(style){
+  const kept=[];
+  for(const declaration of styleDeclarations(style)){
+    const colon=declaration.indexOf(':');
+    if(colon===-1)continue;
+    const name=declaration.slice(0,colon).trim().toLowerCase(),value=declaration.slice(colon+1).trim();
+    // An escape or a comment hides a property or a value from the check.
+    const hidden=/[\\@]|\/\*|<!--/i.test(declaration);
+    const functions=[...value.matchAll(/([a-z0-9_-]+)\(/gi)].map(match=>match[1].toLowerCase());
+    if(hidden||!value||!EDITOR_STYLE_PROPERTIES.has(name)||functions.some(name=>!EDITOR_STYLE_FUNCTIONS.has(name)))continue;
+    kept.push(`${name}: ${value}`);
+  }
+  return kept.join('; ');
+}
+// In the window the attributes are named nodes; in the test window they are a plain object.
+function attributeNames(node){
+  const attrs=node.attributes;
+  if(!attrs)return [];
+  return typeof attrs.item==='function'?Array.from({length:attrs.length},(_,index)=>attrs.item(index).name):Object.keys(attrs);
+}
+function editorSafeHtml(html){
+  const root=parseInert(html);
+  (function clean(node){for(const child of [...(node.children||[])]){
+    const tag=String(child.tagName).toUpperCase();
+    if(EDITOR_DROP_TAGS.has(tag)){child.remove();continue;}
+    if(EDITOR_UNWRAP_TAGS.has(tag)){
+      clean(child);
+      while(child.firstChild)child.before(child.firstChild);
+      child.remove();
+      continue;
+    }
+    let dropped=false;
+    for(const name of attributeNames(child)){
+      const value=String(child.getAttribute(name)??'');
+      if(name==='class'){
+        const kept=value.split(/\s+/).filter(value=>EDITOR_OWN_CLASSES.has(value));
+        if(kept.length)child.setAttribute('class',kept.join(' '));else child.removeAttribute(name);
+        continue;
+      }
+      // A picture with an outside address goes away whole: an empty box would stay otherwise.
+      if(tag==='IMG'&&name==='src'&&!safeImageSource(value)){child.remove();dropped=true;break;}
+      if(name==='style'){
+        const style=safeStyle(value);
+        if(style)child.setAttribute('style',style);else child.removeAttribute(name);
+        continue;
+      }
+      if(/^on/i.test(name)||EDITOR_DROP_ATTRIBUTES.has(name)||/^xlink:/i.test(name)||(name==='href'&&!safeLink(value)))child.removeAttribute(name);
+    }
+    if(dropped)continue;
+    clean(child);
+  }})(root);
+  return inertHtml(root);
+}
+window.editorSafeHtml=editorSafeHtml;
+function draftLetterProblem(request){
+  const addresses=[...request.to,...request.cc,...request.bcc];
+  if(!addresses.length)return L('Укажите хотя бы одного получателя','Add at least one recipient');
+  const invalid=addresses.find(address=>!validAddress(address));
+  return invalid?L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`):null;
+}
+// The refusal of the core comes with its reason: the user has to finish the letter.
+function refusalText(error){
+  const shown=window.errorPresentation.presentError(error,{locale:wizardLocale,translations:wizardText});
+  return shown.details?`${shown.text} ${shown.details}`:shown.text;
+}
+function letterTooLarge(name){
+  return L(`Не добавлено: ${name} не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,
+    `Not attached: ${name} does not fit, the whole letter together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`);
+}
+/* The draft as a request for the sending queue, with the attachments that could
+   be read. `problem` explains why the letter cannot go out as it is. */
+async function readDraftLetter(full){
+  const letter=await readDraftLetterParts(full);
+  // Not for the queue: it says that the editor must not make a text part of
+  // the body either.
+  letter.textMissing=full.has_text_part===false;
+  return letter;
+}
+async function readDraftLetterParts(full){
+  const request={account_id:full.meta.account_id,to:full.meta.to.map(recipientFormat),cc:full.meta.cc.map(recipientFormat),bcc:(full.bcc||[]).map(recipientFormat),
+    subject:full.meta.subject||'',
+    // The text of a letter that has no text part is taken from its markup; it is
+    // not sent as if it were written.
+    body_text:full.has_text_part===false?'':full.body_text||'',
+    body_html:full.body_html||escapeHtml(full.body_text||'').replace(/\n/g,'<br>'),attachments:[]};
+  // Pictures inside the body count first: a letter of pictures alone can be too large.
+  let bytes=composerBody.totalMessageBytes([],htmlImageSources(request.body_html));
+  if(!composerBody.fitsMessageLimit(bytes,0))return {request,problem:letterTooLarge(L('встроенные картинки','the embedded pictures'))};
+  for(const att of full.attachments||[]){
+    // Only a part the core has put into the body is not attached a second time.
+    if(att.embedded===true)continue;
+    const name=att.filename||'attachment';
+    // A size the core already knows is checked before the content is read.
+    if(att.size!=null&&!composerBody.fitsMessageLimit(bytes,att.size))return {request,problem:letterTooLarge(name)};
+    let content;
+    try{content=await window.tm.attachmentContent(full.meta.id,att.id);}
+    catch(error){
+      // The letter is not sent with a part of its attachments; the editor gets what was read.
+      return {request,problem:window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText})};
+    }
+    const size=decodedSize(content.base64);
+    if(!composerBody.fitsMessageLimit(bytes,size))return {request,problem:letterTooLarge(name)};
+    bytes+=size;
+    request.attachments.push({filename:content.filename||name,mime_type:content.mime_type||att.mime_type||'application/octet-stream',data:bytesFromBase64(content.base64)});
+  }
+  return {request,problem:null};
+}
+async function queueLetter(request){
+  const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  showUndoSendCard(queued,request);
+}
+function showDraftComposer(hint){
+  document.getElementById('compTitle').textContent=L('Черновик','Draft');
+  const status=document.getElementById('composeStatus');
+  status.textContent=hint||'';status.dataset.kind=hint?'error':'';
+  scheduleDraftSave();showView('composeView');
+}
+/* The editor takes the letter as it was read. Nothing is awaited between the
+   reset and the last field, so no other letter can get in between. */
+function applyDraftToComposer(request,textMissing=false){
+  resetComposer();
+  const fromSel=document.querySelector('.from-sel');
+  if(Array.from(fromSel?.options||[]).some(option=>option.value===String(request.account_id))){fromSel.value=String(request.account_id);window.rememberComposerFrom?.();}
+  setRecipients('compTo',request.to);setRecipients('compCc',request.cc);setRecipients('compBcc',request.bcc);
+  setRecipientFieldVisible('compCc',recipientModel.compCc.length>0);setRecipientFieldVisible('compBcc',recipientModel.compBcc.length>0);
+  document.getElementById('compSubj').value=request.subject||'';
+  compEditEl.innerHTML=editorSafeHtml(request.body_html);
+  composerTextMissing=textMissing===true;
+  request.attachments.forEach(item=>{composerAttachments.push(item);renderComposerAttachment(item);});
+}
+/* The letter has to be finished by the user: it goes to the editor, unless the
+   editor is taken by another letter. */
+function finishDraftInEditor(message,request,problem,textMissing=false){
+  // The same draft left in the editor is not another letter.
+  if(composerHasContent()&&draftBeingSent===message.id){showView('composeView');return;}
+  if(composerHasContent()){
+    showToast(L('В редакторе есть другое неотправленное письмо. Отправьте или удалите его, затем отправьте черновик.','The editor holds another unsent letter. Send or delete it, then send the draft.'));
+    showView('composeView');return;
+  }
+  applyDraftToComposer(request,textMissing);
+  draftBeingSent=message.id;
+  showDraftComposer(problem);
+  if(!recipientModel.compTo.length)document.getElementById('compTo')?.focus();
+}
+/* The draft has served its purpose once the letter is queued. It leaves the
+   screen at once, so that a second click finds nothing to send. */
+function forgetSentDraft(messageId){
+  if(activeMessage?.id===messageId){activeMessage=null;activeFullMessage=null;}
+  if(window.paneLetter?.()?.id===messageId){
+    window.forgetShownLetter?.();
+    // A show of the same letter that has not finished yet has nothing to draw into.
+    messageViewGeneration++;
+    document.getElementById('tSubject').textContent='';document.getElementById('tbody').innerHTML='';
+  }
+  window.forgetMessages?.([messageId]);
+  window.refreshToolbarForMessage?.();
+}
+async function discardSentDraft(messageId){
+  const failed=()=>{
+    window.tm?.uiLog?.(`draft ${messageId} was not moved to Trash after sending`);
+    showToast(L('Письмо отправляется, но убрать черновик из папки не удалось. Удалите его вручную.','The letter is being sent, but the draft could not be removed from its folder. Delete it by hand.'));
+  };
+  let queued;
+  try{queued=await window.tm.messageAction([messageId],'trash');}
+  catch(error){
+    window.tm?.uiLog?.(`draft ${messageId} was not moved to Trash after sending: ${error?.message||error}`);
+    failed();return;
+  }
+  showSkippedMessages(queued);
+  if(!queued?.operation_ids?.length&&queued?.skipped)failed();
+  try{await window.reloadCoreData?.();}
+  catch(error){window.tm?.uiLog?.(`the list was not reloaded after sending draft ${messageId}: ${error?.message||error}`);}
+}
+// Drafts whose letter the queue has already taken in this session: a draft that
+// stayed in its folder must not be sent a second time.
+const sentDrafts=new Set();
+window.sentDrafts=sentDrafts;
+function draftQueued(messageId){
+  sentDrafts.add(messageId);
+  forgetSentDraft(messageId);
+  discardSentDraft(messageId);
+}
+// Drafts that are being read for sending right now.
+const draftsInFlight=new Set();
+async function sendDraftMessage(message=activeMessage){
+  if(!draftMessageModel.isDraftMessage(message,coreFolders))return;
+  if(sentDrafts.has(message.id)){
+    showToast(L('Письмо из этого черновика уже отправляется. Сам черновик можно удалить.','The letter from this draft is already on its way. The draft itself can be deleted.'));
+    return;
+  }
+  // The same draft is being sent from the editor right now: the queue must not get the letter twice.
+  if(draftBeingSent===message.id&&letterHandedOver(composerGeneration)){
+    showToast(L('Письмо из этого черновика уже передаётся в очередь','The letter from this draft is already going to the queue'));
+    return;
+  }
+  // One sending of a draft at a time: a second click must not queue the letter twice.
+  if(draftsInFlight.has(message.id))return;
+  draftsInFlight.add(message.id);
+  try{
+    let full;
+    try{full=await window.tm.getMessage(message.id);}
+    catch(error){showToast(error);return;}
+    if(full.body_fetched===false){
+      showToast(L('Тело черновика ещё не загружено. Проверьте связь и повторите','The draft is not downloaded yet. Check the connection and try again'));
+      return;
+    }
+    let letter;
+    try{letter=await readDraftLetter(full);}
+    catch(error){letter={request:null,problem:window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText})};}
+    if(!letter.request){showToast(letter.problem);return;}
+    const problem=letter.problem||draftLetterProblem(letter.request)
+      // A hidden copy alone is not enough to send in one click: the user sees no addressee on the letter.
+      ||(!letter.request.to.length&&!letter.request.cc.length?L('Укажите получателя в поле "Кому" и отправьте письмо','Add a recipient to To and send the letter'):null);
+    if(!problem){
+      try{await queueLetter(letter.request);}
+      catch(error){
+        // A letter the core refuses to take (an address, the size) is finished in
+        // the editor; any other refusal is only reported, the draft stays untouched.
+        if(window.errorPresentation.normalizeApiError(error).kind==='account_config'){finishDraftInEditor(message,letter.request,refusalText(error),letter.textMissing===true);}
+        else showToast(error);
+        return;
+      }
+      draftQueued(message.id);
+      return;
+    }
+    finishDraftInEditor(message,letter.request,problem,letter.textMissing===true);
+  }finally{draftsInFlight.delete(message.id);}
+}
+window.sendDraftMessage=sendDraftMessage;
+// The letter restored from the saved state gets its draft back, as long as the
+// draft still exists and the editor still holds that letter.
+// The check of the draft of a restored letter that has not answered yet, with the generation of the editor it belongs to.
+let draftLinkCheck=null;
+window.restoreDraftLink=messageId=>{
+  const generation=composerGeneration;
+  const check=(async()=>{
+    let link=null;
+    try{
+      const full=await window.tm.getMessage(messageId);
+      // The link comes back only while the letter is still a draft.
+      if(draftMessageModel.isDraftMessage(full?.meta,coreFolders))link=messageId;
+    }catch(error){link=null;}
+    if(link!==null&&generation===composerGeneration&&draftBeingSent===null)draftBeingSent=link;
+  })();
+  draftLinkCheck={generation,check};
+  return check;
+};
+// Nothing is sent before the check of the draft of a restored letter has answered.
+async function settleDraftLink(){
+  if(draftLinkCheck&&draftLinkCheck.generation===composerGeneration)await draftLinkCheck.check;
+}
+// The saved copy of the letter that went out is cleared. A failure to clear it is
+// written to the log: it does not undo the sending.
+function clearSavedLetter(){
+  window.tm.setSetting('composer_draft','').catch(error=>{window.tm?.uiLog?.(`the saved copy of a sent letter was not cleared: ${error?.message||error}`);});
+}
+// Another letter is in the editor while the queue answers for the old one: the
+// new one is saved at once, so that the copy of the sent one does not come back
+// after a restart.
+function saveLetterOfEditor(){
+  if(letterHandedOver(composerGeneration))return;
+  saveDraftNow().catch(error=>{window.tm?.uiLog?.(`the letter of the editor was not saved after another letter went out: ${error?.message||error}`);});
+}
+// The generation of the editor whose letter the queue has already taken, and the
+// one being handed over now. Both buttons ask them: a letter goes to the queue
+// once, whichever button and whichever click.
+let handedOverGeneration=null,handingOverGeneration=null;
+function letterHandedOver(generation){return generation===handedOverGeneration||generation===handingOverGeneration;}
 document.getElementById('compSend').onclick=async()=>{
   // Крупный файл может ещё дочитываться: без ожидания письмо ушло бы без него,
   // а вложение легло бы в уже очищенный композер. Если за это время открыли
   // другое письмо, нажатие относилось к прежнему - отправлять нечего.
   const generation=composerGeneration;
+  await settleDraftLink();
   await settleAttachments();
-  if(generation!==composerGeneration)return;
+  if(generation!==composerGeneration||letterHandedOver(generation))return;
   let request;
   // S-005: адресаты проверяются до записи операции.
   try{request=composerRequest();}catch(error){showToast(error);return;}
   if(!composerRequestKey)composerRequestKey=`send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  // The draft of this letter is captured before the wait: another letter may
+  // take the editor while the queue is answering.
+  const sentDraft=draftBeingSent;
   let queued;
+  handingOverGeneration=generation;
   try{queued=await window.tm.sendMessage(request,composerRequestKey);}
   catch(error){
     // S-003: письмо не принято - композер и черновик остаются нетронутыми.
     showToast(error);return;
-  }
+  }finally{if(handingOverGeneration===generation)handingOverGeneration=null;}
   // S-002: композер очищается только после подтверждённой записи в очередь;
-  // очистка снимает и ключ запроса - следующее письмо получит свой.
-  resetComposer();showView('mailView');window.tm.setSetting('composer_draft','').catch(()=>{});
+  // очистка снимает и ключ запроса - следующее письмо получит свой. Другое
+  // письмо, начатое за время ожидания, остаётся.
+  if(generation===composerGeneration){
+    handedOverGeneration=generation;
+    clearTimeout(draftSaveTimer);
+    resetComposer();showView('mailView');clearSavedLetter();
+  }else saveLetterOfEditor();
   showUndoSendCard(queued,request);
+  if(sentDraft!==null)draftQueued(sentDraft);
 };
-document.getElementById('compSendLater').onclick=async()=>{const generation=composerGeneration;await settleAttachments();if(generation!==composerGeneration)return;const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}try{const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());await window.tm.setSetting('composer_draft','');status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';setTimeout(()=>{resetComposer();showView('mailView');},700);}catch(error){status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}};
+document.getElementById('compSendLater').onclick=async()=>{
+  const generation=composerGeneration;
+  // The letter already taken by the queue, or being taken now, is not scheduled
+  // twice. The sign is set before the first wait, so a second click sees it.
+  if(letterHandedOver(generation))return;
+  handingOverGeneration=generation;
+  try{
+    await settleDraftLink();
+    await settleAttachments();
+    if(generation!==composerGeneration)return;
+    const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');
+    if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}
+    try{
+      const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));
+      // The draft of this letter is captured before the wait: another letter may take the editor.
+      const sentDraft=draftBeingSent;
+      const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());
+      // Taken by the queue: its draft leaves the folder at once.
+      if(sentDraft!==null)draftQueued(sentDraft);
+      if(generation===composerGeneration){
+        // No other sending of this letter, by either button.
+        handedOverGeneration=generation;
+        clearTimeout(draftSaveTimer);
+        draftBeingSent=null;
+        // The saved copy is cleared after the queue has the letter. A failure to
+        // clear it is written to the log: it does not undo the scheduling.
+        clearSavedLetter();
+        status.textContent=L(`Запланировано (задача ${id})`,`Scheduled (task ${id})`);status.dataset.kind='success';
+        setTimeout(()=>{if(generation===composerGeneration){resetComposer();showView('mailView');}},700);
+      }else saveLetterOfEditor();
+    }catch(error){if(generation!==composerGeneration)return;status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
+  }finally{if(handingOverGeneration===generation)handingOverGeneration=null;}
+};
 document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};

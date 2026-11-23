@@ -7,6 +7,21 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-11-24
+
+### Fixed
+
+- A draft no longer looks like an incoming letter. A letter from the Drafts folder used to show "Reply", "Archive" and "Spam" above it, and it could not be sent from the program at all. A draft now has a "Send" button: the letter goes out with its recipients, subject, body and attachments, and the draft leaves the folder. Without a recipient the editor opens with a hint. The letter menu of a draft keeps only the actions that suit it, and the hidden copy is kept.
+- The buttons above an open letter always belong to that letter. Before, if you opened the right-click menu on another letter of the list, "Delete" and "View source" above the open letter acted on that other letter.
+- The commands of the right-click menu in the list belong to the letter the menu was opened on. Before, "Reply" or "Forward" could take the address and the quote of one letter and the subject of another, and "Block sender" or "Ignore conversation" acted on the open letter even when the menu was opened on another one.
+- Deleting or moving a letter from the list menu no longer closes the open letter. Before, its neighbour of the list appeared in the reading pane instead.
+- A blind copy reaches its recipients when the account works through Gmail, Exchange or JMAP. Before, when sending through such accounts, the blind copy addresses were cut out of the letter before it was given to the server, and those recipients never got the letter.
+- The account in the "From" field is not reset to the first one while a letter is being written and the mail is refreshed. Before, it was enough to wait for the list of letters to refresh.
+
+### Other
+
+- After the update, a letter takes a little longer to open the first time: the stored parse results are built again.
+
 ## [0.3.5] - 2026-11-23
 
 ### Fixed

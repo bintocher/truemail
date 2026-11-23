@@ -81,6 +81,14 @@ pub struct Attachment {
     pub is_inline: bool,
     pub content_id: Option<String>,
     pub fetched: bool,
+    /// True when the core has put this part into the body as a data URL.
+    /// None in parse results stored before the field existed.
+    #[serde(default)]
+    pub embedded: Option<bool>,
+}
+
+fn body_fetched_by_default() -> bool {
+    true
 }
 
 /// Полное письмо с телом (для просмотра).
@@ -90,6 +98,17 @@ pub struct MessageFull {
     pub body_html: Option<String>,
     pub body_text: Option<String>,
     pub attachments: Vec<Attachment>,
+    /// Hidden copy of a draft, read from the letter headers; empty otherwise.
+    #[serde(default)]
+    pub bcc: Vec<Addr>,
+    /// False when only the headers and the preview of the letter are stored;
+    /// answers without the field are treated as complete.
+    #[serde(default = "body_fetched_by_default")]
+    pub body_fetched: bool,
+    /// True when the letter has a text/plain part of its own; false when its text
+    /// is taken from the markup. Answers without the field count as true.
+    #[serde(default = "body_fetched_by_default")]
+    pub has_text_part: bool,
     /// True, если письмо содержит внешние ресурсы (для плашки блокировки).
     pub has_remote_content: bool,
     /// True, если это рассылка (есть заголовок List-Unsubscribe).

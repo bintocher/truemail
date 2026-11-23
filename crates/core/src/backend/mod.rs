@@ -17,7 +17,8 @@ pub use imap::{
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{
-    OutgoingAttachment, OutgoingMessage, send_gmail, send_password, send_yandex, validate_outgoing,
+    OutgoingAttachment, OutgoingMessage, is_inline_image_type, replace_img_sources, send_gmail,
+    send_password, send_yandex, validate_outgoing,
 };
 
 #[derive(Debug)]
@@ -555,7 +556,7 @@ impl MailBackend for GmailBackend {
     async fn send(&self, message: OutgoingMessage, credential: &str) -> SendResult {
         // Сборка письма отказывает до запроса, поэтому она отделена от самого
         // запроса: их отказы означают разное.
-        let raw = smtp::build_message(message)?.formatted();
+        let raw = smtp::build_message_with_bcc(message)?.formatted();
         smtp::send_gmail_raw(&raw, credential)
             .await
             .map_err(request_failure)?;

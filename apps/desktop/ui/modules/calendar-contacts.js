@@ -193,8 +193,14 @@ function popupMenuNodes(id){return (POPUP_MENU_REGISTRY[id]?.find()||[]).filter(
 function popupMenuIsOpen(id){const entry=POPUP_MENU_REGISTRY[id];return popupMenuNodes(id).some(node=>entry.isOpen(node));}
 function openPopupMenuIds(){return POPUP_MENU_IDS.filter(popupMenuIsOpen);}
 // Отсутствующий узел не мешает закрыть остальные меню (S-019).
+// The letter the context menu of the list was opened for. It is active only
+// while the menu is open: the reading pane acts on the letter it shows.
+let contextLetter=null;
+window.contextMenuLetter=()=>contextLetter;
 function closePopupMenus(ids){
-  withDependentMenus(ids).forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
+  const closing=withDependentMenus(ids);
+  closing.forEach(id=>{const entry=POPUP_MENU_REGISTRY[id];if(!entry)return;popupMenuNodes(id).forEach(node=>{if(entry.isOpen(node)){entry.close(node);popupMenuEpoch++;}});});
+  if(closing.includes('message'))window.restoreActiveToShown?.();
 }
 function applyPopupMenuAction(action){const plan=planPopupMenus(openPopupMenuIds(),action);closePopupMenus(plan.close);return plan;}
 // Вызывается перед показом любого меню семейства: закрывает все прочие (S-002).
@@ -225,7 +231,10 @@ document.addEventListener('contextmenu',e=>{if(e.target.closest('input,textarea,
   // списка, но письмом не являются: без номера письма меню открывалось бы для
   // ранее выбранного письма с пунктами удаления и снятия флажка.
   const msg=e.target.closest('.msg[data-message-id]'),smart=e.target.closest('[data-smart-index]'),contactCard=e.target.closest('.ccard[data-contact-id]'),tagRow=e.target.closest('.tag-row');
-  if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);activeMessage=messages.find(item=>item.id===id)||activeMessage;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
+  if(msg){const id=Number(msg.dataset.messageId);openPopupMenu('message',`message:${id}`);contextLetter=messages.find(item=>item.id===id)||currentMessageRows.find(item=>item?.id===id)||lastListRows.find(item=>item?.id===id)||null;
+    // The row is still on the screen, but the letter is gone from the data: the menu would act on another letter.
+    if(!contextLetter){closePopupMenus(['message']);return;}
+    activeMessage=contextLetter;buildContextMenu();posMenu(ctxmenu,e);}else if(tagRow){contextTag=coreTags.find(tag=>tag.id===Number(tagRow.dataset.tagId))||null;if(contextTag){openPopupMenu('tag',`tag:${contextTag.id}`);posMenu(ctxtag,e);}}else if(smart){openPopupMenu('smart',`smart:${smart.dataset.smartIndex}`);ctxsmart.dataset.index=smart.dataset.smartIndex;window.syncSmartContextMenu?.(Number(smart.dataset.smartIndex));posMenu(ctxsmart,e);}else if(contactCard){contextContact=coreContacts.find(contact=>contact.id===Number(contactCard.dataset.contactId))||null;if(contextContact){openPopupMenu('contact',`contact:${contextContact.id}`);const hasEmail=Boolean(contextContact.emails?.[0]?.email);ctxcontact.querySelectorAll('[data-contact-action="compose"],[data-contact-action="copy"]').forEach(item=>item.classList.toggle('disabled',!hasEmail));posMenu(ctxcontact,e);}}else{applyPopupMenuAction({type:'outside'});popupMenuAnchor={id:null,key:null};} });
 // Меню, которые остаются открытыми при клике внутри них: в фильтре стоят поле
 // ввода и переключатели, в подменю меток за одно открытие отмечают несколько
 // меток (S-015). Остальные закрываются выбранным пунктом (S-022) - на своих
@@ -343,25 +352,36 @@ function openLabelEditor(label){
 // ПКМ-меню письма = все действия панели письма (tbActions, даже выключенные) + доп.
 function buildContextMenu(){
   ctxmenu.innerHTML='';
-  tbActions.forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
+  // A draft is an unsent letter: the menu offers sending instead of replies.
+  const draft=draftMessageModel.isDraftMessage(activeMessage,coreFolders);
+  if(draft){const item=document.createElement('div');item.className='tmi';item.dataset.contextAction='send-draft';item.innerHTML=`<i data-i="send"></i>${escapeHtml(L('Отправить','Send'))}`;ctxmenu.appendChild(item);}
+  tbActions.filter(action=>!draft||draftMessageModel.DRAFT_ACTIONS.has(action.k)).forEach(action=>{const item=document.createElement('div');item.className='tmi';item.dataset.contextAction=action.k;item.innerHTML=`<i data-i="${action.i||action.k}"></i>${escapeHtml(tbLabel(action))}`;ctxmenu.appendChild(item);});
   const sep=document.createElement('div');sep.className='tmsep';ctxmenu.appendChild(sep);
-  (smartIsEnglish()?[['flag','flag','Add tag'],['important-toggle','check','Set or clear flag'],['pin-message','pin','Pin or unpin'],['task-edit','cal','Remind about message'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule'],['block-sender','shield','Block sender'],['ignore-conversation','snooze','Ignore conversation'],['sweep-sender','trash','Clean up by sender'],['delete-forever','trash','Delete permanently']]:[['flag','flag','Добавить метку'],['important-toggle','check','Поставить или снять флажок'],['pin-message','pin','Закрепить или открепить'],['task-edit','cal','Напомнить о письме'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило'],['block-sender','shield','Заблокировать отправителя'],['ignore-conversation','snooze','Игнорировать переписку'],['sweep-sender','trash','Автоочистка по отправителю'],['delete-forever','trash','Удалить навсегда']]).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top},true);}});ctxmenu.appendChild(item);});
+  (smartIsEnglish()?[['flag','flag','Add tag'],['important-toggle','check','Set or clear flag'],['pin-message','pin','Pin or unpin'],['task-edit','cal','Remind about message'],['raw','edit','View source'],['eml','download','Save as .eml'],['create-rule','filter','Create rule'],['block-sender','shield','Block sender'],['ignore-conversation','snooze','Ignore conversation'],['sweep-sender','trash','Clean up by sender'],['delete-forever','trash','Delete permanently']]:[['flag','flag','Добавить метку'],['important-toggle','check','Поставить или снять флажок'],['pin-message','pin','Закрепить или открепить'],['task-edit','cal','Напомнить о письме'],['raw','edit','Исходный текст'],['eml','download','Сохранить как .eml'],['create-rule','filter','Создать правило'],['block-sender','shield','Заблокировать отправителя'],['ignore-conversation','snooze','Игнорировать переписку'],['sweep-sender','trash','Автоочистка по отправителю'],['delete-forever','trash','Удалить навсегда']]).filter(([act])=>!draft||draftMessageModel.DRAFT_ACTIONS.has(act)).forEach(([act,icon,label])=>{const item=document.createElement('div');item.className='tmi'+(act==='flag'?' has-submenu':'');item.dataset.contextAction=act;item.innerHTML=`<i data-i="${icon}"></i>${label}`;if(act==='flag')item.addEventListener('mouseenter',()=>{if(activeMessage){const rect=item.getBoundingClientRect();openFlagMenu(activeMessage,{clientX:rect.right+2,clientY:rect.top},true);}});ctxmenu.appendChild(item);});
   renderIcons(ctxmenu);
 }
 // Пункт меню письма закрывает и само меню, и открытое подменю меток (S-008).
-ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;closePopupMenus(['message']);const action=item.dataset.contextAction;
+// An item acts on the letter the menu was opened for; once the item has run,
+// the letter of the reading pane is active again.
+ctxmenu.addEventListener('click',async event=>{const item=event.target.closest('[data-context-action]');if(!item)return;const letter=contextLetter;closePopupMenus(['message']);if(letter)activeMessage=letter;const action=item.dataset.contextAction;
+  // The selection of the list counts only when the letter under the cursor is one of the selected.
+  const targets=letter&&!selectedMessageIds.has(letter.id)?[letter.id]:null;
+  const idsOf=()=>targets||(selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[]);
+  try{
   if(action==='raw'){openRawViewer(activeMessage?.id);return;}
   if(action==='eml'){saveMessageAsEml(activeMessage?.id);return;}
   if(action==='create-rule'){openRuleEditor(activeMessage);return;}
   // S-013: безвозвратное удаление доступно только этим явно названным пунктом
   // и только с подтверждением - из переноса в корзину оно не получается.
-  if(action==='delete-forever'){const ids=selectedMessageIds.size?[...selectedMessageIds]:activeMessage?[activeMessage.id]:[];window.deleteMessagesForever?.(ids);return;}
-  if(action==='important-toggle'&&activeMessage){const ids=selectedMessageIds.size?[...selectedMessageIds]:[activeMessage.id];window.setMessagesFlaggedFromUi?.(ids,!activeMessage.flags?.flagged,activeMessage);return;}
-  if(action==='pin-message'&&activeMessage){const ids=selectedMessageIds.size?[...selectedMessageIds]:[activeMessage.id];window.setMessagesPinnedFromUi?.(ids,!activeMessage.pinned_at);return;}
+  if(action==='delete-forever'){const ids=idsOf();window.deleteMessagesForever?.(ids);return;}
+  if(action==='important-toggle'&&activeMessage){const ids=idsOf();window.setMessagesFlaggedFromUi?.(ids,!activeMessage.flags?.flagged,activeMessage);return;}
+  if(action==='pin-message'&&activeMessage){const ids=idsOf();window.setMessagesPinnedFromUi?.(ids,!activeMessage.pinned_at);return;}
   if(action==='task-edit'&&activeMessage){window.openMessageTaskEditor?.(activeMessage);return;}
-  if(action.startsWith('quick-step:')){window.executeQuickStep?.(Number(action.slice(11)));return;}
+  if(action.startsWith('quick-step:')){window.executeQuickStep?.(Number(action.slice(11)),targets);return;}
   if(action==='flag'){openFlagMenu(activeMessage,event);return;}
-  executeToolbarAction(action);
+  if(targets&&['archive','trash','spam'].includes(action)){performMessageActionForIds(action,targets);return;}
+  executeToolbarAction(action,true,targets);
+  }finally{window.restoreActiveToShown?.();}
 });
 ctxfolder.querySelectorAll('[data-folder-action]').forEach(item=>item.addEventListener('click',async()=>{if(item.classList.contains('disabled')||!contextFolder)return;const action=item.dataset.folderAction;if(action==='open'){contextFolderOpen?.();return;}if(action==='settings'){showView('settingsView');setSection('folders');return;}if(action==='count-total'||action==='count-unread'){const key=action==='count-total'?'t':'u';const set=new Set((folderCounterModes[contextFolder.id]||'u').split('').filter(c=>c==='u'||c==='t'));set.has(key)?set.delete(key):set.add(key);folderCounterModes[contextFolder.id]=['u','t'].filter(k=>set.has(k)).join('')||'n';window.tm.setSetting('folder_counters',JSON.stringify(folderCounterModes)).catch(console.error);item.classList.toggle('on',set.has(key));updateFolderBadge(document.querySelector(`.folder-row[data-folder-id="${contextFolder.id}"]`),contextFolder);return;}if(action==='create'){const name=prompt(L(`Имя новой папки внутри «${contextFolder.display_name}»`,`New folder name inside "${contextFolder.display_name}"`),'');if(!name||!name.trim())return;try{await window.tm.createFolder(contextFolder.account_id,contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка создана на сервере','Folder created on the server'));}catch(error){showToast(error);}return;}
   if(action==='rename'){const name=prompt(L('Новое имя папки','New folder name'),contextFolder.display_name);if(!name||name.trim()===contextFolder.display_name)return;try{await window.tm.renameFolder(contextFolder.id,name.trim());await window.reloadCoreData();showToast(L('Папка переименована на сервере','Folder renamed on the server'));}catch(error){showToast(error);}return;}if(action==='delete'){if(!await confirmAction(L(`Удалить папку «${contextFolder.display_name}» на сервере? Письма внутри также будут удалены.`,`Delete the folder "${contextFolder.display_name}" on the server? Messages inside will also be deleted.`)))return;try{await window.tm.deleteFolder(contextFolder.id);await window.reloadCoreData();showToast(L('Папка удалена на сервере','Folder deleted on the server'));}catch(error){showToast(error);}}}));

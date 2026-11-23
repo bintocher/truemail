@@ -112,6 +112,7 @@
   "actionForward": "Forward",
   "actionReply": "Reply",
   "actionReplyAll": "Reply all",
+  "actionSendDraft": "Send",
   "actMoveToFolder": "Move to folder",
   "actToSpam": "Spam",
   "addAccount": "Add account",

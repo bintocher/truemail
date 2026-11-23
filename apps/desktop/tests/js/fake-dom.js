@@ -316,6 +316,11 @@ class FakeNode {
       node.parent = null;
     });
     this.childNodes = [];
+    if (this.tag === 'select') {
+      // Как в браузере: список без вариантов не показывает отправителя.
+      this.options = [];
+      this.value = '';
+    }
     parseMarkup(String(html ?? '')).forEach(node => this.appendChild(node));
   }
 
@@ -427,6 +432,11 @@ class FakeNode {
   }
 
   removeAttribute(name) {
+    if (name === 'class') {
+      // Как в браузере: без атрибута у элемента нет и классов.
+      this.classes = new Set();
+      return;
+    }
     delete this.attributes[name];
   }
 

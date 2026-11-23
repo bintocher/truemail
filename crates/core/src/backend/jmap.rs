@@ -534,7 +534,7 @@ impl JmapBackend {
         }
         let account_id = self.mail_account(&session)?.to_owned();
         let submission_account_id = self.submission_account(&session)?.to_owned();
-        let raw = super::smtp::build_message(message)?.formatted();
+        let raw = super::smtp::build_message_with_bcc(message)?.formatted();
         let upload_url = expand_upload_url(&session.upload_url, &account_id);
         let upload = client()?
             .post(upload_url)
