@@ -79,6 +79,29 @@ test('S-002: разорванная и закольцованная цепочк
   assert.equal(folderPathLabel(second, looped), 'B');
 });
 
+test('#137: точка в серверном пути различает одноимённые папки без родительских связей', () => {
+  for (const [remotePath, expected] of [['A.Projects', 'A / Projects'], ['B.Projects', 'B / Projects'], ['Projects', 'Projects']]) {
+    const item = folder({remote_path: remotePath, display_name: 'Projects'});
+    assert.equal(folderPathLabel(item, byId([item])), expected);
+  }
+});
+
+test('#137: кавычки различают разделитель внутри имени и границу двух папок', () => {
+  const items = [
+    folder({id: 1, display_name: 'A / B'}),
+    folder({id: 2, parent_id: 1, display_name: 'Projects'}),
+    folder({id: 3, display_name: 'A'}),
+    folder({id: 4, parent_id: 3, display_name: 'B'}),
+    folder({id: 5, parent_id: 4, display_name: 'Projects'}),
+    folder({id: 6, display_name: 'Work'}),
+    folder({id: 7, parent_id: 6, display_name: 'Projects'}),
+  ];
+  const map = byId(items);
+  assert.equal(folderPathLabel(map.get(2), map), '"A / B" / Projects');
+  assert.equal(folderPathLabel(map.get(5), map), 'A / B / Projects');
+  assert.equal(folderPathLabel(map.get(7), map), 'Work / Projects');
+});
+
 // S-004: пустые и битые значения не должны ломать строку списка.
 test('S-004: при пустом имени показывается remote_path, при пустом всём - пустая строка', () => {
   const cases = [

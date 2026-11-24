@@ -484,19 +484,23 @@ function openRuleEditor(source=null,rule=null){
   document.getElementById('ruleName').focus();
 }
 function closeRuleEditor(){ruleEditor.classList.add('hidden');editingRuleId=null;}
-function ruleDescription(rule){
-  return mailRulesModel.ruleSummary(rule,{lang:ruleLang(),accounts:coreAccounts,folders:coreFolders,labels:coreTags||[]});
+function ruleDescription(rule,foldersById){
+  return mailRulesModel.ruleSummary(rule,{
+    lang:ruleLang(),accounts:coreAccounts,folders:coreFolders,labels:coreTags||[],
+    folderPathLabel:folder=>folderNames.folderPathLabel(folder,foldersById,folderTitle),
+  });
 }
 function renderRulesList(){
   // Имена правил задаёт пользователь: словарь автоперевода их не трогает.
   const list=document.getElementById('rulesList');list.dataset.noI18n='1';list.innerHTML='';
   if(lastRuleRun){const report=document.createElement('p');report.className='note-muted';report.textContent=`${L('Последний ручной прогон','Last manual run')}: ${mailRulesModel.runReportText(lastRuleRun,ruleLang())}`;list.appendChild(report);}
   if(!mailRules.length){const empty=document.createElement('p');empty.className='rule-empty';empty.textContent=L('Правил пока нет.','No rules yet.');list.appendChild(empty);return;}
+  const foldersById=new Map(coreFolders.map(folder=>[folder.id,folder]));
   mailRules.forEach((rule,index)=>{
     const row=document.createElement('div');row.className='rule-row';row.dataset.ruleId=rule.id;row.draggable=true;
     row.innerHTML=`<span class="grip"><i data-i="grip"></i></span><div class="toggle${rule.enabled!==false?' on':''}" role="switch"></div><div class="rule-row-body"><div class="rule-row-title"></div><div class="rule-row-description"></div><div class="rule-row-state"></div></div><button type="button" class="btn sm"><i data-i="edit"></i>${escapeHtml(L('Изменить','Edit'))}</button>`;
     row.querySelector('.rule-row-title').textContent=`${index+1}. ${rule.name}`;
-    row.querySelector('.rule-row-description').textContent=ruleDescription(rule);
+    row.querySelector('.rule-row-description').textContent=ruleDescription(rule,foldersById);
     const state=row.querySelector('.rule-row-state');state.textContent=mailRulesModel.ruleStateText(rule,ruleLang());state.classList.toggle('hidden',!state.textContent);
     row.querySelector('.toggle').onclick=async()=>{try{await window.tm.setMailRuleEnabled(rule.id,!rule.enabled);await reloadMailRules();}catch(error){showToast(error);}};
     row.querySelector('button').onclick=()=>openRuleEditor(null,rule);

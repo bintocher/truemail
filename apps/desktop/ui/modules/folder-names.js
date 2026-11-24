@@ -92,21 +92,33 @@ function parentChain(folder, foldersById) {
   return chain;
 }
 
+function quoteFolderPathSegment(name) {
+  return name.includes(' / ') ? `"${name.replaceAll('"', '""')}"` : name;
+}
+
 function folderPathLabel(folder, foldersById, rootLabel = folderOwnLabel) {
   if (!folder) return '';
   if (folder.parent_id) {
     const chain = foldersById && parentChain(folder, foldersById);
-    return chain ? chain.map(folderOwnLabel).join(' / ') : rootLabel(folder);
+    return chain
+      ? chain.map(item => quoteFolderPathSegment(folderOwnLabel(item))).join(' / ')
+      : quoteFolderPathSegment(rootLabel(folder));
   }
   // Support cached IMAP folders whose parent links have not been discovered yet.
   const remotePath = folder.remote_path || '';
-  for (const delimiter of ['/', '|']) {
-    const segments = remotePath.split(delimiter).filter(part => part !== '');
-    if (segments.length > 1 && decodeFolderSegment(segments.at(-1)) === folder.display_name) {
-      return segments.map(decodeFolderSegment).join(' / ');
+  const displayName = folder.display_name;
+  if (displayName && decodeFolderSegment(remotePath) !== displayName) {
+    for (const {0: delimiter, index} of Array.from(remotePath.matchAll(/./gsu)).reverse()) {
+      if (index === 0) break;
+      const last = remotePath.slice(index + delimiter.length);
+      if (decodeFolderSegment(last) !== displayName) continue;
+      const ancestors = remotePath.slice(0, index).split(delimiter).filter(Boolean);
+      if (ancestors.length) {
+        return [...ancestors.map(decodeFolderSegment), displayName].map(quoteFolderPathSegment).join(' / ');
+      }
     }
   }
-  return rootLabel(folder);
+  return quoteFolderPathSegment(rootLabel(folder));
 }
 
 // Порядок ролей списка источников - тот же, что и в общем sortedFolders
