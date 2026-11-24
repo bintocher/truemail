@@ -8725,7 +8725,7 @@ async fn infer_missing_folder_role(
     let folders: Vec<(i64, String)> = sqlx::query_as(
         "SELECT child.id, child.display_name FROM folders child
          LEFT JOIN folders parent ON parent.id=child.parent_id AND parent.account_id=child.account_id
-         WHERE child.account_id=? AND child.role IS NULL AND
+         WHERE child.account_id=? AND
                (child.parent_id IS NULL OR parent.remote_path='INBOX' COLLATE NOCASE)",
     )
     .bind(account_id)
@@ -8737,7 +8737,7 @@ async fn infer_missing_folder_role(
     if let Some((id, _)) = candidates.next()
         && candidates.next().is_none()
     {
-        sqlx::query("UPDATE folders SET role=? WHERE id=?")
+        sqlx::query("UPDATE folders SET role=? WHERE id=? AND role IS NULL")
             .bind(role)
             .bind(id)
             .execute(&mut **tx)
