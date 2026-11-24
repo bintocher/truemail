@@ -307,7 +307,9 @@ function ruleSummary(source, context = {}) {
     const meta = ruleAction(action.kind);
     if (action.kind === 'move') {
       const folder = (context.folders || []).find(item => item.id === action.folder_id);
-      const name = folder ? (folder.display_name || folder.remote_path) : (action.folder_role || '?');
+      const name = folder
+        ? (context.folderPathLabel?.(folder) ?? (folder.display_name || folder.remote_path))
+        : (action.folder_role || '?');
       return `${ruleText(meta, lang)}: ${name}`;
     }
     if (meta.needs === 'label') {

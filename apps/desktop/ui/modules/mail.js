@@ -117,16 +117,54 @@ async function openGallery(full,att,messageId){
   const single=images.length<2;overlay.querySelector('.prev').hidden=single;overlay.querySelector('.next').hidden=single;
   show(idx);
 }
-function folderTitle(folder){const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};return names[folder?.role]||folder?.display_name||folder?.remote_path||'';}
-function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
-// Порядок и глубина папок. Если бэкенд отдал parent_id (Exchange) - строим
-// дерево, дети под родителем. Иначе (IMAP) глубина по разделителям remote_path.
+function folderTitle(folder){
+  const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};
+  const roleTitle=names[folder?.role];
+  if(roleTitle&&!coreFolders.some(other=>other.id!==folder.id&&other.account_id===folder.account_id&&other.role===folder.role))return roleTitle;
+  return folder?.display_name||folder?.remote_path||'';
+}
+function mailFolderPathLabel(folder){
+  return folderNames.folderPathLabel(folder,new Map(coreFolders.map(item=>[item.id,item])),folderTitle);
+}
+function sortedFolders(folders,label=folder=>folder.remote_path||folder.display_name||''){
+  const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};
+  return [...folders].sort((a,b)=>{
+    const ar=order[a.role]??20,br=order[b.role]??20;
+    if(ar!==br)return ar-br;
+    return String(label(a)).localeCompare(String(label(b)),wizardLocale||'ru',{numeric:true,sensitivity:'base'});
+  });
+}
 function folderTreeRows(folders){
   const byId=new Map(folders.map(folder=>[folder.id,folder]));
-  const hasTree=folders.some(folder=>folder.parent_id&&byId.has(folder.parent_id));
-  if(!hasTree)return sortedFolders(folders).map(folder=>({folder,depth:Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length)}));
-  const children=new Map();folders.forEach(folder=>{const parent=(folder.parent_id&&byId.has(folder.parent_id))?folder.parent_id:0;if(!children.has(parent))children.set(parent,[]);children.get(parent).push(folder);});
-  const rows=[];const walk=(list,depth)=>sortedFolders(list).forEach(folder=>{rows.push({folder,depth});walk(children.get(folder.id)||[],depth+1);});walk(children.get(0)||[],0);
+  const roots=[],children=new Map();
+  for(const folder of folders){
+    const parent=byId.get(folder.parent_id);
+    if(parent&&parent.account_id===folder.account_id){
+      if(!children.has(folder.parent_id))children.set(folder.parent_id,[]);
+      children.get(folder.parent_id).push(folder);
+    }else{
+      roots.push(folder);
+    }
+  }
+  const rows=[],visited=new Set();
+  const byName=folder=>folder.display_name||folder.remote_path||'';
+  function walk(list){
+    const stack=list.map(folder=>({folder,depth:0})).reverse();
+    while(stack.length){
+      const row=stack.pop();
+      const {folder,depth}=row;
+      if(visited.has(folder.id))continue;
+      visited.add(folder.id);
+      rows.push(row);
+      const nested=children.get(folder.id);
+      if(nested){
+        const sorted=sortedFolders(nested,byName);
+        for(let i=sorted.length-1;i>=0;i--)stack.push({folder:sorted[i],depth:depth+1});
+      }
+    }
+  }
+  walk(sortedFolders(roots,byName));
+  walk(folders);
   return rows;
 }
 // Счётчик писем у папки: 'u' непрочитанные, 't' всего, 'ut' оба (непрочит/всего), 'n' ничего.
@@ -166,13 +204,12 @@ window.relocalizeFolderTree=function(){
     const name=row.querySelector('.folder-name');
     if(name)name.textContent=folderTitle(folder);
   });
-  // Заголовок открытой папки собран той же функцией.
   if(currentFolderId!==null){
     const folder=coreFolders.find(item=>item.id===currentFolderId);
     const heading=document.querySelector('.listhead h2');
     // Папка могла исчезнуть (удалена на сервере, а просмотр ещё на неё
     // ссылается) - тогда ставим общий заголовок, а не оставляем прежний язык.
-    if(heading)heading.textContent=folder?folderTitle(folder):messagesTitle();
+    if(heading)heading.textContent=folder?mailFolderPathLabel(folder):messagesTitle();
   }
   // Строки списка собраны в коде: подпись ящика и подпись "без получателя"
   // остались бы на прежнем языке до следующей прокрутки.
@@ -327,7 +364,7 @@ function expandConversationIds(ids){
 window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showToast(L(`Письма перемещены в «${folderTitle(folder)}»`,`Messages moved to “${folderTitle(folder)}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;const destination=mailFolderPathLabel(folder);try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showToast(L(`Письма перемещены в «${destination}»`,`Messages moved to “${destination}”`),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
 // Метки письма в списке (issue #86, specs/message-labels-visible.md). Разбор
 // вынесен в messageLabels: там чистые функции без DOM, их покрывают проверки.
 // Метка "открыта" только когда не открыты папка и умная папка: переход по
@@ -1025,12 +1062,12 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
       const icon=folderIcon(folder);row.style.paddingLeft=`${14+depth*14}px`;
       row.innerHTML=`<i data-i="${icon}"></i><span class="folder-name"></span>`;
       row.querySelector('.folder-name').textContent=folderTitle(folder);updateFolderBadge(row,folder);
-      const openFolder=()=>{window.setListLoading?.(false);tasksSectionOpen=false;goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,folderTitle(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openPopupMenu('folder',`folder:${folder.id}`);contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
+      const openFolder=()=>{window.setListLoading?.(false);tasksSectionOpen=false;goMail();document.querySelectorAll('.navitem').forEach(item=>item.classList.remove('active'));row.classList.add('active');currentFolderId=folder.id;currentSmartIndex=null;currentTagName=null;applyListOptions(true,mailFolderPathLabel(folder));window.ensureListFilled?.();};row.onclick=openFolder;row.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();openPopupMenu('folder',`folder:${folder.id}`);contextFolder=folder;contextFolderOpen=openFolder;ctxfolder.dataset.system=folder.role?'true':'false';ctxfolder.querySelectorAll('[data-folder-action="rename"],[data-folder-action="delete"]').forEach(item=>item.classList.toggle('disabled',Boolean(folder.role)));const mode=folderCounterMode(folder);ctxfolder.querySelector('[data-folder-action="count-unread"]')?.classList.toggle('on',mode.includes('u'));ctxfolder.querySelector('[data-folder-action="count-total"]')?.classList.toggle('on',mode.includes('t'));posMenu(ctxfolder,event);};row.ondragover=event=>{event.preventDefault();event.dataTransfer.dropEffect='move';row.classList.add('drop-hi');};row.ondragleave=event=>{if(!row.contains(event.relatedTarget))row.classList.remove('drop-hi');};row.ondrop=event=>{event.preventDefault();row.classList.remove('drop-hi');try{moveMessagesByDrop(JSON.parse(event.dataTransfer.getData('application/x-truemail-messages')),folder);}catch(_){}};sub.appendChild(row);});
     anchor.after(sub);anchor=sub;
   });
   renderIcons(document.querySelector('.nav'));
   if(previousFolder!==null&&coreFolders.some(folder=>folder.id===previousFolder)){
-    currentFolderId=previousFolder;currentSmartIndex=null;const folder=coreFolders.find(item=>item.id===previousFolder);document.querySelector(`.folder-row[data-folder-id="${previousFolder}"]`)?.classList.add('active');applyListOptions(false,folderTitle(folder));
+    currentFolderId=previousFolder;currentSmartIndex=null;const folder=coreFolders.find(item=>item.id===previousFolder);document.querySelector(`.folder-row[data-folder-id="${previousFolder}"]`)?.classList.add('active');applyListOptions(false,mailFolderPathLabel(folder));
   // Просмотр метки переживает перезагрузку данных: раньше любая фоновая
   // синхронизация выбрасывала из метки в первую умную папку.
   }else if(previousTag!=null&&coreTags.some(tag=>tag.name===previousTag)){

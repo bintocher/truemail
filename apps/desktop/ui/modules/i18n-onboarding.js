@@ -88,7 +88,7 @@ function relocalizeDynamic(){
       // переход по уведомлению ставит currentFolderId, но currentTagName от
       // прошлого просмотра не сбрасывает.
       if(currentTagName!=null&&currentFolderId===null&&currentSmartIndex==null)heading.textContent=currentTagName;
-      else if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=folderTitle(folder);}
+      else if(currentFolderId!==null){const folder=coreFolders.find(item=>item.id===currentFolderId);if(folder)heading.textContent=mailFolderPathLabel(folder);}
       else if(currentSmartIndex!=null&&smartFolders[currentSmartIndex])heading.textContent=smartFolderTitle(smartFolders[currentSmartIndex])||messagesTitle();
     }
     // Подзаголовок списка собирает одна и та же функция, что и обычная

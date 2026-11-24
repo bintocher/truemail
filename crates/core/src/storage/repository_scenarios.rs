@@ -42,6 +42,57 @@ async fn seed_folder(db: &Db, account_id: i64, path: &str, role: Option<&str>) -
     .0
 }
 
+#[tokio::test]
+async fn folder_refresh_recalculates_parents_for_existing_rows() {
+    let db: TestDb = open_test_db("repo-folder-parents").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let other = seed_account(&db, "other@example.test").await;
+    seed_folder(&db, other, "Trash", Some("trash")).await;
+    let child_id = seed_folder(&db, account, "Trash|pending", None).await;
+    let mut child = DiscoveredFolder {
+        remote_path: "Trash|pending".into(),
+        display_name: "pending".into(),
+        role: None,
+        parent_remote_path: Some("Trash".into()),
+        unread_count: 0,
+        total_count: 0,
+        uidvalidity: None,
+        uidnext: None,
+        highestmodseq: None,
+        sync_token: None,
+    };
+    db.save_discovered_folders(account, std::slice::from_ref(&child))
+        .await
+        .unwrap();
+    assert_eq!(db.folder(child_id).await.unwrap().parent_id, None);
+
+    let parent = DiscoveredFolder {
+        remote_path: "Trash".into(),
+        display_name: "Trash".into(),
+        role: Some(FolderRole::Trash),
+        parent_remote_path: None,
+        ..child.clone()
+    };
+    db.save_discovered_folders(account, &[child.clone(), parent])
+        .await
+        .unwrap();
+    let parent_id = db
+        .list_folders(account)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.remote_path == "Trash")
+        .unwrap()
+        .id;
+    let saved_child = db.folder(child_id).await.unwrap();
+    assert_eq!(saved_child.parent_id, Some(parent_id));
+    assert_eq!(saved_child.display_name, "pending");
+
+    child.parent_remote_path = None;
+    db.save_discovered_folders(account, &[child]).await.unwrap();
+    assert_eq!(db.folder(child_id).await.unwrap().parent_id, None);
+}
+
 async fn seed_message(db: &Db, account_id: i64, folder_id: i64, uid: i64, subject: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(
         "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject, preview, date, size)
@@ -56,6 +107,300 @@ async fn seed_message(db: &Db, account_id: i64, folder_id: i64, uid: i64, subjec
     .await
     .expect("сохранить письмо")
     .0
+}
+
+fn discovered_folder(path: &str, name: &str, parent: Option<&str>) -> DiscoveredFolder {
+    DiscoveredFolder {
+        remote_path: path.into(),
+        display_name: name.into(),
+        role: None,
+        parent_remote_path: parent.map(str::to_owned),
+        unread_count: 0,
+        total_count: 0,
+        uidvalidity: None,
+        uidnext: None,
+        highestmodseq: None,
+        sync_token: None,
+    }
+}
+
+#[tokio::test]
+async fn missing_parent_does_not_remove_a_discovered_child_or_its_message() {
+    for save_before_reconcile in [true, false] {
+        let db = open_test_db("repo-missing-folder-parent").await;
+        let account = seed_account(&db, "repo@example.test").await;
+        let parent = discovered_folder("Work", "Work", None);
+        let child = discovered_folder("Work|Reports", "Reports", Some("Work"));
+        db.save_discovered_folders(account, &[child.clone(), parent])
+            .await
+            .unwrap();
+        let original = db
+            .list_folders(account)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.remote_path == child.remote_path)
+            .unwrap();
+        assert!(original.parent_id.is_some());
+        let message_id = seed_message(&db, account, original.id, 1, "Report").await;
+
+        let updated = [child];
+        if save_before_reconcile {
+            db.save_discovered_folders(account, &updated).await.unwrap();
+            assert_eq!(db.folder(original.id).await.unwrap().parent_id, None);
+        }
+        assert_eq!(
+            db.reconcile_discovered_folders(account, &updated)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let remaining = db.list_folders(account).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, original.id);
+        assert_eq!(remaining[0].parent_id, None);
+        let folder_id: i64 = sqlx::query_scalar("SELECT folder_id FROM messages WHERE id=?")
+            .bind(message_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(folder_id, original.id);
+    }
+}
+
+#[tokio::test]
+async fn reconciliation_removes_a_child_absent_from_discovery() {
+    let db = open_test_db("repo-missing-child-folder").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let parent = discovered_folder("Work", "Work", None);
+    let child = discovered_folder("Work|Reports", "Reports", Some("Work"));
+    db.save_discovered_folders(account, &[parent.clone(), child])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.reconcile_discovered_folders(account, &[parent])
+            .await
+            .unwrap(),
+        1
+    );
+    let remaining = db.list_folders(account).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].remote_path, "Work");
+}
+
+#[tokio::test]
+async fn discovery_keeps_a_manually_assigned_nested_role_shared_with_a_root() {
+    let db = open_test_db("repo-duplicate-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let root_id = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let child_id = seed_folder(&db, account, "Work|Trash", None).await;
+    db.set_folder_role(account, "trash", Some(child_id))
+        .await
+        .unwrap();
+    let root = DiscoveredFolder {
+        role: Some(FolderRole::Trash),
+        ..discovered_folder("Trash", "Trash", None)
+    };
+    let parent = discovered_folder("Work", "Work", None);
+    let child = discovered_folder("Work|Trash", "Trash", Some("Work"));
+
+    db.save_discovered_folders(account, &[child, parent, root])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.folder(root_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+    assert_eq!(
+        db.folder(child_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+}
+
+#[tokio::test]
+async fn discovery_keeps_explicit_and_unique_nested_roles() {
+    let db = open_test_db("repo-preserved-folder-roles").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let explicit_id = seed_folder(&db, account, "Work|Trash", Some("trash")).await;
+    let unique_id = seed_folder(&db, account, "Work|Archive", Some("archive")).await;
+    let root = DiscoveredFolder {
+        role: Some(FolderRole::Trash),
+        ..discovered_folder("Trash", "Trash", None)
+    };
+    let explicit = DiscoveredFolder {
+        role: Some(FolderRole::Trash),
+        ..discovered_folder("Work|Trash", "Trash", Some("Work"))
+    };
+    let parent = discovered_folder("Work", "Work", None);
+    let unique = discovered_folder("Work|Archive", "Archive", Some("Work"));
+
+    db.save_discovered_folders(account, &[root, explicit, unique, parent])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.folder(explicit_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+    assert_eq!(
+        db.folder(unique_id).await.unwrap().role,
+        Some(FolderRole::Archive)
+    );
+}
+
+#[tokio::test]
+async fn manual_trash_infers_a_role_only_from_a_root_display_name() {
+    let db = open_test_db("repo-infer-root-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("Work", "Work", None),
+        discovered_folder("Work|Trash", "Trash", Some("Work")),
+        discovered_folder("Legacy/Trash", "Legacy/Trash", None),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert_eq!(db.folder(folder_id("Work|Trash")).await.unwrap().role, None);
+    assert_eq!(
+        db.folder(folder_id("Legacy/Trash")).await.unwrap().role,
+        None
+    );
+
+    let root_id = seed_folder(&db, account, "Trash", None).await;
+    let queued = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(queued.skipped_no_folder, 0);
+    assert_eq!(queued.operation_ids.len(), 1);
+    assert_eq!(
+        db.folder(root_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+    assert_eq!(db.folder(folder_id("Work|Trash")).await.unwrap().role, None);
+}
+
+#[tokio::test]
+async fn manual_trash_infers_a_role_from_a_unique_inbox_child() {
+    let db = open_test_db("repo-infer-inbox-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("INBOX.Sent", "Sent", Some("INBOX")),
+        discovered_folder("INBOX.Trash", "Trash", Some("INBOX")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+    let trash_id = folder_id("INBOX.Trash");
+    let duplicate_id = seed_folder(&db, account, "Trash", None).await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(db.folder(trash_id).await.unwrap().role, None);
+    assert_eq!(db.folder(duplicate_id).await.unwrap().role, None);
+
+    db.delete_folder_local(duplicate_id).await.unwrap();
+    let queued = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(queued.skipped_no_folder, 0);
+    assert_eq!(queued.operation_ids.len(), 1);
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+}
+
+#[tokio::test]
+async fn manual_trash_preserves_an_assigned_role_on_an_inbox_child() {
+    let db = open_test_db("repo-infer-unassigned-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("INBOX.Trash", "Trash", Some("INBOX")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let trash_id = folder_id("INBOX.Trash");
+    db.set_folder_role(account, "archive", Some(trash_id))
+        .await
+        .unwrap();
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Archive)
+    );
+
+    db.set_folder_role(account, "archive", None).await.unwrap();
+    let queued = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(queued.skipped_no_folder, 0);
+    assert_eq!(queued.operation_ids.len(), 1);
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+}
+
+#[tokio::test]
+async fn manual_trash_skips_when_a_matching_root_has_another_role() {
+    let db = open_test_db("repo-infer-ambiguous-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("INBOX.Trash", "Trash", Some("INBOX")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let root_id = seed_folder(&db, account, "Trash", Some("archive")).await;
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(
+        db.folder(root_id).await.unwrap().role,
+        Some(FolderRole::Archive)
+    );
+    assert_eq!(
+        db.folder(folder_id("INBOX.Trash")).await.unwrap().role,
+        None
+    );
 }
 
 /// Письмо с вложением-приглашением: разбор MIME, вложение и тело для поиска

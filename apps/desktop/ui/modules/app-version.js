@@ -1,3 +1,3 @@
 // Файл создаётся сборкой из версии пакета: править руками бессмысленно.
 // См. specs/app-version-in-statusbar.md.
-window.truemailVersion={version:"0.3.6",releaseUrl:"https://github.com/bintocher/truemail/releases/tag/v0.3.6"};
+window.truemailVersion={version:"0.3.7",releaseUrl:"https://github.com/bintocher/truemail/releases/tag/v0.3.7"};

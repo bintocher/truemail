@@ -79,41 +79,46 @@ function folderOwnLabel(folder) {
   return (folder.remote_path || '').trim();
 }
 
-// Цепочка родителей от корня к папке по parent_id (Exchange). null, если
-// родитель не найден в списке или обнаружен цикл - тогда используется только
-// имя самой папки (S-002).
 function parentChain(folder, foldersById) {
   const chain = [folder], visited = new Set([folder.id]);
   let current = folder;
   while (current.parent_id) {
-    if (!foldersById.has(current.parent_id) || visited.has(current.parent_id)) return null;
     const parent = foldersById.get(current.parent_id);
-    chain.unshift(parent);
+    if (!parent || parent.account_id !== folder.account_id || visited.has(parent.id)) return null;
+    chain.push(parent);
     visited.add(parent.id);
     current = parent;
   }
-  return chain;
+  return chain.reverse();
 }
 
-// Подпись строки списка источников (S-001, S-002, S-004):
-// 1) parent_id указывает на папку из списка (Exchange) - путь от корня по
-//    цепочке человекочитаемых имён;
-// 2) иначе remote_path с разделителями '/' или '|' (IMAP) - путь из
-//    декодированных сегментов;
-// 3) иначе display_name, а если и оно пусто - remote_path, а если и он пуст -
-//    пустая строка.
-function folderPathLabel(folder, foldersById) {
+function quoteFolderPathSegment(name) {
+  return name.includes(' / ') || name.includes('"') ? `"${name.replaceAll('"', '""')}"` : name;
+}
+
+function folderPathLabel(folder, foldersById, rootLabel = folderOwnLabel) {
   if (!folder) return '';
-  if (folder.parent_id && foldersById && foldersById.has(folder.parent_id)) {
-    const chain = parentChain(folder, foldersById);
-    if (chain) return chain.map(folderOwnLabel).join('/');
+  if (folder.parent_id) {
+    const chain = foldersById && parentChain(folder, foldersById);
+    return chain
+      ? chain.map(item => quoteFolderPathSegment(folderOwnLabel(item))).join(' / ')
+      : quoteFolderPathSegment(rootLabel(folder));
   }
+  // Support cached IMAP folders whose parent links have not been discovered yet.
   const remotePath = folder.remote_path || '';
-  if (/[/|]/.test(remotePath)) {
-    const segments = remotePath.split(/[/|]/).filter(part => part !== '');
-    if (segments.length) return segments.map(decodeFolderSegment).join('/');
+  const displayName = folder.display_name;
+  if (displayName && decodeFolderSegment(remotePath) !== displayName) {
+    for (const {0: delimiter, index} of Array.from(remotePath.matchAll(/[/|.]/g)).reverse()) {
+      if (index === 0) break;
+      const last = remotePath.slice(index + delimiter.length);
+      if (decodeFolderSegment(last) !== displayName) continue;
+      const ancestors = remotePath.slice(0, index).split(delimiter).filter(Boolean);
+      if (ancestors.length) {
+        return [...ancestors.map(decodeFolderSegment), displayName].map(quoteFolderPathSegment).join(' / ');
+      }
+    }
   }
-  return folderOwnLabel(folder);
+  return quoteFolderPathSegment(rootLabel(folder));
 }
 
 // Порядок ролей списка источников - тот же, что и в общем sortedFolders

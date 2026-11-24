@@ -251,6 +251,23 @@ async function rulesApp() {
 
 const rulesList = app => app.document.getElementById('rulesList');
 
+test('#137: список правил различает одноимённые папки по полному пути', async () => {
+  const folders = [
+    {id: 1, display_name: 'Работа'}, {id: 2, display_name: 'Личное'},
+    {id: 3, display_name: '2026', parent_id: 1}, {id: 4, display_name: '2026', parent_id: 2},
+  ].map(folder => ({...folder, account_id: 1}));
+  const app = startApp({accounts: [{id: 1, email: 'me@example.test'}], folders});
+  await app.ready();
+  const moveRules = [3, 4].map(id => ({...RULE_ROW, id: `move-${id}`, actions: [{kind: 'move', folder_id: id}]}));
+  app.set('mailRules', moveRules);
+  app.run('renderRulesList()');
+
+  const descriptions = rulesList(app).querySelectorAll('.rule-row-description');
+  assert.match(descriptions[0].textContent, /Работа \/ 2026/);
+  assert.match(descriptions[1].textContent, /Личное \/ 2026/);
+  assert.match(rules.ruleSummary(moveRules[0], {folders}), /: 2026 - /);
+});
+
 test('S-083: смена языка переводит список правил вместе с описанием и состоянием', async () => {
   const app = await rulesApp();
   const row = rulesList(app).querySelector('.rule-row');
