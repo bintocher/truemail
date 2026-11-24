@@ -49,8 +49,13 @@ async function renderMail(list = accounts, folders = yandexFolders) {
 }
 
 const navRows = app => app.queryAll('.folder-row[data-folder-id]');
+const navIds = app => navRows(app).map(row => Number(row.dataset.folderId));
 const folderName = row => row.querySelector('.folder-name').textContent;
 const rowById = (app, id) => app.query(`.folder-row[data-folder-id="${id}"]`);
+const padding = (app, id) => parseInt(rowById(app, id).style.paddingLeft, 10);
+const treeFolder = (id, display_name, parent_id = null, fields = {}) => ({
+  id, display_name, parent_id, account_id: 1, remote_path: `id-${id}`, role: null, ...fields,
+});
 
 test('#137: подпапки двух ящиков Яндекса идут под родителями, одинаковые роли различимы', async () => {
   const app = await renderMail();
@@ -98,10 +103,49 @@ test('#137: без родителя подпапка остаётся на ве�
   assert.equal(orphan.style.paddingLeft, rowById(app, 15).style.paddingLeft);
 });
 
-test('#137: подпапки сортируются по имени при назначенной роли', async () => {
-  const extra = {...yandexFolders[1].find(folder => folder.id === 20), id: 22, remote_path: 'Trash|z-last', display_name: 'z-last', role: 'archive'};
-  const app = await renderMail([accounts[1]], [[...yandexFolders[1], extra]]);
-  const ids = navRows(app).map(row => Number(row.dataset.folderId));
+test('#137: подпапки Яндекса без роли сортируются по короткому имени', async () => {
+  const extra = {...yandexFolders[1].find(folder => folder.id === 20), id: 22, remote_path: 'Trash|a-first', display_name: 'z-last'};
+  const app = await renderMail([accounts[1]], [[extra, ...yandexFolders[1]]]);
+  const ids = navIds(app);
   const parentIndex = ids.indexOf(19);
   assert.deepEqual(ids.slice(parentIndex, parentIndex + 3), [19, 20, 22]);
+});
+
+test('#137: в папке Exchange дети с ролью идут перед детьми без роли', async () => {
+  const account = {id: 1, email: 'mail@exchange.example', provider: 'exchange'};
+  const folders = [treeFolder(1, 'Work'), treeFolder(2, 'Notes', 1), treeFolder(3, 'Trash', 1, {role: 'trash'})];
+  const app = await renderMail([account], [folders]);
+  assert.deepEqual(navIds(app), [1, 3, 2]);
+});
+
+test('#137: цикл родителей JMAP сохраняет все папки и ветку под первой папкой цикла', async () => {
+  const folders = [treeFolder(1, 'A', 2), treeFolder(2, 'B', 1), treeFolder(3, 'C', 1), treeFolder(4, 'D')];
+  const app = await renderMail([accounts[0]], [folders]);
+  assert.deepEqual(navIds(app), [4, 1, 2, 3]);
+  assert.equal(padding(app, 1), padding(app, 4));
+  assert.equal(padding(app, 3), padding(app, 2));
+  assert.ok(padding(app, 3) > padding(app, 1));
+});
+
+test('#137: папка со ссылкой на себя показывается один раз на верхнем уровне', async () => {
+  const folders = [treeFolder(1, 'A', 1), treeFolder(2, 'B')];
+  const app = await renderMail([accounts[0]], [folders]);
+  assert.deepEqual(navIds(app), [2, 1]);
+  assert.equal(padding(app, 1), padding(app, 2));
+});
+
+test('#137: обычная цепочка из трёх папок сохраняет глубину', async () => {
+  const folders = [treeFolder(3, 'C', 2), treeFolder(2, 'B', 1), treeFolder(1, 'A')];
+  const app = await renderMail([accounts[0]], [folders]);
+  assert.deepEqual(navIds(app), [1, 2, 3]);
+  assert.ok(padding(app, 1) < padding(app, 2));
+  assert.ok(padding(app, 2) < padding(app, 3));
+});
+
+test('#137: ссылка на родителя из другого ящика оставляет папку на верхнем уровне', async () => {
+  const local = [treeFolder(1, 'A'), treeFolder(2, 'B', 3)];
+  const foreign = [treeFolder(3, 'C', null, {account_id: 2})];
+  const app = await renderMail(accounts, [local, foreign]);
+  assert.deepEqual(navIds(app), [1, 2, 3]);
+  assert.equal(padding(app, 2), padding(app, 1));
 });

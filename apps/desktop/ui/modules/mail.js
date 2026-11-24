@@ -123,30 +123,39 @@ function folderTitle(folder){
   if(roleTitle&&!coreFolders.some(other=>other.id!==folder.id&&other.account_id===folder.account_id&&other.role===folder.role))return roleTitle;
   return folder?.display_name||folder?.remote_path||'';
 }
-function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
+function sortedFolders(folders,label=folder=>folder.remote_path||folder.display_name||''){
+  const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};
+  return [...folders].sort((a,b)=>{
+    const ar=order[a.role]??20,br=order[b.role]??20;
+    if(ar!==br)return ar-br;
+    return String(label(a)).localeCompare(String(label(b)),wizardLocale||'ru',{numeric:true,sensitivity:'base'});
+  });
+}
 function folderTreeRows(folders){
   const byId=new Map(folders.map(folder=>[folder.id,folder]));
   const roots=[],children=new Map();
   for(const folder of folders){
-    if(byId.has(folder.parent_id)){
+    const parent=byId.get(folder.parent_id);
+    if(parent&&parent.account_id===folder.account_id){
       if(!children.has(folder.parent_id))children.set(folder.parent_id,[]);
       children.get(folder.parent_id).push(folder);
     }else{
       roots.push(folder);
     }
   }
-  const rows=[];
+  const rows=[],visited=new Set();
+  const byName=folder=>folder.display_name||folder.remote_path||'';
   function walk(list,depth){
     for(const folder of list){
+      if(visited.has(folder.id))continue;
+      visited.add(folder.id);
       rows.push({folder,depth});
       const nested=children.get(folder.id);
-      if(nested){
-        nested.sort((a,b)=>(a.display_name||a.remote_path||'').localeCompare(b.display_name||b.remote_path||'',wizardLocale||'ru',{numeric:true,sensitivity:'base'}));
-        walk(nested,depth+1);
-      }
+      if(nested)walk(sortedFolders(nested,byName),depth+1);
     }
   }
-  walk(sortedFolders(roots),0);
+  walk(sortedFolders(roots,byName),0);
+  walk(folders,0);
   return rows;
 }
 // Счётчик писем у папки: 'u' непрочитанные, 't' всего, 'ut' оба (непрочит/всего), 'n' ничего.
