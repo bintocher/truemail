@@ -42,6 +42,57 @@ async fn seed_folder(db: &Db, account_id: i64, path: &str, role: Option<&str>) -
     .0
 }
 
+#[tokio::test]
+async fn folder_refresh_recalculates_parents_for_existing_rows() {
+    let db: TestDb = open_test_db("repo-folder-parents").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let other = seed_account(&db, "other@example.test").await;
+    seed_folder(&db, other, "Trash", Some("trash")).await;
+    let child_id = seed_folder(&db, account, "Trash|pending", None).await;
+    let mut child = DiscoveredFolder {
+        remote_path: "Trash|pending".into(),
+        display_name: "pending".into(),
+        role: None,
+        parent_remote_path: Some("Trash".into()),
+        unread_count: 0,
+        total_count: 0,
+        uidvalidity: None,
+        uidnext: None,
+        highestmodseq: None,
+        sync_token: None,
+    };
+    db.save_discovered_folders(account, std::slice::from_ref(&child))
+        .await
+        .unwrap();
+    assert_eq!(db.folder(child_id).await.unwrap().parent_id, None);
+
+    let parent = DiscoveredFolder {
+        remote_path: "Trash".into(),
+        display_name: "Trash".into(),
+        role: Some(FolderRole::Trash),
+        parent_remote_path: None,
+        ..child.clone()
+    };
+    db.save_discovered_folders(account, &[child.clone(), parent])
+        .await
+        .unwrap();
+    let parent_id = db
+        .list_folders(account)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|folder| folder.remote_path == "Trash")
+        .unwrap()
+        .id;
+    let saved_child = db.folder(child_id).await.unwrap();
+    assert_eq!(saved_child.parent_id, Some(parent_id));
+    assert_eq!(saved_child.display_name, "pending");
+
+    child.parent_remote_path = None;
+    db.save_discovered_folders(account, &[child]).await.unwrap();
+    assert_eq!(db.folder(child_id).await.unwrap().parent_id, None);
+}
+
 async fn seed_message(db: &Db, account_id: i64, folder_id: i64, uid: i64, subject: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(
         "INSERT INTO messages(account_id, folder_id, uid, from_addr, subject, preview, date, size)

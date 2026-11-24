@@ -18,9 +18,7 @@ pub struct DiscoveredFolder {
     pub remote_path: String,
     pub display_name: String,
     pub role: Option<FolderRole>,
-    /// remote_path родительской папки для построения дерева (Exchange). None -
-    /// корневая папка или провайдер без явной иерархии (у IMAP вложенность в
-    /// самом remote_path через разделитель).
+    /// The parent's remote path, if the provider reports a parent.
     pub parent_remote_path: Option<String>,
     pub unread_count: i64,
     pub total_count: i64,
@@ -1117,7 +1115,7 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             } else {
                 None
             };
-            (name.name().to_owned(), role)
+            imap_list_folder(name.name().to_owned(), name.delimiter(), role)
         })
         .try_collect::<Vec<_>>()
         .await
@@ -1126,36 +1124,52 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             message: e.to_string(),
         })?;
 
-    let mut folders = Vec::with_capacity(names.len());
-    for (remote_path, role) in names {
+    let mut folders = names;
+    for folder in &mut folders {
         let status = session
-            .status(&remote_path, "(MESSAGES UNSEEN)")
+            .status(&folder.remote_path, "(MESSAGES UNSEEN)")
             .await
             .map_err(|e| Error::Backend {
                 backend: "imap-status".into(),
-                message: format!("{}: {e}", folder_label(&remote_path)),
+                message: format!("{}: {e}", folder_label(&folder.remote_path)),
             })?;
-        let encoded_name = remote_path
-            .rsplit(['/', '|'])
-            .next()
-            .unwrap_or(&remote_path)
-            .to_owned();
-        let display_name = decode_modified_utf7(&encoded_name).unwrap_or(encoded_name);
-        let role = role.or_else(|| infer_folder_role(&remote_path, &display_name));
-        folders.push(DiscoveredFolder {
-            remote_path,
-            display_name,
-            role,
-            parent_remote_path: None,
-            unread_count: status.unseen.unwrap_or(0) as i64,
-            total_count: status.exists as i64,
-            uidvalidity: None,
-            uidnext: None,
-            highestmodseq: None,
-            sync_token: None,
-        });
+        folder.unread_count = status.unseen.unwrap_or(0) as i64;
+        folder.total_count = status.exists as i64;
     }
     Ok(folders)
+}
+
+fn imap_list_folder(
+    remote_path: String,
+    delimiter: Option<&str>,
+    role: Option<FolderRole>,
+) -> DiscoveredFolder {
+    let (parent_remote_path, encoded_name) = delimiter
+        .and_then(|delimiter| remote_path.rsplit_once(delimiter))
+        .map_or((None, remote_path.as_str()), |(parent, name)| {
+            (Some(parent.to_owned()), name)
+        });
+    let display_name =
+        decode_modified_utf7(encoded_name).unwrap_or_else(|| encoded_name.to_owned());
+    let role = role.or_else(|| {
+        if parent_remote_path.is_none() {
+            infer_folder_role("", &display_name)
+        } else {
+            None
+        }
+    });
+    DiscoveredFolder {
+        remote_path,
+        display_name,
+        role,
+        parent_remote_path,
+        unread_count: 0,
+        total_count: 0,
+        uidvalidity: None,
+        uidnext: None,
+        highestmodseq: None,
+        sync_token: None,
+    }
 }
 
 /// Быстро получить папки и счётчики. Используется до тяжёлой загрузки писем.
@@ -2537,10 +2551,50 @@ fn encode_modified_utf7(value: &str) -> String {
 #[cfg(test)]
 mod utf7_tests {
     use super::{
-        MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, folder_label,
-        imap_store_commands, mime_message_id, parse_cursor_datetime, parse_header_date,
-        sent_mailbox_candidate, uid_set, validate_folder_name,
+        FolderRole, MESSAGE_FETCH_ITEMS, decode_modified_utf7, encode_modified_utf7, folder_label,
+        imap_list_folder, imap_store_commands, mime_message_id, parse_cursor_datetime,
+        parse_header_date, sent_mailbox_candidate, uid_set, validate_folder_name,
     };
+
+    #[test]
+    fn imap_list_decodes_yandex_names_and_keeps_encoded_parent_paths() {
+        let trash = encode_modified_utf7("Удаленные");
+        let parent = imap_list_folder(trash.clone(), Some("|"), None);
+        assert_eq!(parent.display_name, "Удаленные");
+        assert_eq!(parent.role, Some(FolderRole::Trash));
+        assert_eq!(parent.parent_remote_path, None);
+
+        let pending = imap_list_folder(format!("{trash}|pending"), Some("|"), None);
+        assert_eq!(pending.parent_remote_path.as_deref(), Some(trash.as_str()));
+        assert_eq!(pending.display_name, "pending");
+
+        let encoded_drafts = encode_modified_utf7("Черновики");
+        let path = format!("{trash}|pending|{encoded_drafts}");
+        let child = imap_list_folder(path.clone(), Some("|"), None);
+        assert_eq!(child.remote_path, path);
+        assert_eq!(
+            child.parent_remote_path.as_deref(),
+            Some(pending.remote_path.as_str())
+        );
+        assert_eq!(child.display_name, "Черновики");
+        assert_eq!(child.role, None);
+        let special_use = imap_list_folder(path, Some("|"), Some(FolderRole::Drafts));
+        assert_eq!(special_use.role, Some(FolderRole::Drafts));
+    }
+
+    #[test]
+    fn imap_list_splits_only_on_the_server_delimiter() {
+        let child = imap_list_folder("Work.2026/Archive|old".into(), Some("."), None);
+        assert_eq!(child.parent_remote_path.as_deref(), Some("Work"));
+        assert_eq!(child.display_name, "2026/Archive|old");
+
+        for delimiter in [None, Some("|")] {
+            let folder = imap_list_folder("Work/Trash".into(), delimiter, None);
+            assert_eq!(folder.display_name, "Work/Trash");
+            assert_eq!(folder.parent_remote_path, None);
+            assert_eq!(folder.role, None);
+        }
+    }
 
     #[test]
     fn qresync_known_uids_are_compacted_without_inventing_gaps() {

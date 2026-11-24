@@ -1011,6 +1011,7 @@ impl Db {
                  VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, remote_path) DO UPDATE SET
                     display_name = excluded.display_name, role = coalesce(excluded.role, folders.role),
+                    parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
                     uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
@@ -1028,9 +1029,7 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         }
-        // Второй проход: разрешаем parent_id по remote_path родителя (родитель
-        // мог быть вставлен позже в этом же батче). Родитель верхнего уровня
-        // (msgfolderroot и т.п.) среди папок отсутствует - parent_id остаётся NULL.
+        // Resolve parents after upserting every folder, since a parent may arrive after its child.
         for folder in folders {
             if let Some(parent) = folder.parent_remote_path.as_deref() {
                 sqlx::query(

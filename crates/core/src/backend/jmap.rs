@@ -42,6 +42,7 @@ struct Session {
 struct Mailbox {
     id: String,
     name: String,
+    parent_id: Option<String>,
     role: Option<String>,
     #[serde(default)]
     total_emails: i64,
@@ -185,7 +186,7 @@ impl JmapBackend {
                 password,
                 vec![json!(["Mailbox/get", {
                     "accountId": account_id,
-                    "properties": ["id", "name", "role", "totalEmails", "unreadEmails"]
+                    "properties": ["id", "name", "parentId", "role", "totalEmails", "unreadEmails"]
                 }, "mailboxes"])],
             )
             .await?;
@@ -482,7 +483,7 @@ impl JmapBackend {
                     remote_path: mailbox.id,
                     display_name: mailbox.name,
                     role: mailbox.role.as_deref().and_then(jmap_role),
-                    parent_remote_path: None,
+                    parent_remote_path: mailbox.parent_id,
                     unread_count: mailbox.unread_emails,
                     total_count: mailbox.total_emails,
                     uidvalidity: None,
@@ -657,7 +658,7 @@ impl MailBackend for JmapBackend {
                 remote_path: mailbox.id,
                 display_name: mailbox.name,
                 role: mailbox.role.as_deref().and_then(jmap_role),
-                parent_remote_path: None,
+                parent_remote_path: mailbox.parent_id,
                 unread_count: mailbox.unread_emails,
                 total_count: mailbox.total_emails,
                 uidvalidity: None,
@@ -1101,7 +1102,12 @@ mod tests {
                 "state": "m1",
                 "list": [
                     {"id":"inbox-id","name":"Inbox","role":"inbox","totalEmails":1,"unreadEmails":1},
-                    {"id":"archive-id","name":"Archive","role":"archive","totalEmails":0,"unreadEmails":0}
+                    {
+                        "id":"archive-id","name":"Archive","role":"archive","totalEmails":0,"unreadEmails":0,
+                        "parentId": call[1]["properties"].as_array()
+                            .filter(|properties| properties.iter().any(|property| property == "parentId"))
+                            .map(|_| "inbox-id")
+                    }
                 ],
                 "notFound": []
             }),
@@ -1191,6 +1197,10 @@ mod tests {
             .await
             .unwrap();
 
+        let folders = backend
+            .discover_folders("user@example.test", "app-password")
+            .await
+            .unwrap();
         server.abort();
         assert_eq!(discovered.folders.len(), 2);
         assert!(
@@ -1206,6 +1216,13 @@ mod tests {
                 .any(|folder| folder.role == Some(FolderRole::Archive))
         );
         assert!(discovered.folders[0].sync_token.is_some());
+        for folders in [&discovered.folders, &folders] {
+            let archive = folders
+                .iter()
+                .find(|folder| folder.remote_path == "archive-id")
+                .unwrap();
+            assert_eq!(archive.parent_remote_path.as_deref(), Some("inbox-id"));
+        }
         assert_eq!(discovered.messages.len(), 1);
         assert_eq!(discovered.messages[0].remote_id.as_deref(), Some("email-1"));
         assert!(discovered.messages[0].flagged);
