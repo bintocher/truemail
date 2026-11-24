@@ -83,17 +83,17 @@ function parentChain(folder, foldersById) {
   const chain = [folder], visited = new Set([folder.id]);
   let current = folder;
   while (current.parent_id) {
-    if (!foldersById.has(current.parent_id) || visited.has(current.parent_id)) return null;
     const parent = foldersById.get(current.parent_id);
-    chain.unshift(parent);
+    if (!parent || parent.account_id !== folder.account_id || visited.has(parent.id)) return null;
+    chain.push(parent);
     visited.add(parent.id);
     current = parent;
   }
-  return chain;
+  return chain.reverse();
 }
 
 function quoteFolderPathSegment(name) {
-  return name.includes(' / ') ? `"${name.replaceAll('"', '""')}"` : name;
+  return name.includes(' / ') || name.includes('"') ? `"${name.replaceAll('"', '""')}"` : name;
 }
 
 function folderPathLabel(folder, foldersById, rootLabel = folderOwnLabel) {
@@ -108,7 +108,7 @@ function folderPathLabel(folder, foldersById, rootLabel = folderOwnLabel) {
   const remotePath = folder.remote_path || '';
   const displayName = folder.display_name;
   if (displayName && decodeFolderSegment(remotePath) !== displayName) {
-    for (const {0: delimiter, index} of Array.from(remotePath.matchAll(/./gsu)).reverse()) {
+    for (const {0: delimiter, index} of Array.from(remotePath.matchAll(/[/|.]/g)).reverse()) {
       if (index === 0) break;
       const last = remotePath.slice(index + delimiter.length);
       if (decodeFolderSegment(last) !== displayName) continue;

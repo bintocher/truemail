@@ -1047,24 +1047,6 @@ impl Db {
                     .await?;
             }
         }
-        for folder in folders.iter().filter(|folder| {
-            folder.role.is_none()
-                && folder
-                    .parent_remote_path
-                    .as_deref()
-                    .is_some_and(|path| folder_ids.contains_key(path))
-        }) {
-            sqlx::query(
-                "UPDATE folders AS child SET role=NULL WHERE id=? AND EXISTS (
-                     SELECT 1 FROM folders AS root
-                     WHERE root.account_id=child.account_id AND root.parent_id IS NULL
-                       AND root.role=child.role
-                 )",
-            )
-            .bind(folder_ids[folder.remote_path.as_str()])
-            .execute(&mut *tx)
-            .await?;
-        }
         tx.commit().await?;
         Ok(())
     }
@@ -1102,6 +1084,20 @@ impl Db {
             .iter()
             .map(|folder| folder.remote_path.as_str())
             .collect::<std::collections::HashSet<_>>();
+        let blob_refs: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT f.id, m.raw_blob_ref
+             FROM folders f JOIN messages m ON m.folder_id=f.id
+             WHERE f.account_id=? AND m.raw_blob_ref IS NOT NULL
+             UNION ALL
+             SELECT f.id, a.blob_ref
+             FROM folders f JOIN messages m ON m.folder_id=f.id
+             JOIN attachments a ON a.message_id=m.id
+             WHERE f.account_id=? AND a.blob_ref IS NOT NULL",
+        )
+        .bind(account_id)
+        .bind(account_id)
+        .fetch_all(&self.pool)
+        .await?;
         let mut tx = self.begin_write().await?;
         let existing: Vec<(i64, String)> =
             sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=?")
@@ -1111,32 +1107,9 @@ impl Db {
         let stale_ids = existing
             .into_iter()
             .filter_map(|(id, path)| (!active.contains(path.as_str())).then_some(id))
-            .collect::<Vec<_>>();
+            .collect::<std::collections::HashSet<_>>();
         if stale_ids.is_empty() {
             return Ok(0);
-        }
-        let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
-            "SELECT m.id, f.remote_path, m.raw_blob_ref
-             FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE f.account_id=?",
-        )
-        .bind(account_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut blob_refs = Vec::new();
-        for (message_id, path, raw_ref) in rows {
-            if active.contains(path.as_str()) {
-                continue;
-            }
-            if let Some(reference) = raw_ref {
-                blob_refs.push(reference);
-            }
-            let attachment_refs: Vec<(Option<String>,)> =
-                sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id=?")
-                    .bind(message_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            blob_refs.extend(attachment_refs.into_iter().filter_map(|row| row.0));
         }
         for id in &stale_ids {
             sqlx::query("UPDATE folders SET parent_id=NULL WHERE parent_id=? AND account_id=?")
@@ -1153,8 +1126,10 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
+        for (folder_id, reference) in blob_refs {
+            if stale_ids.contains(&folder_id) {
+                let _ = self.blobs.remove(&reference);
+            }
         }
         Ok(stale_ids.len())
     }
@@ -8732,9 +8707,6 @@ async fn clear_stage_result_of_operation(
     Ok(())
 }
 
-/// Проставить роль папке, у которой она не выставлена при первом обходе:
-/// роль выводится из пути и названия. Без этого шага ящик, где роль ещё не
-/// определилась, выглядел бы как ящик без такой папки.
 async fn infer_missing_folder_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
@@ -8751,14 +8723,19 @@ async fn infer_missing_folder_role(
     }
     let expected = FolderRole::parse(role);
     let folders: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, display_name FROM folders WHERE account_id=? AND parent_id IS NULL",
+        "SELECT child.id, child.display_name FROM folders child
+         LEFT JOIN folders parent ON parent.id=child.parent_id AND parent.account_id=child.account_id
+         WHERE child.account_id=? AND
+               (child.parent_id IS NULL OR parent.remote_path='INBOX' COLLATE NOCASE)",
     )
     .bind(account_id)
     .fetch_all(&mut **tx)
     .await?;
-    if let Some((id, _)) = folders
+    let mut candidates = folders
         .into_iter()
-        .find(|(_, name)| crate::model::infer_folder_role("", name) == expected)
+        .filter(|(_, name)| crate::model::infer_folder_role("", name) == expected);
+    if let Some((id, _)) = candidates.next()
+        && candidates.next().is_none()
     {
         sqlx::query("UPDATE folders SET role=? WHERE id=?")
             .bind(role)

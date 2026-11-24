@@ -1152,7 +1152,10 @@ fn imap_list_folder(
     let display_name =
         decode_modified_utf7(encoded_name).unwrap_or_else(|| encoded_name.to_owned());
     let role = role.or_else(|| {
-        if parent_remote_path.is_none() {
+        if parent_remote_path
+            .as_deref()
+            .is_none_or(|parent| parent.eq_ignore_ascii_case("INBOX"))
+        {
             infer_folder_role("", &display_name)
         } else {
             None
@@ -2593,6 +2596,17 @@ mod utf7_tests {
             assert_eq!(folder.display_name, "Work/Trash");
             assert_eq!(folder.parent_remote_path, None);
             assert_eq!(folder.role, None);
+        }
+    }
+
+    #[test]
+    fn imap_list_infers_nested_roles_only_directly_under_inbox() {
+        for (path, role) in [
+            ("INBOX.Trash", Some(FolderRole::Trash)),
+            ("inbox.Trash", Some(FolderRole::Trash)),
+            ("Work.Trash", None),
+        ] {
+            assert_eq!(imap_list_folder(path.into(), Some("."), None).role, role);
         }
     }
 

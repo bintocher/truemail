@@ -95,6 +95,19 @@ test('#137: сопоставление, источники и выбор пап�
   assert.equal(app.query('#ruleRunFolders input[value="20"]').parentElement.querySelector('span').textContent, 'Trash / template');
 });
 
+test('#137: заголовок списка и перенос письма показывают полный путь подпапки', async () => {
+  const app = await renderMail();
+  rowById(app, 6).onclick();
+  assert.equal(app.query('.listhead h2').textContent, 'Удаленные / pending');
+
+  app.bridge.answer('moveMessagesToFolder', {operation_ids: [1]});
+  app.run('window.reloadCoreData = async () => {}');
+  await app.run('moveMessagesByDrop([42], testFoldersByAccount[0].find(folder => folder.id === 6))');
+  assert.equal(app.callsOf('moveMessagesToFolder').at(-1).args[1], 6);
+  const notices = app.queryAll('#activityPanel .activity-entry-text');
+  assert.ok(notices.some(notice => notice.textContent.includes('Удаленные / pending')));
+});
+
 test('#137: без родителя подпапка остаётся на верхнем уровне', async () => {
   const folders = yandexFolders[1].filter(folder => folder.id !== 19).map(folder => ({...folder, parent_id: null}));
   const app = await renderMail([accounts[1]], [folders]);

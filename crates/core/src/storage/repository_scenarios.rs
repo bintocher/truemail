@@ -191,11 +191,14 @@ async fn reconciliation_removes_a_child_absent_from_discovery() {
 }
 
 #[tokio::test]
-async fn discovery_clears_a_nested_legacy_role_shared_with_a_root() {
+async fn discovery_keeps_a_manually_assigned_nested_role_shared_with_a_root() {
     let db = open_test_db("repo-duplicate-folder-role").await;
     let account = seed_account(&db, "repo@example.test").await;
     let root_id = seed_folder(&db, account, "Trash", Some("trash")).await;
-    let child_id = seed_folder(&db, account, "Work|Trash", Some("trash")).await;
+    let child_id = seed_folder(&db, account, "Work|Trash", None).await;
+    db.set_folder_role(account, "trash", Some(child_id))
+        .await
+        .unwrap();
     let root = DiscoveredFolder {
         role: Some(FolderRole::Trash),
         ..discovered_folder("Trash", "Trash", None)
@@ -211,7 +214,10 @@ async fn discovery_clears_a_nested_legacy_role_shared_with_a_root() {
         db.folder(root_id).await.unwrap().role,
         Some(FolderRole::Trash)
     );
-    assert_eq!(db.folder(child_id).await.unwrap().role, None);
+    assert_eq!(
+        db.folder(child_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
 }
 
 #[tokio::test]
@@ -283,6 +289,44 @@ async fn manual_trash_infers_a_role_only_from_a_root_display_name() {
         Some(FolderRole::Trash)
     );
     assert_eq!(db.folder(folder_id("Work|Trash")).await.unwrap().role, None);
+}
+
+#[tokio::test]
+async fn manual_trash_infers_a_role_from_a_unique_inbox_child() {
+    let db = open_test_db("repo-infer-inbox-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("INBOX.Sent", "Sent", Some("INBOX")),
+        discovered_folder("INBOX.Trash", "Trash", Some("INBOX")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+    let trash_id = folder_id("INBOX.Trash");
+    let duplicate_id = seed_folder(&db, account, "Trash", None).await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(db.folder(trash_id).await.unwrap().role, None);
+    assert_eq!(db.folder(duplicate_id).await.unwrap().role, None);
+
+    db.delete_folder_local(duplicate_id).await.unwrap();
+    let queued = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(queued.skipped_no_folder, 0);
+    assert_eq!(queued.operation_ids.len(), 1);
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
 }
 
 /// Письмо с вложением-приглашением: разбор MIME, вложение и тело для поиска

@@ -43,6 +43,7 @@ test('S-001: папка верхнего уровня подписана сво�
     ['AAMkADRk/M2U1ZDAw', 'Архив проектов'],
     ['mailbox-id-42', 'Спам'],
     ['Work/Trash', 'Work/Trash'],
+    ['Label_42', '42'],
   ];
   cases.forEach(([remotePath, name]) => {
     const item = folder({remote_path: remotePath, display_name: name});
@@ -86,6 +87,12 @@ test('#137: точка в серверном пути различает одн�
   }
 });
 
+test('#137: путь не включает родителя из другого ящика', () => {
+  const parent = folder({id: 1, display_name: 'Private', account_id: 2});
+  const child = folder({id: 2, display_name: 'Projects', remote_path: 'Private.Projects', parent_id: 1});
+  assert.equal(folderPathLabel(child, byId([parent, child])), 'Projects');
+});
+
 test('#137: кавычки различают разделитель внутри имени и границу двух папок', () => {
   const items = [
     folder({id: 1, display_name: 'A / B'}),
@@ -95,11 +102,16 @@ test('#137: кавычки различают разделитель внутр�
     folder({id: 5, parent_id: 4, display_name: 'Projects'}),
     folder({id: 6, display_name: 'Work'}),
     folder({id: 7, parent_id: 6, display_name: 'Projects'}),
+    folder({id: 8, display_name: '"A'}),
+    folder({id: 9, parent_id: 8, display_name: 'B"'}),
   ];
   const map = byId(items);
   assert.equal(folderPathLabel(map.get(2), map), '"A / B" / Projects');
   assert.equal(folderPathLabel(map.get(5), map), 'A / B / Projects');
   assert.equal(folderPathLabel(map.get(7), map), 'Work / Projects');
+  assert.equal(folderPathLabel(map.get(1), map), '"A / B"');
+  assert.equal(folderPathLabel(map.get(9), map), '"""A" / "B"""');
+  assert.notEqual(folderPathLabel(map.get(1), map), folderPathLabel(map.get(9), map));
 });
 
 // S-004: пустые и битые значения не должны ломать строку списка.
