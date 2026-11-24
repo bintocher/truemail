@@ -117,16 +117,36 @@ async function openGallery(full,att,messageId){
   const single=images.length<2;overlay.querySelector('.prev').hidden=single;overlay.querySelector('.next').hidden=single;
   show(idx);
 }
-function folderTitle(folder){const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};return names[folder?.role]||folder?.display_name||folder?.remote_path||'';}
+function folderTitle(folder){
+  const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};
+  const roleTitle=names[folder?.role];
+  if(roleTitle&&!coreFolders.some(other=>other.id!==folder.id&&other.account_id===folder.account_id&&other.role===folder.role))return roleTitle;
+  return folder?.display_name||folder?.remote_path||'';
+}
 function sortedFolders(folders){const order={inbox:0,sent:1,drafts:2,archive:3,spam:4,trash:5};return [...folders].sort((a,b)=>{const ar=order[a.role]??20,br=order[b.role]??20;if(ar!==br)return ar-br;return String(a.remote_path||a.display_name||'').localeCompare(String(b.remote_path||b.display_name||''),wizardLocale||'ru',{numeric:true,sensitivity:'base'});});}
-// Порядок и глубина папок. Если бэкенд отдал parent_id (Exchange) - строим
-// дерево, дети под родителем. Иначе (IMAP) глубина по разделителям remote_path.
 function folderTreeRows(folders){
   const byId=new Map(folders.map(folder=>[folder.id,folder]));
-  const hasTree=folders.some(folder=>folder.parent_id&&byId.has(folder.parent_id));
-  if(!hasTree)return sortedFolders(folders).map(folder=>({folder,depth:Math.max(0,(folder.remote_path.match(/[\/|]/g)||[]).length)}));
-  const children=new Map();folders.forEach(folder=>{const parent=(folder.parent_id&&byId.has(folder.parent_id))?folder.parent_id:0;if(!children.has(parent))children.set(parent,[]);children.get(parent).push(folder);});
-  const rows=[];const walk=(list,depth)=>sortedFolders(list).forEach(folder=>{rows.push({folder,depth});walk(children.get(folder.id)||[],depth+1);});walk(children.get(0)||[],0);
+  const roots=[],children=new Map();
+  for(const folder of folders){
+    if(byId.has(folder.parent_id)){
+      if(!children.has(folder.parent_id))children.set(folder.parent_id,[]);
+      children.get(folder.parent_id).push(folder);
+    }else{
+      roots.push(folder);
+    }
+  }
+  const rows=[];
+  function walk(list,depth){
+    for(const folder of list){
+      rows.push({folder,depth});
+      const nested=children.get(folder.id);
+      if(nested){
+        nested.sort((a,b)=>(a.display_name||a.remote_path||'').localeCompare(b.display_name||b.remote_path||'',wizardLocale||'ru',{numeric:true,sensitivity:'base'}));
+        walk(nested,depth+1);
+      }
+    }
+  }
+  walk(sortedFolders(roots),0);
   return rows;
 }
 // Счётчик писем у папки: 'u' непрочитанные, 't' всего, 'ut' оба (непрочит/всего), 'n' ничего.

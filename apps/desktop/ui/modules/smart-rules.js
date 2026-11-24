@@ -154,7 +154,7 @@ function applyQuickStepToolbarSet(layout){
    есть весь мост команд (S-004, S-005, S-012, S-013). */
 function quickStepFolderOptions(){
   const groups=(coreAccounts||[]).map(account=>{
-    const folders=ruleAccountFolders(account.id).map(folder=>`<option value="folder:${folder.id}">${escapeHtml(folderTitle(folder))}</option>`).join('');
+    const folders=ruleFolderOptions(account.id);
     return folders?`<optgroup label="${escapeHtml(account.email)}">${folders}</optgroup>`:'';
   }).join('');
   const roles=[['inbox',L('Тип: Входящие','Type: Inbox')],['archive',L('Тип: Архив','Type: Archive')],['spam',L('Тип: Спам','Type: Spam')],['trash',L('Тип: Корзина','Type: Trash')]];
@@ -354,6 +354,10 @@ const ruleFieldLabel=field=>mailRulesModel.ruleText(field,ruleLang());
 const ruleOpLabel=id=>(mailRulesModel.RULE_OPS[id]||[id,id])[smartIsEnglish()?1:0];
 let lastRuleRun=null,ruleListSnapshot=[];
 function ruleAccountFolders(accountId){return coreFolders.filter(folder=>folder.account_id===accountId);}
+function ruleFolderOptions(accountId){
+  const folders=ruleAccountFolders(accountId),byId=new Map(folders.map(folder=>[folder.id,folder]));
+  return folders.map(folder=>`<option value="folder:${folder.id}">${escapeHtml(folderNames.folderPathLabel(folder,byId,folderTitle))}</option>`).join('');
+}
 /* Значение условия: перечисление, дата, размер или обычный текст. Разметка
    повторяет редактор умной папки, чтобы оба редактора выглядели одинаково. */
 function renderRuleConditionValue(row,condition){
@@ -413,7 +417,7 @@ function renderRuleActionTarget(row,action){
   const meta=mailRulesModel.ruleAction(action.kind),host=row.querySelector('.rule-action-target');host.innerHTML='';
   if(meta.needs==='folder'){
     const accountId=ruleAccount.value==='all'?null:Number(ruleAccount.value),select=document.createElement('select');select.className='sel rule-action-folder';
-    if(accountId){select.innerHTML=ruleAccountFolders(accountId).map(folder=>`<option value="folder:${folder.id}">${escapeHtml(folderTitle(folder))}</option>`).join('');}
+    if(accountId){select.innerHTML=ruleFolderOptions(accountId);}
     const roles=[['inbox',L('Тип: Входящие','Type: Inbox')],['archive',L('Тип: Архив','Type: Archive')],['spam',L('Тип: Спам','Type: Spam')],['trash',L('Тип: Корзина','Type: Trash')]];
     select.innerHTML+=roles.map(([id,title])=>`<option value="role:${id}">${escapeHtml(title)}</option>`).join('');
     const wanted=action.folder_id?`folder:${action.folder_id}`:action.folder_role?`role:${action.folder_role}`:'';
@@ -635,13 +639,14 @@ function renderRuleRunFolders(){
   coreAccounts.forEach(account=>{
     // Отправленные, черновики, спам и корзина не рабочие папки ни в одной
     // стадии: прогон по ним увёл бы почту, которую никто не получал.
-    const folders=ruleAccountFolders(account.id).filter(folder=>!RULE_RUN_SKIPPED_ROLES.includes(folder.role));if(!folders.length)return;
+    const accountFolders=ruleAccountFolders(account.id),byId=new Map(accountFolders.map(folder=>[folder.id,folder]));
+    const folders=accountFolders.filter(folder=>!RULE_RUN_SKIPPED_ROLES.includes(folder.role));if(!folders.length)return;
     const block=document.createElement('div');block.className='rule-run-account';
     block.innerHTML=`<div class="rule-run-account-title">${escapeHtml(account.email)}</div>`;
     folders.forEach(folder=>{
       const label=document.createElement('label');label.className='aux-check';
       label.innerHTML=`<input type="checkbox" data-account="${account.id}" value="${folder.id}"> <span></span>`;
-      label.querySelector('span').textContent=folderTitle(folder);
+      label.querySelector('span').textContent=folderNames.folderPathLabel(folder,byId,folderTitle);
       block.appendChild(label);
     });
     ruleRunFolders.appendChild(block);

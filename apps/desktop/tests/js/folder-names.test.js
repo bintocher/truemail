@@ -22,15 +22,15 @@ const SENT_UTF7 = '&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-';
 // примеры, что и у декодера ядра (crates/core/src/backend/imap.rs).
 test('S-001, S-004: сегменты пути IMAP раскодируются, повреждённые показываются как есть', () => {
   const cases = [
-    ['INBOX/Work', 'INBOX/Work', 'имя без кодирования'],
-    [`INBOX/${SENT_UTF7}`, 'INBOX/Отправленные', 'кириллическое имя'],
-    ['INBOX/A&-B', 'INBOX/A&B', 'сам знак & экранирован как "&-"'],
-    ['INBOX/&BB4-broken&', 'INBOX/&BB4-broken&', 'повреждённая последовательность'],
-    ['INBOX/&!!!-', 'INBOX/&!!!-', 'непригодные данные вместо base64'],
+    ['INBOX/Work', 'Work', 'имя без кодирования'],
+    [`INBOX/${SENT_UTF7}`, 'Отправленные', 'кириллическое имя'],
+    ['INBOX/A&-B', 'A&B', 'сам знак & экранирован как "&-"'],
+    ['INBOX/&BB4-broken&', '&BB4-broken&', 'повреждённая последовательность'],
+    ['INBOX/&!!!-', '&!!!-', 'непригодные данные вместо base64'],
   ];
-  cases.forEach(([remotePath, expected, reason]) => {
-    const item = folder({remote_path: remotePath, display_name: 'Работа'});
-    assert.equal(folderPathLabel(item, byId([item])), expected, reason);
+  cases.forEach(([remotePath, name, reason]) => {
+    const item = folder({remote_path: remotePath, display_name: name});
+    assert.equal(folderPathLabel(item, byId([item])), `INBOX / ${name}`, reason);
   });
 });
 
@@ -40,8 +40,9 @@ test('S-001, S-004: сегменты пути IMAP раскодируются, �
 test('S-001: папка верхнего уровня подписана своим именем при любом виде remote_path', () => {
   const cases = [
     [SENT_UTF7, 'Отправленные'],
-    ['AAMkADRkM2U1ZDAw', 'Архив проектов'],
+    ['AAMkADRk/M2U1ZDAw', 'Архив проектов'],
     ['mailbox-id-42', 'Спам'],
+    ['Work/Trash', 'Work/Trash'],
   ];
   cases.forEach(([remotePath, name]) => {
     const item = folder({remote_path: remotePath, display_name: name});
@@ -59,13 +60,13 @@ test('S-002: путь строится от корня и различает о�
   const twin = folder({id: 4, display_name: 'Проекты', parent_id: 2});
   const deep = folder({id: 5, display_name: '2026', parent_id: 3});
   const map = byId([root, personal, child, twin, deep]);
-  assert.equal(folderPathLabel(deep, map), 'Архив/Проекты/2026');
-  assert.equal(folderPathLabel(child, map), 'Архив/Проекты');
-  assert.equal(folderPathLabel(twin, map), 'Личное/Проекты');
+  assert.equal(folderPathLabel(deep, map), 'Архив / Проекты / 2026');
+  assert.equal(folderPathLabel(child, map), 'Архив / Проекты');
+  assert.equal(folderPathLabel(twin, map), 'Личное / Проекты');
   assert.notEqual(folderPathLabel(child, map), folderPathLabel(twin, map));
   // Путь IMAP из трёх сегментов, разделитель '|', средний сегмент закодирован.
   const imap = folder({id: 6, remote_path: `INBOX|${SENT_UTF7}|2026`, display_name: '2026'});
-  assert.equal(folderPathLabel(imap, byId([imap])), 'INBOX/Отправленные/2026');
+  assert.equal(folderPathLabel(imap, byId([imap])), 'INBOX / Отправленные / 2026');
 });
 
 test('S-002: разорванная и закольцованная цепочка родителей даёт имя самой папки', () => {
@@ -138,7 +139,7 @@ test('S-001, S-002, S-003: строка источника показывает 
   const app = await sourcesApp();
   assert.deepEqual(
     sourceRows(app).map(row => row.querySelector('.source-path').textContent),
-    ['Входящие', 'Корзина', 'INBOX/Отправленные/Работа'],
+    ['Входящие', 'Корзина', 'INBOX / Отправленные / Работа'],
     'технический путь IMAP показан человеку раскодированным, порядок - по ролям',
   );
   assert.deepEqual(
