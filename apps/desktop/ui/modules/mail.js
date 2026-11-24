@@ -124,7 +124,6 @@ function folderTitle(folder){
   return folder?.display_name||folder?.remote_path||'';
 }
 function mailFolderPathLabel(folder){
-  if(!folder?.parent_id)return folderTitle(folder);
   return folderNames.folderPathLabel(folder,new Map(coreFolders.map(item=>[item.id,item])),folderTitle);
 }
 function sortedFolders(folders,label=folder=>folder.remote_path||folder.display_name||''){

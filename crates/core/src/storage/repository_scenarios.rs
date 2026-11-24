@@ -329,6 +329,47 @@ async fn manual_trash_infers_a_role_from_a_unique_inbox_child() {
     );
 }
 
+#[tokio::test]
+async fn manual_trash_preserves_an_assigned_role_on_an_inbox_child() {
+    let db = open_test_db("repo-infer-unassigned-folder-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let folders = [
+        discovered_folder("INBOX", "Inbox", None),
+        discovered_folder("INBOX.Trash", "Trash", Some("INBOX")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    let stored = db.list_folders(account).await.unwrap();
+    let folder_id = |path| {
+        stored
+            .iter()
+            .find(|folder| folder.remote_path == path)
+            .unwrap()
+            .id
+    };
+    let trash_id = folder_id("INBOX.Trash");
+    db.set_folder_role(account, "archive", Some(trash_id))
+        .await
+        .unwrap();
+    let message = seed_message(&db, account, folder_id("INBOX"), 1, "Report").await;
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Archive)
+    );
+
+    db.set_folder_role(account, "archive", None).await.unwrap();
+    let queued = db.queue_message_action(&[message], "trash").await.unwrap();
+    assert_eq!(queued.skipped_no_folder, 0);
+    assert_eq!(queued.operation_ids.len(), 1);
+    assert_eq!(
+        db.folder(trash_id).await.unwrap().role,
+        Some(FolderRole::Trash)
+    );
+}
+
 /// Письмо с вложением-приглашением: разбор MIME, вложение и тело для поиска
 /// берутся проверками из него.
 const CALENDAR_LETTER: &[u8] = b"From: calendar@example.test\r\nTo: repo@example.test\r\nSubject: Meeting\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=calendar\r\n\r\n--calendar\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nInvitation\r\n--calendar\r\nContent-Type: text/calendar; charset=utf-8; name=invite.ics\r\nContent-Disposition: attachment; filename=invite.ics\r\n\r\nBEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n--calendar--\r\n";

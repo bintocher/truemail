@@ -54,12 +54,12 @@ window.openMessageById=async function(id){
       if(sub&&!sub.classList.contains('open')){sub.classList.add('open');header?.classList.add('open');if(header?.dataset.accountId)saveAccountNavOpen(header.dataset.accountId,true);}
       row.scrollIntoView({block:'nearest'});
     }
-    applyListOptions(true,folderTitle(folder));
+    applyListOptions(true,mailFolderPathLabel(folder));
     // Активные фильтры списка могут скрыть только что пришедшее письмо - тогда снимаем их.
     if(!currentMessageRows.some(item=>item.id===id)){
       filterMenu.querySelectorAll('input[type="checkbox"]:checked').forEach(input=>{input.checked=false;});
       const filterText=document.getElementById('filterText');if(filterText)filterText.value='';
-      applyListOptions(true,folderTitle(folder));
+      applyListOptions(true,mailFolderPathLabel(folder));
     }
   }
   const index=currentMessageRows.findIndex(item=>item.id===id);

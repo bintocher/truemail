@@ -108,12 +108,43 @@ test('#137: заголовок списка и перенос письма по�
   assert.ok(notices.some(notice => notice.textContent.includes('Удаленные / pending')));
 });
 
-test('#137: без родителя подпапка остаётся на верхнем уровне', async () => {
-  const folders = yandexFolders[1].filter(folder => folder.id !== 19).map(folder => ({...folder, parent_id: null}));
+test('#137: смена языка сохраняет полный путь открытой подпапки', async () => {
+  const app = await renderMail();
+  rowById(app, 6).onclick();
+  for (const locale of ['en', 'ru']) {
+    await app.setLanguage(locale);
+    assert.equal(app.document.documentElement.lang, locale);
+    assert.equal(app.query('.listhead h2').textContent, 'Удаленные / pending');
+  }
+});
+
+test('#137: открытие письма по идентификатору показывает полный путь подпапки', async () => {
+  const app = await renderMail();
+  app.bridge.answer('getMessage', {
+    meta: {id: 42, account_id: 1, folder_id: 6, subject: 'Report', flags: {seen: true}},
+    body_text: 'Report text',
+  });
+  await app.run('window.openMessageById(42)');
+  assert.equal(app.query('#tSubject').textContent, 'Report');
+  assert.equal(app.query('.listhead h2').textContent, 'Удаленные / pending');
+});
+
+test('#137: без родителя подпапка остаётся на верхнем уровне и сохраняет полный путь', async () => {
+  const orphanFolder = treeFolder(20, 'Reports', null, {account_id: 2, remote_path: 'Work|Reports'});
+  const folders = [...yandexFolders[1].filter(folder => folder.id !== 19 && folder.id !== 20), orphanFolder];
   const app = await renderMail([accounts[1]], [folders]);
   const orphan = rowById(app, 20);
-  assert.equal(folderName(orphan), 'template');
+  assert.equal(folderName(orphan), 'Reports');
   assert.equal(orphan.style.paddingLeft, rowById(app, 15).style.paddingLeft);
+  assert.equal(app.query('#set-folders option[value="20"]').textContent, 'Work / Reports');
+  orphan.onclick();
+  assert.equal(app.query('.listhead h2').textContent, 'Work / Reports');
+
+  app.bridge.answer('moveMessagesToFolder', {operation_ids: [1]});
+  app.run('window.reloadCoreData = async () => {}');
+  await app.run('moveMessagesByDrop([42], testFoldersByAccount[0].find(folder => folder.id === 20))');
+  const notices = app.queryAll('#activityPanel .activity-entry-text');
+  assert.ok(notices.some(notice => notice.textContent.includes('Work / Reports')));
 });
 
 test('#137: подпапки Яндекса без роли сортируются по короткому имени', async () => {
