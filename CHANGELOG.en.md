@@ -7,6 +7,10 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- Yandex Mail subfolders now appear under their parent folders. Folder pickers show the full path of each subfolder, and folders with the same purpose keep distinct names.
+
 ## [0.3.6] - 2026-11-24
 
 ### Fixed
