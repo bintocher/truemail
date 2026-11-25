@@ -8310,6 +8310,11 @@ async fn preserve_message_traits(
     .bind(target_folder)
     .fetch_all(&mut **tx)
     .await?;
+    if candidates.len() > 1 {
+        // Даже в папке назначения Message-ID может принадлежать нескольким
+        // письмам. Позднее исчезновение одной копии не подтверждает другую.
+        return Ok(());
+    }
     let traits = TransferredMessageTraits {
         pinned_at: source.pinned_at,
         snoozed_until: source.snoozed_until,
