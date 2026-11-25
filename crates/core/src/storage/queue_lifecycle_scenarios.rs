@@ -93,6 +93,7 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
     let db = open_test_db("imap-stale-action").await;
     let account = seed_account(&db, "changed@example.test").await;
     let inbox = seed_folder(&db, account, "INBOX", "inbox").await;
+    let archive = seed_folder(&db, account, "Archive", "archive").await;
     let folder = |uidvalidity| crate::backend::DiscoveredFolder {
         remote_path: "INBOX".into(),
         display_name: "INBOX".into(),
@@ -136,6 +137,13 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
     assert_eq!(payload["uidvalidity"], 20);
     assert_eq!(payload["uid"], 10);
     db.reject_stale_imap_operation(&operation).await.unwrap();
+    let rejected = db.failed_takeaway_operations().await.unwrap().remove(0);
+    assert_eq!(rejected.id, operation_id);
+    assert!(
+        rejected
+            .last_error
+            .is_some_and(|text| text.contains("Номер письма"))
+    );
     assert!(db.retry_failed_operation(operation_id).await.is_err());
     db.save_discovered_folders(account, &[folder(21)])
         .await
@@ -146,6 +154,23 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
     db.reconcile_imap_snapshot(account, &[("INBOX".into(), vec![10, 25])], &[])
         .await
         .unwrap();
+    sqlx::query("UPDATE folders SET uidvalidity=92,sync_token='imap-reconcile:1' WHERE id=?")
+        .bind(archive)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let copy = crate::backend::DiscoveredMessage {
+        folder_path: "Archive".into(),
+        uid: 3,
+        uidvalidity: Some(92),
+        remote_id: None,
+        ..discovered(10)
+    };
+    db.save_discovered_messages(account, &[copy], false)
+        .await
+        .unwrap();
+    db.rebind_stale_imap_operations(account).await.unwrap();
+    assert!(db.retry_failed_operation(operation_id).await.is_err());
     let unrelated = crate::backend::DiscoveredMessage {
         uid: 10,
         uidvalidity: Some(21),
@@ -180,7 +205,14 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
     let payload: serde_json::Value = serde_json::from_str(&retried.payload).unwrap();
     assert_eq!(payload["uid"], 25);
     assert_eq!(payload["uidvalidity"], 21);
-    assert!(retried.message_id.is_some_and(|id| id != old_id));
+    let matching_id: i64 =
+        sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=? AND uid=25")
+            .bind(inbox)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_ne!(matching_id, old_id);
+    assert_eq!(retried.message_id, Some(matching_id));
     db.close().await;
 }
 

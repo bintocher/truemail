@@ -392,8 +392,16 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
             }
             _ => ErrorKind::Unknown,
         }
-    } else if error.is_client() || error.is_response() {
+    } else if error.is_response()
+        && std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string() == "incomplete response")
+    {
+        // Lettre 0.11.24 сообщает так о закрывшемся соединении без ответа.
+        ErrorKind::NetworkUnavailable
+    } else if error.is_client() {
         ErrorKind::AccountConfig
+    } else if error.is_response() {
+        ErrorKind::ServerUnavailable
     } else {
         ErrorKind::NetworkUnavailable
     };

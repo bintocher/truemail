@@ -1015,6 +1015,9 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
             backend: "imap-outbox".into(),
             message: format!("{folder}: {error}"),
         })?;
+    if payload["uidvalidity"].as_u64() == Some(0) {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
     let expected_uidvalidity = json_uid(&payload["uidvalidity"]);
     verify_message_uid(
         &mut session,

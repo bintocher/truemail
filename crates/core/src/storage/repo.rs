@@ -986,7 +986,7 @@ impl Db {
                     .await?;
             refs.extend(atts.into_iter().filter_map(|(reference,)| reference));
             refs.extend(raw_ref.iter().cloned());
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id = ?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1422,7 +1422,7 @@ impl Db {
                     .fetch_all(&mut *tx)
                     .await?;
             for message_id in messages {
-                preserve_message_traits(&mut tx, message_id, &limits).await?;
+                preserve_message_traits(&mut tx, message_id, &limits, None).await?;
             }
             sqlx::query("DELETE FROM folders WHERE id=? AND account_id=?")
                 .bind(id)
@@ -1606,7 +1606,7 @@ impl Db {
             }
             // Проекция письма убрана провайдером - строка уходит, а сроки дела
             // и закрепление остаются: письмо то же самое.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1671,7 +1671,7 @@ impl Db {
             // Сверка снимка и смена признака действительности папки удаляют
             // строку письма, которое на сервере осталось: приметы сохраняются
             // ровно как при своём переносе.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1802,7 +1802,7 @@ impl Db {
         for id in &delete_ids {
             // Письмо исчезло из этой папки, но в ящике оно чаще всего уже
             // лежит на новом месте: приметы уходят туда, а не пропадают.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -2752,7 +2752,7 @@ impl Db {
                         || (old.imap_uidvalidity.is_none() && old.rfc822_message_id != message_id))
                 {
                     detach_stale_imap_operations(&mut tx, old.id).await?;
-                    preserve_message_traits(&mut tx, old.id, &limits).await?;
+                    preserve_message_traits(&mut tx, old.id, &limits, None).await?;
                     let attachments = sqlx::query_scalar::<_, String>(
                         "SELECT blob_ref FROM attachments WHERE message_id=? AND blob_ref IS NOT NULL",
                     ).bind(old.id).fetch_all(&mut *tx).await?;
@@ -5046,27 +5046,30 @@ impl Db {
     /// после сверки. Действие остаётся отказавшим до ручного повтора.
     pub(crate) async fn rebind_stale_imap_operations(&self, account_id: i64) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        let failed: Vec<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        let failed: Vec<(i64, String, String, Option<i64>, String)> = sqlx::query_as(
             "SELECT id, op_kind, json_extract(payload,'$.rfc822_message_id'),
-                    json_extract(payload,'$.target_folder_id') FROM outbox_ops
+                    json_extract(payload,'$.target_folder_id'), json_extract(payload,'$.folder_path')
+             FROM outbox_ops
              WHERE account_id=? AND status='failed' AND message_id IS NULL
                AND json_extract(payload,'$.imap_identity_stale')=1
-               AND json_extract(payload,'$.rfc822_message_id') IS NOT NULL",
+               AND json_extract(payload,'$.rfc822_message_id') IS NOT NULL
+               AND json_extract(payload,'$.folder_path') IS NOT NULL",
         )
         .bind(account_id)
         .fetch_all(&mut *tx)
         .await?;
-        for (operation_id, kind, message_id, target_id) in failed {
+        for (operation_id, kind, message_id, target_id, original_path) in failed {
             let candidates: Vec<(i64, i64, i64, Option<i64>, String)> = sqlx::query_as(
                 "SELECT m.id, m.folder_id, m.uid,
                         CASE WHEN f.uidvalidity=m.imap_uidvalidity AND f.sync_token IS NOT NULL
                              THEN m.imap_uidvalidity END,
                         f.remote_path
                  FROM messages m JOIN folders f ON f.id=m.folder_id
-                 WHERE m.account_id=? AND m.rfc822_message_id=? LIMIT 2",
+                 WHERE m.account_id=? AND m.rfc822_message_id=? AND f.remote_path=? LIMIT 2",
             )
             .bind(account_id)
             .bind(message_id)
+            .bind(original_path)
             .fetch_all(&mut *tx)
             .await?;
             let [(message_id, folder_id, uid, Some(uidvalidity), path)] = candidates.as_slice()
@@ -5219,9 +5222,13 @@ impl Db {
             // Отказ переноса примет не отменяет завершения операции: письмо на
             // сервере уже переехало, и откат вернул бы строку письма на старое
             // место, а операцию оставил бы в состоянии выполнения навсегда.
+            let target_folder = serde_json::from_str::<serde_json::Value>(&operation.payload)
+                .ok()
+                .and_then(|payload| payload["target_folder_id"].as_i64());
             if operation.op_kind == "move"
                 && let Err(error) =
-                    preserve_message_traits(&mut tx, message_id, &self.limit_set()).await
+                    preserve_message_traits(&mut tx, message_id, &self.limit_set(), target_folder)
+                        .await
             {
                 tracing::warn!(
                     message_id,
@@ -8124,6 +8131,8 @@ struct TransferredMessageTraits {
     processing_origin_id: Option<i64>,
     #[serde(default)]
     backfilled: bool,
+    #[serde(default)]
+    target_folder: Option<i64>,
     /// Время, когда приметы отложены. Письмо может не вернуться вовсе, и без
     /// срока годности запись лежала бы вечно, а письмо с повторяющимся
     /// заголовком однажды унаследовало бы чужое закрепление.
@@ -8269,6 +8278,7 @@ async fn preserve_message_traits(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: i64,
     limits: &LimitSet,
+    target_folder: Option<i64>,
 ) -> Result<()> {
     #[derive(sqlx::FromRow)]
     struct Source {
@@ -8290,22 +8300,23 @@ async fn preserve_message_traits(
     .await?;
     let Some(source) = source else { return Ok(()) };
     let candidates: Vec<i64> = sqlx::query_scalar(
-        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>? LIMIT 2",
+        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>?
+          AND (? IS NULL OR folder_id=?) LIMIT 2",
     )
     .bind(source.account_id)
     .bind(&source.rfc822_message_id)
     .bind(message_id)
+    .bind(target_folder)
+    .bind(target_folder)
     .fetch_all(&mut **tx)
     .await?;
-    if candidates.len() > 1 {
-        return Ok(());
-    }
     let traits = TransferredMessageTraits {
         pinned_at: source.pinned_at,
         snoozed_until: source.snoozed_until,
         closed_by_stage: source.closed_by_stage,
         processing_origin_id: Some(source.processing_origin_id),
         backfilled: source.backfilled,
+        target_folder,
         task: sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
             .bind(message_id)
             .fetch_optional(&mut **tx)
@@ -8394,14 +8405,17 @@ async fn restore_transferred_message_traits(
                 > chrono::Duration::days(limits.get(LIMIT_MESSAGE_TRAITS_DAYS))
         });
     if !expired {
-        let copies: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM messages WHERE account_id=? AND rfc822_message_id=?",
+        let copies: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=?
+             AND (? IS NULL OR folder_id=?) LIMIT 2",
         )
         .bind(account_id)
         .bind(fixed_id)
-        .fetch_one(&mut **tx)
+        .bind(traits.target_folder)
+        .bind(traits.target_folder)
+        .fetch_all(&mut **tx)
         .await?;
-        if copies != 1 {
+        if copies.as_slice() != [message_id] {
             return Ok(());
         }
         apply_transferred_message_traits(tx, message_id, traits, limits).await?;
