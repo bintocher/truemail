@@ -272,6 +272,7 @@ fn run() -> anyhow::Result<()> {
         quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
         api_server: Arc::new(tokio::sync::Mutex::new(None)),
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),

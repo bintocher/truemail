@@ -545,6 +545,84 @@ impl Db {
         Ok((removed, missing))
     }
 
+    /// Сбросить загруженное содержимое писем, сохранив список писем,
+    /// локальные признаки, очередь, календари и контакты.
+    pub async fn clear_cached_mail(&self, scope: &str) -> Result<()> {
+        if !matches!(scope, "all" | "trash_spam" | "old_attachments") {
+            return Err(crate::Error::AccountConfig(
+                "неизвестный режим очистки".into(),
+            ));
+        }
+        let mut tx = self.begin_write().await?;
+        if scope == "all" {
+            let pending: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM outbox_ops WHERE op_kind='send'
+                   AND status IN ('pending','retry','processing','uncertain','failed'))",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending {
+                return Err(crate::Error::Other(
+                    "В исходящих есть письма. Отправьте их, верните в редактор или удалите перед очисткой."
+                        .into(),
+                ));
+            }
+        }
+        let messages: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.raw_blob_ref FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.draft=0 AND coalesce(f.role,'') NOT IN ('drafts','outbox')
+             AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id)
+             AND (?='all' OR (?='trash_spam' AND f.role IN ('trash','spam'))
+                  OR (?='old_attachments' AND m.has_attachments=1
+                      AND m.date<datetime('now','-1 year')))
+             AND (m.body_fetched=1 OR m.raw_blob_ref IS NOT NULL
+                  OR EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id AND a.blob_ref IS NOT NULL))",
+        )
+        .bind(scope)
+        .bind(scope)
+        .bind(scope)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut refs = Vec::new();
+        for (id, raw_ref) in messages {
+            refs.extend(raw_ref);
+            refs.extend(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT blob_ref FROM attachments WHERE message_id=? AND blob_ref IS NOT NULL",
+                )
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?,
+            );
+            sqlx::query("UPDATE attachments SET blob_ref=NULL, fetched=0 WHERE message_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM message_content_cache WHERE message_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE messages SET raw_blob_ref=NULL, body_fetched=0 WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if scope != "old_attachments" {
+            sqlx::query(
+                "UPDATE folders SET sync_token=NULL, highestmodseq=NULL
+                         WHERE ?='all' OR role IN ('trash','spam')",
+            )
+            .bind(scope)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        for reference in refs {
+            self.blobs.remove(&reference)?;
+        }
+        Ok(())
+    }
+
     // ---------- Аккаунты ----------
 
     pub async fn save_account(&self, input: &NewAccount) -> Result<Account> {
@@ -7516,7 +7594,7 @@ impl From<FolderRow> for Folder {
     }
 }
 
-fn parse_utc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_utc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&chrono::Utc))
         .or_else(|_| {

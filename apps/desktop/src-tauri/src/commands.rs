@@ -49,6 +49,7 @@ pub struct AppState {
     pub syncing_aux: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    pub outbox_work: Arc<tokio::sync::RwLock<()>>,
     pub api_server: Arc<tokio::sync::Mutex<Option<truemail_core::api::RunningApiServer>>>,
     pub shortcut_actions: Arc<std::sync::RwLock<HashMap<String, String>>>,
     // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
@@ -3924,6 +3925,7 @@ pub async fn move_storage(
     state: State<'_, AppState>,
     target: String,
 ) -> CmdResult<()> {
+    let _guards = lock_storage_maintenance(&state).await?;
     let source = truemail_core::crypto::load_data_dir()?.unwrap_or_else(super::default_data_dir);
     let target = PathBuf::from(target.trim());
     if !target.is_absolute() || target == source {
@@ -3937,15 +3939,6 @@ pub async fn move_storage(
     if target.join("truemail.db").exists() || target.join("blobs").exists() {
         return Err(ApiError {
             message: "В выбранной папке уже есть данные truemail".into(),
-        });
-    }
-    // Не даём фоновой синхронизации начать запись между checkpoint и
-    // переключением Core. Активную синхронизацию пользователь может повторить
-    // после её завершения, без риска получить неполную копию.
-    let sync_guard = state.syncing.lock().await;
-    if !sync_guard.is_empty() {
-        return Err(ApiError {
-            message: "Дождитесь окончания текущей синхронизации и повторите перенос".into(),
         });
     }
     let old_core = state.core.write().await.take().ok_or_else(|| ApiError {
@@ -4019,7 +4012,6 @@ pub async fn move_storage(
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.watching.lock().await.clear();
-    drop(sync_guard);
     let _ = app.emit(
         "truemail-storage-moved",
         target.to_string_lossy().into_owned(),
@@ -4057,50 +4049,33 @@ pub async fn open_data_dir(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdResult<()> {
-    let core = core(&state).await?;
-    match scope.as_str() {
-        "trash_spam" => {
-            sqlx::query("DELETE FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE role IN ('trash','spam'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
-        }
-        "all" => {
-            let mut tx = core.db.begin_write().await?;
-            sqlx::query("DELETE FROM outbox_ops")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM messages")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM attachments")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM contacts")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM calendars")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM folders")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            tx.commit().await.map_err(truemail_core::Error::from)?;
-            core.db.blobs.clear()?;
-        }
-        "old_attachments" => {
-            sqlx::query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE date < datetime('now','-1 year'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
-        }
-        _ => {
-            return Err(ApiError {
-                message: "Неизвестный режим очистки".into(),
-            });
-        }
-    }
+    let _guards = lock_storage_maintenance(&state).await?;
+    core(&state).await?.db.clear_cached_mail(&scope).await?;
     Ok(())
+}
+
+struct StorageMaintenance<'a> {
+    _mail: tokio::sync::MutexGuard<'a, HashSet<i64>>,
+    _aux: tokio::sync::MutexGuard<'a, HashSet<i64>>,
+    _outbox: tokio::sync::RwLockWriteGuard<'a, ()>,
+}
+
+async fn lock_storage_maintenance(state: &AppState) -> CmdResult<StorageMaintenance<'_>> {
+    let busy = || ApiError {
+        message: "Дождитесь окончания синхронизации и отправки писем, затем повторите действие"
+            .into(),
+    };
+    let mail = state.syncing.lock().await;
+    let aux = state.syncing_aux.lock().await;
+    if !mail.is_empty() || !aux.is_empty() {
+        return Err(busy());
+    }
+    let outbox = state.outbox_work.try_write().map_err(|_| busy())?;
+    Ok(StorageMaintenance {
+        _mail: mail,
+        _aux: aux,
+        _outbox: outbox,
+    })
 }
 
 #[tauri::command]
@@ -4653,9 +4628,11 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         let send_wakeup = state.send_wakeup.clone();
         let outbox_app = app.clone();
         let outbox_generation = state.generation.clone();
+        let outbox_work = state.outbox_work.clone();
         let generation = outbox_generation.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
             loop {
+                let work = outbox_work.read().await;
                 if outbox_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     break;
                 }
@@ -4692,6 +4669,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     .unwrap_or(None)
                     .map(|seconds| seconds.clamp(1, 10))
                     .unwrap_or(10);
+                drop(work);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)) => {}
                     _ = wakeup_signal => {}
@@ -4771,6 +4749,10 @@ pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
         return;
     }
     tauri::async_runtime::block_on(async move {
+        let _work = state.outbox_work.read().await;
+        let Some(core) = state.core.read().await.clone() else {
+            return;
+        };
         if let Err(error) = core.db.release_undo_windows().await {
             tracing::warn!(%error, "окна отмены не отпущены при выходе");
             return;
