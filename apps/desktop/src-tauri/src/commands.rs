@@ -4654,6 +4654,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         let _ = outbox_app.emit("truemail-imap-action-rejected", outbox_account.id);
                         let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
                     }
+                    Err(truemail_core::Error::PermanentDeleteUnavailable) => {
+                        let _ = outbox_app.emit("truemail-permanent-delete-unavailable", ());
+                        let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
+                    }
                     Err(error) => tracing::warn!(
                         account = %truemail_core::logging::mask_email(&outbox_account.email),
                         %error,
@@ -5401,6 +5405,19 @@ pub async fn delete_message_template(
         .db
         .delete_message_template(id, account_id)
         .await?)
+}
+
+#[tauri::command]
+pub async fn check_permanent_delete(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<()> {
+    core(&state)
+        .await?
+        .accounts
+        .check_permanent_delete(&message_ids)
+        .await
+        .map_err(|error| api_error(error.to_string()))
 }
 
 #[tauri::command]

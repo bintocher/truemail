@@ -667,6 +667,7 @@ fn run() -> anyhow::Result<()> {
             commands::list_message_templates,
             commands::save_message_template,
             commands::delete_message_template,
+            commands::check_permanent_delete,
             commands::message_action,
             commands::move_messages_to_folder,
             commands::undo_message_action,

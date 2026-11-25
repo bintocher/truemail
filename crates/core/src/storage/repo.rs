@@ -1143,6 +1143,21 @@ impl Db {
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
+            if let Some(uidvalidity) = folder.uidvalidity {
+                // После обновления поколения папки эти старые строки нельзя
+                // использовать даже если сверка писем прервётся до удаления.
+                sqlx::query(
+                    "UPDATE messages SET imap_uidvalidity=0
+                     WHERE imap_uidvalidity IS NULL AND folder_id=(
+                       SELECT id FROM folders WHERE account_id=? AND remote_path=?
+                         AND uidvalidity IS NOT NULL AND uidvalidity<>?)",
+                )
+                .bind(account_id)
+                .bind(&folder.remote_path)
+                .bind(i64::from(uidvalidity))
+                .execute(&mut *tx)
+                .await?;
+            }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO folders(account_id, remote_path, display_name, role, unread_count,
                                      total_count, uidvalidity, uidnext, highestmodseq)
@@ -1151,6 +1166,10 @@ impl Db {
                     display_name = excluded.display_name, role = coalesce(excluded.role, folders.role),
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
+                    sync_token = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
+                        THEN NULL ELSE folders.sync_token END,
+                    highestmodseq = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
+                        THEN NULL ELSE folders.highestmodseq END,
                     uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
                     last_synced = datetime('now')
@@ -1451,6 +1470,7 @@ impl Db {
             "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid),
                     f.highestmodseq, f.sync_token
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
+                 AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              WHERE f.account_id=?
              GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token",
         )
@@ -1479,7 +1499,9 @@ impl Db {
         let known_uid_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT f.remote_path, m.uid
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE f.account_id=? ORDER BY f.remote_path, m.uid",
+             WHERE f.account_id=?
+               AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
+             ORDER BY f.remote_path, m.uid",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
@@ -5000,7 +5022,10 @@ impl Db {
         .await?;
         for (operation_id, kind, message_id, target_id) in failed {
             let candidates: Vec<(i64, i64, i64, Option<i64>, String)> = sqlx::query_as(
-                "SELECT m.id, m.folder_id, m.uid, m.imap_uidvalidity, f.remote_path
+                "SELECT m.id, m.folder_id, m.uid,
+                        CASE WHEN f.uidvalidity=m.imap_uidvalidity AND f.sync_token IS NOT NULL
+                             THEN m.imap_uidvalidity END,
+                        f.remote_path
                  FROM messages m JOIN folders f ON f.id=m.folder_id
                  WHERE m.account_id=? AND m.rfc822_message_id=? LIMIT 2",
             )

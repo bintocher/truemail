@@ -1043,6 +1043,7 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
                     .await
                     .map_err(imap_outbox_error)?;
             } else {
+                require_uid_expunge(&capabilities)?;
                 session
                     .uid_copy(uid.to_string(), target)
                     .await
@@ -1050,7 +1051,11 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
                 mark_deleted(&mut session, uid).await?;
             }
         }
-        "delete" => mark_deleted(&mut session, uid).await?,
+        "delete" => {
+            let capabilities = session.capabilities().await.map_err(imap_outbox_error)?;
+            require_uid_expunge(&capabilities)?;
+            mark_deleted(&mut session, uid).await?;
+        }
         other => {
             return Err(Error::AccountConfig(format!(
                 "outbox: неизвестная операция {other}"
@@ -1084,6 +1089,44 @@ fn imap_outbox_error(error: async_imap::error::Error) -> Error {
         backend: "imap-outbox".into(),
         message: error.to_string(),
     }
+}
+
+fn require_uid_expunge(capabilities: &async_imap::types::Capabilities) -> Result<()> {
+    if capabilities.has_str("UIDPLUS") || capabilities.has_str("IMAP4rev2") {
+        Ok(())
+    } else {
+        Err(Error::PermanentDeleteUnavailable)
+    }
+}
+
+pub(crate) async fn check_oauth_delete(host: &str, email: &str, token: &str) -> Result<()> {
+    check_uid_expunge(connect_oauth(host, email, token).await?).await
+}
+
+pub(crate) async fn check_password_delete(
+    config: &crate::model::ServerConfig,
+    username: &str,
+    credential: &str,
+) -> Result<()> {
+    check_uid_expunge(
+        connect_password(
+            &config.host,
+            config.port,
+            config.security,
+            username,
+            credential,
+            config.tls_insecure,
+        )
+        .await?,
+    )
+    .await
+}
+
+async fn check_uid_expunge(mut session: OAuthSession) -> Result<()> {
+    let capabilities = session.capabilities().await.map_err(imap_outbox_error)?;
+    let result = require_uid_expunge(&capabilities);
+    let _ = session.logout().await;
+    result
 }
 
 fn json_uid(value: &serde_json::Value) -> Option<u32> {

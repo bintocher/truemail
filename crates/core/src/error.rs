@@ -184,6 +184,9 @@ pub enum Error {
     )]
     ImapMessageIdentityChanged,
 
+    #[error("Почтовый сервер не поддерживает безопасное безвозвратное удаление выбранных писем.")]
+    PermanentDeleteUnavailable,
+
     #[error("нет доступа: право '{0}' не выдано")]
     Forbidden(String),
 
@@ -221,6 +224,7 @@ impl Error {
             Self::RateLimited { .. } => ErrorKind::RateLimited,
             Self::AccountConfig(_) => ErrorKind::AccountConfig,
             Self::Forbidden(_) => ErrorKind::Forbidden,
+            Self::PermanentDeleteUnavailable => ErrorKind::Forbidden,
         }
     }
 

@@ -195,6 +195,7 @@ window.corePageSize = null;
     listMessageTemplates: (accountId) => invoke("list_message_templates", { accountId }),
     saveMessageTemplate: (template) => invoke("save_message_template", template),
     deleteMessageTemplate: (id, accountId) => invoke("delete_message_template", { id, accountId }),
+    checkPermanentDelete: messageIds => invoke("check_permanent_delete", { messageIds }),
     messageAction: (messageIds, action) => invoke("message_action", { messageIds, action }),
     moveMessagesToFolder: (messageIds, folderId) => invoke("move_messages_to_folder", { messageIds, folderId }),
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
@@ -356,6 +357,10 @@ window.corePageSize = null;
   tauri.event?.listen("truemail-imap-action-rejected", () => {
     showToast(L("Действие с письмом остановлено. Сервер изменил номера писем. Обновите папку и проверьте письмо перед повтором.",
       "An action was stopped because the server changed message identifiers. Refresh the folder and check the message before retrying."));
+  }).catch(console.error);
+  tauri.event?.listen("truemail-permanent-delete-unavailable", () => {
+    showToast(L("Почтовый сервер не поддерживает безопасное удаление письма навсегда.",
+      "The mail server does not support safe permanent deletion."));
   }).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
   // account-connect-progress.md, S-002, S-003: этап попытки подключения,

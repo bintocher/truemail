@@ -298,6 +298,10 @@ pub trait MailBackend: Send + Sync {
         new_name: &str,
     ) -> Result<String>;
     async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
+
+    async fn check_permanent_delete(&self, _email: &str, _credential: &str) -> Result<()> {
+        Ok(())
+    }
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
     /// Передать письмо серверу. Отказ несёт признак точки, в которой он
     /// случился: повторять можно только отказ до передачи письма (S-049).
@@ -351,6 +355,9 @@ pub struct GenericImapBackend {
 
 #[async_trait]
 impl MailBackend for YandexBackend {
+    async fn check_permanent_delete(&self, email: &str, credential: &str) -> Result<()> {
+        imap::check_oauth_delete("imap.yandex.com", email, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "yandex"
     }
@@ -582,6 +589,9 @@ impl MailBackend for GmailBackend {
 
 #[async_trait]
 impl MailBackend for OutlookBackend {
+    async fn check_permanent_delete(&self, email: &str, credential: &str) -> Result<()> {
+        imap::check_oauth_delete("outlook.office365.com", email, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "outlook"
     }
@@ -733,6 +743,9 @@ impl MailBackend for OutlookBackend {
 
 #[async_trait]
 impl MailBackend for GenericImapBackend {
+    async fn check_permanent_delete(&self, _email: &str, credential: &str) -> Result<()> {
+        imap::check_password_delete(&self.imap, &self.username, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "generic-imap"
     }

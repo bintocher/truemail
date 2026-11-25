@@ -504,12 +504,13 @@ async fn server_rejections_spend_attempts_and_permanent_rejection_stops() {
         .await
         .unwrap();
     let temporary = FakeBackend::new(&db, Answer::Reject(crate::ErrorKind::ServerUnavailable));
-    let backoff = |id| async {
+    let pool = &db.pool;
+    let backoff = |id| async move {
         sqlx::query_scalar::<_, i64>(
             "SELECT unixepoch(next_attempt_at)-unixepoch('now') FROM outbox_ops WHERE id=?",
         )
         .bind(id)
-        .fetch_one(&db.pool)
+        .fetch_one(pool)
         .await
         .unwrap()
     };

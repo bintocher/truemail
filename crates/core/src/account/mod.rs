@@ -2490,6 +2490,36 @@ impl AccountManager {
             .await
     }
 
+    /// Проверить возможность удаления до показа подтверждения.
+    pub async fn check_permanent_delete(&self, ids: &[i64]) -> Result<()> {
+        let mut account_ids = std::collections::HashSet::new();
+        for &id in ids {
+            if let Some(locator) = self.db.message_fetch_locator(id).await? {
+                account_ids.insert(locator.account_id);
+            }
+        }
+        for account in self.db.list_accounts().await? {
+            if !account_ids.contains(&account.id) {
+                continue;
+            }
+            let check = async {
+                let token = self.mail_credential(&account).await?;
+                Self::mail_backend(&account)?
+                    .check_permanent_delete(&account.email, &token)
+                    .await
+            };
+            // Вне сети действие по-прежнему можно поставить в очередь.
+            // При подключении серверный модуль вновь проверит возможность.
+            if matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(4), check).await,
+                Ok(Err(crate::Error::PermanentDeleteUnavailable))
+            ) {
+                return Err(crate::Error::PermanentDeleteUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
         if account.provider == Provider::Exchange
@@ -2521,6 +2551,7 @@ impl AccountManager {
         let token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let mut stale_identity = false;
+        let mut delete_unavailable = false;
         for operation in operations {
             let applied = if operation.op_kind == "append_sent" {
                 match self.sent_append_bytes_of(&operation).await {
@@ -2545,6 +2576,12 @@ impl AccountManager {
                 Err(crate::Error::ImapMessageIdentityChanged) => {
                     self.db.reject_stale_imap_operation(&operation).await?;
                     stale_identity = true;
+                }
+                Err(error @ crate::Error::PermanentDeleteUnavailable) => {
+                    self.db
+                        .reject_outbox_operation(operation.id, &error.to_string())
+                        .await?;
+                    delete_unavailable = true;
                 }
                 Err(error) => {
                     // S-084: текст ошибки сервера маскируется и в журнале, и в
@@ -2571,6 +2608,9 @@ impl AccountManager {
                 );
             }
             return Err(crate::Error::ImapMessageIdentityChanged);
+        }
+        if delete_unavailable {
+            return Err(crate::Error::PermanentDeleteUnavailable);
         }
         Ok(completed)
     }

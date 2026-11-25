@@ -30,11 +30,20 @@ pub struct JmapBackend {
 #[serde(rename_all = "camelCase")]
 struct Session {
     capabilities: HashMap<String, Value>,
+    #[serde(default)]
+    accounts: HashMap<String, SessionAccount>,
     primary_accounts: HashMap<String, String>,
     api_url: String,
     download_url: String,
     upload_url: String,
     event_source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAccount {
+    #[serde(default)]
+    is_read_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -62,6 +71,7 @@ struct QueryResult {
     ids: Vec<String>,
     query_state: String,
     full: bool,
+    incremental: bool,
     removed: Vec<String>,
 }
 
@@ -227,6 +237,7 @@ impl JmapBackend {
                     ids,
                     query_state: required_string(args, "newQueryState")?,
                     full: false,
+                    incremental: true,
                     removed,
                 });
             }
@@ -293,6 +304,7 @@ impl JmapBackend {
             if full || empty {
                 return Ok(QueryResult {
                     full,
+                    incremental: false,
                     ids,
                     query_state: state,
                     removed: Vec::new(),
@@ -529,7 +541,14 @@ impl JmapBackend {
                         .filter(|_| had_email_changes),
                 )
                 .await?;
-            changed_ids.extend(result.ids.iter().cloned());
+            if result.incremental {
+                changed_ids.extend(result.ids.iter().cloned());
+            } else {
+                // Полный список нужен для сверки удаления. Тела старых писем
+                // загружаются при прокрутке, чтобы начальная синхронизация
+                // большого ящика не держала все вложения одновременно в памяти.
+                changed_ids.extend(result.ids.iter().take(EMAIL_QUERY_PAGE_SIZE).cloned());
+            }
             changed_ids.extend(result.removed.iter().cloned());
             if result.full {
                 snapshot.extend(result.ids.iter().cloned());
@@ -600,7 +619,14 @@ impl JmapBackend {
             )
             .await?;
         let args = method_args(&response, "set")?;
-        ensure_set_succeeded(args, "Email/set")
+        ensure_set_succeeded(args, "Email/set")?;
+        if !destroy.is_empty() && required_ids(args, "destroyed")? != destroy {
+            return Err(backend_error(
+                "set",
+                "сервер не подтвердил безвозвратное удаление",
+            ));
+        }
+        Ok(())
     }
 
     async fn send_message(&self, password: &str, message: OutgoingMessage) -> Result<()> {
@@ -697,6 +723,19 @@ impl JmapBackend {
 
 #[async_trait]
 impl MailBackend for JmapBackend {
+    async fn check_permanent_delete(&self, _email: &str, credential: &str) -> Result<()> {
+        let session = self.session(credential).await?;
+        let account = self.mail_account(&session)?;
+        if session
+            .accounts
+            .get(account)
+            .is_some_and(|account| account.is_read_only)
+        {
+            return Err(Error::PermanentDeleteUnavailable);
+        }
+        Ok(())
+    }
+
     fn provider_id(&self) -> &'static str {
         "jmap"
     }

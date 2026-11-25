@@ -406,6 +406,9 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
   }
   // S-013, S-048: безвозвратное удаление подтверждается отдельно и отмены не
   // имеет.
+  if(action==='delete'){
+    try{await window.tm?.checkPermanentDelete?.(ids);}catch(error){showToast(error?.message||error);return;}
+  }
   if(action==='delete'){const hasActiveTask=ids.some(id=>(currentMessageRows.find(item=>item.id===id)||messages.find(item=>item.id===id))?.task_state==='active');const warning=hasActiveTask?L(`Удалить навсегда писем: ${ids.length}? Среди них есть невыполненное дело. Отмены не будет.`,`Delete ${ids.length} message(s) permanently? An unfinished task will be deleted. There is no undo.`):L(`Удалить навсегда писем: ${ids.length}? Отмены не будет.`,`Delete ${ids.length} message(s) permanently? There is no undo.`);if(!await confirmAction(warning))return;}
   // Запоминаем соседнее письмо, чтобы после действия перейти к нему, а не терять фокус.
   // The letter of the reading pane is remembered as well: an action on other
