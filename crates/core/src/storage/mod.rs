@@ -1260,10 +1260,11 @@ mod tests {
             .expect("set user version");
         plaintext.close().await.expect("close plaintext database");
         assert!(has_plaintext_sqlite_header(&database_path).expect("read plaintext header"));
+        let original = std::fs::read(&database_path).unwrap();
 
         let crypto = Arc::new(StorageCrypto::from_key(random_key()));
         let database_key = DatabaseKey::from_key(random_key());
-        let db = Db::open_with_database_key(&root, crypto, &database_key)
+        let db = Db::open_with_database_key(&root, crypto.clone(), &database_key)
             .await
             .expect("migrate and open database");
         let (value,): (String,) = sqlx::query_as("SELECT value FROM legacy")
@@ -1278,6 +1279,23 @@ mod tests {
         assert_eq!(user_version, 7);
         db.close().await;
         assert!(!has_plaintext_sqlite_header(&database_path).expect("read encrypted header"));
+        let backup = migration_path(&database_path, ".plaintext.migrating");
+        std::fs::write(&backup, &original).unwrap();
+        let wrong_key = DatabaseKey::from_key(random_key());
+        assert!(
+            Db::open_with_database_key(&root, crypto.clone(), &wrong_key)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let reopened = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .unwrap();
+        assert!(
+            !backup.exists(),
+            "открытая копия остаётся рядом с исправной базой"
+        );
+        reopened.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 

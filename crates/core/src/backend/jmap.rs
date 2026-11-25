@@ -1219,10 +1219,42 @@ mod tests {
                 ],
                 "notFound": []
             }),
-            "Email/query" => json!({
-                "accountId": "a1", "queryState": "q1", "canCalculateChanges": true,
-                "position": 0, "ids": ["email-1"], "total": 1
-            }),
+            "Email/query" => {
+                let position = call[1]["position"].as_u64().unwrap_or(0);
+                let mailbox = call[1]["filter"]["inMailbox"].as_str().unwrap();
+                let (ids, total) = match (mailbox, position) {
+                    ("large", 0) => ((0..500).map(|i| format!("email-{i}")).collect(), Some(501)),
+                    ("large", 500) => (vec!["email-500".to_owned()], Some(501)),
+                    ("without-total", 0) => (vec!["email-1".to_owned()], None),
+                    ("without-total", 1) => (vec![], None),
+                    ("archive-id", 0) => (vec![], Some(0)),
+                    ("inbox-id", 0) => (vec!["email-1".to_owned()], Some(1)),
+                    _ => panic!("неожиданная страница {mailbox} {position}"),
+                };
+                let mut args = json!({
+                    "accountId": "a1", "queryState": "q1", "canCalculateChanges": true,
+                    "position": position, "ids": ids
+                });
+                if let Some(total) = total {
+                    args["total"] = json!(total);
+                }
+                if tag == "older" {
+                    assert_eq!(call[1]["filter"]["before"], "2026-11-25T12:00:00Z");
+                    assert_eq!(call[1]["limit"], 10);
+                }
+                args
+            }
+            "Email/changes" => match call[1]["sinceState"].as_str().unwrap() {
+                "e1" => json!({
+                    "oldState":"e1","newState":"e2","hasMoreChanges":true,
+                    "created":["email-1"],"updated":[],"destroyed":[]
+                }),
+                "e2" => json!({
+                    "oldState":"e2","newState":"e3","hasMoreChanges":false,
+                    "created":[],"updated":["email-2"],"destroyed":["email-3"]
+                }),
+                other => panic!("неожиданное состояние {other}"),
+            },
             "Email/get" => json!({
                 "accountId": "a1", "state": "e1",
                 "list": [{
@@ -1242,16 +1274,27 @@ mod tests {
                 "accountId":"a1", "oldState":"s1", "newState":"s2",
                 "created":{"send":{"id":"submission-1"}}
             }),
-            "Email/set" => json!({
-                "accountId":"a1", "oldState":"e1", "newState":"e2",
-                "updated":{"email-1":null}, "notUpdated":{}, "notDestroyed":{}
-            }),
+            "Email/set" => {
+                if call[1]["destroy"]
+                    .as_array()
+                    .is_some_and(|ids| !ids.is_empty())
+                {
+                    assert_eq!(call[1]["destroy"], json!(["email-1"]));
+                    assert_eq!(call[1]["update"], json!({}));
+                }
+                json!({
+                    "accountId":"a1", "oldState":"e1", "newState":"e2",
+                    "updated":{"email-1":null}, "notUpdated":{},
+                    "destroyed":call[1]["destroy"], "notDestroyed":{}
+                })
+            }
             _ => json!({"type":"unknownMethod","description":name}),
         };
         let response_name = if matches!(
             name,
             "Mailbox/get"
                 | "Email/query"
+                | "Email/changes"
                 | "Email/get"
                 | "Email/import"
                 | "Identity/get"
@@ -1280,6 +1323,66 @@ mod tests {
         Json(json!({
             "accountId":"a1", "blobId":"blob-upload", "type":"message/rfc822", "size":100
         }))
+    }
+
+    #[tokio::test]
+    async fn mailbox_pages_changes_backfill_and_permanent_delete_use_jmap_modes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/jmap", get(mock_session))
+            .route("/api", post(mock_api))
+            .route("/download/{account}/{blob}/{name}", get(mock_download))
+            .with_state(base.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = JmapBackend {
+            session_url: format!("{base}/jmap"),
+            username: "user@example.test".into(),
+        };
+        let session = backend.session("password").await.unwrap();
+        let large = backend
+            .query_mailbox(&session, "password", "a1", "large", None)
+            .await
+            .unwrap();
+        assert!(large.full);
+        assert_eq!(large.ids.len(), 501);
+        assert_eq!(large.ids.last().unwrap(), "email-500");
+        let no_total = backend
+            .query_mailbox(&session, "password", "a1", "without-total", None)
+            .await
+            .unwrap();
+        assert!(!no_total.full);
+        assert_eq!(no_total.ids, ["email-1"]);
+        let (ids, state) = backend
+            .email_changes(&session, "password", "a1", Some("e1"))
+            .await
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("e3"));
+        assert_eq!(
+            ids,
+            HashSet::from_iter(["email-1", "email-2", "email-3"].map(str::to_owned))
+        );
+        let older = backend
+            .fetch_older_messages(
+                "user@example.test",
+                "password",
+                "inbox-id",
+                "2026-11-25 12:00:00",
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        backend
+            .apply_operation(
+                "user@example.test",
+                "password",
+                "delete",
+                r#"{"remote_id":"email-1","folder_path":"inbox-id"}"#,
+            )
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

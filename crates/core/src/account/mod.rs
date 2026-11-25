@@ -1510,6 +1510,15 @@ impl AccountManager {
         self.db
             .save_discovered_folders(account.id, &discovery.folders)
             .await?;
+        if self
+            .db
+            .reconcile_imap_folder_renames(account.id, &discovery, &cursors)
+            .await?
+        {
+            self.db
+                .save_discovered_folders(account.id, &discovery.folders)
+                .await?;
+        }
         let folders_changed = self.db.folder_state_signature(account.id).await? != folders_before;
         let snapshot_removed = self
             .db
@@ -3357,6 +3366,15 @@ impl AccountManager {
                     .await
                 {
                     Ok(()) => {
+                        if self
+                            .db
+                            .reconcile_imap_folder_renames(account.id, &imap, &cursors)
+                            .await?
+                        {
+                            self.db
+                                .save_discovered_folders(account.id, &imap.folders)
+                                .await?;
+                        }
                         match self
                             .db
                             .reconcile_imap_snapshot(

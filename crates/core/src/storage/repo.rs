@@ -953,7 +953,8 @@ impl Db {
              WHERE m.account_id = ? AND m.date IS NOT NULL AND m.date < datetime('now', ?) \
              AND m.pinned_at IS NULL \
              AND m.draft=0 AND m.snoozed_until IS NULL \
-             AND NOT EXISTS(SELECT 1 FROM message_tasks t WHERE t.message_id=m.id) \
+             AND NOT EXISTS(SELECT 1 FROM message_tasks t WHERE t.message_id=m.id \
+                            AND t.state IN ('active','detached')) \
              AND NOT EXISTS(SELECT 1 FROM message_labels l WHERE l.message_id=m.id) \
              AND NOT EXISTS(SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id) \
              AND (f.role IS NULL OR f.role NOT IN ('sent','drafts','outbox'))",
@@ -1204,6 +1205,134 @@ impl Db {
         .bind(account_id)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    /// Сохранить папку при подтверждённом переименовании на сервере.
+    pub(crate) async fn reconcile_imap_folder_renames(
+        &self,
+        account_id: i64,
+        discovery: &crate::backend::ImapDiscovery,
+        previous: &std::collections::HashMap<String, crate::backend::FolderSyncCursor>,
+    ) -> Result<bool> {
+        use std::collections::{HashMap, HashSet};
+
+        let active: HashSet<_> = discovery
+            .folders
+            .iter()
+            .map(|folder| folder.remote_path.as_str())
+            .collect();
+        let absent: Vec<_> = previous
+            .iter()
+            .filter(|(path, cursor)| {
+                !active.contains(path.as_str()) && cursor.uidvalidity.is_some()
+            })
+            .collect();
+        if absent.is_empty() {
+            return Ok(false);
+        }
+        let mut incoming: HashMap<&str, HashMap<i64, String>> = HashMap::new();
+        let parser = mail_parser::MessageParser::default();
+        for message in &discovery.messages {
+            if message.uidvalidity.is_some()
+                && previous
+                    .get(&message.folder_path)
+                    .is_none_or(|c| c.uidvalidity.is_none() && c.sync_token.is_none())
+                && let Some(parsed) = parser.parse(&message.raw)
+                && let Some(id) = parsed.message_id()
+            {
+                incoming
+                    .entry(&message.folder_path)
+                    .or_default()
+                    .insert(i64::from(message.uid), id.to_owned());
+            }
+        }
+        if incoming.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.begin_write().await?;
+        let mut matches = Vec::new();
+        for folder in &discovery.folders {
+            let path = folder.remote_path.as_str();
+            let Some(messages) = incoming.get(path) else {
+                continue;
+            };
+            // UIDVALIDITY у разных папок может совпасть. Сопоставляем только
+            // новые папки с полным совпадением UID и Message-ID всего набора.
+            if !discovery
+                .server_uids
+                .iter()
+                .any(|(name, uids)| name == path && uids.len() == messages.len())
+            {
+                continue;
+            }
+            for (old_path, cursor) in &absent {
+                if cursor.uidvalidity != folder.uidvalidity {
+                    continue;
+                }
+                let Some(old_id) = sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM folders WHERE account_id=? AND remote_path=?",
+                )
+                .bind(account_id)
+                .bind(old_path)
+                .fetch_optional(&mut *tx)
+                .await?
+                else {
+                    continue;
+                };
+                let rows: Vec<(i64, Option<String>)> =
+                    sqlx::query_as("SELECT uid,rfc822_message_id FROM messages WHERE folder_id=?")
+                        .bind(old_id)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                if rows.len() == messages.len()
+                    && rows
+                        .iter()
+                        .all(|(uid, id)| messages.get(uid) == id.as_ref())
+                {
+                    matches.push((old_id, old_path.as_str(), path));
+                }
+            }
+        }
+        let mut renamed = false;
+        for (old_id, old_path, new_path) in &matches {
+            if matches
+                .iter()
+                .filter(|(id, _, path)| id == old_id || path == new_path)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let placeholder: Option<i64> = sqlx::query_scalar(
+                "SELECT f.id FROM folders f WHERE f.account_id=? AND f.remote_path=?
+                  AND f.sync_token IS NULL
+                  AND NOT EXISTS(SELECT 1 FROM messages WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM unified_sources WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM mail_rule_actions WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM quick_step_actions WHERE folder_id=f.id)",
+            )
+            .bind(account_id)
+            .bind(new_path)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(placeholder) = placeholder else {
+                continue;
+            };
+            sqlx::query("UPDATE folders SET parent_id=? WHERE parent_id=? AND id<>?")
+                .bind(old_id)
+                .bind(placeholder)
+                .bind(old_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM folders WHERE id=?")
+                .bind(placeholder)
+                .execute(&mut *tx)
+                .await?;
+            rename_folder_path(&mut tx, account_id, *old_id, old_path, new_path).await?;
+            renamed = true;
+        }
+        tx.commit().await?;
+        Ok(renamed)
     }
 
     /// Remove remote folders absent from a complete provider discovery.

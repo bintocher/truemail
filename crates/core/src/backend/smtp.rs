@@ -744,6 +744,77 @@ pub(crate) async fn send_password_with_raw(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn smtp_loss_of_final_reply_and_explicit_rejections_are_distinct() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (reply, ambiguous, kind) in [
+            (None, true, None),
+            (
+                Some("451 Temporary failure\r\n"),
+                false,
+                Some(crate::ErrorKind::ServerUnavailable),
+            ),
+            (
+                Some("550 Rejected\r\n"),
+                false,
+                Some(crate::ErrorKind::Forbidden),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (connection, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(connection);
+                stream
+                    .get_mut()
+                    .write_all(b"220 test SMTP\r\n")
+                    .await
+                    .unwrap();
+                let mut in_data = false;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if in_data {
+                        if line == ".\r\n" {
+                            if let Some(reply) = reply {
+                                stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                            }
+                            break;
+                        }
+                    } else {
+                        let response: &[u8] = if line == "DATA\r\n" {
+                            in_data = true;
+                            b"354 Continue\r\n"
+                        } else {
+                            b"250 OK\r\n"
+                        };
+                        stream.get_mut().write_all(response).await.unwrap();
+                    }
+                }
+            });
+            let transport = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous("127.0.0.1")
+                .port(port)
+                .timeout(Some(std::time::Duration::from_secs(5)))
+                .build();
+            let letter = build_message(sample_message(None, Vec::new())).unwrap();
+            let failure = smtp_failure(
+                "smtp",
+                transport
+                    .send_raw(letter.envelope(), &letter.formatted())
+                    .await
+                    .unwrap_err(),
+            );
+            server.await.unwrap();
+            assert_eq!(failure.after_handoff, ambiguous);
+            if let Some(kind) = kind {
+                assert_eq!(failure.error.kind(), kind);
+            }
+        }
+    }
+
     #[test]
     fn rejects_message_without_recipients_before_network() {
         let message = OutgoingMessage {
