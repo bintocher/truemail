@@ -403,9 +403,12 @@ impl Db {
     pub(crate) async fn max_message_id(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ) -> Result<i64> {
-        let row: (Option<i64>,) = sqlx::query_as("SELECT max(id) FROM messages")
-            .fetch_one(&mut **tx)
-            .await?;
-        Ok(row.0.unwrap_or(0))
+        let last_id = sqlx::query_scalar(
+            "SELECT max(last_id,coalesce((SELECT max(id) FROM messages),0))
+             FROM message_id_sequence WHERE singleton=1",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(last_id)
     }
 }

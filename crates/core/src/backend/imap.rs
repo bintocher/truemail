@@ -762,7 +762,23 @@ async fn rename_folder(
     new_name: &str,
 ) -> Result<String> {
     let name = validate_folder_name(new_name)?;
-    let prefix_len = remote_path.rfind(['/', '|']).map_or(0, |index| index + 1);
+    let entries = session
+        .list(Some(""), Some(remote_path))
+        .await
+        .map_err(imap_outbox_error)?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(imap_outbox_error)?;
+    let prefix_len = entries
+        .iter()
+        .find(|entry| entry.name() == remote_path)
+        .and_then(|entry| entry.delimiter())
+        .and_then(|delimiter| {
+            remote_path
+                .rfind(delimiter)
+                .map(|index| index + delimiter.len())
+        })
+        .unwrap_or(0);
     let target = format!(
         "{}{}",
         &remote_path[..prefix_len],
@@ -1105,10 +1121,7 @@ async fn verify_message_uid(
         return Err(Error::ImapMessageIdentityChanged);
     }
     let headers = session
-        .uid_fetch(
-            identity.uid.to_string(),
-            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
-        )
+        .uid_fetch(identity.uid.to_string(), "(UID BODY.PEEK[HEADER])")
         .await
         .map_err(imap_outbox_error)?
         .try_collect::<Vec<_>>()

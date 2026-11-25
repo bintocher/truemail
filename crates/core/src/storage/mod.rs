@@ -1641,7 +1641,7 @@ mod tests {
                 .await
                 .expect("read full-body locator")
                 .expect("full-body locator")
-                .4
+                .body_fetched
         );
         assert_eq!(
             db.message_raw_bytes(calendar_message_id)
@@ -1691,7 +1691,7 @@ mod tests {
                 .await
                 .expect("read metadata locator")
                 .expect("metadata locator")
-                .4
+                .body_fetched
         );
         db.store_fetched_raw(
             &db.message_fetch_locator(metadata_message_id)
@@ -1707,7 +1707,7 @@ mod tests {
                 .await
                 .expect("read hydrated locator")
                 .expect("hydrated locator")
-                .4
+                .body_fetched
         );
 
         let custom_smart = crate::model::SmartFolder {

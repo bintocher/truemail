@@ -1114,7 +1114,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             .await
             .expect("прочитать признак полноты")
             .expect("письмо на месте")
-            .4,
+            .body_fetched,
         "письмо осталось полным"
     );
     assert_eq!(
@@ -1167,7 +1167,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             .await
             .expect("прочитать признак полноты проекции")
             .expect("проекция на месте")
-            .4,
+            .body_fetched,
         "проекция помечена неполной"
     );
     db.store_fetched_raw(
@@ -1181,7 +1181,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             .await
             .expect("прочитать признак полноты после догрузки")
             .expect("проекция на месте")
-            .4,
+            .body_fetched,
         "догруженное письмо стало полным"
     );
     db.close().await;

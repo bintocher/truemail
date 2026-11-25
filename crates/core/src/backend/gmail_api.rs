@@ -906,6 +906,7 @@ fn project_messages(
         for folder_path in destinations {
             messages.push(DiscoveredMessage {
                 folder_path,
+                uidvalidity: None,
                 uid: stable_uid(&message.id),
                 remote_id: Some(message.id.clone()),
                 size: Some(message.size_estimate),
