@@ -547,8 +547,8 @@ async fn clearing_mail_cache_keeps_unsent_mail_and_local_auxiliary_data() {
     let email = "me@example.test";
     let account = seed_account(&db, email).await;
     let folder: i64 = sqlx::query_scalar(
-        "INSERT INTO folders(account_id,remote_path,display_name,role,sync_token)
-         VALUES(?,'Trash','Trash','trash','old') RETURNING id",
+        "INSERT INTO folders(account_id,remote_path,display_name,role,sync_token,uidvalidity)
+         VALUES(?,'Trash','Trash','trash','old',42) RETURNING id",
     )
     .bind(account)
     .fetch_one(&db.write_pool)

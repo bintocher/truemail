@@ -4757,7 +4757,9 @@ pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
         return;
     }
     tauri::async_runtime::block_on(async move {
-        let _work = state.outbox_work.read().await;
+        let Ok(_work) = state.outbox_work.try_read() else {
+            return;
+        };
         let Some(core) = state.core.read().await.clone() else {
             return;
         };

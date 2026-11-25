@@ -593,6 +593,7 @@ impl Db {
         let messages: Vec<(i64, Option<String>)> = sqlx::query_as(
             "SELECT m.id, m.raw_blob_ref FROM messages m JOIN folders f ON f.id=m.folder_id
              WHERE m.draft=0 AND coalesce(f.role,'') NOT IN ('drafts','outbox')
+             AND (m.uid>0 OR m.remote_id IS NOT NULL)
              AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id)
              AND (?='all' OR (?='trash_spam' AND f.role IN ('trash','spam'))
                   OR (?='old_attachments' AND m.has_attachments=1
@@ -632,7 +633,7 @@ impl Db {
         if scope != "old_attachments" {
             sqlx::query(
                 "UPDATE folders SET sync_token=NULL, highestmodseq=NULL
-                         WHERE ?='all' OR role IN ('trash','spam')",
+                         WHERE uidvalidity IS NOT NULL AND (?='all' OR role IN ('trash','spam'))",
             )
             .bind(scope)
             .execute(&mut *tx)
