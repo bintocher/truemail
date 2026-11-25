@@ -187,6 +187,9 @@ pub enum Error {
     #[error("Почтовый сервер не поддерживает безопасное безвозвратное удаление выбранных писем.")]
     PermanentDeleteUnavailable,
 
+    #[error("SMTP отклонил отправку: {0}")]
+    SmtpRejected(String),
+
     #[error("нет доступа: право '{0}' не выдано")]
     Forbidden(String),
 
@@ -216,7 +219,10 @@ impl Error {
                 | std::io::ErrorKind::UnexpectedEof => ErrorKind::NetworkUnavailable,
                 _ => ErrorKind::StorageError,
             },
-            Self::Json(_) | Self::Other(_) | Self::ImapMessageIdentityChanged => ErrorKind::Unknown,
+            Self::Json(_)
+            | Self::Other(_)
+            | Self::ImapMessageIdentityChanged
+            | Self::SmtpRejected(_) => ErrorKind::Unknown,
             Self::Backend { message, .. } => classify_backend_message(message),
             Self::Keyring(_) => ErrorKind::SecretStoreError,
             Self::Crypto(_) => ErrorKind::CryptoError,

@@ -387,6 +387,9 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
             // 535 и 534 - отказ проверки подлинности, 530 - сервер требует входа.
             (_, "535" | "534" | "530") => ErrorKind::InvalidCredentials,
             (Severity::TransientNegativeCompletion, _) => ErrorKind::ServerUnavailable,
+            (Severity::PermanentNegativeCompletion, _) => {
+                return Error::SmtpRejected(error.to_string());
+            }
             _ => ErrorKind::Unknown,
         }
     } else if error.is_client() || error.is_response() {
@@ -400,7 +403,11 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
 /// После DATA отсутствие явного отказа означает, что сервер мог принять письмо.
 fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::SendFailure {
     let after_handoff = !error.is_transient() && !error.is_permanent();
-    let error = smtp_error(backend, error);
+    let error = if error.is_permanent() {
+        Error::SmtpRejected(error.to_string())
+    } else {
+        smtp_error(backend, error)
+    };
     if after_handoff {
         super::SendFailure::after_handoff(error)
     } else {
@@ -923,6 +930,9 @@ mod tests {
             assert_eq!(failure.after_handoff, ambiguous);
             if let Some(kind) = kind {
                 assert_eq!(failure.error.kind(), kind);
+            }
+            if reply == Some("550 Rejected\r\n") {
+                assert!(matches!(failure.error, Error::SmtpRejected(_)));
             }
         }
     }

@@ -210,7 +210,9 @@ async function runActivityAction(id){
   const entry=activityLog.entries.find(item=>item.id===id);
   if(!entry||!activityModel.actionAvailable(entry,Date.now()))return;
   activityLog=activityModel.beginAction(activityLog,id,wt('errorActionPending'));renderActivity();
-  const callbacks=entry.syncScope?entry.activeSyncIds.map(accountId=>errorAction({...entry,accountId})):entry.callbacks;
+  const canRunTogether=entry.action==='retry'||entry.action==='wait';
+  const activeIds=canRunTogether?entry.activeSyncIds:entry.activeSyncIds?.slice(0,1);
+  const callbacks=entry.syncScope?activeIds.map(accountId=>errorAction({...entry,accountId})):entry.callbacks;
   try{
     const results=await Promise.allSettled(callbacks.map(callback=>Promise.resolve().then(callback)));
     const failure=results.find(result=>result.status==='rejected');

@@ -166,14 +166,17 @@
   // собственным действием.
   function finishAction(log, id, outcome, now) {
     const next = mapEntry(log, id, entry => {
+      if (entry.syncScope) {
+        if (entry.resolved) return entry;
+        return outcome.ok
+          ? {...entry, actionState: '', actionStatus: ''}
+          : {...entry, actionState: 'failed', actionStatus: outcome.item?.text || ''};
+      }
       if (outcome.ok) {
         return {...entry, level: 'info', details: '', hasAction: false,
           actionState: 'success', actionStatus: outcome.text, time: now};
       }
       const item = outcome.item || {};
-      if (entry.syncScope) {
-        return entry.resolved ? entry : {...entry, actionState: 'failed', actionStatus: item.text || ''};
-      }
       // Ключ предмета и сроки относились к прежнему действию: у новой причины
       // свои, иначе она не склеилась бы со своим повтором и получила бы чужое
       // истёкшее окно отмены.

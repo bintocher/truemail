@@ -199,7 +199,7 @@ fn run() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("не удалось установить TLS crypto provider aws-lc-rs"))?;
 
     // Логи пишем и в stdout (виден при запуске из терминала), и в файл в
-    // data_dir/logs/ - у GUI-сборки на Windows stdout не отображается, поэтому
+    // постоянный каталог приложения - у GUI-сборки на Windows stdout не отображается, поэтому
     // файл единственный способ увидеть диагностику. В отладочной сборке
     // по умолчанию включаем debug для ядра, чтобы IMAP-операции (удаление
     // папок и т.п.) логировались из коробки. В релизе дефолт - info: debug
@@ -207,7 +207,7 @@ fn run() -> anyhow::Result<()> {
     // RUST_LOG пользователя в любом случае имеет приоритет над этим дефолтом.
     use tracing_appender::rolling::{Builder, Rotation};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
-    let log_dir = data_dir().join("logs");
+    let log_dir = default_data_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     activity::prune_logs(&log_dir, chrono::Utc::now().date_naive());
     // Ротация суточная, но без ограничения файлы копились бесконечно (у
@@ -217,19 +217,13 @@ fn run() -> anyhow::Result<()> {
         .filename_prefix("truemail.log")
         .max_log_files(activity::LOG_DAYS as usize)
         .build(&log_dir);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            if cfg!(debug_assertions) {
-                tracing_subscriber::EnvFilter::new("info,truemail_core=debug")
-            } else {
-                tracing_subscriber::EnvFilter::new("info")
-            }
-        })
-        .add_directive(
-            "truemail::activity=info"
-                .parse()
-                .expect("фиксированный фильтр журнала"),
-        );
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            tracing_subscriber::EnvFilter::new("info,truemail_core=debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
     match file_appender {
         Ok(file_appender) => {
             tracing_subscriber::fmt()

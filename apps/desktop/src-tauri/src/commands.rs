@@ -4757,7 +4757,7 @@ pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
         return;
     }
     tauri::async_runtime::block_on(async move {
-        let Ok(_work) = state.outbox_work.try_read() else {
+        let Ok(shared_work) = state.outbox_work.try_read() else {
             return;
         };
         let Some(core) = state.core.read().await.clone() else {
@@ -4767,6 +4767,13 @@ pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
             tracing::warn!(%error, "окна отмены не отпущены при выходе");
             return;
         }
+        drop(shared_work);
+        let Ok(_exclusive_work) = state.outbox_work.try_write() else {
+            return;
+        };
+        let Some(core) = state.core.read().await.clone() else {
+            return;
+        };
         let Ok(accounts) = core.db.list_accounts().await else {
             return;
         };

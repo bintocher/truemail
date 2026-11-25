@@ -218,12 +218,17 @@ async fn defer_send(db: &Db, operation_id: i64, reason: &crate::Error) {
 }
 
 async fn record_send_rejection(db: &Db, operation_id: i64, reason: &crate::Error) {
+    if matches!(reason, crate::Error::SmtpRejected(_)) {
+        fail_send(db, operation_id, reason).await;
+        return;
+    }
     match reason.kind() {
         ErrorKind::NetworkUnavailable
         | ErrorKind::InvalidCredentials
         | ErrorKind::NeedsReauth
-        | ErrorKind::RateLimited => defer_send(db, operation_id, reason).await,
-        ErrorKind::ServerUnavailable | ErrorKind::Timeout => {
+        | ErrorKind::RateLimited
+        | ErrorKind::SecretStoreError => defer_send(db, operation_id, reason).await,
+        ErrorKind::ServerUnavailable | ErrorKind::Timeout | ErrorKind::Unknown => {
             if let Err(error) = db
                 .fail_outbox_operation(operation_id, &reason.to_string())
                 .await
@@ -2587,27 +2592,28 @@ impl AccountManager {
                     )
                     .await
             };
-            match applied {
-                Ok(()) => {
-                    self.db.complete_outbox_operation(&operation).await?;
-                    completed += 1;
-                }
+            let recorded = match applied {
+                Ok(()) => self
+                    .db
+                    .complete_outbox_operation(&operation)
+                    .await
+                    .map(|()| completed += 1),
                 Err(crate::Error::ImapMessageIdentityChanged) => {
-                    self.db.reject_stale_imap_operation(&operation).await?;
                     stale_identity = true;
+                    self.db.reject_stale_imap_operation(&operation).await
                 }
                 Err(error @ crate::Error::PermanentDeleteUnavailable) => {
+                    delete_unavailable = true;
                     self.db
                         .reject_outbox_operation(operation.id, &error.to_string())
-                        .await?;
-                    delete_unavailable = true;
+                        .await
                 }
                 Err(error) => {
                     // S-084: текст ошибки сервера маскируется и в журнале, и в
                     // поле последней ошибки очереди - он повторяет адреса и
                     // тему письма.
                     let reason = crate::logging::mask_error_text(&error.to_string());
-                    self.db.fail_outbox_operation(operation.id, &reason).await?;
+                    let result = self.db.fail_outbox_operation(operation.id, &reason).await;
                     tracing::warn!(
                         account = %crate::logging::mask_email(&account.email),
                         operation = operation.id,
@@ -2615,7 +2621,15 @@ impl AccountManager {
                         last_error = %reason,
                         "операция outbox будет повторена"
                     );
+                    result
                 }
+            };
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    operation = operation.id,
+                    error_kind = error.code(),
+                    "итог операции не записан, она снова станет доступна после истечения срока"
+                );
             }
         }
         if stale_identity {
