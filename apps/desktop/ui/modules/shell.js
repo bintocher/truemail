@@ -452,13 +452,41 @@ async function loadNextMessagePage(serverBackfill=false){
       // Прогресс меряем по НОВЫМ письмам, а не по длине страницы: локальная
       // выборка по курсору может вернуть уже показанные письма (дубли по
       // одинаковой дате). Если новых нет, а на сервере писем больше - догружаем.
-      let backfillDone=false;
-      if(!fresh.length&&cursor.date&&serverBackfill){const folder=coreFolders.find(item=>item.id===folderId);const total=folder?.total_count||0;window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);if(folder&&total>loaded.length){try{const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,backfillPageSize());const fetched=fetchedPage?.fetched||0;backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);if(fetched>0){page=await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())||[];fresh=page.filter(message=>!known.has(message.id));}}catch(error){window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);console.error('truemail backfill:',error);}}else{backfillDone=true;window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);}}
-      messages.push(...fresh);messages=trimMessages(messages,page.map(message=>message.id));page.forEach(message=>known.add(message.id));const pageLast=page[page.length-1];if(pageLast)ordinaryPageCursors.set(folderId,{date:pageLast.date||'',id:pageLast.id});
+      let backfillDone=false,backfillProgress=false;
+      if(!fresh.length&&cursor.date&&serverBackfill){
+        const folder=coreFolders.find(item=>item.id===folderId);
+        const total=folder?.total_count||0;
+        window.tm?.uiLog?.(`догрузка: папка ${folderId} локально=${loaded.length} сервер=${total} before=${cursor.date}`);
+        if(folder&&total>loaded.length){
+          try{
+            const fetchedPage=await window.tm?.fetchOlderMessages(folderId,cursor.date,backfillPageSize());
+            const fetched=fetchedPage?.fetched||0;
+            backfillDone=true;
+            backfillProgress=fetched>0;
+            window.tm?.uiLog?.(`догрузка: папка ${folderId} догружено=${fetched}`);
+            if(backfillProgress){
+              // JMAP может вернуть письма той же даты с новыми локальными
+              // номерами. Запрос по прежнему курсору их уже не увидит.
+              page=fetchedPage.messages??await window.tm?.listMessagesPage(folderId,cursor.date||'',cursor.id,messagePageSize())??[];
+              fresh=page.filter(message=>!known.has(message.id));
+            }
+          }catch(error){
+            window.tm?.uiLog?.(`догрузка ошибка: ${error?.message||error}`);
+            console.error('truemail backfill:',error);
+          }
+        }else{
+          backfillDone=true;
+          window.tm?.uiLog?.(`догрузка: папка ${folderId} пропущена (нет ещё писем на сервере)`);
+        }
+      }
+      messages.push(...fresh);
+      messages=trimMessages(messages,page.map(message=>message.id));
+      page.forEach(message=>known.add(message.id));
+      if(page.length)ordinaryPageCursors.set(folderId,pinMessageModel.ordinaryCursor([cursor,...page]));
       // Концом папки считаем только удавшийся проход: пустая страница без похода
       // на сервер и упавший запрос догрузки его не подтверждают - письма на
       // сервере есть, и прокрутка пользователя должна их достать.
-      if(fresh.length||backfillDone)folderHasMore.set(folderId,fresh.length>0);}
+      if(fresh.length||backfillDone)folderHasMore.set(folderId,fresh.length>0||backfillProgress);}
     if(currentFolderId!==null||currentSmartIndex!==null)applyListOptions(false);
   }catch(error){console.error('truemail pagination:',error);paginationFailed=true;}finally{loadingMoreMessages=false;setListLoading(false);ensureListFilled(serverBackfill);}
 }

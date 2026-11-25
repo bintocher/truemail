@@ -497,6 +497,8 @@ fn apply_skipped_folders(
 pub struct BackfillPage {
     pub fetched: usize,
     pub oldest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<crate::model::MessageMeta>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1777,6 +1779,7 @@ impl AccountManager {
             return Ok(BackfillPage {
                 fetched: 0,
                 oldest: self.db.folder_oldest_message_date(folder_id).await?,
+                messages: None,
             });
         }
         let count = messages.len();
@@ -1786,10 +1789,24 @@ impl AccountManager {
             .save_discovered_messages(account.id, &messages, true)
             .await?;
         self.db.process_backfill_stages().await?;
+        let visible = if known_ids.is_some() {
+            let remote_ids = messages
+                .iter()
+                .filter_map(|message| message.remote_id.as_deref())
+                .collect::<Vec<_>>();
+            Some(
+                self.db
+                    .list_backfilled_folder_messages(folder_id, &remote_ids)
+                    .await?,
+            )
+        } else {
+            None
+        };
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(BackfillPage {
             fetched: count,
             oldest: self.db.folder_oldest_message_date(folder_id).await?,
+            messages: visible,
         })
     }
 

@@ -3442,6 +3442,33 @@ impl Db {
         Ok(messages)
     }
 
+    /// Вернуть письма страницы JMAP, включая те, что уже за границей
+    /// курсора списка по дате и номеру строки. Скрытые письма не выдаём.
+    pub(crate) async fn list_backfilled_folder_messages(
+        &self,
+        folder_id: i64,
+        remote_ids: &[&str],
+    ) -> Result<Vec<MessageMeta>> {
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id FROM messages WHERE pinned_at IS NULL
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                 AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry'))
+               AND folder_id=",
+        );
+        query.push_bind(folder_id).push(" AND remote_id IN (");
+        let mut ids = query.separated(",");
+        for id in remote_ids {
+            ids.push_bind(*id);
+        }
+        ids.push_unseparated(") ORDER BY date DESC,id DESC");
+        let ids = query.build_query_scalar().fetch_all(&self.pool).await?;
+        self.list_messages_by_ids(&ids).await
+    }
+
     /// Закрепить или открепить пачку писем. Предел считается отдельно для
     /// каждого ящика внутри одной транзакции, включая отложенные и уводимые
     /// письма: они остаются живыми и позднее вернутся в список.
