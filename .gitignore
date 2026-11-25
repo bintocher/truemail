@@ -9,6 +9,7 @@ temp/
 CLAUDE.md
 CLAUDE.local.md
 AGENTS.md
+!/AGENTS.md
 GEMINI.md
 .mcp.json
 
