@@ -1609,7 +1609,12 @@ impl AccountManager {
         let Some(locator) = self.db.message_fetch_locator(message_id).await? else {
             return Ok(());
         };
-        if locator.body_fetched {
+        if locator.body_fetched
+            && locator
+                .raw_blob_ref
+                .as_deref()
+                .is_some_and(|reference| self.db.blobs.exists(reference))
+        {
             return Ok(());
         }
         let Some(account) = self
@@ -2510,11 +2515,16 @@ impl AccountManager {
             };
             // Вне сети действие по-прежнему можно поставить в очередь.
             // При подключении серверный модуль вновь проверит возможность.
-            if matches!(
-                tokio::time::timeout(std::time::Duration::from_secs(4), check).await,
-                Ok(Err(crate::Error::PermanentDeleteUnavailable))
-            ) {
-                return Err(crate::Error::PermanentDeleteUnavailable);
+            if let Ok(Err(error)) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), check).await
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::NetworkUnavailable
+                        | ErrorKind::Timeout
+                        | ErrorKind::ServerUnavailable
+                )
+            {
+                return Err(error);
             }
         }
         Ok(())

@@ -6,7 +6,9 @@ use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
 use lettre::transport::smtp::authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism};
 use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
-use lettre::transport::smtp::extension::ClientId;
+use lettre::transport::smtp::commands::{Data, Mail, Rcpt};
+use lettre::transport::smtp::extension::{ClientId, Extension, MailBodyParameter, MailParameter};
+use lettre::transport::smtp::response::Severity;
 use std::time::Duration;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -381,7 +383,6 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
     } else if error.is_tls() {
         ErrorKind::CertificateError
     } else if let Some(code) = error.status() {
-        use lettre::transport::smtp::response::Severity;
         match (code.severity, code.to_string().as_str()) {
             // 535 и 534 - отказ проверки подлинности, 530 - сервер требует входа.
             (_, "535" | "534" | "530") => ErrorKind::InvalidCredentials,
@@ -396,10 +397,9 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
     Error::classified_backend(backend, kind, error.to_string())
 }
 
-/// Lettre не сообщает, на каком шаге оборвался send_raw. Без явного отказа
-/// сервера ответ мог потеряться уже после приёма DATA (S-049).
+/// После DATA отсутствие явного отказа означает, что сервер мог принять письмо.
 fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::SendFailure {
-    let after_handoff = !error.is_transient() && !error.is_permanent() && !error.is_client();
+    let after_handoff = !error.is_transient() && !error.is_permanent();
     let error = smtp_error(backend, error);
     if after_handoff {
         super::SendFailure::after_handoff(error)
@@ -676,7 +676,70 @@ async fn submit_smtp(
     envelope: &lettre::address::Envelope,
     raw: &[u8],
 ) -> std::result::Result<(), super::SendFailure> {
-    tokio::time::timeout(SMTP_TIMEOUT, connection.send(envelope, raw))
+    let mut options = Vec::new();
+    if envelope
+        .from()
+        .into_iter()
+        .chain(envelope.to())
+        .any(|address| !address.as_ref().is_ascii())
+    {
+        if !connection
+            .server_info()
+            .supports_feature(Extension::SmtpUtfEight)
+        {
+            return Err(Error::AccountConfig(
+                "сервер не поддерживает SMTPUTF8 для адреса письма".into(),
+            )
+            .into());
+        }
+        options.push(MailParameter::SmtpUtfEight);
+    }
+    if !raw.is_ascii() {
+        if !connection
+            .server_info()
+            .supports_feature(Extension::EightBitMime)
+        {
+            return Err(Error::AccountConfig(
+                "сервер не поддерживает 8BITMIME для содержимого письма".into(),
+            )
+            .into());
+        }
+        options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+    let begin = async {
+        connection
+            .command(Mail::new(envelope.from().cloned(), options))
+            .await
+            .map_err(|error| smtp_error("smtp", error))?;
+        for address in envelope.to() {
+            connection
+                .command(Rcpt::new(address.clone(), Vec::new()))
+                .await
+                .map_err(|error| smtp_error("smtp", error))?;
+        }
+        let response = connection
+            .command(Data)
+            .await
+            .map_err(|error| smtp_error("smtp", error))?;
+        if u16::from(response.code()) != 354 {
+            return Err(Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::ServerUnavailable,
+                "неожиданный ответ на команду DATA",
+            ));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(SMTP_TIMEOUT, begin)
+        .await
+        .map_err(|_| {
+            Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::Timeout,
+                "сервер не ответил до передачи письма",
+            )
+        })??;
+    let response = tokio::time::timeout(SMTP_TIMEOUT, connection.message(raw))
         .await
         .map_err(|_| {
             super::SendFailure::after_handoff(Error::classified_backend(
@@ -686,6 +749,15 @@ async fn submit_smtp(
             ))
         })?
         .map_err(|error| smtp_failure("smtp", error))?;
+    if response.code().severity != Severity::PositiveCompletion {
+        return Err(super::SendFailure::after_handoff(
+            Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::Unknown,
+                "сервер не подтвердил приём письма",
+            ),
+        ));
+    }
     // Ответ о приёме получен. Сбой при закрытии уже не меняет итог передачи.
     let _ = tokio::time::timeout(Duration::from_secs(2), connection.quit()).await;
     Ok(())
@@ -777,14 +849,22 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
-        for (reply, ambiguous, kind) in [
-            (None, true, None),
+        for (drop_before_data, reply, ambiguous, kind) in [
             (
+                true,
+                None,
+                false,
+                Some(crate::ErrorKind::NetworkUnavailable),
+            ),
+            (false, None, true, None),
+            (
+                false,
                 Some("451 Temporary failure\r\n"),
                 false,
                 Some(crate::ErrorKind::ServerUnavailable),
             ),
             (
+                false,
                 Some("550 Rejected\r\n"),
                 false,
                 Some(crate::ErrorKind::Unknown),
@@ -805,6 +885,9 @@ mod tests {
                 loop {
                     line.clear();
                     assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if drop_before_data && line.starts_with("MAIL FROM:") {
+                        break;
+                    }
                     if in_data {
                         if line == ".\r\n" {
                             if let Some(reply) = reply {

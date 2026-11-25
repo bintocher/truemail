@@ -325,6 +325,7 @@ pub(crate) struct MessageFetchLocator {
     pub path: String,
     pub uid: i64,
     pub remote_id: Option<String>,
+    pub raw_blob_ref: Option<String>,
     pub body_fetched: bool,
     pub imap_uidvalidity: Option<i64>,
     pub rfc822_message_id: Option<String>,
@@ -3955,7 +3956,7 @@ impl Db {
     ) -> Result<Option<MessageFetchLocator>> {
         Ok(sqlx::query_as(
             "SELECT m.id, m.account_id, f.remote_path AS path, m.uid, m.remote_id,
-                    m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
+                    m.raw_blob_ref, m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
              FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
         )
         .bind(message_id)
@@ -3982,7 +3983,7 @@ impl Db {
         };
         let rows = sqlx::query_as(
             "SELECT m.id, m.account_id, f.remote_path AS path, m.uid, m.remote_id,
-                    m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
+                    m.raw_blob_ref, m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
              FROM messages m JOIN folders f ON f.id = m.folder_id
              WHERE m.account_id = ? AND m.body_fetched = 0
                AND (m.size IS NULL OR m.size <= ?)
