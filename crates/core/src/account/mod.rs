@@ -1544,6 +1544,7 @@ impl AccountManager {
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
+        self.db.rebind_stale_imap_operations(account.id).await?;
         let rules_applied = match self.db.process_sync_batch_stages().await {
             Ok(count) => count,
             Err(error) => {
@@ -1596,12 +1597,10 @@ impl AccountManager {
     /// по глубине хранения, письмо докачивается с сервера и сохраняется, чтобы
     /// открыться мгновенно в этой сессии (prune действует только на старте).
     pub async fn ensure_message_raw(&self, message_id: i64) -> Result<()> {
-        let Some((account_id, folder_path, uid, remote_id, has_raw)) =
-            self.db.message_fetch_locator(message_id).await?
-        else {
+        let Some(locator) = self.db.message_fetch_locator(message_id).await? else {
             return Ok(());
         };
-        if has_raw {
+        if locator.body_fetched {
             return Ok(());
         }
         let Some(account) = self
@@ -1609,22 +1608,28 @@ impl AccountManager {
             .list_accounts()
             .await?
             .into_iter()
-            .find(|item| item.id == account_id)
+            .find(|item| item.id == locator.account_id)
         else {
             return Ok(());
         };
         let access_token = self.mail_credential(&account).await?;
         let backend = Self::mail_backend(&account)?;
-        let raw = backend
+        let result = backend
             .fetch_message_raw(
                 &account.email,
                 &access_token,
-                &folder_path,
-                uid as u32,
-                remote_id.as_deref(),
+                &locator.path,
+                locator.imap_uid(),
+                locator.remote_id.as_deref(),
             )
-            .await?;
-        self.db.store_fetched_raw(message_id, &raw).await?;
+            .await;
+        if matches!(result, Err(crate::Error::ImapMessageIdentityChanged)) {
+            self.db
+                .invalidate_imap_folder(account.id, &locator.path)
+                .await?;
+            let _ = self.sync_mail_account(&account).await;
+        }
+        self.db.store_fetched_raw(&locator, &result?).await?;
         tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
     }
@@ -1655,29 +1660,34 @@ impl AccountManager {
         };
         // Запросы идут по одному (S-007): фоновая догрузка не должна вытеснять
         // обычную синхронизацию из квоты почтового сервиса.
-        for (message_id, folder_path, uid, remote_id) in pending {
+        for locator in pending {
             match backend
                 .fetch_message_raw(
                     &account.email,
                     &access_token,
-                    &folder_path,
-                    uid as u32,
-                    remote_id.as_deref(),
+                    &locator.path,
+                    locator.imap_uid(),
+                    locator.remote_id.as_deref(),
                 )
                 .await
             {
                 Ok(raw) => {
-                    self.db.store_fetched_raw(message_id, &raw).await?;
+                    self.db.store_fetched_raw(&locator, &raw).await?;
                     result.fetched += 1;
                     result.remaining -= 1;
                 }
                 Err(error) => {
+                    if matches!(error, crate::Error::ImapMessageIdentityChanged) {
+                        self.db
+                            .invalidate_imap_folder(account.id, &locator.path)
+                            .await?;
+                    }
                     // Ограничение частоты обращений: прекращаем до следующего
                     // прохода, иначе квота уйдёт на повторные отказы (S-009).
                     let rate_limited = matches!(error, crate::Error::RateLimited { .. });
                     self.remember_gmail_rate_limit(account, &error).await;
                     tracing::warn!(
-                        message_id,
+                        message_id = locator.id,
                         account = %crate::logging::mask_email(&account.email),
                         %error,
                         "фоновая догрузка тела письма не удалась"
@@ -2501,6 +2511,7 @@ impl AccountManager {
         // Не трогаем transport/OAuth/quota gate, когда отправлять нечего.
         let token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
+        let mut stale_identity = false;
         for operation in operations {
             let applied = if operation.op_kind == "append_sent" {
                 match self.sent_append_bytes_of(&operation).await {
@@ -2522,6 +2533,10 @@ impl AccountManager {
                     self.db.complete_outbox_operation(&operation).await?;
                     completed += 1;
                 }
+                Err(crate::Error::ImapMessageIdentityChanged) => {
+                    self.db.reject_stale_imap_operation(&operation).await?;
+                    stale_identity = true;
+                }
                 Err(error) => {
                     // S-084: текст ошибки сервера маскируется и в журнале, и в
                     // поле последней ошибки очереди - он повторяет адреса и
@@ -2537,6 +2552,16 @@ impl AccountManager {
                     );
                 }
             }
+        }
+        if stale_identity {
+            if let Err(error) = self.sync_mail_account(account).await {
+                tracing::warn!(
+                    account_id = account.id,
+                    error_kind = error.code(),
+                    "сверка папки IMAP будет повторена при следующей синхронизации"
+                );
+            }
+            return Err(crate::Error::ImapMessageIdentityChanged);
         }
         Ok(completed)
     }
@@ -3405,6 +3430,11 @@ impl AccountManager {
                                                     .await
                                                 {
                                                     Ok(()) => {
+                                                        self.db
+                                                            .rebind_stale_imap_operations(
+                                                                account.id,
+                                                            )
+                                                            .await?;
                                                         if let Err(error) = self
                                                             .db
                                                             .process_sync_batch_stages()

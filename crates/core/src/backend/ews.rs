@@ -1787,6 +1787,7 @@ fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>
             }
         };
         messages.push(DiscoveredMessage {
+            uidvalidity: None,
             folder_path: folder_path.to_owned(),
             uid: stable_uid(id),
             remote_id: Some(id.to_owned()),
@@ -3480,7 +3481,7 @@ impl MailBackend for EwsBackend {
         _email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: super::ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         self.raw_item(

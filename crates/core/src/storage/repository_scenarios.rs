@@ -551,6 +551,7 @@ async fn remote_projections_are_reduced_to_what_the_server_reports() {
         .reconcile_remote_projections(
             account,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 2,
                 remote_id: Some("remote-1".into()),
@@ -692,6 +693,7 @@ async fn a_saved_letter_keeps_its_attachment_body_and_search_entry() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 5,
             remote_id: Some("calendar-message".into()),
@@ -774,6 +776,7 @@ async fn a_draft_keeps_its_hidden_copy_on_every_opening() {
     seed_folder(&db, account, "INBOX", Some("inbox")).await;
     seed_folder(&db, account, "Drafts", Some("drafts")).await;
     let letter = |path: &str, uid: u32, draft: bool| DiscoveredMessage {
+        uidvalidity: None,
         folder_path: path.into(),
         uid,
         remote_id: Some(format!("letter-{uid}")),
@@ -881,6 +884,7 @@ async fn only_a_part_put_into_the_body_is_marked_embedded() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 9,
             remote_id: Some("inline-letter".into()),
@@ -1010,6 +1014,7 @@ async fn a_letter_with_its_own_text_part_says_so_on_every_opening() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 10,
             remote_id: Some("plain-letter".into()),
@@ -1060,6 +1065,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 5,
             remote_id: Some("calendar-message".into()),
@@ -1085,6 +1091,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 5,
             remote_id: Some("calendar-message".into()),
@@ -1132,6 +1139,7 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
     db.save_discovered_messages(
         account,
         &[DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 6,
             remote_id: Some("metadata-only".into()),
@@ -1162,9 +1170,12 @@ async fn a_metadata_projection_does_not_erase_a_downloaded_body() {
             .4,
         "проекция помечена неполной"
     );
-    db.store_fetched_raw(projection, "Subject: Large\r\n\r\nполное тело".as_bytes())
-        .await
-        .expect("догрузить тело");
+    db.store_fetched_raw(
+        &db.message_fetch_locator(projection).await.unwrap().unwrap(),
+        "Subject: Large\r\n\r\nполное тело".as_bytes(),
+    )
+    .await
+    .expect("догрузить тело");
     assert!(
         db.message_fetch_locator(projection)
             .await

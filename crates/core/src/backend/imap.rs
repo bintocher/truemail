@@ -52,6 +52,7 @@ pub struct DiscoveredFlagUpdate {
 pub struct DiscoveredMessage {
     pub folder_path: String,
     pub uid: u32,
+    pub uidvalidity: Option<u32>,
     pub remote_id: Option<String>,
     pub size: Option<u32>,
     pub seen: bool,
@@ -66,6 +67,13 @@ pub struct DiscoveredMessage {
     /// признак берётся из разбора сырого письма
     /// (ews-lightweight-message-fetch.md, S-007).
     pub has_attachments: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImapUid<'a> {
+    pub uid: u32,
+    pub uidvalidity: Option<u32>,
+    pub message_id: Option<&'a str>,
 }
 
 type OAuthSession = async_imap::Session<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -973,16 +981,25 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
     let folder = payload["folder_path"]
         .as_str()
         .ok_or_else(|| Error::AccountConfig("outbox: нет folder_path".into()))?;
-    let uid = payload["uid"]
-        .as_u64()
-        .ok_or_else(|| Error::AccountConfig("outbox: нет uid".into()))?;
-    session
+    let uid =
+        json_uid(&payload["uid"]).ok_or_else(|| Error::AccountConfig("outbox: нет uid".into()))?;
+    let mailbox = session
         .select(folder)
         .await
         .map_err(|error| Error::Backend {
             backend: "imap-outbox".into(),
             message: format!("{folder}: {error}"),
         })?;
+    verify_message_uid(
+        &mut session,
+        ImapUid {
+            uid,
+            uidvalidity: json_uid(&payload["uidvalidity"]),
+            message_id: payload["rfc822_message_id"].as_str(),
+        },
+        mailbox.uid_validity,
+    )
+    .await?;
     match op_kind {
         "flag" => {
             let seen = payload["seen"]
@@ -1053,7 +1070,60 @@ fn imap_outbox_error(error: async_imap::error::Error) -> Error {
     }
 }
 
-async fn mark_deleted(session: &mut OAuthSession, uid: u64) -> Result<()> {
+fn json_uid(value: &serde_json::Value) -> Option<u32> {
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+}
+
+async fn verify_message_uid(
+    session: &mut OAuthSession,
+    identity: ImapUid<'_>,
+    actual: Option<u32>,
+) -> Result<()> {
+    if identity.uid == 0 || actual.is_none_or(|value| value == 0) {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
+    if let Some(expected) = identity.uidvalidity {
+        return (actual == Some(expected))
+            .then_some(())
+            .ok_or(Error::ImapMessageIdentityChanged);
+    }
+    // Старые строки могли не знать UIDVALIDITY. Старый UID допускается
+    // только если он однозначно найден по Message-ID в выбранной папке.
+    let id = identity
+        .message_id
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_graphic()))
+        .ok_or(Error::ImapMessageIdentityChanged)?;
+    let quoted = id.replace('\\', "\\\\").replace('"', "\\\"");
+    let found = session
+        .uid_search(format!("HEADER Message-ID \"{quoted}\""))
+        .await
+        .map_err(imap_outbox_error)?;
+    if found.len() != 1 || !found.contains(&identity.uid) {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
+    let headers = session
+        .uid_fetch(
+            identity.uid.to_string(),
+            "(UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])",
+        )
+        .await
+        .map_err(imap_outbox_error)?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(imap_outbox_error)?;
+    let exact = headers
+        .iter()
+        .find(|fetch| fetch.uid == Some(identity.uid))
+        .and_then(|fetch| fetch.header())
+        .and_then(|header| mail_parser::MessageParser::default().parse(header))
+        .is_some_and(|message| message.message_id() == Some(id));
+    exact.then_some(()).ok_or(Error::ImapMessageIdentityChanged)
+}
+
+async fn mark_deleted(session: &mut OAuthSession, uid: u32) -> Result<()> {
     session
         .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
         .await
@@ -1462,6 +1532,7 @@ async fn fetch_incremental_messages(
             messages.push(DiscoveredMessage {
                 folder_path: folder.remote_path.clone(),
                 uid,
+                uidvalidity: mailbox.uid_validity,
                 remote_id: None,
                 size: fetch.size,
                 seen: flags
@@ -2095,12 +2166,13 @@ pub async fn fetch_oauth_message_raw(
     email: &str,
     access_token: &str,
     folder_path: &str,
-    uid: u32,
+    uid: ImapUid<'_>,
 ) -> Result<Vec<u8>> {
     let session = connect_oauth(host, email, access_token).await?;
     fetch_message_raw(session, folder_path, uid).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_password_message_raw(
     host: &str,
     port: u16,
@@ -2109,7 +2181,7 @@ pub async fn fetch_password_message_raw(
     password: &str,
     tls_insecure: bool,
     folder_path: &str,
-    uid: u32,
+    uid: ImapUid<'_>,
 ) -> Result<Vec<u8>> {
     let session = connect_password(host, port, security, username, password, tls_insecure).await?;
     fetch_message_raw(session, folder_path, uid).await
@@ -2269,7 +2341,7 @@ async fn fetch_older_messages(
     before: &str,
     limit: usize,
 ) -> Result<Vec<DiscoveredMessage>> {
-    session
+    let mailbox = session
         .select(folder_path)
         .await
         .map_err(|error| Error::Backend {
@@ -2330,6 +2402,7 @@ async fn fetch_older_messages(
         messages.push(DiscoveredMessage {
             folder_path: folder_path.to_owned(),
             uid,
+            uidvalidity: mailbox.uid_validity,
             remote_id: None,
             size: fetch.size,
             seen: flags
@@ -2440,15 +2513,17 @@ pub async fn fetch_older_password(
 async fn fetch_message_raw(
     mut session: OAuthSession,
     folder_path: &str,
-    uid: u32,
+    identity: ImapUid<'_>,
 ) -> Result<Vec<u8>> {
-    session
+    let mailbox = session
         .select(folder_path)
         .await
         .map_err(|error| Error::Backend {
             backend: "imap-select".into(),
             message: format!("{}: {error}", folder_label(folder_path)),
         })?;
+    verify_message_uid(&mut session, identity, mailbox.uid_validity).await?;
+    let uid = identity.uid;
     let fetched = session
         .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
         .await

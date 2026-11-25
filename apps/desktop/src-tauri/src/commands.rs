@@ -4650,6 +4650,10 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
                     }
                     Ok(_) => {}
+                    Err(truemail_core::Error::ImapMessageIdentityChanged) => {
+                        let _ = outbox_app.emit("truemail-imap-action-rejected", outbox_account.id);
+                        let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
+                    }
                     Err(error) => tracing::warn!(
                         account = %truemail_core::logging::mask_email(&outbox_account.email),
                         %error,

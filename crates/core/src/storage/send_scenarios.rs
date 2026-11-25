@@ -246,7 +246,7 @@ impl MailBackend for FakeBackend {
         _email: &str,
         _credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: crate::backend::ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> crate::Result<Vec<u8>> {
         unimplemented!("докачка письма в сценарии отправки не участвует")

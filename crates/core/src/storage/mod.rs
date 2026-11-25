@@ -1458,6 +1458,7 @@ mod tests {
             .expect("insert Gmail projection");
         }
         let desired = DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 2,
             remote_id: Some("remote-1".into()),
@@ -1549,6 +1550,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 5,
                 remote_id: Some("calendar-message".into()),
@@ -1617,6 +1619,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 5,
                 remote_id: Some("calendar-message".into()),
@@ -1660,6 +1663,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 6,
                 remote_id: Some("metadata-only".into()),
@@ -1689,9 +1693,15 @@ mod tests {
                 .expect("metadata locator")
                 .4
         );
-        db.store_fetched_raw(metadata_message_id, b"Subject: Large\r\n\r\nfull body")
-            .await
-            .expect("store lazy full raw");
+        db.store_fetched_raw(
+            &db.message_fetch_locator(metadata_message_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"Subject: Large\r\n\r\nfull body",
+        )
+        .await
+        .expect("store lazy full raw");
         assert!(
             db.message_fetch_locator(metadata_message_id)
                 .await

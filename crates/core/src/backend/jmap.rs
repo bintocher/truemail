@@ -444,6 +444,7 @@ impl JmapBackend {
                     continue;
                 }
                 messages.push(DiscoveredMessage {
+                    uidvalidity: None,
                     folder_path: mailbox_id.to_owned(),
                     uid: stable_uid(&id),
                     remote_id: Some(id.clone()),
@@ -912,7 +913,7 @@ impl MailBackend for JmapBackend {
         _email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: super::ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         let id = remote_id.ok_or_else(|| Error::AccountConfig("JMAP: нет remote_id".into()))?;

@@ -107,6 +107,7 @@ fn discovered(folder: &str, uid: u32, message_id: &str, flagged: bool) -> Discov
         "From: Начальник <boss@example.test>\r\nTo: me@example.test\r\nSubject: Договор\r\nMessage-ID: {message_id}\r\nDate: Mon, 14 Sep 2026 10:00:00 +0000\r\n\r\nТекст письма\r\n"
     );
     DiscoveredMessage {
+        uidvalidity: None,
         folder_path: folder.to_owned(),
         uid,
         remote_id: Some(format!("remote-{folder}-{uid}")),

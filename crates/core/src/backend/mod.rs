@@ -9,11 +9,11 @@ mod smtp;
 pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
 pub use imap::{
     DiscoveredFlagUpdate, DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery,
-    apply_gmail_operation, apply_password_operation, apply_yandex_operation, discover_gmail,
-    discover_gmail_folders, discover_gmail_inbox, discover_password, discover_password_folders,
-    discover_password_inbox, discover_yandex, discover_yandex_folders, discover_yandex_inbox,
-    validate_gmail, validate_password, validate_yandex, wait_for_gmail_change,
-    wait_for_password_change, wait_for_yandex_change,
+    ImapUid, apply_gmail_operation, apply_password_operation, apply_yandex_operation,
+    discover_gmail, discover_gmail_folders, discover_gmail_inbox, discover_password,
+    discover_password_folders, discover_password_inbox, discover_yandex, discover_yandex_folders,
+    discover_yandex_inbox, validate_gmail, validate_password, validate_yandex,
+    wait_for_gmail_change, wait_for_password_change, wait_for_yandex_change,
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{
@@ -314,7 +314,7 @@ pub trait MailBackend: Send + Sync {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>>;
     /// Догрузить более старые письма папки (бесконечная прокрутка): строго
@@ -440,7 +440,7 @@ impl MailBackend for YandexBackend {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_oauth_message_raw("imap.yandex.com", email, credential, folder_path, uid).await
@@ -568,7 +568,7 @@ impl MailBackend for GmailBackend {
         email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         let _ = email;
@@ -704,7 +704,7 @@ impl MailBackend for OutlookBackend {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_oauth_message_raw("outlook.office365.com", email, credential, folder_path, uid)
@@ -923,7 +923,7 @@ impl MailBackend for GenericImapBackend {
         _email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_password_message_raw(

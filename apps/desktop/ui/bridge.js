@@ -353,6 +353,10 @@ window.corePageSize = null;
     if (reloadPending) scheduleReload(0);
   });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
+  tauri.event?.listen("truemail-imap-action-rejected", () => {
+    showToast(L("Действие с письмом остановлено. Сервер изменил номера писем. Обновите папку и проверьте письмо перед повтором.",
+      "An action was stopped because the server changed message identifiers. Refresh the folder and check the message before retrying."));
+  }).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
   // account-connect-progress.md, S-002, S-003: этап попытки подключения,
   // подтверждённый ядром в ходе одного вызова команды (например, переход к
