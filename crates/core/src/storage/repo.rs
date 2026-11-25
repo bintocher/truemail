@@ -4766,15 +4766,24 @@ impl Db {
     }
 
     pub async fn fail_outbox_operation(&self, id: i64, error: &str) -> Result<()> {
+        self.record_outbox_failure(id, error, false).await
+    }
+
+    pub async fn reject_outbox_operation(&self, id: i64, error: &str) -> Result<()> {
+        self.record_outbox_failure(id, error, true).await
+    }
+
+    async fn record_outbox_failure(&self, id: i64, error: &str, permanent: bool) -> Result<()> {
+        let mut tx = self.begin_write().await?;
         let attempts: (i64,) = sqlx::query_as("SELECT attempts+1 FROM outbox_ops WHERE id=?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let delay = (5_i64.saturating_mul(1_i64 << attempts.0.min(9))).min(3600);
         // Сколько раз повторять действие - настройка: на неустойчивой связи
         // восьми попыток мало, а на устойчивой сбой означает отказ сервера, и
         // повторять его восемь раз незачем.
-        let status = if attempts.0 >= self.limit(LIMIT_OPERATION_ATTEMPTS) {
+        let status = if permanent || attempts.0 >= self.limit(LIMIT_OPERATION_ATTEMPTS) {
             "failed"
         } else {
             "retry"
@@ -4782,7 +4791,7 @@ impl Db {
         // S-084: поле последней ошибки названо среди маскируемого, а сервер
         // охотно повторяет в ней адрес письма.
         let reason = crate::logging::mask_error_text(error);
-        let mut tx = self.begin_write().await?;
+        let next_attempt = (status == "retry").then(|| format!("+{delay} seconds"));
         sqlx::query(
             "UPDATE outbox_ops SET attempts=?, last_error=?, status=?,
                     next_attempt_at=datetime('now', ?)
@@ -4791,7 +4800,7 @@ impl Db {
         .bind(attempts.0)
         .bind(reason.chars().take(1000).collect::<String>())
         .bind(status)
-        .bind(format!("+{delay} seconds"))
+        .bind(next_attempt)
         .bind(id)
         .execute(&mut *tx)
         .await?;

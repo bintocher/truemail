@@ -385,6 +385,7 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
             // 535 и 534 - отказ проверки подлинности, 530 - сервер требует входа.
             (_, "535" | "534" | "530") => ErrorKind::InvalidCredentials,
             (Severity::TransientNegativeCompletion, _) => ErrorKind::ServerUnavailable,
+            (Severity::PermanentNegativeCompletion, _) => ErrorKind::Forbidden,
             _ => ErrorKind::Unknown,
         }
     } else if error.is_client() || error.is_transport_shutdown() {
@@ -395,13 +396,10 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
     Error::classified_backend(backend, kind, error.to_string())
 }
 
-/// Отказ SMTP вместе с точкой, в которой он случился. Обрыв соединения и
-/// истечение времени ожидания застают передачу уже начатой: байты письма могли
-/// дойти до сервера, и повтор доставил бы получателю второй экземпляр. Ответ
-/// сервера с кодом, отказ входа и отказ TLS приходят до передачи письма, и
-/// такой отказ повторяется обычным порядком очереди (S-048, S-049).
+/// Lettre не сообщает, на каком шаге оборвался send_raw. Без явного отказа
+/// сервера ответ мог потеряться уже после приёма DATA (S-049).
 fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::SendFailure {
-    let after_handoff = error.is_timeout() || error.is_transport_shutdown();
+    let after_handoff = !error.is_transient() && !error.is_permanent();
     let error = smtp_error(backend, error);
     if after_handoff {
         super::SendFailure::after_handoff(error)
@@ -607,7 +605,7 @@ pub(crate) async fn send_oauth_with_raw(
         None => builder,
     };
     let transport = builder
-        .map_err(|error| smtp_failure("smtp", error))?
+        .map_err(|error| super::SendFailure::before_handoff(smtp_error("smtp", error)))?
         .port(port)
         .credentials(credentials)
         .authentication(vec![Mechanism::Xoauth2])
@@ -725,7 +723,7 @@ pub(crate) async fn send_password_with_raw(
     } else {
         AsyncSmtpTransport::<Tokio1Executor>::relay(host)
     }
-    .map_err(|error| smtp_failure("smtp", error))?;
+    .map_err(|error| super::SendFailure::before_handoff(smtp_error("smtp", error)))?;
     let builder = match insecure_tls(host, security, tls_insecure) {
         Some(tls) => builder.tls(tls),
         None => builder,

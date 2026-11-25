@@ -1289,6 +1289,7 @@ async fn fetch_incremental_messages(
         .and_then(|value| value.parse::<i64>().ok());
     let full_snapshot = cursor.is_none()
         || uidvalidity_changed
+        || (mailbox.exists > 0 && cursor.is_some_and(|value| value.last_uid.is_none()))
         || last_full_reconcile.is_none_or(|last| now.saturating_sub(last) >= 24 * 60 * 60);
     let mut uids: Vec<u32> = if full_snapshot {
         session

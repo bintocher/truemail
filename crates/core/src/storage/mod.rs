@@ -582,8 +582,20 @@ fn ensure_version_at_least(product: &str, actual: &str, minimum: (u64, u64, u64)
 
 async fn prepare_encrypted_database(path: &Path, database_key: &DatabaseKey) -> Result<()> {
     recover_interrupted_migration(path)?;
-    if path.is_file() && has_plaintext_sqlite_header(path)? {
-        migrate_plaintext_database(path, database_key).await?;
+    if path.is_file() {
+        if has_plaintext_sqlite_header(path)? {
+            migrate_plaintext_database(path, database_key).await?;
+        } else if migration_path(path, ".plaintext.migrating").exists() {
+            // Проверяем существующую замену с настоящим ключом, прежде чем
+            // уничтожить единственную открытую копию. WAL рабочей базы сохраняем.
+            if std::fs::metadata(path)?.len() == 0 {
+                return Err(crate::Error::Crypto(
+                    "после миграции зашифрованная база оказалась пустой".into(),
+                ));
+            }
+            verify_encrypted_file(path, database_key).await?;
+            purge_plaintext_backup(path);
+        }
     }
     Ok(())
 }
@@ -600,6 +612,11 @@ fn has_plaintext_sqlite_header(path: &Path) -> Result<bool> {
 async fn migrate_plaintext_database(path: &Path, database_key: &DatabaseKey) -> Result<()> {
     let encrypted = migration_path(path, ".sqlcipher.tmp");
     let backup = migration_path(path, ".plaintext.migrating");
+    if backup.exists() {
+        return Err(crate::Error::Crypto(
+            "рядом с открытой базой уже есть резервная копия миграции".into(),
+        ));
+    }
     remove_database_files(&encrypted)?;
     // Main connection deliberately has SQLITE_OPEN_CREATE disabled. ATTACH
     // inherits those flags, so create the empty destination ourselves first.
@@ -651,13 +668,14 @@ async fn migrate_plaintext_database(path: &Path, database_key: &DatabaseKey) -> 
 
     remove_sidecars(path)?;
     verify_encrypted_file(&encrypted, database_key).await?;
+    remove_sidecars(&encrypted)?;
 
     std::fs::rename(path, &backup)?;
     if let Err(error) = std::fs::rename(&encrypted, path) {
         let _ = std::fs::rename(&backup, path);
         return Err(error.into());
     }
-    secure_remove_file(&backup)?;
+    purge_plaintext_backup(path);
     tracing::info!(database = %path.display(), "plaintext SQLite migrated to SQLCipher");
     Ok(())
 }
@@ -675,8 +693,21 @@ async fn verify_encrypted_file(path: &Path, database_key: &DatabaseKey) -> Resul
         .await?;
     verify_sqlcipher(&pool).await?;
     pool.close().await;
-    remove_sidecars(path)?;
     Ok(())
+}
+
+fn purge_plaintext_backup(path: &Path) {
+    let backup = migration_path(path, ".plaintext.migrating");
+    for file in [
+        sidecar_path(&backup, "-wal"),
+        sidecar_path(&backup, "-shm"),
+        backup,
+    ] {
+        if let Err(error) = secure_remove_file(&file) {
+            tracing::error!(%error, "не удалось стереть открытую копию базы, повторим при запуске");
+            break;
+        }
+    }
 }
 
 fn recover_interrupted_migration(path: &Path) -> Result<()> {

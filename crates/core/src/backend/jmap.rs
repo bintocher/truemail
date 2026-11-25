@@ -720,26 +720,9 @@ impl MailBackend for JmapBackend {
                 );
             }
             "delete" => {
-                let session = self.session(credential).await?;
-                let trash = self
-                    .mailboxes(&session, credential)
-                    .await?
-                    .into_iter()
-                    .find(|mailbox| mailbox.role.as_deref() == Some("trash"));
-                let source = payload["folder_path"].as_str();
-                if source == trash.as_ref().map(|mailbox| mailbox.id.as_str()) || trash.is_none() {
-                    return self
-                        .email_set(credential, json!({}), vec![id.to_owned()])
-                        .await;
-                }
-                if let Some(source) = source {
-                    patch.insert(format!("mailboxIds/{}", patch_segment(source)), Value::Null);
-                }
-                let trash = trash.expect("checked above");
-                patch.insert(
-                    format!("mailboxIds/{}", patch_segment(&trash.id)),
-                    Value::Bool(true),
-                );
+                return self
+                    .email_set(credential, json!({}), vec![id.to_owned()])
+                    .await;
             }
             other => {
                 return Err(Error::AccountConfig(format!(

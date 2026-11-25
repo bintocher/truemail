@@ -3402,7 +3402,7 @@ impl MailBackend for EwsBackend {
             "delete" => (
                 "DeleteItem",
                 format!(
-                    r#"<m:DeleteItem DeleteType="MoveToDeletedItems"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
+                    r#"<m:DeleteItem DeleteType="HardDelete"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
                     escape(item_id)
                 ),
             ),

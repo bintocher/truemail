@@ -99,7 +99,7 @@ pub(crate) async fn transmit_with_backend(
     let outcome = match backend.send(message, token).await {
         Ok(outcome) => outcome,
         Err(failure) if !failure.after_handoff => {
-            defer_send(db, operation.id, &failure.error).await;
+            record_send_rejection(db, operation.id, &failure.error).await;
             return 0;
         }
         Err(failure) => {
@@ -217,10 +217,32 @@ async fn defer_send(db: &Db, operation_id: i64, reason: &crate::Error) {
     }
 }
 
-/// Отказ, зависящий от содержимого письма: попытку он расходует (S-048).
+async fn record_send_rejection(db: &Db, operation_id: i64, reason: &crate::Error) {
+    match reason.kind() {
+        ErrorKind::NetworkUnavailable
+        | ErrorKind::InvalidCredentials
+        | ErrorKind::NeedsReauth
+        | ErrorKind::RateLimited => defer_send(db, operation_id, reason).await,
+        ErrorKind::ServerUnavailable | ErrorKind::Timeout => {
+            if let Err(error) = db
+                .fail_outbox_operation(operation_id, &reason.to_string())
+                .await
+            {
+                tracing::warn!(
+                    operation = operation_id,
+                    error_kind = error.code(),
+                    "повтор отправки не записан"
+                );
+            }
+        }
+        _ => fail_send(db, operation_id, reason).await,
+    }
+}
+
+/// Окончательный отказ. Письмо остаётся в исходящих для ручного решения.
 async fn fail_send(db: &Db, operation_id: i64, reason: &crate::Error) {
     if let Err(error) = db
-        .fail_outbox_operation(operation_id, &reason.to_string())
+        .reject_outbox_operation(operation_id, &reason.to_string())
         .await
     {
         tracing::warn!(
@@ -2536,14 +2558,14 @@ impl AccountManager {
                 // S-028, S-048: отказ учётных данных и недоступность сети не
                 // сжигают восемь попыток на заведомо неверный пароль и не
                 // теряют письмо при суточном отсутствии связи.
-                defer_send(&self.db, operation.id, &error).await;
+                record_send_rejection(&self.db, operation.id, &error).await;
                 return Ok(0);
             }
         };
         let backend = match Self::mail_backend(account) {
             Ok(backend) => backend,
             Err(error) => {
-                defer_send(&self.db, operation.id, &error).await;
+                record_send_rejection(&self.db, operation.id, &error).await;
                 return Ok(0);
             }
         };
