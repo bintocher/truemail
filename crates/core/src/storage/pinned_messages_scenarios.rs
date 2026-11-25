@@ -387,6 +387,11 @@ async fn a_pin_survives_every_path_that_drops_the_message_row() {
             .await
             .expect("перенос выполнен на сервере");
     }
+    sqlx::query("UPDATE labels SET name='Renamed while moving' WHERE id=?")
+        .bind(label)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
     db.save_discovered_messages(
         account,
         &[discovered("Trash", 904, "<move@example.test>")],

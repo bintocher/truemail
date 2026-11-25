@@ -1746,6 +1746,11 @@ impl AccountManager {
         tracing::info!(folder_id, before, provider = ?account.provider, remote_path = %folder.remote_path, "догрузка: запрос старых писем с сервера");
         let credential = self.mail_credential(&account).await?;
         let backend = Self::mail_backend(&account)?;
+        let known_ids = if account.backend_kind == BackendKind::Jmap {
+            Some(self.db.folder_remote_message_ids(folder.id).await?)
+        } else {
+            None
+        };
         let messages = backend
             .fetch_older_messages(
                 &account.email,
@@ -1753,6 +1758,7 @@ impl AccountManager {
                 &folder.remote_path,
                 before,
                 limit,
+                known_ids.as_ref(),
             )
             .await?;
         tracing::info!(
@@ -2499,9 +2505,12 @@ impl AccountManager {
     pub async fn check_permanent_delete(&self, ids: &[i64]) -> Result<()> {
         let mut account_ids = std::collections::HashSet::new();
         for &id in ids {
-            if let Some(locator) = self.db.message_fetch_locator(id).await? {
-                account_ids.insert(locator.account_id);
-            }
+            let locator = self.db.message_fetch_locator(id).await?.ok_or_else(|| {
+                crate::Error::Other(
+                    "Письмо больше недоступно. Обновите список перед удалением.".into(),
+                )
+            })?;
+            account_ids.insert(locator.account_id);
         }
         for account in self.db.list_accounts().await? {
             if !account_ids.contains(&account.id) {

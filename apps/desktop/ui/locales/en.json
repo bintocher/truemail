@@ -151,7 +151,7 @@
   "clear": "Clear",
   "clearAll": "Clear mail cache",
   "clearAllLocal": "Downloaded messages and attachments",
-  "clearAllLocalDesc": "Message lists, drafts, outgoing mail, contacts, and calendars will be kept",
+  "clearAllLocalDesc": "Message lists, sent messages, drafts, outgoing mail, contacts, and calendars will be kept",
   "collectDiagnostics": "Collect diagnostics",
   "close": "Close",
   "closeWizard": "Close wizard",

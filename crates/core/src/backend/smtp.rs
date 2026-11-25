@@ -681,7 +681,7 @@ async fn submit_smtp(
         .from()
         .into_iter()
         .chain(envelope.to())
-        .any(|address| !address.as_ref().is_ascii())
+        .any(|address| !AsRef::<str>::as_ref(address).is_ascii())
     {
         if !connection
             .server_info()

@@ -343,6 +343,15 @@ impl MessageFetchLocator {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct CachedMessageBody {
+    id: i64,
+    raw_blob_ref: Option<String>,
+    body_fetched: bool,
+    imap_uidvalidity: Option<i64>,
+    rfc822_message_id: Option<String>,
+}
+
 /// Строка метаданных письма для уведомления: id, from_name, from_addr, subject, preview.
 type NotificationPreviewRow = (i64, Option<String>, Option<String>, String, Option<String>);
 
@@ -593,7 +602,7 @@ impl Db {
         }
         let messages: Vec<(i64, Option<String>)> = sqlx::query_as(
             "SELECT m.id, m.raw_blob_ref FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE m.draft=0 AND coalesce(f.role,'') NOT IN ('drafts','outbox')
+             WHERE m.draft=0 AND coalesce(f.role,'') NOT IN ('sent','drafts','outbox')
              AND (m.uid>0 OR m.remote_id IS NOT NULL)
              AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id)
              AND (?='all' OR (?='trash_spam' AND f.role IN ('trash','spam'))
@@ -1330,7 +1339,9 @@ impl Db {
                   AND NOT EXISTS(SELECT 1 FROM messages WHERE folder_id=f.id)
                   AND NOT EXISTS(SELECT 1 FROM unified_sources WHERE folder_id=f.id)
                   AND NOT EXISTS(SELECT 1 FROM mail_rule_actions WHERE folder_id=f.id)
-                  AND NOT EXISTS(SELECT 1 FROM quick_step_actions WHERE folder_id=f.id)",
+                  AND NOT EXISTS(SELECT 1 FROM quick_step_actions WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM outbox_ops WHERE account_id=f.account_id AND op_kind='move'
+                    AND json_extract(payload,'$.target_folder_id')=f.id)",
             )
             .bind(account_id)
             .bind(new_path)
@@ -1641,15 +1652,7 @@ impl Db {
                 let reset_identity = reset.contains(path.as_str()) || prior_generation;
                 if reset_identity || !server.contains(&uid) {
                     if reset_identity {
-                        sqlx::query(
-                            "UPDATE outbox_ops SET status='failed', next_attempt_at=NULL, last_error=?,
-                                 message_id=NULL, payload=json_set(payload,'$.imap_identity_stale',1)
-                             WHERE message_id=? AND op_kind IN ('move','delete','flag')",
-                        )
-                        .bind(crate::Error::ImapMessageIdentityChanged.to_string())
-                        .bind(id)
-                        .execute(&mut *tx)
-                        .await?;
+                        detach_stale_imap_operations(&mut tx, id).await?;
                     }
                     delete_ids.push(id);
                     if let Some(reference) = reference {
@@ -2735,20 +2738,37 @@ impl Db {
                 if matches!((uidvalidity, folder_uidvalidity), (Some(current), Some(saved)) if current != saved) {
                     return Err(crate::Error::ImapMessageIdentityChanged);
                 }
-                let old_ref: Option<(i64, Option<String>, i64)> = sqlx::query_as(
-                    "SELECT id, raw_blob_ref, body_fetched FROM messages WHERE folder_id=? AND uid=?",
+                let mut old_ref: Option<CachedMessageBody> = sqlx::query_as(
+                    "SELECT id, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                     FROM messages WHERE folder_id=? AND uid=?",
                 )
                 .bind(folder_id)
                 .bind(source.uid as i64)
                 .fetch_optional(&mut *tx)
                 .await?;
+                if let Some(old) = &old_ref
+                    && let Some(current_generation) = uidvalidity
+                    && (old.imap_uidvalidity.is_some_and(|generation| generation != current_generation)
+                        || (old.imap_uidvalidity.is_none() && old.rfc822_message_id != message_id))
+                {
+                    detach_stale_imap_operations(&mut tx, old.id).await?;
+                    preserve_message_traits(&mut tx, old.id, &limits).await?;
+                    let attachments = sqlx::query_scalar::<_, String>(
+                        "SELECT blob_ref FROM attachments WHERE message_id=? AND blob_ref IS NOT NULL",
+                    ).bind(old.id).fetch_all(&mut *tx).await?;
+                    stale_refs.extend(attachments);
+                    stale_refs.extend(old.raw_blob_ref.iter().cloned());
+                    sqlx::query("DELETE FROM messages WHERE id=?")
+                        .bind(old.id).execute(&mut *tx).await?;
+                    old_ref = None;
+                }
                 let is_new_message = old_ref.is_none();
                 let preserve_full_body = !source.body_fetched
                     && old_ref
                         .as_ref()
-                        .is_some_and(|(_, _, body_fetched)| *body_fetched != 0);
+                        .is_some_and(|row| row.body_fetched);
                 let local_id = match &old_ref {
-                    Some((id, _, _)) => *id,
+                    Some(row) => row.id,
                     None => sqlx::query_scalar(
                         "UPDATE message_id_sequence
                          SET last_id=max(last_id,coalesce((SELECT max(id) FROM messages),0))+1
@@ -2758,7 +2778,7 @@ impl Db {
                 let effective_ref = if preserve_full_body {
                     old_ref
                         .as_ref()
-                        .and_then(|(_, reference, _)| reference.clone())
+                        .and_then(|row| row.raw_blob_ref.clone())
                         .unwrap_or_else(|| raw_ref.clone())
                 } else {
                     raw_ref.clone()
@@ -2823,7 +2843,7 @@ impl Db {
                     if raw_ref != effective_ref {
                         stale_refs.push(raw_ref);
                     }
-                } else if let Some((_, Some(reference), _)) = old_ref
+                } else if let Some(reference) = old_ref.and_then(|row| row.raw_blob_ref)
                     && reference != effective_ref
                 {
                     stale_refs.push(reference);
@@ -3075,6 +3095,20 @@ impl Db {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(value.flatten().filter(|date| !date.is_empty()))
+    }
+
+    pub(crate) async fn folder_remote_message_ids(
+        &self,
+        folder_id: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT remote_id FROM messages WHERE folder_id=? AND remote_id IS NOT NULL",
+        )
+        .bind(folder_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
     }
 
     /// Cursor page ordered by `(date DESC, id DESC)`. Unlike OFFSET this stays
@@ -8278,7 +8312,7 @@ async fn preserve_message_traits(
             .await?
             .map(Into::into),
         labels: sqlx::query_as(
-            "SELECT l.id,l.name FROM message_labels ml JOIN labels l ON l.id=ml.label_id
+            "SELECT l.id,l.transfer_identity FROM message_labels ml JOIN labels l ON l.id=ml.label_id
              WHERE ml.message_id=?",
         )
         .bind(message_id)
@@ -8398,14 +8432,14 @@ async fn apply_transferred_message_traits(
     .bind(message_id)
     .execute(&mut **tx)
     .await?;
-    for (label_id, name) in traits.labels {
+    for (label_id, identity) in traits.labels {
         sqlx::query(
             "INSERT OR IGNORE INTO message_labels(message_id,label_id)
-                     SELECT ?,id FROM labels WHERE id=? AND name=?",
+                     SELECT ?,id FROM labels WHERE id=? AND transfer_identity=?",
         )
         .bind(message_id)
         .bind(label_id)
-        .bind(name)
+        .bind(identity)
         .execute(&mut **tx)
         .await?;
     }
@@ -9382,6 +9416,22 @@ async fn outbox_message_identity(
             .fetch_one(&mut **tx)
             .await?,
     )
+}
+
+async fn detach_stale_imap_operations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_ops SET status='failed', next_attempt_at=NULL, last_error=?,
+             message_id=NULL, payload=json_set(payload,'$.imap_identity_stale',1)
+         WHERE message_id=? AND op_kind IN ('move','delete','flag')",
+    )
+    .bind(crate::Error::ImapMessageIdentityChanged.to_string())
+    .bind(message_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn rename_folder_path(

@@ -3498,6 +3498,7 @@ impl MailBackend for EwsBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         self.older_messages_in_folder(credential, folder_path, before, limit)
             .await

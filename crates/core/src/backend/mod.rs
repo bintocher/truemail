@@ -331,6 +331,7 @@ pub trait MailBackend: Send + Sync {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         let _ = (email, credential, folder_path, before, limit);
         Ok(Vec::new())
@@ -460,6 +461,7 @@ impl MailBackend for YandexBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_oauth(
             "imap.yandex.com",
@@ -728,6 +730,7 @@ impl MailBackend for OutlookBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_oauth(
             "outlook.office365.com",
@@ -959,6 +962,7 @@ impl MailBackend for GenericImapBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_password(
             &self.imap.host,

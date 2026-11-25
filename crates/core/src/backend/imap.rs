@@ -769,10 +769,19 @@ async fn rename_folder(
         .try_collect::<Vec<_>>()
         .await
         .map_err(imap_outbox_error)?;
-    let prefix_len = entries
+    let entry = entries
         .iter()
         .find(|entry| entry.name() == remote_path)
-        .and_then(|entry| entry.delimiter())
+        .ok_or_else(|| {
+            Error::AccountConfig("сервер не подтвердил путь переименовываемой папки".into())
+        })?;
+    let delimiter = entry.delimiter();
+    if delimiter.is_some_and(|delimiter| name.contains(delimiter)) {
+        return Err(Error::AccountConfig(
+            "имя папки содержит разделитель сервера".into(),
+        ));
+    }
+    let prefix_len = delimiter
         .and_then(|delimiter| {
             remote_path
                 .rfind(delimiter)
@@ -1006,16 +1015,26 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
             backend: "imap-outbox".into(),
             message: format!("{folder}: {error}"),
         })?;
+    let expected_uidvalidity = json_uid(&payload["uidvalidity"]);
     verify_message_uid(
         &mut session,
         ImapUid {
             uid,
-            uidvalidity: json_uid(&payload["uidvalidity"]),
+            uidvalidity: expected_uidvalidity,
             message_id: payload["rfc822_message_id"].as_str(),
         },
         mailbox.uid_validity,
     )
     .await?;
+    if expected_uidvalidity.is_some()
+        && !session
+            .uid_search(format!("UID {uid}"))
+            .await
+            .map_err(imap_outbox_error)?
+            .contains(&uid)
+    {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
     match op_kind {
         "flag" => {
             let seen = payload["seen"]

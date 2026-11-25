@@ -436,6 +436,9 @@ impl JmapBackend {
         ids: &[String],
         mailbox: Option<&str>,
     ) -> Result<Vec<DiscoveredMessage>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let (values, _) = self.get_emails(session, password, account_id, ids).await?;
         let downloads = stream::iter(values.into_iter().map(|value| async move {
             let id = required_string(&value, "id")?;
@@ -619,12 +622,18 @@ impl JmapBackend {
             )
             .await?;
         let args = method_args(&response, "set")?;
-        ensure_set_succeeded(args, "Email/set")?;
-        if !destroy.is_empty() && required_ids(args, "destroyed")? != destroy {
-            return Err(backend_error(
-                "set",
-                "сервер не подтвердил безвозвратное удаление",
-            ));
+        if destroy.is_empty() {
+            return ensure_set_succeeded(args, "Email/set");
+        }
+        let destroyed = string_array(&args["destroyed"]);
+        for id in destroy {
+            let failure = &args["notDestroyed"][&id];
+            if !destroyed.contains(&id) && failure["type"].as_str() != Some("notFound") {
+                return Err(backend_error(
+                    "set",
+                    format!("сервер не подтвердил безвозвратное удаление: {failure}"),
+                ));
+            }
         }
         Ok(())
     }
@@ -976,15 +985,32 @@ impl MailBackend for JmapBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let session = self.session(credential).await?;
+        let account_id = self.mail_account(&session)?;
+        if let Some(known) = known_remote_ids {
+            // Курсор интерфейса основан на Date письма, а JMAP сортирует
+            // по receivedAt. Дата также не различает письма одной секунды.
+            let page = self
+                .query_mailbox(&session, credential, account_id, folder_path, None)
+                .await?;
+            let ids = page
+                .ids
+                .into_iter()
+                .filter(|id| !known.contains(id))
+                .take(limit)
+                .collect::<Vec<_>>();
+            return self
+                .discover_messages(&session, credential, account_id, &ids, Some(folder_path))
+                .await;
+        }
         let before = crate::storage::repo::parse_utc_time(before)
             .ok_or_else(|| Error::AccountConfig("JMAP: неверная дата догрузки".into()))?
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let session = self.session(credential).await?;
-        let account_id = self.mail_account(&session)?;
         let response = self
             .api(
                 &session,
@@ -1408,10 +1434,24 @@ mod tests {
                 "inbox-id",
                 "2026-11-25 12:00:00",
                 10,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(older.len(), 1);
+        let known = HashSet::from(["email-1".to_owned()]);
+        let older = backend
+            .fetch_older_messages(
+                "user@example.test",
+                "password",
+                "inbox-id",
+                "2026-11-25 12:00:00",
+                10,
+                Some(&known),
+            )
+            .await
+            .unwrap();
+        assert!(older.is_empty());
         backend
             .apply_operation(
                 "user@example.test",
