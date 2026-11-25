@@ -219,7 +219,13 @@ impl Db {
         // undo-send.md S-027: операция отправки, застигнутая аварийным
         // завершением в состоянии передачи, получает неопределённый итог. Её
         // повтор без решения пользователя отправил бы письмо второй раз.
-        self.recover_sending_operations().await?;
+        let uncertain_sends = self.recover_sending_operations().await?;
+        if uncertain_sends > 0 {
+            tracing::warn!(
+                uncertain_sends,
+                "предыдущий запуск завершился во время отправки писем"
+            );
+        }
         self.purge_send_request_keys().await?;
         // out-of-office.md S-050 и recipient-history.md S-010: память об
         // ответах и об отметках собственных отправок стареет фоновым

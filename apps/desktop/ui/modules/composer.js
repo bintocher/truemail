@@ -113,47 +113,93 @@ function chooseRecipient(input,contact){addRecipientEntry(input.id,recipientForm
 document.addEventListener('click',event=>{if(!event.target.closest('.recipient-input'))document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));});
 const syncActionWaiters=new Map();
 function errorTranslations(){return typeof wizardText==='undefined'?undefined:wizardText;}
-function waitForAccountSync(accountId){
+function waitForAccountSync(accountId,scope){
   if(accountId==null)return window.tm?.syncAccounts();
-  return new Promise((resolve,reject)=>{
-    const id=Number(accountId),timer=setTimeout(()=>{syncActionWaiters.delete(id);reject({kind:'timeout',account_id:id,message:'sync result timeout'});},120000);
-    syncActionWaiters.set(id,{resolve,reject,timer});
-    Promise.resolve(window.tm?.syncAccounts()).catch(error=>{clearTimeout(timer);syncActionWaiters.delete(id);reject(error);});
+  const id=Number(accountId),key=`${scope||'mail'}:${id}`;
+  const pending=syncActionWaiters.get(key);
+  if(pending)return pending.promise;
+  let waiter;
+  const promise=new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>{syncActionWaiters.delete(key);reject({kind:'timeout',account_id:id,message:'sync result timeout'});},120000);
+    waiter={resolve,reject,timer};
   });
+  syncActionWaiters.set(key,{...waiter,promise});
+  const sync=scope==='auxiliary'?window.tm?.syncAuxiliaryAccounts:window.tm?.syncAccounts;
+  Promise.resolve().then(()=>sync?.()).catch(error=>{
+    if(syncActionWaiters.get(key)?.promise!==promise)return;
+    clearTimeout(waiter.timer);syncActionWaiters.delete(key);waiter.reject(error);
+  });
+  return promise;
 }
-function settleSyncAction(state){
-  const waiter=syncActionWaiters.get(Number(state?.account_id));
-  if(!waiter||['syncing','retrying'].includes(state.status))return;
-  clearTimeout(waiter.timer);syncActionWaiters.delete(Number(state.account_id));
-  const warning=Array.isArray(state.warnings)?state.warnings.find(item=>item&&typeof item==='object'):null;
-  if(state.error_kind||state.status==='error'||warning)waiter.reject(warning||{kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at});
+function settleSyncAction(state,scope,error){
+  const key=`${scope}:${Number(state.account_id)}`,waiter=syncActionWaiters.get(key);
+  if(!waiter)return;
+  clearTimeout(waiter.timer);syncActionWaiters.delete(key);
+  if(error)waiter.reject(error);
   else waiter.resolve(state);
 }
 function errorAction(presented,context={}){
   if(context.action)return context.action;
   const account=coreAccounts.find(item=>item.id===Number(presented.accountId));
   if(presented.action==='reconnect'||presented.action==='check_and_retry')return ()=>showAccountWizard(account?.email||context.email||'');
-  if(presented.action==='retry'||presented.action==='wait')return context.retry||(()=>waitForAccountSync(presented.accountId));
+  if(presented.action==='retry'||presented.action==='wait')return context.retry||(()=>waitForAccountSync(presented.accountId,presented.syncScope||context.syncScope));
   if(presented.action==='settings')return ()=>{showView('settingsView');setSection('addacct');};
   return ()=>window.tm?.openDataDir();
 }
 /* ---------- журнал событий строки статуса ----------
    Уведомления, ошибки и действия не всплывают карточками, а пишутся в журнал:
-   последняя запись всегда видна в нижней строке окна, остальные открываются
+   последняя актуальная запись видна в нижней строке окна, остальные открываются
    щелчком по ней (issue #120, specs/status-activity-log.md). Число записей и
    видимых строк - пределы limit_activity_log_entries и limit_activity_log_visible. */
 const activityModel=window.activityLogModel;
 let activityLog=activityModel.createLog();
 let activityPanelOpen=false;
 let activityTimer=null;
+let activityHistory=[];
+let activityHistoryLoading=false;
+let activityHistoryGeneration=0;
+let activityWrite=Promise.resolve();
+const activitySession=`${Date.now()}-${Math.random().toString(36).slice(2)}`;
 // Ключи пределов пишутся явно: проверка ядра ищет место применения каждого
 // предела по имени KEYS.<ключ>.
 function activityLimit(key){return key?window.limitsModel?.limitValue(key)??null:null;}
-function activityTime(time){try{return new Date(time).toLocaleTimeString(composerLang()==='en'?'en-US':'ru-RU',{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
+function activityTime(time,history=false){
+  const date=new Date(time);
+  const older=history&&date.toDateString()!==new Date().toDateString();
+  return date.toLocaleString(composerLang()==='en'?'en-US':'ru-RU',{
+    ...(older?{day:'numeric',month:'short'}:{}),hour:'2-digit',minute:'2-digit',
+  });
+}
 function activityAccountsText(baseText,accounts,item){return window.errorPresentation.formatAccountErrorText(baseText,accounts,item.locale,item.translations);}
-function logActivity(item){const result=activityModel.addEntry(activityLog,item,Date.now(),activityLimit(window.limitsModel?.KEYS.activityLogEntries),activityAccountsText);activityLog=result.log;renderActivity();return result;}
+function recordActivity(entry){
+  if(!window.tm?.recordUiActivity)return;
+  const record=entry?{
+    id:`${activitySession}/${entry.id}`,time:entry.time,level:entry.level,kind:entry.kind||'notice',
+    text:entry.text||'',details:entry.details||'',count:entry.count,actionStatus:entry.actionStatus||'',
+  }:null;
+  activityWrite=activityWrite.then(()=>window.tm.recordUiActivity(record)).catch(console.error);
+}
+function logActivity(item){const result=activityModel.addEntry(activityLog,item,Date.now(),activityLimit(window.limitsModel?.KEYS.activityLogEntries),activityAccountsText);activityLog=result.log;recordActivity(activityLog.entries.find(entry=>entry.id===result.id));renderActivity();return result;}
+async function loadActivityHistory(){
+  if(activityHistoryLoading||!window.tm?.readUiActivity)return;
+  activityHistoryLoading=true;
+  const generation=activityHistoryGeneration;
+  try{
+    await activityWrite;
+    const history=await window.tm.readUiActivity(500);
+    if(generation!==activityHistoryGeneration)return;
+    activityHistory=history||[];
+    renderActivityPanel();
+  }catch(error){console.error(error);}
+  finally{activityHistoryLoading=false;}
+}
+function activitySyncText(entry){
+  if(!entry.syncScope||entry.activeSyncIds.length===entry.accountIds.length)return entry.text;
+  const accounts=coreAccounts.filter(account=>entry.activeSyncIds.includes(Number(account.id)));
+  return activityAccountsText(entry.baseText,accounts,entry);
+}
 function activityActionButton(entry,className){
-  if(!entry.hasAction||(entry.actionUntil!=null&&Number(entry.actionUntil)<=Date.now()))return null;
+  if(!entry.hasAction||entry.resolved||(entry.actionUntil!=null&&Number(entry.actionUntil)<=Date.now()))return null;
   const button=document.createElement('button');button.type='button';button.className=className;
   button.textContent=entry.actionState==='pending'?wt('errorActionPending'):entry.actionLabel;
   button.disabled=!activityModel.actionAvailable(entry,Date.now());
@@ -164,8 +210,16 @@ async function runActivityAction(id){
   const entry=activityLog.entries.find(item=>item.id===id);
   if(!entry||!activityModel.actionAvailable(entry,Date.now()))return;
   activityLog=activityModel.beginAction(activityLog,id,wt('errorActionPending'));renderActivity();
-  try{await Promise.all(entry.callbacks.map(callback=>callback()));activityLog=activityModel.finishAction(activityLog,id,{ok:true,text:wt('errorActionSucceeded')},Date.now());}
+  const callbacks=entry.syncScope?entry.activeSyncIds.map(accountId=>errorAction({...entry,accountId})):entry.callbacks;
+  try{
+    const results=await Promise.allSettled(callbacks.map(callback=>Promise.resolve().then(callback)));
+    const failure=results.find(result=>result.status==='rejected');
+    if(failure)throw failure.reason;
+    activityLog=activityModel.finishAction(activityLog,id,{ok:true,text:wt('errorActionSucceeded')},Date.now());
+  }
   catch(error){activityLog=activityModel.finishAction(activityLog,id,{ok:false,item:errorToastItem(error,{connected:true})},Date.now());}
+  const updated=activityLog.entries.find(entry=>entry.id===id);
+  if(updated)recordActivity(updated);
   renderActivity();
 }
 // Перерисовка к ближайшему сроку: истекает окно отмены или наступает время,
@@ -183,10 +237,10 @@ function renderActivityStatus(){
   const progress=window.activityProgress;
   if(progress){line.dataset.level='progress';const text=document.createElement('span');text.className='statusbar-entry-text';text.textContent=progress;line.appendChild(text);return;}
   const entry=activityModel.latestEntry(activityLog);
-  if(!entry){delete line.dataset.level;return;}
+  if(!entry){delete line.dataset.level;line.textContent=wt('activityLogTitle');return;}
   line.dataset.level=entry.level;
   const time=document.createElement('span');time.className='statusbar-entry-time';time.textContent=activityTime(entry.time);
-  const text=document.createElement('span');text.className='statusbar-entry-text';text.textContent=entry.text;
+  const text=document.createElement('span');text.className='statusbar-entry-text';text.textContent=activitySyncText(entry);
   line.append(time,text);
   if(entry.count>1){const count=document.createElement('span');count.className='activity-count';count.textContent=`x${entry.count}`;line.appendChild(count);}
   const button=activityActionButton(entry,'statusbar-entry-action');if(button)line.appendChild(button);
@@ -202,11 +256,18 @@ function renderActivityPanel(){
   const opened=new Set([...list.querySelectorAll('.activity-entry')].filter(row=>row.querySelector('details')?.open).map(row=>row.dataset.activityId));
   const scroll=list.scrollTop;
   list.innerHTML='';
-  if(!activityLog.entries.length){const empty=document.createElement('div');empty.className='activity-empty';empty.textContent=wt('activityLogEmpty');list.appendChild(empty);return;}
-  activityLog.entries.forEach(entry=>{
+  const capacity=activityLimit(window.limitsModel?.KEYS.activityLogEntries);
+  const cutoff=new Date();
+  cutoff.setUTCHours(0,0,0,0);
+  cutoff.setUTCDate(cutoff.getUTCDate()-6);
+  const liveIds=new Set(activityLog.entries.map(entry=>`${activitySession}/${entry.id}`));
+  const entries=[...activityLog.entries,...activityHistory.filter(entry=>!liveIds.has(entry.id))]
+    .filter(entry=>entry.time>=cutoff.getTime()).slice(0,capacity??Infinity);
+  if(!entries.length){const empty=document.createElement('div');empty.className='activity-empty';empty.textContent=wt('activityLogEmpty');list.appendChild(empty);return;}
+  entries.forEach(entry=>{
     const row=document.createElement('div');row.className='activity-entry';row.dataset.level=entry.level;row.dataset.activityId=entry.id;
     const head=document.createElement('div');head.className='activity-entry-head';
-    const time=document.createElement('span');time.className='activity-entry-time';time.textContent=activityTime(entry.time);
+    const time=document.createElement('span');time.className='activity-entry-time';time.textContent=activityTime(entry.time,true);
     const text=document.createElement('span');text.className='activity-entry-text';text.textContent=entry.text;
     head.append(time,text);
     if(entry.count>1){const count=document.createElement('span');count.className='activity-count';count.textContent=`x${entry.count}`;head.appendChild(count);}
@@ -223,7 +284,7 @@ function renderActivity(){
   if(capacity&&activityLog.entries.length>capacity)activityLog={...activityLog,entries:activityLog.entries.slice(0,capacity)};
   renderActivityStatus();renderActivityPanel();scheduleActivityRefresh();
 }
-function setActivityPanel(open){activityPanelOpen=open;if(open)activityLog=activityModel.markSeen(activityLog);document.getElementById('statusbarText')?.setAttribute('aria-expanded',String(open));renderActivity();}
+function setActivityPanel(open){activityPanelOpen=open;if(open){activityLog=activityModel.markSeen(activityLog);void loadActivityHistory();}document.getElementById('statusbarText')?.setAttribute('aria-expanded',String(open));renderActivity();}
 window.renderActivityStatus=renderActivityStatus;
 window.renderActivity=renderActivity;
 window.logActivity=logActivity;
@@ -235,12 +296,20 @@ window.logActivity=logActivity;
   // должен выполнить действие, а не открыть журнал.
   line.addEventListener('keydown',event=>{if(event.target!==line)return;if(event.key==='Enter'||event.key===' '){event.preventDefault();setActivityPanel(!activityPanelOpen);}});
   panel.querySelector('.activity-close')?.addEventListener('click',()=>setActivityPanel(false));
-  panel.querySelector('.activity-clear')?.addEventListener('click',()=>{activityLog=activityModel.clearLog(activityLog);renderActivity();});
+  panel.querySelector('.activity-clear')?.addEventListener('click',()=>{
+    activityHistoryGeneration++;activityHistory=[];
+    activityLog=activityModel.clearLog(activityLog);recordActivity(null);renderActivity();
+  });
   document.addEventListener('keydown',event=>{if(event.key==='Escape'&&activityPanelOpen)setActivityPanel(false);});
-  document.addEventListener('click',event=>{if(activityPanelOpen&&!event.target?.closest?.('#activityPanel,#statusbarText'))setActivityPanel(false);});
+  // При открытии содержимое строки меняется в этом же событии. Его путь
+  // сохраняет прежних родителей, даже если исходный узел уже снят.
+  document.addEventListener('click',event=>{
+    const path=event.composedPath();
+    if(activityPanelOpen&&!path.includes(panel)&&!path.includes(line))setActivityPanel(false);
+  });
   renderActivity();
 })();
-function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {level:'error',kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,locale:presented.locale,translations};}
+function errorToastItem(error,context={}){const account=coreAccounts.find(item=>item.id===Number(error?.account_id));const translations=errorTranslations();const presented=window.errorPresentation.presentError(error,{locale:wizardLocale,translations,connected:context.connected,account});return {level:'error',kind:presented.kind,accountId:presented.accountId,accounts:presented.accounts,baseText:presented.baseText,text:presented.text,details:presented.details,action:presented.action,actionLabel:presented.actionLabel,retryAt:presented.retryAt,hasAction:true,callback:errorAction(presented,context),groupByKind:presented.accountId!=null,syncScope:context.syncScope,locale:presented.locale,translations};}
 function showApiError(error,context={}){return logActivity(errorToastItem(error,context));}
 // Сообщение с действием - это отдельная операция со своим обработчиком: два
 // переноса с одинаковым текстом дают две отмены, а не одну. Поэтому у него
@@ -250,24 +319,78 @@ function showToast(message,actionLabel,action){if(message&&typeof message==='obj
 window.showApiError=showApiError;
 // Одна беда одного ящика - одно сообщение: без этого при каждом проходе
 // счётчик повторов рос до десятков, а нового человеку не сообщалось (issue #77).
-let syncToastMemo={};
-function rememberSyncToast(failure){
-  const decision=window.errorPresentation.nextSyncToastMemo(syncToastMemo,failure);
-  syncToastMemo=decision.memo;
+const syncToastMemo={mail:{},auxiliary:{}};
+const syncOutcomes=new Map();
+function rememberSyncToast(scope,failure){
+  const decision=window.errorPresentation.nextSyncToastMemo(syncToastMemo[scope],failure);
+  syncToastMemo[scope]=decision.memo;
   return decision.show;
 }
-window.handleSyncState=function(state){if(!state)return;
-  if(!state.error_kind&&!state.error&&state.status==='ready')syncToastMemo=window.errorPresentation.nextSyncToastMemo(syncToastMemo,state).memo;
-  settleSyncAction(state);
+function activitySyncScope(scope){return scope==='auxiliary'||scope==='dav'?'auxiliary':'mail';}
+function currentSyncOutcome(state,scope){
+  if(state.account_id==null)return true;
+  const time=state[`${scope}_finished_at`]??Date.parse(state.attempted_at);
+  const finishedAt=Number.isFinite(time)?time:Date.now();
+  const key=`${scope}:${state.account_id}`;
+  if((syncOutcomes.get(key)??-Infinity)>finishedAt)return false;
+  syncOutcomes.set(key,finishedAt);
+  return true;
+}
+function resolveActivitySync(scope,state){
+  if(state.account_id==null)return;
+  rememberSyncToast(scope,{account_id:state.account_id,status:'ready'});
+  const previous=activityLog.entries;
+  activityLog=activityModel.resolveSync(activityLog,state.account_id,scope,
+    L('Синхронизация восстановлена.','Sync recovered.'),
+    ids=>{
+      const labels=coreAccounts.filter(account=>ids.includes(Number(account.id)))
+        .map(account=>account.display_name||account.email).filter(Boolean).join(', ');
+      return labels?L(`Синхронизация восстановлена для ${labels}.`,`Sync recovered for ${labels}.`):'';
+    });
+  activityLog.entries.forEach((entry,index)=>{if(entry!==previous[index])recordActivity(entry);});
+}
+window.handleSyncState=function(state){
+  if(!state)return;
   // Постоянное состояние (needs_reauth/last_sync_error) читается из аккаунта
   // после перезагрузки данных; переходные статусы "syncing"/"retrying" видны
   // раньше - сразу по этому событию, без ожидания truemail-data-changed
   // (mail-sync-visible-state.md, S-006, S-011).
   if(window.mailSyncIndicator?.isMailSyncScope(state.scope)){window.mailSyncTransient=window.mailSyncIndicator.nextMailSyncTransient(window.mailSyncTransient,state);window.refreshAccountSyncIndicator?.(state.account_id);}
   const info=document.getElementById('calSyncInfo');if(info&&['dav','auxiliary'].includes(state.scope)){if(state.status==='syncing')info.textContent=wizardLocale==='en'?'Syncing calendars, tasks and contacts…':'Синхронизация календарей, задач и контактов…';else if(state.status==='error')info.textContent=wizardLocale==='en'?'Calendar, tasks and contacts sync error':'Ошибка синхронизации календаря, задач и контактов';}
-  const warnings=Array.isArray(state.warnings)?state.warnings:[];
-  if(warnings.length){warnings.forEach(warning=>{if(typeof warning==='string'){showToast(warning);return;}const failure={...warning,account_id:state.account_id,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure)&&rememberSyncToast(failure))showApiError(failure,{connected:true});});return;}
-  if(state.error_kind||['error','retrying'].includes(state.status)){const failure={kind:state.error_kind,message:state.error_message||state.error,account_id:state.account_id,retry_at:state.retry_at,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at,retries_exhausted:state.retries_exhausted};if(window.errorPresentation.shouldShowSyncToast(failure)&&rememberSyncToast(failure))showApiError(failure,{connected:true});}};
+  if(state.status==='syncing')return;
+  const scope=activitySyncScope(state.scope);
+  const warnings=[];
+  for(const warning of Array.isArray(state.warnings)?state.warnings:[]){
+    if(typeof warning==='string'){showToast(warning);continue;}
+    if(warning)warnings.push({...warning,sync_scope:warning.sync_scope||scope});
+  }
+  const failures=[...warnings];
+  if(state.error_kind||['error','retrying'].includes(state.status)){
+    failures.push({kind:state.error_kind,message:state.error_message||state.error,sync_scope:scope,
+      retry_at:state.retry_at,server:state.server,response_code:state.response_code,attempted_at:state.attempted_at});
+  }
+  const completed=state.status==='ready'&&!state.error_kind&&!state.error
+    ? state.scope==='all'
+      ? [state.mail_synced?'mail':null,state.auxiliary_synced?'auxiliary':null].filter(Boolean)
+      : [scope]
+    : [];
+  for(const completedScope of completed){
+    if(!currentSyncOutcome(state,completedScope))continue;
+    settleSyncAction(state,completedScope);
+    resolveActivitySync(completedScope,state);
+  }
+  for(const failure of failures){
+    failure.account_id=state.account_id;
+    failure.retries_exhausted=state.retries_exhausted;
+    const failedScope=activitySyncScope(failure.sync_scope);
+    if(!currentSyncOutcome(state,failedScope))continue;
+    if(state.status!=='retrying'&&!completed.includes(failedScope))settleSyncAction(state,failedScope,failure);
+    if(window.errorPresentation.shouldShowSyncToast(failure)&&rememberSyncToast(failedScope,failure)){
+      showApiError(failure,{connected:true,syncScope:state.account_id==null?undefined:failedScope});
+    }
+  }
+  if(completed.length)renderActivity();
+};
 async function performMessageActionForIds(action,ids){if(!ids.length){showToast(L('Сначала выберите письмо','Select a message first'));return;}
   ids=window.expandConversationIds?window.expandConversationIds(ids):ids;
   if(action==='trash'&&ids.length>10&&!await confirmAction(L(`Удалить ${ids.length} писем?`,`Delete ${ids.length} messages?`)))return;
@@ -729,7 +852,15 @@ async function restoreUndoWindows(){
   });
   if(state.expired>0)showToast(window.outboxModel.expiredWindowsText(state.expired,lang));
   if(state.uncertain>0){
-    showToast(L(`Писем с неизвестным итогом передачи: ${state.uncertain}`,`Messages with an unknown outcome: ${state.uncertain}`));
+    showToast(L(`Итог отправки неизвестен для ${state.uncertain} писем. Перед повтором проверьте папку "Отправленные".`,
+      `Sending outcome unknown for ${state.uncertain} messages. Check Sent before retrying.`),
+    L('Открыть исходящие','Open Outbox'),()=>{
+      const accounts=document.getElementById('outboxAccount');
+      if(accounts)accounts.value='';
+      setActivityPanel(false);
+      showView('settingsView');setSection('outbox');
+      return window.reloadQueueSections?.();
+    });
   }
 }
 /* Список очереди, прочитанный разделом "Исходящие": карточка окна отмены берёт

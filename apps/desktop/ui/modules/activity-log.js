@@ -1,7 +1,7 @@
 // truemail UI module: activity-log.js
 // Журнал событий строки статуса: уведомления, ошибки и действия программы.
-// Всплывающих карточек больше нет - последняя запись всегда видна в нижней
-// строке окна, остальные открываются по щелчку на ней (issue #120).
+// В нижней строке окна видна последняя актуальная запись. История открывается
+// по щелчку на строке (issue #120).
 // Здесь только чистые функции над состоянием журнала; отрисовка - в composer.js.
 // Размер журнала задаёт предел limit_activity_log_entries, своего числа тут нет.
 // См. specs/status-activity-log.md.
@@ -27,6 +27,7 @@
       item.text || '',
       item.action || '',
       item.key ?? null,
+      item.syncScope ?? null,
     ]);
   }
 
@@ -64,7 +65,8 @@
     const unseenError = Boolean(log?.unseenError) || item.level === 'error';
     let sequence = log?.sequence || 0;
     const grouped = item.groupByKind && item.accountId != null
-      ? entries.find(entry => entry.groupByKind && entry.kind === item.kind)
+      ? entries.find(entry => entry.groupByKind && entry.kind === item.kind &&
+          entry.syncScope === item.syncScope && !entry.resolved)
       : null;
     if (grouped) {
       const accounts = [...(grouped.accounts || [])];
@@ -74,6 +76,9 @@
         ...grouped,
         accounts,
         accountIds: included ? grouped.accountIds : [...grouped.accountIds, item.accountId],
+        activeSyncIds: item.syncScope
+          ? [...new Set([...grouped.activeSyncIds, Number(item.accountId)])]
+          : undefined,
         // После завершённого действия прежние обработчики своё отработали:
         // новое событие приносит свой. Иначе - обработчик нового ящика
         // дописывается, а повтор уже учтённого ящика второй не заводит (G3).
@@ -92,11 +97,14 @@
         time: now,
       };
       Object.assign(merged, repeatAction(grouped, item, merged.callbacks));
+      if (item.syncScope && merged.activeSyncIds.length < merged.accountIds.length) {
+        merged.actionStatus = grouped.actionStatus;
+      }
       const rest = entries.filter(entry => entry.id !== grouped.id);
       return {log: {entries: trim([merged, ...rest], capacity), sequence, unseenError}, id: merged.id, merged: true};
     }
     const print = fingerprint(item);
-    const repeated = entries.find(entry => entry.fingerprint === print);
+    const repeated = entries.find(entry => entry.fingerprint === print && !entry.resolved);
     if (repeated) {
       const merged = {
         ...repeated,
@@ -117,6 +125,7 @@
       count: 1,
       time: now,
       accountIds: item.accountId == null ? [] : [item.accountId],
+      activeSyncIds: item.syncScope ? [Number(item.accountId)] : undefined,
       callbacks: (item.callbacks || [item.callback]).filter(Boolean),
       actionUntil: item.actionUntil ?? null,
       actionState: '',
@@ -139,7 +148,7 @@
   // Действие доступно, пока оно есть у записи и не вышел его срок. Истёкшая
   // отмена остаётся в журнале просто строкой истории.
   function actionAvailable(entry, now) {
-    if (!entry?.hasAction || !(entry.callbacks || []).length) return false;
+    if (!entry?.hasAction || entry.resolved || !(entry.callbacks || []).length) return false;
     if (entry.actionUntil != null && Number(entry.actionUntil) <= now) return false;
     if (entry.action === 'wait') {
       const until = entry.retryAt ? Date.parse(entry.retryAt) : 0;
@@ -162,6 +171,9 @@
           actionState: 'success', actionStatus: outcome.text, time: now};
       }
       const item = outcome.item || {};
+      if (entry.syncScope) {
+        return entry.resolved ? entry : {...entry, actionState: 'failed', actionStatus: item.text || ''};
+      }
       // Ключ предмета и сроки относились к прежнему действию: у новой причины
       // свои, иначе она не склеилась бы со своим повтором и получила бы чужое
       // истёкшее окно отмены.
@@ -187,8 +199,22 @@
     return {...createLog(), sequence: log?.sequence || 0};
   }
 
+  function resolveSync(log, accountId, scope, text, partialText) {
+    const entries = log.entries.map(entry => {
+      if (entry.syncScope !== scope || !entry.activeSyncIds?.includes(Number(accountId))) return entry;
+      const activeSyncIds = entry.activeSyncIds.filter(id => id !== Number(accountId));
+      return activeSyncIds.length ? {...entry, activeSyncIds,
+        actionStatus: partialText(entry.accountIds.map(Number).filter(id => !activeSyncIds.includes(id))),
+      } : {
+        ...entry, activeSyncIds, resolved: true, hasAction: false,
+        actionState: 'success', actionStatus: text,
+      };
+    });
+    return {...log, entries, unseenError: log.unseenError && entries.some(entry => entry.level === 'error' && !entry.resolved)};
+  }
+
   function latestEntry(log) {
-    return log?.entries?.[0] || null;
+    return log?.entries?.find(entry => !entry.resolved) || null;
   }
 
   return {
@@ -201,6 +227,7 @@
     finishAction,
     markSeen,
     clearLog,
+    resolveSync,
     latestEntry,
   };
 });

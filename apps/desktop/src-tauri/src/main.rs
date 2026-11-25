@@ -1,6 +1,7 @@
 //! truemail — десктоп-приложение (Tauri v2). Тонкий клиент над ядром.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod commands;
 mod diagnostics;
 
@@ -208,20 +209,27 @@ fn run() -> anyhow::Result<()> {
     use tracing_subscriber::fmt::writer::MakeWriterExt;
     let log_dir = data_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
+    activity::prune_logs(&log_dir, chrono::Utc::now().date_naive());
     // Ротация суточная, но без ограничения файлы копились бесконечно (у
     // пользователя за 6 дней набежало 4+ МБ). Храним последнюю неделю.
     let file_appender = Builder::new()
         .rotation(Rotation::DAILY)
         .filename_prefix("truemail.log")
-        .max_log_files(7)
+        .max_log_files(activity::LOG_DAYS as usize)
         .build(&log_dir);
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            tracing_subscriber::EnvFilter::new("info,truemail_core=debug")
-        } else {
-            tracing_subscriber::EnvFilter::new("info")
-        }
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| {
+            if cfg!(debug_assertions) {
+                tracing_subscriber::EnvFilter::new("info,truemail_core=debug")
+            } else {
+                tracing_subscriber::EnvFilter::new("info")
+            }
+        })
+        .add_directive(
+            "truemail::activity=info"
+                .parse()
+                .expect("фиксированный фильтр журнала"),
+        );
     match file_appender {
         Ok(file_appender) => {
             tracing_subscriber::fmt()
@@ -252,6 +260,7 @@ fn run() -> anyhow::Result<()> {
     // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
     // работающей программой.
     let state = AppState {
+        log_dir,
         core: tokio::sync::RwLock::new(None),
         notify_anchor: Arc::new(std::sync::Mutex::new(
             commands::NotifyAnchor::platform_default(),
@@ -538,6 +547,8 @@ fn run() -> anyhow::Result<()> {
             commands::label_message_counts,
             commands::fetch_older_messages,
             commands::ui_log,
+            activity::record_ui_activity,
+            activity::read_ui_activity,
             commands::get_message,
             commands::message_raw,
             commands::export_message_eml,

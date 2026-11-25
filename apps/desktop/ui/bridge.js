@@ -59,6 +59,8 @@ window.corePageSize = null;
     // называет ядро, а не запасное число моста.
     fetchOlderMessages: (folderId, before, limit = null) => invoke("fetch_older_messages", { folderId, before, limit }),
     uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
+    recordUiActivity: (record) => invoke("record_ui_activity", { record }),
+    readUiActivity: (limit) => invoke("read_ui_activity", { limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
     exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),
