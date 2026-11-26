@@ -220,6 +220,8 @@ pub struct StartupSendState {
     pub expired: i64,
     pub pending: Vec<SendQueued>,
     pub uncertain: i64,
+    #[serde(default)]
+    pub draft_cleanup_warnings: i64,
 }
 
 #[cfg(test)]

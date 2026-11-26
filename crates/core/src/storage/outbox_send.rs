@@ -810,9 +810,16 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
+        let draft_cleanup_warnings = sqlx::query_scalar(
+            "SELECT count(*) FROM draft_submissions d JOIN outbox_ops o ON o.id=d.operation_id
+             WHERE d.cleanup_failed=1 AND o.status<>'cancelled'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(StartupSendState {
             expired,
             uncertain,
+            draft_cleanup_warnings,
             pending: rows
                 .into_iter()
                 .map(

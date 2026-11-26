@@ -866,7 +866,7 @@ async function restoreUndoWindows(){
   if(!window.tm?.startupSendState)return;
   const state=await window.tm.startupSendState();
   const lang=composerLang();
-  if((state.pending||[]).some(queued=>queued.draft_cleanup_failed))showDraftCleanupWarning();
+  if(state.draft_cleanup_warnings>0)showDraftCleanupWarning();
   (state.pending||[]).forEach(queued=>{
     // Тема и адресаты ожидающего письма в список не передаются: карточка
     // показывает то, что уже известно очереди.
@@ -1071,8 +1071,12 @@ async function readDraftLetterParts(full){
   }
   return {request,problem:null};
 }
+const draftSendKeys=new Map();
 async function queueLetter(request,draftId=null){
-  const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`,draftId);
+  const key=draftSendKeys.get(draftId)||`send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if(draftId!==null)draftSendKeys.set(draftId,key);
+  const queued=await window.tm.sendMessage(request,key,draftId);
+  draftSendKeys.delete(draftId);
   showUndoSendCard(queued,request);
   return queued;
 }
@@ -1142,14 +1146,18 @@ async function discardSentDraft(messageId){
 // stayed in its folder must not be sent a second time.
 const sentDrafts=new Set();
 window.sentDrafts=sentDrafts;
-window.draftSubmissionGeneration=0;
+const draftSubmissionRevisions=new Map();
+window.draftSubmissionRevisions=draftSubmissionRevisions;
+function markDraftSubmitted(messageId){
+  draftSubmissionRevisions.set(messageId,(draftSubmissionRevisions.get(messageId)||0)+1);
+  sentDrafts.add(messageId);
+}
 function showDraftCleanupWarning(){
   showToast(L('Не удалось запланировать перенос исходного черновика в корзину. После отправки его можно удалить вручную.',
     'The original draft could not be scheduled for Trash. You can remove it manually after sending.'));
 }
 function draftQueued(messageId,recorded=false,cleanupFailed=false){
-  window.draftSubmissionGeneration++;
-  sentDrafts.add(messageId);
+  markDraftSubmitted(messageId);
   forgetSentDraft(messageId);
   if(!recorded)discardSentDraft(messageId);
   else if(cleanupFailed)showDraftCleanupWarning();
@@ -1234,7 +1242,7 @@ window.restoreDraftLink=messageId=>{
     }catch(error){link=null;}
     if(window.tm?.draftAlreadySubmitted&&(await Promise.resolve(window.tm.draftAlreadySubmitted(messageId)).catch(()=>false))===true){
       if(generation===composerGeneration){
-        draftBeingSent=messageId;sentDrafts.add(messageId);
+        draftBeingSent=messageId;markDraftSubmitted(messageId);
         showSubmittedEditorNotice();
       }
       return;
