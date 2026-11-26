@@ -414,6 +414,22 @@ async fn manual_trash_preserves_an_assigned_role_on_an_inbox_child() {
 }
 
 #[tokio::test]
+async fn an_explicitly_unassigned_trash_role_is_not_inferred_again() {
+    let db = open_test_db("repo-explicitly-unassigned-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let message = seed_message(&db, account, inbox, 1, "Report").await;
+    db.set_folder_role(account, "trash", None).await.unwrap();
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(db.folder(trash).await.unwrap().role, None);
+}
+
+#[tokio::test]
 async fn manual_trash_skips_when_a_matching_root_has_another_role() {
     let db = open_test_db("repo-infer-ambiguous-folder-role").await;
     let account = seed_account(&db, "repo@example.test").await;

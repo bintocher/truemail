@@ -9576,13 +9576,17 @@ pub(crate) async fn infer_missing_folder_role(
     account_id: i64,
     role: &str,
 ) -> Result<()> {
-    let known: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role=? LIMIT 1")
-            .bind(account_id)
-            .bind(role)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if known.is_some() {
+    let known: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND role=?) OR
+                EXISTS(SELECT 1 FROM folder_role_overrides WHERE account_id=? AND role=?)",
+    )
+    .bind(account_id)
+    .bind(role)
+    .bind(account_id)
+    .bind(role)
+    .fetch_one(&mut **tx)
+    .await?;
+    if known {
         return Ok(());
     }
     let expected = FolderRole::parse(role);
@@ -9617,17 +9621,17 @@ pub(crate) async fn resolve_role_folder(
     account_id: i64,
     role: &str,
 ) -> Result<Option<(i64, String)>> {
-    let assigned = sqlx::query_as(
+    let assigned: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
         "SELECT f.id,f.remote_path FROM folder_role_overrides o
-         JOIN folders f ON f.id=o.folder_id AND f.account_id=o.account_id
+         LEFT JOIN folders f ON f.id=o.folder_id AND f.account_id=o.account_id
          WHERE o.account_id=? AND o.role=?",
     )
     .bind(account_id)
     .bind(role)
     .fetch_optional(&mut **tx)
     .await?;
-    if assigned.is_some() {
-        return Ok(assigned);
+    if let Some((id, path)) = assigned {
+        return Ok(id.zip(path));
     }
     let folders: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=? AND role=?")
