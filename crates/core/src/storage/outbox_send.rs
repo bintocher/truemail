@@ -316,8 +316,8 @@ impl Db {
         account_id: i64,
         request_key: &str,
     ) -> Result<Option<SendQueued>> {
-        let row: Option<(i64, Option<String>, Option<String>, bool, bool)> = sqlx::query_as(
-            "SELECT k.operation_id, k.cancel_until, o.status,
+        let row: Option<(i64, String, String, bool, bool)> = sqlx::query_as(
+            "SELECT k.operation_id, coalesce(k.cancel_until,''), coalesce(o.status,'pending'),
                     k.draft_recorded, k.draft_cleanup_failed
                FROM send_request_keys k
                LEFT JOIN outbox_ops o ON o.id=k.operation_id AND o.account_id=k.account_id
@@ -333,8 +333,8 @@ impl Db {
                 SendQueued {
                     operation_id,
                     account_id,
-                    status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
-                    cancel_until: cancel_until.unwrap_or_default(),
+                    status,
+                    cancel_until,
                     undo_seconds: 0,
                     duplicate: true,
                     draft_recorded,
