@@ -76,7 +76,14 @@ function showView(id){ document.querySelectorAll('.view').forEach(v=>v.classList
   if(id==='composeView'){const m=document.getElementById('compEdit');if(m){m.focus();}} }
 document.getElementById('toSettings').onclick=()=>{showView('settingsView');};
 document.getElementById('backToMail').onclick=()=>showView('mailView');
-document.getElementById('composeBtn').onclick=async()=>{resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');await applyComposerSignature('new');};
+document.getElementById('composeBtn').onclick=async()=>{
+  if(composerHasContent()&&!letterHandedOver(composerGeneration)){
+    showView('composeView');
+    showToast(L('В редакторе уже есть письмо. Чтобы начать новое, отправьте или удалите текущее.','A letter is already open. Send or delete it before starting another.'));
+    return;
+  }
+  resetComposer();document.getElementById('compTitle').textContent=L('Новое письмо','New message');showView('composeView');await applyComposerSignature('new');
+};
 document.getElementById('compClose').onclick=()=>showView('mailView');
 
 /* settings section switching */
@@ -552,6 +559,7 @@ document.querySelectorAll('.thead [data-act]').forEach(b=>b.onclick=async()=>{
   window.restoreActiveToShown?.();
   if(['reply','replyall','forward'].includes(b.dataset.act))openComposerForMessage(b.dataset.act);
   else if(b.dataset.act==='send-draft')sendDraftMessage(window.paneLetter?.());
+  else if(b.dataset.act==='edit-draft')editDraftMessage(window.paneLetter?.());
   else if(['archive','trash'].includes(b.dataset.act))performMessageAction(b.dataset.act);
   /* Шапка письма ведёт флажок тем же путём, что строка списка и контекстное
      меню: второй путь спрашивал бы про сроки по-своему (S-005, S-006). */

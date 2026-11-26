@@ -256,15 +256,19 @@ function applyToolbar(){const state=toolbarState(),bar=document.querySelector('.
   const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders),actions=draftMessageModel.actionsForMessage(letter,coreFolders,state.actions);
   toolbarShowsDraft=draft;
   // The draft whose letter is already on its way has nothing left to send.
-  document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
+  updateDraftToolbar(letter,draft);
   document.querySelectorAll('#threadMoreMenu [data-thread-action]').forEach(item=>item.classList.toggle('hidden',draft&&!draftMessageModel.DRAFT_ACTIONS.has(item.dataset.threadAction)));bar.classList.toggle('toolbar-right',state.align==='right');bar.querySelectorAll('[data-toolbar-generated]').forEach(el=>el.remove());const anchor=bar.querySelector('.sp');actions.filter(action=>action.visible).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.className=`${action.key==='reply'?'btn primary':'btn'}${action.labels==='icons'?' toolbar-action-icons':''}`;button.dataset.toolbarGenerated='1';button.dataset.act=action.key;button.title=tbLabel(meta);button.innerHTML=`<i data-i="${escapeHtml(meta.i||action.key)}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;renderIcons(button);bar.insertBefore(button,anchor);});bar.querySelectorAll(':scope > button:not([data-toolbar-generated]):not([data-toolbar-persistent])').forEach(button=>button.classList.add('toolbar-original-hidden'));
   // The sending button follows the letter that is shown: one draft may be on
   // its way already while the next one still has to be sent. The pane itself
   // is rebuilt only when the letter changed between a draft and the rest.
 function refreshToolbarForMessage(){
   const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders);
-  document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
+  updateDraftToolbar(letter,draft);
   if(toolbarShowsDraft!==draft)applyToolbar();
+}
+function updateDraftToolbar(letter,draft){
+  const hidden=!draft||window.sentDrafts?.has(letter.id)===true;
+  for(const id of ['threadSendDraft','threadEditDraft'])document.getElementById(id)?.classList.toggle('hidden',hidden);
 }
 window.refreshToolbarForMessage=refreshToolbarForMessage;
   const menuDyn=document.getElementById('threadMenuDynamic');
@@ -307,16 +311,18 @@ window.executeQuickStepSlot=slot=>quickStepsModel.handleSlotPress(`quick_step_${
 // fromList: the action comes from the context menu of the list and belongs to
 // the letter that menu was opened for. targets: the letters it belongs to when
 // that letter is outside the selection of the list.
-async function executeToolbarAction(action,fromList=false,targets=null){
+async function executeToolbarAction(action,fromList=false,targets=null,menuLetter=null){
   if(!fromList)window.restoreActiveToShown?.();
-  if(action==='send-draft'){await sendDraftMessage(activeMessage);return;}
+  if(action==='send-draft'){await sendDraftMessage(menuLetter||activeMessage);return;}
+  if(action==='edit-draft'){await editDraftMessage(menuLetter||activeMessage);return;}
   // Printing and unsubscribing work on the letter shown in the reading pane:
   // the letter of the list menu is shown first.
-  if(targets&&['print','unsub'].includes(action)&&window.paneLetter?.()?.id!==activeMessage?.id){
-    const letter=activeMessage;
-    await showMessage(letter);
+  if(fromList&&['print','unsub'].includes(action)){
+    const letter=menuLetter;
+    if(!letter)return;
+    if(window.paneLetter?.()?.id!==letter.id||activeFullMessage?.meta?.id!==letter.id)await showMessage(letter);
     // Another letter was opened meanwhile, or the letter could not be read.
-    if(window.paneLetter?.()?.id!==letter?.id||activeMessage!==letter)return;
+    if(window.paneLetter?.()?.id!==letter.id)return;
     if(action==='unsub'&&activeFullMessage?.meta?.id!==letter.id)return;
   }
   const toolbarStepId=quickStepsModel.toolbarStepId(action);if(toolbarStepId!==null){await executeQuickStep(toolbarStepId,targets);return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog(targets);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;

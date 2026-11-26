@@ -1082,7 +1082,7 @@ function finishDraftInEditor(message,request,problem,textMissing=false){
   // The same draft left in the editor is not another letter.
   if(composerHasContent()&&draftBeingSent===message.id){showView('composeView');return;}
   if(composerHasContent()){
-    showToast(L('В редакторе есть другое неотправленное письмо. Отправьте или удалите его, затем отправьте черновик.','The editor holds another unsent letter. Send or delete it, then send the draft.'));
+    showToast(L('В редакторе есть другое неотправленное письмо. Отправьте или удалите его, чтобы открыть черновик.','The editor holds another unsent letter. Send or delete it before opening the draft.'));
     showView('composeView');return;
   }
   applyDraftToComposer(request,textMissing);
@@ -1130,6 +1130,22 @@ function draftQueued(messageId){
 }
 // Drafts that are being read for sending right now.
 const draftsInFlight=new Set();
+async function editDraftMessage(message){
+  if(!draftMessageModel.isDraftMessage(message,coreFolders)||sentDrafts.has(message.id)||draftsInFlight.has(message.id))return;
+  if(composerHasContent()){showView('composeView');if(draftBeingSent!==message.id)showToast(L('Сначала закончите письмо, открытое в редакторе','Finish the letter already open in the editor first'));return;}
+  const generation=composerGeneration;
+  draftsInFlight.add(message.id);
+  try{
+    const full=await window.tm.getMessage(message.id);
+    if(!draftMessageModel.isDraftMessage(full?.meta,coreFolders))return;
+    if(full.body_fetched===false){showToast(L('Тело черновика ещё не загружено. Проверьте связь и повторите','The draft is not downloaded yet. Check the connection and try again'));return;}
+    const letter=await readDraftLetter(full);
+    if(generation!==composerGeneration||sentDrafts.has(message.id))return;
+    if(letter.problem){showToast(letter.problem);return;}
+    finishDraftInEditor(message,letter.request,null,letter.textMissing);
+  }catch(error){showToast(error);}
+  finally{draftsInFlight.delete(message.id);}
+}
 async function sendDraftMessage(message=activeMessage){
   if(!draftMessageModel.isDraftMessage(message,coreFolders))return;
   if(sentDrafts.has(message.id)){
@@ -1141,6 +1157,7 @@ async function sendDraftMessage(message=activeMessage){
     showToast(L('Письмо из этого черновика уже передаётся в очередь','The letter from this draft is already going to the queue'));
     return;
   }
+  if(draftBeingSent===message.id&&composerHasContent()){showView('composeView');return;}
   // One sending of a draft at a time: a second click must not queue the letter twice.
   if(draftsInFlight.has(message.id))return;
   draftsInFlight.add(message.id);

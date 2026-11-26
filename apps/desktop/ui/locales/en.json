@@ -113,6 +113,7 @@
   "actionReply": "Reply",
   "actionReplyAll": "Reply all",
   "actionSendDraft": "Send",
+  "actionEditDraft": "Edit draft",
   "actMoveToFolder": "Move to folder",
   "actToSpam": "Spam",
   "addAccount": "Add account",
