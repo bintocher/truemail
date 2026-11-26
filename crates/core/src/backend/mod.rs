@@ -4,6 +4,7 @@ mod ews;
 mod gmail_api;
 mod imap;
 mod jmap;
+mod mail_image;
 mod smtp;
 
 pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
@@ -16,6 +17,7 @@ pub use imap::{
     wait_for_gmail_change, wait_for_password_change, wait_for_yandex_change,
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
+pub use mail_image::fetch_remote_mail_image;
 pub use smtp::{
     OutgoingAttachment, OutgoingMessage, is_inline_image_type, replace_img_sources, send_gmail,
     send_password, send_yandex, validate_outgoing,

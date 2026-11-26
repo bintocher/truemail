@@ -140,6 +140,10 @@ pub struct SendQueued {
     /// Повторное нажатие с тем же ключом запроса второй отправки не создаёт
     /// (S-053).
     pub duplicate: bool,
+    #[serde(default)]
+    pub draft_recorded: bool,
+    #[serde(default)]
+    pub draft_cleanup_failed: bool,
 }
 
 /// Строка раздела "Исходящие". Тело и вложения сюда не попадают: интерфейсу
@@ -153,6 +157,8 @@ pub struct OutboxSendEntry {
     /// (S-029).
     pub account_enabled: bool,
     pub origin: String,
+    #[serde(default)]
+    pub op_kind: String,
     pub status: String,
     pub subject: String,
     pub to: Vec<String>,
@@ -214,6 +220,8 @@ pub struct StartupSendState {
     pub expired: i64,
     pub pending: Vec<SendQueued>,
     pub uncertain: i64,
+    #[serde(default)]
+    pub draft_cleanup_warnings: i64,
 }
 
 #[cfg(test)]

@@ -2086,6 +2086,24 @@ pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>
 }
 
 #[tauri::command]
+pub async fn configure_account_dav(
+    state: State<'_, AppState>,
+    account_id: i64,
+    caldav: Option<String>,
+    carddav: Option<String>,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let account = account_by_id(&core, account_id).await?;
+    if !is_dav_capable(&account) {
+        return Err(api_error("Этот ящик не использует CalDAV и CardDAV"));
+    }
+    Ok(core
+        .accounts
+        .configure_dav_urls(account_id, caldav.as_deref(), carddav.as_deref())
+        .await?)
+}
+
+#[tauri::command]
 pub async fn rename_account(
     state: State<'_, AppState>,
     account_id: i64,
@@ -3578,6 +3596,195 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
     Ok(())
 }
 
+enum AuxiliaryCreation {
+    Save { key: Option<String> },
+    Saved,
+}
+
+async fn claim_auxiliary_creation(
+    core: &Core,
+    account_id: i64,
+    kind: &str,
+    key: Option<&str>,
+    signature: &str,
+    retry_uncertain: bool,
+) -> CmdResult<AuxiliaryCreation> {
+    let Some(key) = key else {
+        return Ok(AuxiliaryCreation::Save { key: None });
+    };
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(api_error("Неверный номер запроса на создание"));
+    }
+    let mut tx = core.db.begin_write().await?;
+    let similar_pending: Option<(String, bool)> = sqlx::query_as(
+        "SELECT request_key, uncertain=1 OR created_at<=datetime('now','-10 minutes')
+         FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_signature=?
+           AND saved=0 ORDER BY created_at LIMIT 1",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(signature)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    if let Some((pending_key, can_retry)) = similar_pending {
+        if !can_retry {
+            return Err(api_error(
+                "Запись ещё сохраняется. Проверьте список и повторите позже",
+            ));
+        }
+        if !retry_uncertain {
+            return Err(ApiError::from_parts(
+                "Сервер не подтвердил сохранение. Проверьте, появилась ли запись",
+                "auxiliary_create_uncertain",
+                Some(account_id),
+                None,
+            ));
+        }
+        sqlx::query(
+            "UPDATE auxiliary_create_requests SET uncertain=0, created_at=datetime('now')
+                     WHERE kind=? AND request_key=?",
+        )
+        .bind(kind)
+        .bind(&pending_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(truemail_core::Error::from)?;
+        tx.commit().await.map_err(truemail_core::Error::from)?;
+        return Ok(AuxiliaryCreation::Save {
+            key: Some(pending_key),
+        });
+    }
+    if retry_uncertain {
+        return Err(api_error(
+            "Состояние предыдущего сохранения изменилось. Обновите список",
+        ));
+    }
+    let insert = sqlx::query(
+        "INSERT OR IGNORE INTO auxiliary_create_requests(account_id,kind,request_key,request_signature)
+            VALUES(?,?,?,?)",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(key)
+    .bind(signature)
+    .execute(&mut *tx)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    let owned = insert.rows_affected() == 1;
+    let (owner,data):(i64,String)=sqlx::query_as("SELECT account_id,request_signature FROM auxiliary_create_requests WHERE kind=? AND request_key=?")
+        .bind(kind).bind(key).fetch_one(&mut *tx).await.map_err(truemail_core::Error::from)?;
+    tx.commit().await.map_err(truemail_core::Error::from)?;
+    if owner != account_id || data != signature {
+        return Err(api_error(
+            "Предыдущая попытка сохраняла другой вариант. Проверьте её результат в списке записей",
+        ));
+    }
+    Ok(if owned {
+        AuxiliaryCreation::Save {
+            key: Some(key.to_owned()),
+        }
+    } else {
+        AuxiliaryCreation::Saved
+    })
+}
+
+async fn record_auxiliary_creation(
+    core: &Core,
+    account_id: i64,
+    kind: &str,
+    key: Option<&str>,
+    result: truemail_core::Result<()>,
+) -> CmdResult<()> {
+    if let Some(key) = key {
+        let statement = match &result {
+            Ok(()) => {
+                "UPDATE auxiliary_create_requests SET saved=1 WHERE account_id=? AND kind=? AND request_key=?"
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    truemail_core::ErrorKind::AccountConfig
+                        | truemail_core::ErrorKind::InvalidCredentials
+                        | truemail_core::ErrorKind::NeedsReauth
+                        | truemail_core::ErrorKind::Forbidden
+                ) || matches!(
+                    error.response_code(),
+                    Some(400 | 401 | 403 | 404 | 409 | 412 | 422)
+                ) =>
+            {
+                "DELETE FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?"
+            }
+            _ => {
+                "UPDATE auxiliary_create_requests SET uncertain=1 WHERE account_id=? AND kind=? AND request_key=?"
+            }
+        };
+        if let Err(error) = sqlx::query(statement)
+            .bind(account_id)
+            .bind(kind)
+            .bind(key)
+            .execute(&core.db.write_pool)
+            .await
+        {
+            tracing::warn!(%error,"результат создания календарной записи или контакта не записан");
+        }
+    }
+    Ok(result?)
+}
+
+fn refresh_auxiliary_after_write(
+    app: AppHandle,
+    state: &AppState,
+    core: Arc<Core>,
+    account: Account,
+    confirmed: bool,
+) {
+    let active = state.syncing_aux.clone();
+    let generation = state.generation.clone();
+    let original = generation.load(std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            loop {
+                {
+                    let mut accounts = active.lock().await;
+                    if generation.load(std::sync::atomic::Ordering::SeqCst) != original {
+                        return false;
+                    }
+                    if accounts.insert(account.id) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        })
+        .await;
+        if !matches!(acquired, Ok(true)) {
+            if confirmed {
+                let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+            }
+            return;
+        }
+        let result = refresh_auxiliary(&core, &account).await;
+        active.lock().await.remove(&account.id);
+        match result {
+            Ok(()) => {
+                let _ = app.emit("truemail-data-changed", account.id);
+            }
+            Err(error) => {
+                tracing::warn!(account_id=account.id, message=%error.safe_message(),"запись сохранена, обновить список не удалось");
+                if confirmed {
+                    let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+                }
+            }
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn create_event(
     app: AppHandle,
@@ -3585,6 +3792,8 @@ pub async fn create_event(
     account_id: i64,
     calendar_id: i64,
     input: EventInput,
+    request_key: Option<String>,
+    retry_uncertain: Option<bool>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
@@ -3601,21 +3810,37 @@ pub async fn create_event(
     }
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    core.accounts
+    let signature =
+        serde_json::to_string(&(calendar_id, &input)).map_err(truemail_core::Error::from)?;
+    let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
+        &core,
+        account_id,
+        "event",
+        request_key.as_deref(),
+        &signature,
+        retry_uncertain.unwrap_or_default(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let result = core
+        .accounts
         .write_event(
             &account,
             &calendar.1,
             RemoteObject {
-                uid: None,
+                uid: key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
             &input,
         )
-        .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account_id);
-    Ok(())
+        .await;
+    let recorded =
+        record_auxiliary_creation(&core, account_id, "event", key.as_deref(), result).await;
+    refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
+    recorded
 }
 
 #[tauri::command]
@@ -3649,8 +3874,7 @@ pub async fn update_event(
             &input,
         )
         .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account.id);
+    refresh_auxiliary_after_write(app, &state, core, account, true);
     Ok(())
 }
 
@@ -3661,8 +3885,8 @@ pub async fn delete_event(
     event_id: i64,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
-    let row: (i64, String, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT c.account_id, c.url, e.remote_url, e.etag
+    let row: (i64, String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT c.account_id, c.url, e.remote_url, e.etag,e.recurrence_id
          FROM events e JOIN calendars c ON c.id=e.calendar_id WHERE e.id=?",
     )
     .bind(event_id)
@@ -3670,6 +3894,11 @@ pub async fn delete_event(
     .await
     .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
+    if row.4.is_some() && !matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+        return Err(api_error(
+            "Отдельная встреча находится в общей записи серии. Управляйте исключениями из формы серии",
+        ));
+    }
     let remote_url = row.2.as_deref().ok_or_else(|| ApiError {
         message: "У события нет серверного идентификатора".into(),
     })?;
@@ -3745,11 +3974,31 @@ pub async fn create_contact(
     state: State<'_, AppState>,
     account_id: i64,
     input: ContactInput,
+    request_key: Option<String>,
+    retry_uncertain: Option<bool>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
+    let signature = serde_json::to_string(&input).map_err(truemail_core::Error::from)?;
     if !(account.provider == Provider::Gmail || is_dav_capable(&account)) {
-        core.db.save_local_contact(account_id, None, &input).await?;
+        let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
+            &core,
+            account_id,
+            "contact",
+            request_key.as_deref(),
+            &signature,
+            retry_uncertain.unwrap_or_default(),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let saved = core
+            .db
+            .save_local_contact(account_id, None, &input)
+            .await
+            .map(|_| ());
+        record_auxiliary_creation(&core, account_id, "contact", key.as_deref(), saved).await?;
         let _ = app.emit("truemail-data-changed", account_id);
         return Ok(());
     }
@@ -3779,21 +4028,38 @@ pub async fn create_contact(
     };
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    core.accounts
+    if collection.is_none() && !matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+        return Err(api_error("Сначала синхронизируйте адресную книгу"));
+    }
+    let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
+        &core,
+        account_id,
+        "contact",
+        request_key.as_deref(),
+        &signature,
+        retry_uncertain.unwrap_or_default(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let result = core
+        .accounts
         .write_contact(
             &account,
             collection.as_deref(),
             RemoteObject {
-                uid: None,
+                uid: key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
             &input,
         )
-        .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account_id);
-    Ok(())
+        .await;
+    let recorded =
+        record_auxiliary_creation(&core, account_id, "contact", key.as_deref(), result).await;
+    refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
+    recorded
 }
 
 #[tauri::command]
@@ -3941,82 +4207,135 @@ pub async fn move_storage(
             message: "В выбранной папке уже есть данные truemail".into(),
         });
     }
+    let current = core(&state).await?;
+    let sending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM outbox_ops WHERE status='processing' AND op_kind IN ('send','append_sent'))",
+    ).fetch_one(&current.db.pool).await.map_err(truemail_core::Error::from)?;
+    if sending {
+        return Err(api_error(
+            "Дождитесь завершения отправки писем и повторите перенос",
+        ));
+    }
     let old_core = state.core.write().await.take().ok_or_else(|| ApiError {
         message: "Хранилище ещё не создано".into(),
     })?;
     // Порядок важен. wal_checkpoint(TRUNCATE) требует, чтобы читателей не было:
     // сначала закрываем пул чтения, только потом сливаем WAL в основной файл.
     old_core.db.pool.close().await;
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&old_core.db.write_pool)
-        .await
-        .map_err(truemail_core::Error::from)?;
+    let checkpoint = sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&old_core.db.write_pool)
+        .await;
     // Файл БД копируется дальше: writer тоже должен отпустить его, иначе на
     // Windows копирование упрётся в удерживаемый соединением файл.
     old_core.db.write_pool.close().await;
-    let copy_result = std::fs::copy(source.join("truemail.db"), target.join("truemail.db"))
-        .map(|_| ())
-        .map_err(|e| ApiError {
-            message: format!("Не удалось скопировать базу: {e}"),
-        })
-        .and_then(|_| {
-            if source.join("blobs").exists() {
-                copy_dir(&source.join("blobs"), &target.join("blobs")).map_err(|e| ApiError {
-                    message: format!("Не удалось скопировать вложения: {e}"),
-                })
-            } else {
-                Ok(())
-            }
-        });
+    if !matches!(checkpoint, Ok((0, _, _))) {
+        let reason = checkpoint
+            .err()
+            .map_or_else(|| "база занята".to_owned(), |error| error.to_string());
+        return Err(restore_storage_after_error(
+            &app,
+            &state,
+            &source,
+            api_error(format!("Не удалось завершить запись в базу: {reason}")),
+        )
+        .await);
+    }
+    let copy_result = copy_storage_for_move(&source, &target)
+        .map_err(|error| api_error(format!("Не удалось скопировать хранилище: {error}")));
     if let Err(error) = copy_result {
-        let restored = Core::bootstrap(source.clone())
-            .await
-            .map_err(|restore| ApiError {
-                message: format!(
-                    "{}; исходное хранилище не открылось: {restore}",
-                    error.safe_message()
-                ),
-            })?;
-        *state.core.write().await = Some(Arc::new(restored));
-        return Err(error);
+        return Err(restore_storage_after_error(&app, &state, &source, error).await);
     }
     let replacement = match Core::bootstrap(target.clone()).await {
         Ok(core) => Arc::new(core),
         Err(error) => {
             // Источник не удалялся: восстанавливаем рабочее ядро на прежнем
             // пути и возвращаем понятную ошибку вместо полурабочего состояния.
-            let restored = Core::bootstrap(source.clone()).await.map_err(|restore| ApiError {
-                message: format!(
-                    "Копия не открылась: {error}. Исходное хранилище также не удалось открыть: {restore}"
-                ),
-            })?;
-            *state.core.write().await = Some(Arc::new(restored));
-            return Err(ApiError {
-                message: format!("Копия не прошла проверку: {error}"),
-            });
+            return Err(restore_storage_after_error(
+                &app,
+                &state,
+                &source,
+                api_error(format!("Копия не прошла проверку: {error}")),
+            )
+            .await);
         }
     };
     if let Err(error) = truemail_core::crypto::store_data_dir(&target) {
-        let restored = Core::bootstrap(source.clone())
-            .await
-            .map_err(|restore| ApiError {
-                message: format!(
-                    "Не удалось сохранить новый путь: {error}; восстановление: {restore}"
-                ),
-            })?;
-        *state.core.write().await = Some(Arc::new(restored));
-        return Err(error.into());
+        replacement.db.close().await;
+        return Err(restore_storage_after_error(&app, &state, &source, error.into()).await);
     }
     *state.core.write().await = Some(replacement);
+    restart_storage_tasks(&app, &state, &target).await;
+    Ok(())
+}
+
+fn copy_storage_for_move(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = target.join(format!(".truemail-transfer-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&staging)?;
+    let result = (|| {
+        std::fs::copy(source.join("truemail.db"), staging.join("truemail.db"))?;
+        let has_blobs = source.join("blobs").exists();
+        if has_blobs {
+            copy_dir(&source.join("blobs"), &staging.join("blobs"))?;
+        }
+        if target.join("blobs").exists() || target.join("truemail.db").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "в целевом каталоге появились данные",
+            ));
+        }
+        if has_blobs {
+            std::fs::rename(staging.join("blobs"), target.join("blobs"))?;
+        }
+        if let Err(error) = std::fs::rename(staging.join("truemail.db"), target.join("truemail.db"))
+        {
+            if has_blobs {
+                let _ = std::fs::rename(target.join("blobs"), staging.join("blobs"));
+            }
+            return Err(error);
+        }
+        Ok(())
+    })();
+    // Здесь находится только каталог, созданный этой попыткой. Источник и
+    // существующие файлы, выбранные пользователем, эта очистка не трогает.
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+async fn restore_storage_after_error(
+    app: &AppHandle,
+    state: &AppState,
+    source: &std::path::Path,
+    error: ApiError,
+) -> ApiError {
+    match Core::bootstrap(source.to_path_buf()).await {
+        Ok(restored) => {
+            *state.core.write().await = Some(Arc::new(restored));
+            restart_storage_tasks(app, state, source).await;
+            error
+        }
+        Err(restore) => api_error(format!(
+            "{}; исходное хранилище не открылось: {restore}",
+            error.safe_message()
+        )),
+    }
+}
+
+async fn restart_storage_tasks(app: &AppHandle, state: &AppState, path: &std::path::Path) {
     state
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.watching.lock().await.clear();
     let _ = app.emit(
         "truemail-storage-moved",
-        target.to_string_lossy().into_owned(),
+        path.to_string_lossy().into_owned(),
     );
-    Ok(())
 }
 
 #[tauri::command]
@@ -4697,6 +5016,7 @@ pub async fn send_message(
     state: State<'_, AppState>,
     request: SendMessageRequest,
     request_key: Option<String>,
+    draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
@@ -4709,20 +5029,34 @@ pub async fn send_message(
             message: "Аккаунт отправителя не найден".into(),
         })?;
     let outgoing = outgoing_message(&account, request);
-    let queued = core
-        .accounts
-        .queue_outgoing(
-            account.id,
-            outgoing,
-            truemail_core::model::SEND_ORIGIN_ORDINARY,
-            request_key,
-        )
-        .await?;
+    let queued = if let Some(draft_id) = draft_id {
+        core.db
+            .queue_draft_send(account.id, outgoing, request_key, draft_id, None)
+            .await?
+    } else {
+        core.accounts
+            .queue_outgoing(
+                account.id,
+                outgoing,
+                truemail_core::model::SEND_ORIGIN_ORDINARY,
+                request_key,
+            )
+            .await?
+    };
     // S-024: передача начинается не позднее чем через секунду после срока
     // отмены, а работник в этот момент может спать до десяти секунд.
     state.send_wakeup.notify_waiters();
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(queued)
+}
+
+#[tauri::command]
+pub async fn draft_already_submitted(state: State<'_, AppState>, draft_id: i64) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .draft_already_submitted(draft_id)
+        .await?)
 }
 
 /// Письма внутри окна отмены при выходе из программы через меню трея.
@@ -5074,7 +5408,8 @@ pub async fn schedule_message(
     state: State<'_, AppState>,
     request: SendMessageRequest,
     send_at: String,
-) -> CmdResult<i64> {
+    draft_id: Option<i64>,
+) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
         .db
@@ -5094,20 +5429,21 @@ pub async fn schedule_message(
         });
     }
     let outgoing = outgoing_message(&account, request);
-    let operation_id = core
-        .db
-        .queue_scheduled_send(
-            account.id,
-            outgoing,
-            &send_at
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-        )
-        .await?
-        .operation_id;
+    let scheduled = send_at
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let queued = if let Some(draft_id) = draft_id {
+        core.db
+            .queue_draft_send(account.id, outgoing, None, draft_id, Some(&scheduled))
+            .await?
+    } else {
+        core.db
+            .queue_scheduled_send(account.id, outgoing, &scheduled)
+            .await?
+    };
     state.send_wakeup.notify_waiters();
-    Ok(operation_id)
+    Ok(queued)
 }
 
 #[tauri::command]
@@ -5482,11 +5818,11 @@ pub async fn move_messages_to_folder(
 pub async fn undo_message_action(
     state: State<'_, AppState>,
     operation_ids: Vec<i64>,
-) -> CmdResult<usize> {
+) -> CmdResult<truemail_core::storage::repo::UndoMoveOutcome> {
     Ok(core(&state)
         .await?
         .db
-        .cancel_outbox_operations(&operation_ids)
+        .undo_move_operations(&operation_ids)
         .await?)
 }
 
@@ -5609,6 +5945,25 @@ pub async fn set_keybinding(
 #[tauri::command]
 pub async fn image_sender_trusted(state: State<'_, AppState>, sender: String) -> CmdResult<bool> {
     Ok(core(&state).await?.db.image_sender_trusted(&sender).await?)
+}
+
+#[tauri::command]
+pub async fn fetch_mail_image(
+    state: State<'_, AppState>,
+    sender: String,
+    url: String,
+) -> CmdResult<String> {
+    use base64::Engine as _;
+    if !core(&state).await?.db.image_sender_trusted(&sender).await? {
+        return Err(api_error(
+            "Для этого отправителя внешние изображения запрещены",
+        ));
+    }
+    let (kind, bytes) = truemail_core::backend::fetch_remote_mail_image(&url).await?;
+    Ok(format!(
+        "data:{kind};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 #[tauri::command]

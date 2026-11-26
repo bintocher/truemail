@@ -6,7 +6,7 @@
 
 // Actions that apply to a draft: the rest belongs to an incoming letter.
 const DRAFT_ACTIONS = Object.freeze(new Set([
-  'send-draft', 'trash', 'flag-message', 'task-message', 'flag', 'important-toggle', 'pin-message', 'task-edit',
+  'send-draft', 'edit-draft', 'trash', 'flag-message', 'task-message', 'flag', 'important-toggle', 'pin-message', 'task-edit',
   'raw', 'export-eml', 'eml', 'delete-forever', 'settings',
 ]));
 

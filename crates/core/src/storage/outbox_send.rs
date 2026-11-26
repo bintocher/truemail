@@ -10,7 +10,20 @@ use super::Db;
 use crate::Result;
 use crate::backend::{OutgoingAttachment, OutgoingMessage};
 use crate::model::*;
-use crate::storage::repo::OutboxOperation;
+use crate::storage::repo::{
+    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayOutcome, TakeawayTarget,
+    infer_missing_folder_role, queue_takeaway_operation, resolve_role_folder,
+};
+
+#[derive(sqlx::FromRow)]
+struct DraftSource {
+    account_id: i64,
+    folder_id: i64,
+    uid: i64,
+    remote_path: String,
+    remote_id: Option<String>,
+    raw_blob_ref: Option<String>,
+}
 
 /// Как долго операция отправки считается захваченной работником. То же число,
 /// что и у остальных видов операций; в автоматический захват операция отправки
@@ -54,8 +67,15 @@ impl Db {
         request_key: Option<String>,
         undo_seconds: i64,
     ) -> Result<SendQueued> {
-        self.queue_send(account_id, message, origin, request_key, undo_seconds, None)
-            .await
+        self.queue_send(
+            account_id,
+            message,
+            origin,
+            request_key,
+            (undo_seconds, None),
+            None,
+        )
+        .await
     }
 
     /// Отложенная отправка по времени: передача начинается в заданное время, а
@@ -73,10 +93,61 @@ impl Db {
             message,
             SEND_ORIGIN_SCHEDULED,
             None,
-            0,
-            Some(send_at),
+            (0, Some(send_at)),
+            None,
         )
         .await
+    }
+
+    pub async fn queue_draft_send(
+        &self,
+        account_id: i64,
+        message: OutgoingMessage,
+        request_key: Option<String>,
+        draft_id: i64,
+        send_at: Option<&str>,
+    ) -> Result<SendQueued> {
+        let (origin, undo) = if send_at.is_some() {
+            (SEND_ORIGIN_SCHEDULED, 0)
+        } else {
+            (SEND_ORIGIN_ORDINARY, self.undo_send_seconds().await?)
+        };
+        self.queue_send(
+            account_id,
+            message,
+            origin,
+            request_key,
+            (undo, send_at),
+            Some(draft_id),
+        )
+        .await
+    }
+
+    pub async fn draft_already_submitted(&self, draft_id: i64) -> Result<bool> {
+        let reference: Option<Option<String>> =
+            sqlx::query_scalar("SELECT raw_blob_ref FROM messages WHERE id=?")
+                .bind(draft_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let version = reference
+            .flatten()
+            .and_then(|reference| self.draft_version(&reference).ok());
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM draft_submissions WHERE draft_id=?
+                    AND (? IS NULL OR version=?))",
+        )
+        .bind(draft_id)
+        .bind(&version)
+        .bind(&version)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    fn draft_version(&self, reference: &str) -> Result<String> {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(self.blobs.get(reference)?)))
     }
 
     /// Общий приём письма в очередь. Срок передачи известен до записи и
@@ -89,9 +160,10 @@ impl Db {
         message: OutgoingMessage,
         origin: &str,
         request_key: Option<String>,
-        undo_seconds: i64,
-        send_at: Option<&str>,
+        timing: (i64, Option<&str>),
+        draft_id: Option<i64>,
     ) -> Result<SendQueued> {
+        let (undo_seconds, send_at) = timing;
         // S-005: адресаты проверяются до записи операции, поэтому непригодный
         // адрес не создаёт ожидающего письма вовсе.
         crate::backend::validate_outgoing(&message)?;
@@ -144,6 +216,25 @@ impl Db {
                 raw_ref: None,
             };
             let mut tx = self.begin_write().await?;
+            let draft = if let Some(id)=draft_id {
+                let source: DraftSource=sqlx::query_as(
+                    "SELECT m.account_id,m.folder_id,m.uid,f.remote_path,m.remote_id,m.raw_blob_ref
+                     FROM messages m JOIN folders f ON f.id=m.folder_id
+                     WHERE m.id=? AND (m.draft=1 OR f.role='drafts')",
+                ).bind(id).fetch_optional(&mut *tx).await?.ok_or_else(|| {
+                    crate::Error::AccountConfig("Черновик больше недоступен. Обновите папку перед отправкой".into())
+                })?;
+                if source.account_id!=account_id {
+                    return Err(crate::Error::AccountConfig("Отправитель должен совпадать с ящиком черновика".into()));
+                }
+                let version=self.draft_version(source.raw_blob_ref.as_deref().ok_or_else(|| {
+                    crate::Error::AccountConfig("Сначала загрузите содержимое черновика".into())
+                })?)?;
+                let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM draft_submissions WHERE draft_id=? AND version=?)")
+                    .bind(id).bind(&version).fetch_one(&mut *tx).await?;
+                if exists {return Err(crate::Error::Other("Эта версия черновика уже поставлена в очередь отправки".into()));}
+                Some((id,source,version))
+            } else {None};
             let (operation_id, cancel_until) = insert_send_operation(
                 &mut tx,
                 account_id,
@@ -154,6 +245,36 @@ impl Db {
                 send_at,
             )
             .await?;
+            let mut draft_cleanup_failed=false;
+            if let Some((id,source,version))=draft {
+                sqlx::query("INSERT INTO draft_submissions(draft_id,account_id,version,operation_id) VALUES(?,?,?,?)")
+                    .bind(id).bind(source.account_id).bind(version).bind(operation_id)
+                    .execute(&mut *tx).await?;
+                infer_missing_folder_role(&mut tx,source.account_id,"trash").await?;
+                draft_cleanup_failed=true;
+                if let Some((target_id,path))=resolve_role_folder(&mut tx,source.account_id,"trash").await? {
+                    let message=TakeawayMessage { id, account_id:source.account_id,folder_id:source.folder_id,
+                        uid:source.uid,remote_path:source.remote_path,remote_id:source.remote_id };
+                    match queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
+                        TakeawayActor::Stage,None,0).await? {
+                        TakeawayOutcome::Queued(cleanup) => {
+                            sqlx::query("UPDATE draft_submissions SET cleanup_operation_id=? WHERE operation_id=?")
+                                .bind(cleanup).bind(operation_id).execute(&mut *tx).await?;
+                            draft_cleanup_failed=false;
+                        }
+                        TakeawayOutcome::Unchanged => draft_cleanup_failed=false,
+                        _ => {}
+                    }
+                }
+                if draft_cleanup_failed {
+                    sqlx::query("UPDATE draft_submissions SET cleanup_failed=1 WHERE operation_id=?")
+                        .bind(operation_id).execute(&mut *tx).await?;
+                }
+                if let Some(key) = request_key.as_deref() {
+                    sqlx::query("UPDATE send_request_keys SET draft_recorded=1, draft_cleanup_failed=? WHERE request_key=? AND account_id=?")
+                        .bind(draft_cleanup_failed).bind(key).bind(account_id).execute(&mut *tx).await?;
+                }
+            }
             tx.commit().await?;
             Ok::<SendQueued, crate::Error>(SendQueued {
                 operation_id,
@@ -162,6 +283,8 @@ impl Db {
                 cancel_until,
                 undo_seconds,
                 duplicate: false,
+                draft_recorded: draft_id.is_some(),
+                draft_cleanup_failed,
             })
         }
         .await;
@@ -193,24 +316,32 @@ impl Db {
         account_id: i64,
         request_key: &str,
     ) -> Result<Option<SendQueued>> {
-        let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT k.operation_id, k.cancel_until, o.status
+        let row: Option<(i64, String, String, bool, bool)> = sqlx::query_as(
+            "SELECT k.operation_id, coalesce(k.cancel_until,''), coalesce(o.status,'pending'),
+                    k.draft_recorded, k.draft_cleanup_failed
                FROM send_request_keys k
-               LEFT JOIN outbox_ops o ON o.id = k.operation_id
+               LEFT JOIN outbox_ops o ON o.id=k.operation_id AND o.account_id=k.account_id
+                    AND o.op_kind='send' AND o.request_key=k.request_key
               WHERE k.request_key=? AND k.account_id=?",
         )
         .bind(request_key)
         .bind(account_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(operation_id, cancel_until, status)| SendQueued {
-            operation_id,
-            account_id,
-            status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
-            cancel_until: cancel_until.unwrap_or_default(),
-            undo_seconds: 0,
-            duplicate: true,
-        }))
+        Ok(row.map(
+            |(operation_id, cancel_until, status, draft_recorded, draft_cleanup_failed)| {
+                SendQueued {
+                    operation_id,
+                    account_id,
+                    status,
+                    cancel_until,
+                    undo_seconds: 0,
+                    duplicate: true,
+                    draft_recorded,
+                    draft_cleanup_failed,
+                }
+            },
+        ))
     }
 
     /// Захватить одну готовую операцию отправки. Операции отправки берутся по
@@ -272,6 +403,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() == 1 {
+            release_unsent_draft(&mut tx, operation_id).await?;
             tx.commit().await?;
             return Ok(CancelSendOutcome::Cancelled);
         }
@@ -306,7 +438,7 @@ impl Db {
         offset: i64,
     ) -> Result<Vec<OutboxSendEntry>> {
         let rows: Vec<OutboxSendListRow> = sqlx::query_as(
-            "SELECT o.id, o.account_id, a.email, a.enabled, o.send_origin, o.status, o.payload,
+            "SELECT o.id, o.account_id, a.email, a.enabled, o.send_origin, o.op_kind, o.status, o.payload,
                     o.cancel_until, o.next_attempt_at, o.attempts, o.last_error, o.created_at
                FROM outbox_ops o JOIN accounts a ON a.id=o.account_id
               WHERE o.op_kind IN ('send','append_sent')
@@ -314,7 +446,7 @@ impl Db {
                 -- S-058: служебное письмо программы показывается пользователю
                 -- только тогда, когда с ним что-то не так.
                 AND (coalesce(o.send_origin, 'ordinary') <> 'automatic'
-                     OR o.status IN ('failed','uncertain'))
+                     OR o.status IN ('failed','uncertain') OR o.op_kind='append_sent')
               ORDER BY o.id DESC LIMIT ? OFFSET ?",
         )
         .bind(account_id)
@@ -382,6 +514,22 @@ impl Db {
         // Состояние проверяется тем же изменением, которое удаляет строку:
         // между отдельным чтением и удалением работник успевает захватить
         // операцию, и письмо ушло бы уже без своих больших объектов (S-043).
+        let mut tx = self.begin_write().await?;
+        let status: Option<(String, String)> =
+            sqlx::query_as("SELECT op_kind,status FROM outbox_ops WHERE id=? AND account_id=?")
+                .bind(operation_id)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if status.as_ref().is_some_and(|(kind, status)| {
+            kind == "send"
+                && matches!(
+                    status.as_str(),
+                    "pending" | "retry" | "cancelled" | "failed"
+                )
+        }) {
+            release_unsent_draft(&mut tx, operation_id).await?;
+        }
         let deleted: Option<(String,)> = sqlx::query_as(
             "DELETE FROM outbox_ops
               WHERE id=? AND account_id=? AND op_kind IN ('send','append_sent')
@@ -390,23 +538,18 @@ impl Db {
         )
         .bind(operation_id)
         .bind(account_id)
-        .fetch_optional(&self.write_pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((payload,)) = deleted else {
-            let status: Option<(String,)> =
-                sqlx::query_as("SELECT status FROM outbox_ops WHERE id=? AND account_id=?")
-                    .bind(operation_id)
-                    .bind(account_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
             return Err(crate::Error::Other(
-                match status.as_ref().map(|(value,)| value.as_str()) {
+                match status.as_ref().map(|(_, value)| value.as_str()) {
                     Some(SEND_STATUS_PROCESSING) => "отправка уже началась, удалить письмо нельзя",
                     _ => "операция отправки не найдена",
                 }
                 .into(),
             ));
         };
+        tx.commit().await?;
         for reference in serde_json::from_str::<SendPayload>(&payload)
             .map(|payload| payload.blob_refs())
             .unwrap_or_default()
@@ -656,28 +799,46 @@ impl Db {
         .unwrap_or((0, 0));
         // Незакончившиеся окна отмены восстанавливаются карточкой с фактически
         // оставшимся временем (S-034).
-        let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT id, account_id, status, cancel_until
-               FROM outbox_ops
-              WHERE op_kind='send' AND status='pending' AND send_origin='ordinary'
-                AND cancel_until > datetime('now')
-              ORDER BY cancel_until",
+        let rows: Vec<(i64, i64, String, String, bool, bool)> = sqlx::query_as(
+            "SELECT o.id, o.account_id, o.status, o.cancel_until,
+                    d.draft_id IS NOT NULL, coalesce(d.cleanup_failed,0)
+               FROM outbox_ops o
+               LEFT JOIN draft_submissions d ON d.operation_id=o.id
+              WHERE o.op_kind='send' AND o.status='pending' AND o.send_origin='ordinary'
+                AND o.cancel_until > datetime('now')
+              ORDER BY o.cancel_until",
         )
         .fetch_all(&self.pool)
+        .await?;
+        let draft_cleanup_warnings = sqlx::query_scalar(
+            "SELECT count(*) FROM draft_submissions d JOIN outbox_ops o ON o.id=d.operation_id
+             WHERE d.cleanup_failed=1 AND o.status<>'cancelled'",
+        )
+        .fetch_one(&self.pool)
         .await?;
         Ok(StartupSendState {
             expired,
             uncertain,
+            draft_cleanup_warnings,
             pending: rows
                 .into_iter()
                 .map(
-                    |(operation_id, account_id, status, cancel_until)| SendQueued {
+                    |(
+                        operation_id,
+                        account_id,
+                        status,
+                        cancel_until,
+                        draft_recorded,
+                        draft_cleanup_failed,
+                    )| SendQueued {
                         operation_id,
                         account_id,
                         status,
                         cancel_until,
                         undo_seconds: 0,
                         duplicate: false,
+                        draft_recorded,
+                        draft_cleanup_failed,
                     },
                 )
                 .collect(),
@@ -733,6 +894,24 @@ impl Db {
             .flat_map(|payload| payload.blob_refs())
             .collect())
     }
+}
+
+async fn release_unsent_draft(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    operation_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM outbox_ops WHERE op_kind='move' AND status IN ('pending','retry') AND id IN (
+         SELECT cleanup_operation_id FROM draft_submissions WHERE operation_id=?)",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM draft_submissions WHERE operation_id=?")
+        .bind(operation_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Записать операцию отправки и ключ её запроса внутри уже открытой неделимой
@@ -823,6 +1002,7 @@ struct OutboxSendListRow {
     email: String,
     enabled: i64,
     send_origin: Option<String>,
+    op_kind: String,
     status: String,
     payload: String,
     cancel_until: Option<String>,
@@ -859,6 +1039,7 @@ impl From<OutboxSendListRow> for OutboxSendEntry {
             origin: row
                 .send_origin
                 .unwrap_or_else(|| SEND_ORIGIN_ORDINARY.to_owned()),
+            op_kind: row.op_kind,
             status: row.status,
             subject,
             to,

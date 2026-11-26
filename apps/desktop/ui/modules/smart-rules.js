@@ -256,15 +256,19 @@ function applyToolbar(){const state=toolbarState(),bar=document.querySelector('.
   const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders),actions=draftMessageModel.actionsForMessage(letter,coreFolders,state.actions);
   toolbarShowsDraft=draft;
   // The draft whose letter is already on its way has nothing left to send.
-  document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
+  updateDraftToolbar(letter,draft);
   document.querySelectorAll('#threadMoreMenu [data-thread-action]').forEach(item=>item.classList.toggle('hidden',draft&&!draftMessageModel.DRAFT_ACTIONS.has(item.dataset.threadAction)));bar.classList.toggle('toolbar-right',state.align==='right');bar.querySelectorAll('[data-toolbar-generated]').forEach(el=>el.remove());const anchor=bar.querySelector('.sp');actions.filter(action=>action.visible).forEach(action=>{const meta=tbActions.find(a=>a.k===action.key);if(!meta)return;const button=document.createElement('button');button.className=`${action.key==='reply'?'btn primary':'btn'}${action.labels==='icons'?' toolbar-action-icons':''}`;button.dataset.toolbarGenerated='1';button.dataset.act=action.key;button.title=tbLabel(meta);button.innerHTML=`<i data-i="${escapeHtml(meta.i||action.key)}"></i><span>${escapeHtml(tbLabel(meta))}</span>`;renderIcons(button);bar.insertBefore(button,anchor);});bar.querySelectorAll(':scope > button:not([data-toolbar-generated]):not([data-toolbar-persistent])').forEach(button=>button.classList.add('toolbar-original-hidden'));
   // The sending button follows the letter that is shown: one draft may be on
   // its way already while the next one still has to be sent. The pane itself
   // is rebuilt only when the letter changed between a draft and the rest.
 function refreshToolbarForMessage(){
   const letter=paneLetter(),draft=draftMessageModel.isDraftMessage(letter,coreFolders);
-  document.getElementById('threadSendDraft')?.classList.toggle('hidden',!draft||window.sentDrafts?.has(letter.id)===true);
+  updateDraftToolbar(letter,draft);
   if(toolbarShowsDraft!==draft)applyToolbar();
+}
+function updateDraftToolbar(letter,draft){
+  const hidden=!draft||window.sentDrafts?.has(letter.id)===true;
+  for(const id of ['threadSendDraft','threadEditDraft'])document.getElementById(id)?.classList.toggle('hidden',hidden);
 }
 window.refreshToolbarForMessage=refreshToolbarForMessage;
   const menuDyn=document.getElementById('threadMenuDynamic');
@@ -299,7 +303,7 @@ function openSnoozeDialog(targets=null){const ids=targets||selectedOrActiveMessa
 async function exportActiveMessageEml(){if(!activeMessage){showToast(L('Сначала выберите письмо','Select a message first'));return;}const safe=(activeMessage.subject||'message').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').trim().slice(0,100)||'message';try{const path=await window.tm.saveFileDialog(`${safe}.eml`);if(!path)return;await window.tm.exportMessageEml(activeMessage.id,path);showToast(L('Письмо сохранено в .eml','Message saved as .eml'));}catch(error){showToast(error);}}
 function quickStepRunContext(targets=null){
   const collapsedThread=conversationsEnabled&&activeMessage&&!expandedConversations.has(conversationKey(activeMessage))?activeMessage:null;
-  return {bridge:window.tm,steps:quickStepSnapshot,selection:targets||[...selectedMessageIds],activeMessage,collapsedThread,loaded:lastListRows.length?lastListRows:messages,inTextField:Boolean(document.activeElement?.matches?.('input,textarea,select,[contenteditable="true"]')),lang:wizardLocale,confirm:text=>confirmAction(text),notify:showToast,onApplied:async(report,ids)=>{window.forgetMessages?.(report.operation_ids?.length?ids:[]);await window.reloadCoreData?.();showToast(quickStepsModel.reportText(report,wizardLocale));if(report.operation_ids?.length)showToast(L('Перенос можно отменить. Метки и отметки цепочки не снимаются','The move can be undone. Labels and flags are not reverted'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(report.operation_ids);await window.reloadCoreData();});}};
+  return {bridge:window.tm,steps:quickStepSnapshot,selection:targets||[...selectedMessageIds],activeMessage,collapsedThread,loaded:lastListRows.length?lastListRows:messages,inTextField:Boolean(document.activeElement?.matches?.('input,textarea,select,[contenteditable="true"]')),lang:wizardLocale,confirm:text=>confirmAction(text),notify:showToast,onApplied:async(report,ids)=>{window.forgetMessages?.(report.operation_ids?.length?ids:[]);await window.reloadCoreData?.();showToast(quickStepsModel.reportText(report,wizardLocale));if(report.operation_ids?.length)showToast(L('Перенос можно отменить. Метки и отметки цепочки не снимаются','The move can be undone. Labels and flags are not reverted'),L('Отменить','Undo'),()=>undoQueuedMove(report.operation_ids));}};
 }
 async function executeQuickStep(id,targets=null){const step=quickStepSnapshot.find(item=>item.id===Number(id));if(!step)return;try{return await quickStepsModel.runQuickStep(step,quickStepRunContext(targets));}catch(error){showToast(error);return null;}}
 window.executeQuickStep=executeQuickStep;
@@ -307,16 +311,18 @@ window.executeQuickStepSlot=slot=>quickStepsModel.handleSlotPress(`quick_step_${
 // fromList: the action comes from the context menu of the list and belongs to
 // the letter that menu was opened for. targets: the letters it belongs to when
 // that letter is outside the selection of the list.
-async function executeToolbarAction(action,fromList=false,targets=null){
+async function executeToolbarAction(action,fromList=false,targets=null,menuLetter=null){
   if(!fromList)window.restoreActiveToShown?.();
-  if(action==='send-draft'){await sendDraftMessage(activeMessage);return;}
+  if(action==='send-draft'){await sendDraftMessage(menuLetter||activeMessage);return;}
+  if(action==='edit-draft'){await editDraftMessage(menuLetter||activeMessage);return;}
   // Printing and unsubscribing work on the letter shown in the reading pane:
   // the letter of the list menu is shown first.
-  if(targets&&['print','unsub'].includes(action)&&window.paneLetter?.()?.id!==activeMessage?.id){
-    const letter=activeMessage;
-    await showMessage(letter);
+  if(fromList&&['print','unsub'].includes(action)){
+    const letter=menuLetter;
+    if(!letter)return;
+    if(window.paneLetter?.()?.id!==letter.id||activeFullMessage?.meta?.id!==letter.id)await showMessage(letter);
     // Another letter was opened meanwhile, or the letter could not be read.
-    if(window.paneLetter?.()?.id!==letter?.id||activeMessage!==letter)return;
+    if(window.paneLetter?.()?.id!==letter.id)return;
     if(action==='unsub'&&activeFullMessage?.meta?.id!==letter.id)return;
   }
   const toolbarStepId=quickStepsModel.toolbarStepId(action);if(toolbarStepId!==null){await executeQuickStep(toolbarStepId,targets);return;}if(['reply','replyall','forward'].includes(action)){openComposerForMessage(action);return;}if(['archive','trash','spam'].includes(action)){performMessageAction(action);return;}if(action==='snooze'){openSnoozeDialog(targets);return;}if(action==='unread'){if(activeMessage){const ids=window.expandConversationIds?window.expandConversationIds([activeMessage.id]):[activeMessage.id];await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),false);await window.reloadCoreData?.();showToast(L('Письмо отмечено непрочитанным','Message marked as unread'));}return;}if(action==='print'){const frame=document.querySelector('.mail-html-frame');if(frame?.contentWindow)frame.contentWindow.print();else window.print();return;}if(action==='unsub'){const uns=activeFullMessage?.unsubscribe;
@@ -891,8 +897,37 @@ ctxsmart.querySelectorAll('[data-smart-action="count-unread"],[data-smart-action
 });
 
 const auxOverlay=document.getElementById('auxOverlay'),eventForm=document.getElementById('eventForm'),contactForm=document.getElementById('contactForm');
-let editingEvent=null,editingContact=null;
-function closeAuxEditor(){auxOverlay.classList.remove('open');editingEvent=null;editingContact=null;}
+let editingEvent=null,editingContact=null,auxEditorKey=null,auxSaving=false;
+function newAuxEditorKey(){
+  return globalThis.crypto?.randomUUID?.()||`${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+async function submitAuxiliary(form,status,save,success){
+  if(auxSaving){showToast(L('Дождитесь сохранения записи','Wait for the current save'));return;}
+  auxSaving=true;
+  const controls=[...form.querySelectorAll('input, textarea, select, button')].filter(control=>!control.disabled);
+  controls.forEach(control=>{control.disabled=true;});
+  const key=auxEditorKey;
+  status.textContent=L('Сохраняю на сервере...','Saving to the server...');
+  status.dataset.kind='';
+  try{
+    try{await save(key,false);}catch(error){
+      if(error?.kind!=='auxiliary_create_uncertain')throw error;
+      const confirmed=await confirmAction(L('Повторите сохранение только после того, как проверите список на сервере и убедитесь, что записи там нет. Продолжить?',
+        'Retry only after checking that the record is absent from the server. Continue?'));
+      if(!confirmed)throw error;
+      await save(key,true);
+    }
+    if(auxEditorKey===key)closeAuxEditor(true);
+    showToast(success);
+    try{await window.reloadCoreData();}catch(error){showToast(error);}
+  }catch(error){
+    if(auxEditorKey===key){status.textContent=String(error?.message||error);status.dataset.kind='error';}
+  }finally{
+    auxSaving=false;
+    controls.forEach(control=>{control.disabled=false;});
+  }
+}
+function closeAuxEditor(force){if(auxSaving&&force!==true)return;auxOverlay.classList.remove('open');editingEvent=null;editingContact=null;auxEditorKey=null;}
 function fillAccountSelect(select,selected){select.innerHTML='';coreAccounts.forEach(account=>{const option=document.createElement('option');option.value=account.id;option.textContent=account.email;select.appendChild(option);});if(selected!=null)select.value=String(selected);}
 function fillCalendarSelect(accountId,selected){const select=document.getElementById('eventCalendar');select.innerHTML='';(coreCalendarData.calendars||[]).filter(calendar=>calendar.account_id===Number(accountId)).forEach(calendar=>{const option=document.createElement('option');option.value=calendar.id;option.textContent=calendar.name;select.appendChild(option);});if(selected!=null)select.value=String(selected);}
 function localDateValue(value){const date=parseDavDate(value);if(!date)return '';const p=n=>String(n).padStart(2,'0');return `${date.getFullYear()}-${p(date.getMonth()+1)}-${p(date.getDate())}T${p(date.getHours())}:${p(date.getMinutes())}`;}
@@ -943,7 +978,7 @@ document.getElementById('eventRdateAddBtn').onclick=()=>addDateChip('eventRdateA
 document.getElementById('eventAttendeeAddBtn').onclick=()=>{const input=document.getElementById('eventAttendeeAdd'),raw=input.value.trim();if(!raw)return;const match=raw.match(/^(.*?)\s*<([^<>]+)>$/),email=(match?.[2]||raw).trim();if(!email.includes('@')){showToast(L('Введите корректный email','Enter a valid email'));return;}if(!eventFormState.attendees.some(attendee=>attendee.email.toLowerCase()===email.toLowerCase()))eventFormState.attendees.push({email,name:match?.[1]?.trim()||null,role:'REQ-PARTICIPANT',partstat:'NEEDS-ACTION',rsvp:true});renderAttendeeChips();input.value='';};
 function eventInputFromForm(source){const allDay=document.getElementById('eventAllDay').checked;return{summary:document.getElementById('eventSummary').value.trim(),description:document.getElementById('eventDescription').value.trim()||null,location:document.getElementById('eventLocation').value.trim()||null,dtstart:remoteDateValue(document.getElementById('eventStart').value,allDay),dtend:document.getElementById('eventEnd').value?remoteDateValue(document.getElementById('eventEnd').value,allDay):null,all_day:allDay,attendees:eventFormState.attendees.map(attendee=>({...attendee})),alarms:[...eventFormState.alarms].map(trigger_minutes=>{const previous=(source?.alarms||[]).find(alarm=>alarm.trigger_minutes===trigger_minutes);return{trigger_minutes,action:previous?.action||'DISPLAY'};}),rrule:buildEventRrule(),recurrence_id:source?.recurrence_id||null,exdates:eventFormState.exdates.join(',')||null,rdates:eventFormState.rdates.join(',')||null,timezone:document.getElementById('eventTimezone').value.trim()||null,transp:document.getElementById('eventTransp').value||null,class:document.getElementById('eventClass').value||null,categories:eventLineValues(document.getElementById('eventCategories').value),url:document.getElementById('eventUrl').value.trim()||null,organizer:document.getElementById('eventOrganizer').value.trim()||null,sequence:Number(source?.sequence||0)};}
 function setAuxMode(mode){const isEvent=mode==='event';eventForm.classList.toggle('hidden',!isEvent);contactForm.classList.toggle('hidden',isEvent);document.getElementById('auxTitle').textContent=isEvent?(editingEvent?L('Изменить событие / задачу','Edit event / task'):L('Новое событие / задача','New event / task')):(editingContact?L('Изменить контакт','Edit contact'):L('Новый контакт','New contact'));document.getElementById('auxIcon').innerHTML=isEvent?ic.cal:ic.people;}
-function openEventEditor(event=null){editingEvent=event;editingContact=null;setAuxMode('event');fillAccountSelect(document.getElementById('eventAccount'),event?coreCalendarData.calendars.find(calendar=>calendar.id===event.calendar_id)?.account_id:coreAccounts[0]?.id);fillCalendarSelect(document.getElementById('eventAccount').value,event?.calendar_id);document.getElementById('eventAccount').disabled=Boolean(event);document.getElementById('eventCalendar').disabled=Boolean(event);const editingExisting=Boolean(event);document.getElementById('eventAccountField').classList.toggle('hidden',editingExisting);document.getElementById('eventCalendarField').classList.toggle('hidden',editingExisting);const sourceText=document.getElementById('eventSourceText');sourceText.classList.toggle('hidden',!editingExisting);if(editingExisting){const calendar=coreCalendarData.calendars.find(item=>item.id===event.calendar_id);const account=coreAccounts.find(item=>item.id===calendar?.account_id);sourceText.querySelector('.event-source-line').textContent=[account?.email,calendar?.name||calendar?.display_name].filter(Boolean).join(' · ');}document.getElementById('eventSummary').value=event?.summary||'';const start=event?.dtstart?localDateValue(event.dtstart):localDateValue(new Date(Math.ceil(Date.now()/1800000)*1800000).toISOString());document.getElementById('eventStart').value=start;document.getElementById('eventEnd').value=event?.dtend?localDateValue(event.dtend):localDateValue(new Date(new Date(start).getTime()+3600000).toISOString());document.getElementById('eventAllDay').checked=Boolean(event?.all_day)||/^\d{4}-\d{2}-\d{2}$/.test(event?.dtstart||'')||/^\d{8}$/.test(event?.dtstart||'');document.getElementById('eventLocation').value=event?.location||'';document.getElementById('eventDescription').value=event?.description||'';parseEventRrule(event?.rrule);eventFormState.exdates=String(event?.exdates||'').split(',').map(item=>item.trim()).filter(Boolean);eventFormState.rdates=String(event?.rdates||'').split(',').map(item=>item.trim()).filter(Boolean);eventFormState.attendees=(event?.attendees||[]).map(attendee=>({...attendee}));eventFormState.alarms=new Set((event?.alarms||[]).map(alarm=>alarm.trigger_minutes));renderDateChips('eventExdatesChips',eventFormState.exdates);renderDateChips('eventRdatesChips',eventFormState.rdates);renderAttendeeChips();renderAlarmChips();document.getElementById('eventOrganizer').value=event?.organizer||'';document.getElementById('eventTimezone').value=event?.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||'';document.getElementById('eventTransp').value=event?.transp||'opaque';document.getElementById('eventClass').value=event?.class||'public';document.getElementById('eventCategories').value=(event?.categories||[]).join(', ');document.getElementById('eventUrl').value=event?.url||'';document.querySelector('.event-advanced').open=Boolean(event&&(event.rrule||event.exdates||event.rdates||event.attendees?.length||event.alarms?.length||event.organizer||event.categories?.length||event.url));document.getElementById('eventDelete').classList.toggle('hidden',!event);document.getElementById('eventStatus').textContent='';const hasOwnStatus=Boolean(event&&event.my_partstat);document.getElementById('eventRsvpBox').classList.toggle('hidden',!hasOwnStatus);document.getElementById('eventRsvpActions').classList.toggle('hidden',!(event&&event.needs_response));if(hasOwnStatus){document.getElementById('eventRsvpStatus').textContent=rsvpStatusText(event.my_partstat);updateRsvpButtons(event.my_partstat);}auxOverlay.classList.add('open');document.getElementById('eventSummary').focus();}
+function openEventEditor(event=null){if(auxSaving)return;auxEditorKey=newAuxEditorKey();editingEvent=event;editingContact=null;setAuxMode('event');fillAccountSelect(document.getElementById('eventAccount'),event?coreCalendarData.calendars.find(calendar=>calendar.id===event.calendar_id)?.account_id:coreAccounts[0]?.id);fillCalendarSelect(document.getElementById('eventAccount').value,event?.calendar_id);document.getElementById('eventAccount').disabled=Boolean(event);document.getElementById('eventCalendar').disabled=Boolean(event);const editingExisting=Boolean(event);document.getElementById('eventAccountField').classList.toggle('hidden',editingExisting);document.getElementById('eventCalendarField').classList.toggle('hidden',editingExisting);const sourceText=document.getElementById('eventSourceText');sourceText.classList.toggle('hidden',!editingExisting);if(editingExisting){const calendar=coreCalendarData.calendars.find(item=>item.id===event.calendar_id);const account=coreAccounts.find(item=>item.id===calendar?.account_id);sourceText.querySelector('.event-source-line').textContent=[account?.email,calendar?.name||calendar?.display_name].filter(Boolean).join(' · ');}document.getElementById('eventSummary').value=event?.summary||'';const start=event?.dtstart?localDateValue(event.dtstart):localDateValue(new Date(Math.ceil(Date.now()/1800000)*1800000).toISOString());document.getElementById('eventStart').value=start;document.getElementById('eventEnd').value=event?.dtend?localDateValue(event.dtend):localDateValue(new Date(new Date(start).getTime()+3600000).toISOString());document.getElementById('eventAllDay').checked=Boolean(event?.all_day)||/^\d{4}-\d{2}-\d{2}$/.test(event?.dtstart||'')||/^\d{8}$/.test(event?.dtstart||'');document.getElementById('eventLocation').value=event?.location||'';document.getElementById('eventDescription').value=event?.description||'';parseEventRrule(event?.rrule);eventFormState.exdates=String(event?.exdates||'').split(',').map(item=>item.trim()).filter(Boolean);eventFormState.rdates=String(event?.rdates||'').split(',').map(item=>item.trim()).filter(Boolean);eventFormState.attendees=(event?.attendees||[]).map(attendee=>({...attendee}));eventFormState.alarms=new Set((event?.alarms||[]).map(alarm=>alarm.trigger_minutes));renderDateChips('eventExdatesChips',eventFormState.exdates);renderDateChips('eventRdatesChips',eventFormState.rdates);renderAttendeeChips();renderAlarmChips();document.getElementById('eventOrganizer').value=event?.organizer||'';document.getElementById('eventTimezone').value=event?.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||'';document.getElementById('eventTransp').value=event?.transp||'opaque';document.getElementById('eventClass').value=event?.class||'public';document.getElementById('eventCategories').value=(event?.categories||[]).join(', ');document.getElementById('eventUrl').value=event?.url||'';document.querySelector('.event-advanced').open=Boolean(event&&(event.rrule||event.exdates||event.rdates||event.attendees?.length||event.alarms?.length||event.organizer||event.categories?.length||event.url));document.getElementById('eventDelete').classList.toggle('hidden',!event||!canDeleteCalendarEvent(event));document.getElementById('eventStatus').textContent='';const hasOwnStatus=Boolean(event&&event.my_partstat);document.getElementById('eventRsvpBox').classList.toggle('hidden',!hasOwnStatus);document.getElementById('eventRsvpActions').classList.toggle('hidden',!(event&&event.needs_response));if(hasOwnStatus){document.getElementById('eventRsvpStatus').textContent=rsvpStatusText(event.my_partstat);updateRsvpButtons(event.my_partstat);}auxOverlay.classList.add('open');document.getElementById('eventSummary').focus();}
 // Текст своего статуса участия и подсветка активной кнопки ответа - см.
 // resolve_my_attendance в ядре (my_partstat приходит уже вычисленным).
 function rsvpStatusText(partstat){switch(String(partstat||'NEEDS-ACTION').toUpperCase()){case 'ACCEPTED':return L('Вы приняли приглашение','You accepted the invitation');case 'DECLINED':return L('Вы отклонили приглашение','You declined the invitation');case 'TENTATIVE':return L('Вы ответили «возможно»','You replied "maybe"');case 'DELEGATED':return L('Ответ делегирован другому участнику','Response delegated to another attendee');default:return L('Ответ ещё не отправлен','No response sent yet');}}
@@ -963,7 +998,7 @@ document.getElementById('contactAddPhone').onclick=()=>addContactPhoneRow();
 function addContactAddressRow(address={}){const row=document.createElement('div');row.className='contact-address-row';row.innerHTML=`<div class="contact-address-head"><select class="sel contact-address-kind"><option value="home">${L('Домашний','Home')}</option><option value="work">${L('Рабочий','Work')}</option><option value="other">${L('Другой','Other')}</option></select><button class="iconbtn" type="button" title="${L('Удалить','Delete')}"><i data-i="trash"></i></button></div><input class="inp contact-address-street" placeholder="${L('Улица, дом','Street address')}"><div class="contact-address-grid"><input class="inp contact-address-city" placeholder="${L('Город','City')}"><input class="inp contact-address-region" placeholder="${L('Регион','Region')}"><input class="inp contact-address-postal" placeholder="${L('Индекс','Postal code')}"><input class="inp contact-address-country" placeholder="${L('Страна','Country')}"></div>`;row.querySelector('.contact-address-kind').value=address.kind||'home';row.querySelector('.contact-address-street').value=address.street||'';row.querySelector('.contact-address-city').value=address.city||'';row.querySelector('.contact-address-region').value=address.region||'';row.querySelector('.contact-address-postal').value=address.postal_code||'';row.querySelector('.contact-address-country').value=address.country||'';row.querySelector('button').onclick=()=>row.remove();document.getElementById('contactAddresses').appendChild(row);renderIcons(row);}
 function contactAddressesFromForm(){const value=(row,selector)=>row.querySelector(selector).value.trim()||null;return [...document.querySelectorAll('.contact-address-row')].map(row=>({kind:row.querySelector('.contact-address-kind').value,street:value(row,'.contact-address-street'),city:value(row,'.contact-address-city'),region:value(row,'.contact-address-region'),postal_code:value(row,'.contact-address-postal'),country:value(row,'.contact-address-country')})).filter(address=>address.street||address.city||address.region||address.postal_code||address.country);}
 document.getElementById('contactAddAddress').onclick=()=>addContactAddressRow();
-function openContactEditor(contact=null){editingContact=contact;editingEvent=null;setAuxMode('contact');fillAccountSelect(document.getElementById('contactAccount'),contact?.account_id||coreAccounts[0]?.id);document.getElementById('contactAccount').disabled=Boolean(contact);document.getElementById('contactDisplayName').value=contact?.display_name||'';document.getElementById('contactFirstName').value=contact?.first_name||'';document.getElementById('contactLastName').value=contact?.last_name||'';document.getElementById('contactOrganization').value=contact?.organization||'';document.getElementById('contactEmails').value=(contact?.emails||[]).map(item=>item.email).join('\n');document.getElementById('contactPhones').innerHTML='';(contact?.phones||[]).forEach(addContactPhoneRow);document.getElementById('contactAddresses').innerHTML='';(contact?.addresses||[]).forEach(addContactAddressRow);document.getElementById('contactDelete').classList.toggle('hidden',!contact);document.getElementById('contactStatus').textContent='';
+function openContactEditor(contact=null){if(auxSaving)return;auxEditorKey=newAuxEditorKey();editingContact=contact;editingEvent=null;setAuxMode('contact');fillAccountSelect(document.getElementById('contactAccount'),contact?.account_id||coreAccounts[0]?.id);document.getElementById('contactAccount').disabled=Boolean(contact);document.getElementById('contactDisplayName').value=contact?.display_name||'';document.getElementById('contactFirstName').value=contact?.first_name||'';document.getElementById('contactLastName').value=contact?.last_name||'';document.getElementById('contactOrganization').value=contact?.organization||'';document.getElementById('contactEmails').value=(contact?.emails||[]).map(item=>item.email).join('\n');document.getElementById('contactPhones').innerHTML='';(contact?.phones||[]).forEach(addContactPhoneRow);document.getElementById('contactAddresses').innerHTML='';(contact?.addresses||[]).forEach(addContactAddressRow);document.getElementById('contactDelete').classList.toggle('hidden',!contact);document.getElementById('contactStatus').textContent='';
   // Существующий контакт без серверной копии (is_local_only) - предупреждаем
   // заранее, а не когда сохранение молча ничего никуда не отправит.
   document.getElementById('contactLocalOnlyNotice').classList.toggle('hidden',!contact?.is_local_only);
@@ -973,9 +1008,62 @@ document.getElementById('newEventBtn').onclick=()=>openEventEditor();
 document.getElementById('newContactBtn').onclick=()=>openContactEditor();
 document.getElementById('auxClose').onclick=closeAuxEditor;document.getElementById('eventCancel').onclick=closeAuxEditor;document.getElementById('contactCancel').onclick=closeAuxEditor;
 auxOverlay.addEventListener('click',event=>{if(event.target===auxOverlay)closeAuxEditor();});
-eventForm.onsubmit=async event=>{event.preventDefault();const status=document.getElementById('eventStatus'),input=eventInputFromForm(editingEvent);status.textContent=L('Сохраняю на сервере…','Saving to the server…');status.dataset.kind='';try{if(editingEvent)await window.tm.updateEvent(editingEvent.id,input);else await window.tm.createEvent(Number(document.getElementById('eventAccount').value),Number(document.getElementById('eventCalendar').value),input);await window.reloadCoreData();closeAuxEditor();showToast(L('Событие сохранено и синхронизировано','Event saved and synced'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
-document.getElementById('eventDelete').onclick=async()=>{if(!editingEvent||!await confirmAction(L('Удалить событие или задачу на сервере?','Delete this event or task on the server?')))return;const status=document.getElementById('eventStatus');status.textContent=L('Удаляю…','Deleting…');try{await window.tm.deleteEvent(editingEvent.id);await window.reloadCoreData();closeAuxEditor();showToast(L('Удалено на сервере','Deleted on the server'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
-contactForm.onsubmit=async event=>{event.preventDefault();const status=document.getElementById('contactStatus'),input={display_name:document.getElementById('contactDisplayName').value.trim(),first_name:document.getElementById('contactFirstName').value.trim()||null,last_name:document.getElementById('contactLastName').value.trim()||null,organization:document.getElementById('contactOrganization').value.trim()||null,emails:document.getElementById('contactEmails').value.split(/[\n,;]/).map(value=>value.trim()).filter(Boolean),phones:contactPhonesFromForm(),addresses:contactAddressesFromForm()};status.textContent=L('Сохраняю на сервере…','Saving to the server…');status.dataset.kind='';try{if(editingContact)await window.tm.updateContact(editingContact.id,input);else await window.tm.createContact(Number(document.getElementById('contactAccount').value),input);await window.reloadCoreData();closeAuxEditor();showToast(L('Контакт сохранён и синхронизирован','Contact saved and synced'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
+eventForm.onsubmit=async event=>{
+  event.preventDefault();
+  const existing=editingEvent;
+  const input=eventInputFromForm(existing);
+  const accountId=Number(document.getElementById('eventAccount').value);
+  const calendarId=Number(document.getElementById('eventCalendar').value);
+  await submitAuxiliary(eventForm,document.getElementById('eventStatus'),(key,retry)=>
+    existing?window.tm.updateEvent(existing.id,input):window.tm.createEvent(accountId,calendarId,input,key,retry),
+  L('Событие сохранено','Event saved'));
+};
+function canDeleteCalendarEvent(event){
+  const calendar=coreCalendarData.calendars.find(item=>item.id===event.calendar_id);
+  const provider=coreAccounts.find(item=>item.id===calendar?.account_id)?.provider;
+  return !event.recurrence_id||['gmail','exchange'].includes(provider);
+}
+document.getElementById('eventDelete').onclick=async()=>{const event=editingEvent;if(!event||!canDeleteCalendarEvent(event)||!await confirmAction(event.rrule?L('Удалить всю серию встреч на сервере?','Delete the entire series on the server?'):L('Удалить событие или задачу на сервере?','Delete this event or task on the server?'))||editingEvent!==event)return;const status=document.getElementById('eventStatus');status.textContent=L('Удаляю…','Deleting…');try{await window.tm.deleteEvent(event.id);await window.reloadCoreData();closeAuxEditor();showToast(L('Удалено на сервере','Deleted on the server'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
+contactForm.onsubmit=async event=>{
+  event.preventDefault();
+  const existing=editingContact;
+  const accountId=Number(document.getElementById('contactAccount').value);
+  const input={display_name:document.getElementById('contactDisplayName').value.trim(),first_name:document.getElementById('contactFirstName').value.trim()||null,last_name:document.getElementById('contactLastName').value.trim()||null,organization:document.getElementById('contactOrganization').value.trim()||null,emails:document.getElementById('contactEmails').value.split(/[\n,;]/).map(value=>value.trim()).filter(Boolean),phones:contactPhonesFromForm(),addresses:contactAddressesFromForm()};
+  await submitAuxiliary(contactForm,document.getElementById('contactStatus'),(key,retry)=>
+    existing?window.tm.updateContact(existing.id,input):window.tm.createContact(accountId,input,key,retry),
+  L('Контакт сохранён','Contact saved'));
+};
 document.getElementById('contactDelete').onclick=async()=>{if(!editingContact||!await confirmAction(L('Удалить контакт?','Delete this contact?')))return;const status=document.getElementById('contactStatus');status.textContent=L('Удаляю…','Deleting…');try{await window.tm.deleteContact(editingContact.id);await window.reloadCoreData();closeAuxEditor();showToast(L('Контакт удалён','Contact deleted'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
-calSection.addEventListener('click',e=>{if(window.calendarDropJustHappened)return;const item=e.target.closest('.ev,.wk-ev');if(!item)return;e.stopPropagation();const event=coreCalendarData.events.find(value=>value.id===Number(item.dataset.eventId));if(event)openEventEditor(event);});
+calSection.addEventListener('click',e=>{if(window.calendarDropJustHappened)return;const item=e.target.closest('.ev,.wk-ev');if(!item)return;e.stopPropagation();const event=coreCalendarData.events.find(value=>value.id===Number(item.dataset.eventId));if(event)editCalendarSelection(event,item.dataset.eventStart);});
+function editCalendarSelection(event,start){
+  const calendar=coreCalendarData.calendars.find(item=>item.id===event.calendar_id);
+  const account=coreAccounts.find(item=>item.id===calendar?.account_id);
+  const master=event.recurrence_id
+    ?coreCalendarData.events.find(item=>item.calendar_id===event.calendar_id&&item.uid===event.uid&&item.rrule&&!item.recurrence_id)
+    :event.rrule?event:null;
+  if(!master||['gmail','exchange'].includes(account?.provider)){openEventEditor(event);return;}
+  const scope=document.createElement('div');
+  scope.className='overlay open';
+  const panel=document.createElement('div');panel.className='modal compact-modal';
+  const title=document.createElement('div');title.className='mb';
+  title.textContent=L('Какую часть серии изменить?','Which part of the series should change?');
+  const actions=document.createElement('div');actions.className='mf';
+  const add=(label,callback)=>{
+    const button=document.createElement('button');button.type='button';button.className='btn';button.textContent=label;
+    button.onclick=()=>{scope.remove();callback?.();};actions.appendChild(button);
+  };
+  add(L('Отмена','Cancel'));
+  add(L('Вся серия','Entire series'),()=>openEventEditor(master));
+  add(L('Только эта встреча','This occurrence'),()=>{
+    if(event.recurrence_id){openEventEditor(event);return;}
+    const date=parseDavDate(start)||parseDavDate(event.dtstart);
+    if(!date)return;
+    const allDay=Boolean(event.all_day)||isDateOnlyValue(event.dtstart);
+    const sourceStart=parseDavDate(event.dtstart),sourceEnd=parseDavDate(event.dtend);
+    const recurrence=allDay?occurrenceDateValue(date,true).replace(/-/g,''):date.toISOString().replace(/[-:]/g,'').replace(/\.\d{3}Z$/,'Z');
+    const dtend=sourceStart&&sourceEnd?occurrenceDateValue(new Date(date.getTime()+sourceEnd-sourceStart),allDay):null;
+    openEventEditor({...event,rrule:null,exdates:null,rdates:null,recurrence_id:recurrence,dtstart:occurrenceDateValue(date,allDay),dtend});
+  });
+  panel.append(title,actions);scope.appendChild(panel);document.body.appendChild(scope);
+}
 window.prepareCalendarEventMove=(eventId,sourceValue,targetValue)=>{const source=coreCalendarData.events.find(value=>value.id===Number(eventId));if(!source)return;const parseTarget=value=>{const match=String(value).match(/^(\d{4})-(\d{2})-(\d{2})$/);return match?new Date(+match[1],+match[2]-1,+match[3]):parseDavDate(value);},sourceOccurrence=parseDavDate(sourceValue)||parseDavDate(source.dtstart),target=parseTarget(targetValue);if(!sourceOccurrence||!target)return;const targetHasTime=!/^\d{4}-\d{2}-\d{2}$/.test(String(targetValue));if(!targetHasTime&&!source.all_day)target.setHours(sourceOccurrence.getHours(),sourceOccurrence.getMinutes(),sourceOccurrence.getSeconds(),sourceOccurrence.getMilliseconds());const sourceStart=parseDavDate(source.dtstart),sourceEnd=parseDavDate(source.dtend),duration=sourceStart&&sourceEnd&&sourceEnd>sourceStart?sourceEnd-sourceStart:60*60000,movedStart=target,movedEnd=new Date(movedStart.getTime()+duration),becomesTimed=targetHasTime&&Boolean(source.all_day),pad=value=>String(value).padStart(2,'0'),dateOnly=value=>`${value.getFullYear()}-${pad(value.getMonth()+1)}-${pad(value.getDate())}`,draft={...source,all_day:becomesTimed?false:Boolean(source.all_day),dtstart:source.all_day&&!becomesTimed?dateOnly(movedStart):movedStart.toISOString(),dtend:source.all_day&&!becomesTimed?dateOnly(movedEnd):movedEnd.toISOString()};openEventEditor(draft);const status=document.getElementById('eventStatus');status.textContent=L('Проверьте новое время и нажмите «Сохранить».','Check the new time and click Save.');status.dataset.kind='';};

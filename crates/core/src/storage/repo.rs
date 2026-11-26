@@ -38,6 +38,7 @@ macro_rules! flag_op_changes_flag_sql {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
+    pub undo_until: Option<String>,
     /// Письма, пропущенные из-за уже стоящей по ним операции увода (S-005).
     pub skipped: usize,
     /// Из них письма, которые прямо сейчас переносятся на сервере (S-006).
@@ -86,6 +87,14 @@ pub struct FailedOperation {
     pub message_id: Option<i64>,
     pub op_kind: String,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct UndoMoveOutcome {
+    pub cancelled: usize,
+    pub processing: usize,
+    pub completed: usize,
+    pub failed: usize,
 }
 
 /// Результат сохранения календарей/контактов провайдера: счётчики плюс
@@ -346,6 +355,7 @@ impl MessageFetchLocator {
 #[derive(sqlx::FromRow)]
 struct CachedMessageBody {
     id: i64,
+    uid: i64,
     raw_blob_ref: Option<String>,
     body_fetched: bool,
     imap_uidvalidity: Option<i64>,
@@ -706,6 +716,8 @@ impl Db {
                 smtp_security = excluded.smtp_security,
                 ews_url = excluded.ews_url,
                 jmap_url = excluded.jmap_url,
+                caldav_url = coalesce(excluded.caldav_url, accounts.caldav_url),
+                carddav_url = coalesce(excluded.carddav_url, accounts.carddav_url),
                 username = excluded.username,
                 secret_ref = excluded.secret_ref,
                 enabled = 1,
@@ -725,9 +737,7 @@ impl Db {
         .bind(security(input.smtp.as_ref()))
         .bind(input.ews_url.as_deref())
         .bind(input.jmap_url.as_deref())
-        // caldav_url/carddav_url нарочно не входят в ON CONFLICT UPDATE SET
-        // (как и color ниже): переподключение того же email не должно
-        // затирать уже обнаруженные DAV-адреса значением NULL из NewAccount.
+        // Пустые поля при переподключении не затирают найденные DAV-адреса.
         .bind(input.caldav_url.as_deref())
         .bind(input.carddav_url.as_deref())
         .bind(input.username.as_deref())
@@ -736,11 +746,23 @@ impl Db {
         .execute(&self.write_pool)
         .await?;
 
-        self.list_accounts()
+        let account = self
+            .list_accounts()
             .await?
             .into_iter()
             .find(|account| account.email.eq_ignore_ascii_case(&input.email))
-            .ok_or_else(|| crate::Error::Other("аккаунт не найден после сохранения".into()))
+            .ok_or_else(|| crate::Error::Other("аккаунт не найден после сохранения".into()))?;
+        if input.caldav_url.is_some() || input.carddav_url.is_some() {
+            let mut tx = self.begin_write().await?;
+            for (kind, url) in [
+                ("caldav", input.caldav_url.as_deref()),
+                ("carddav", input.carddav_url.as_deref()),
+            ] {
+                remember_dav_base(&mut tx, account.id, kind, url).await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(account)
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
@@ -1009,16 +1031,46 @@ impl Db {
         account_id: i64,
         caldav_url: Option<&str>,
         carddav_url: Option<&str>,
+        previous: Option<(Option<&str>, Option<&str>)>,
     ) -> Result<()> {
-        sqlx::query(
-            "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        let mut tx = self.begin_write().await?;
+        let (previous_caldav, previous_carddav) = previous.unwrap_or_default();
+        let updated = sqlx::query(
+            "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now')
+             WHERE id=? AND enabled=1 AND (? OR (caldav_url IS ? AND carddav_url IS ?))",
         )
         .bind(caldav_url)
         .bind(carddav_url)
         .bind(account_id)
-        .execute(&self.write_pool)
+        .bind(previous.is_none())
+        .bind(previous_caldav)
+        .bind(previous_carddav)
+        .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(crate::Error::AccountConfig(
+                "Настройки ящика изменились. Обновите список и повторите".into(),
+            ));
+        }
+        remember_dav_base(&mut tx, account_id, "caldav", caldav_url).await?;
+        remember_dav_base(&mut tx, account_id, "carddav", carddav_url).await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn is_known_dav_base(
+        &self,
+        account_id: i64,
+        kind: &str,
+        url: &str,
+    ) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key=? AND value=?)")
+                .bind(format!("dav_base:{account_id}:{kind}"))
+                .bind(url)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Задать цвет аккаунта (для аватаров писем и сайдбара).
@@ -1130,6 +1182,15 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         if let Some(folder_id) = folder_id {
+            sqlx::query(
+                "UPDATE folder_role_overrides SET folder_id=NULL
+                         WHERE account_id=? AND folder_id=? AND role<>?",
+            )
+            .bind(account_id)
+            .bind(folder_id)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
             let updated = sqlx::query("UPDATE folders SET role=? WHERE id=? AND account_id=?")
                 .bind(role)
                 .bind(folder_id)
@@ -1140,6 +1201,15 @@ impl Db {
                 return Err(crate::Error::Other("папка аккаунта не найдена".into()));
             }
         }
+        sqlx::query(
+            "INSERT INTO folder_role_overrides(account_id,role,folder_id) VALUES(?,?,?)
+             ON CONFLICT(account_id,role) DO UPDATE SET folder_id=excluded.folder_id",
+        )
+        .bind(account_id)
+        .bind(role)
+        .bind(folder_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1152,6 +1222,11 @@ impl Db {
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
+        let canonical_drafts = folders
+            .iter()
+            .filter(|folder| folder.role == Some(FolderRole::Drafts))
+            .count()
+            == 1;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
             if let Some(uidvalidity) = folder.uidvalidity {
@@ -1171,17 +1246,18 @@ impl Db {
             }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO folders(account_id, remote_path, display_name, role, unread_count,
-                                     total_count, uidvalidity, uidnext, highestmodseq)
+                                     total_count, pending_uidvalidity, uidnext, highestmodseq)
                  VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, remote_path) DO UPDATE SET
-                    display_name = excluded.display_name, role = coalesce(excluded.role, folders.role),
+                    display_name = excluded.display_name,
+                    role = CASE WHEN ? AND excluded.role IS NULL AND folders.role='drafts'
+                           THEN NULL ELSE coalesce(excluded.role, folders.role) END,
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
-                    sync_token = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
-                        THEN NULL ELSE folders.sync_token END,
-                    highestmodseq = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
-                        THEN NULL ELSE folders.highestmodseq END,
-                    uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
+                    pending_uidvalidity = CASE WHEN excluded.pending_uidvalidity IS NULL
+                        THEN folders.pending_uidvalidity
+                        WHEN excluded.pending_uidvalidity IS NOT folders.uidvalidity
+                        THEN excluded.pending_uidvalidity END,
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
                     last_synced = datetime('now')
                  RETURNING id",
@@ -1195,6 +1271,7 @@ impl Db {
             .bind(folder.uidvalidity.map(i64::from))
             .bind(folder.uidnext.map(i64::from))
             .bind(folder.highestmodseq.map(|value| value as i64))
+            .bind(canonical_drafts)
             .fetch_one(&mut *tx)
             .await?;
             folder_ids.insert(folder.remote_path.as_str(), id);
@@ -1209,6 +1286,28 @@ impl Db {
                 sqlx::query("UPDATE folders SET parent_id=? WHERE id=?")
                     .bind(parent_id)
                     .bind(folder_ids[folder.remote_path.as_str()])
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        let overrides: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT role,folder_id FROM folder_role_overrides WHERE account_id=?")
+                .bind(account_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (role, folder_id) in overrides {
+            if folder_id.is_none() || role == "drafts" {
+                sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
+                    .bind(account_id)
+                    .bind(&role)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if let Some(folder_id) = folder_id {
+                sqlx::query("UPDATE folders SET role=? WHERE account_id=? AND id=?")
+                    .bind(role)
+                    .bind(account_id)
+                    .bind(folder_id)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -1452,11 +1551,16 @@ impl Db {
             let Some(sync_token) = folder.sync_token.as_deref() else {
                 continue;
             };
-            sqlx::query(
+            let saved = sqlx::query(
                 "UPDATE folders SET sync_token=?, uidvalidity=coalesce(?, uidvalidity),
+                    pending_uidvalidity=NULL,
                     uidnext=coalesce(?, uidnext),
                     highestmodseq=coalesce(?, highestmodseq), last_synced=datetime('now')
-                 WHERE account_id=? AND remote_path=?",
+                 WHERE account_id=? AND remote_path=?
+                   AND (pending_uidvalidity IS NULL OR (
+                     pending_uidvalidity=? AND NOT EXISTS(SELECT 1 FROM messages m
+                      WHERE m.folder_id=folders.id AND m.imap_uidvalidity IS NOT folders.pending_uidvalidity)
+                   ))",
             )
             .bind(sync_token)
             .bind(folder.uidvalidity.map(i64::from))
@@ -1468,8 +1572,12 @@ impl Db {
             )
             .bind(account_id)
             .bind(&folder.remote_path)
+            .bind(folder.uidvalidity.map(i64::from))
             .execute(&mut *tx)
             .await?;
+            if saved.rows_affected() == 0 {
+                return Err(crate::Error::ImapMessageIdentityChanged);
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1481,11 +1589,13 @@ impl Db {
     ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
         let rows: Vec<FolderCursorRow> = sqlx::query_as(
             "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid),
-                    f.highestmodseq, f.sync_token
+                    CASE WHEN f.pending_uidvalidity IS NULL THEN f.highestmodseq END,
+                    CASE WHEN f.pending_uidvalidity IS NULL THEN f.sync_token END
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
+                 AND f.pending_uidvalidity IS NULL
                  AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              WHERE f.account_id=?
-             GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token",
+             GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token, f.pending_uidvalidity",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
@@ -1512,7 +1622,7 @@ impl Db {
         let known_uid_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT f.remote_path, m.uid
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE f.account_id=?
+             WHERE f.account_id=? AND f.pending_uidvalidity IS NULL
                AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              ORDER BY f.remote_path, m.uid",
         )
@@ -1543,6 +1653,24 @@ impl Db {
         changed_remote_ids: &[String],
         remote_snapshot: Option<&[String]>,
     ) -> Result<usize> {
+        self.reconcile_exact_remote_projections(
+            account_id,
+            messages,
+            changed_remote_ids,
+            remote_snapshot,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn reconcile_exact_remote_projections(
+        &self,
+        account_id: i64,
+        messages: &[crate::backend::DiscoveredMessage],
+        changed_remote_ids: &[String],
+        remote_snapshot: Option<&[String]>,
+        folder_snapshots: &[(String, Vec<String>)],
+    ) -> Result<usize> {
         // Снимок пределов берётся до цикла: клонировать его на каждое
         // письмо незачем, значение за один проход не меняется.
         let limits = self.limit_set();
@@ -1560,27 +1688,36 @@ impl Db {
         let changed: HashSet<&str> = changed_remote_ids.iter().map(String::as_str).collect();
         let snapshot: Option<HashSet<&str>> =
             remote_snapshot.map(|ids| ids.iter().map(String::as_str).collect());
-        if changed.is_empty() && snapshot.is_none() {
+        let exact_folders: HashMap<&str, HashSet<&str>> = folder_snapshots
+            .iter()
+            .map(|(path, ids)| (path.as_str(), ids.iter().map(String::as_str).collect()))
+            .collect();
+        if changed.is_empty() && snapshot.is_none() && exact_folders.is_empty() {
             return Ok(0);
         }
 
+        let mut tx = self.begin_write().await?;
         let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
             "SELECT m.id, m.remote_id, f.remote_path, m.raw_blob_ref
              FROM messages m JOIN folders f ON f.id=m.folder_id
              WHERE m.account_id=? AND m.remote_id IS NOT NULL",
         )
         .bind(account_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let mut delete_rows = Vec::new();
         for (id, remote_id, folder_path, raw_ref) in rows {
-            let should_check = snapshot.is_some() || changed.contains(remote_id.as_str());
+            let folder_snapshot = exact_folders.get(folder_path.as_str());
+            let should_check = snapshot.is_some()
+                || folder_snapshot.is_some()
+                || changed.contains(remote_id.as_str());
             if !should_check {
                 continue;
             }
             let absent_from_server = snapshot
                 .as_ref()
-                .is_some_and(|ids| !ids.contains(remote_id.as_str()));
+                .is_some_and(|ids| !ids.contains(remote_id.as_str()))
+                || folder_snapshot.is_some_and(|ids| !ids.contains(remote_id.as_str()));
             let stale_projection = desired
                 .get(remote_id.as_str())
                 .is_some_and(|paths| !paths.contains(folder_path.as_str()));
@@ -1592,7 +1729,6 @@ impl Db {
             }
         }
 
-        let mut tx = self.begin_write().await?;
         let mut blob_refs = Vec::new();
         for (id, raw_ref) in &delete_rows {
             let attachment_refs: Vec<(Option<String>,)> =
@@ -1638,8 +1774,9 @@ impl Db {
         for (path, server_uids) in snapshots {
             let rows: Vec<(i64, i64, Option<String>, bool)> = sqlx::query_as(
                 "SELECT m.id, m.uid, m.raw_blob_ref,
-                        m.imap_uidvalidity IS NOT NULL AND f.uidvalidity IS NOT NULL
-                        AND m.imap_uidvalidity<>f.uidvalidity FROM messages m
+                        COALESCE(f.pending_uidvalidity,f.uidvalidity) IS NOT NULL
+                        AND (f.pending_uidvalidity IS NOT NULL OR m.imap_uidvalidity IS NOT NULL)
+                        AND m.imap_uidvalidity IS NOT COALESCE(f.pending_uidvalidity,f.uidvalidity) FROM messages m
                  JOIN folders f ON f.id=m.folder_id
                  WHERE m.account_id=? AND f.remote_path=?",
             )
@@ -2727,7 +2864,7 @@ impl Db {
                 ) in batch
                 {
                 let folder: Option<(i64, Option<i64>)> = sqlx::query_as(
-                    "SELECT id, uidvalidity FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
+                    "SELECT id, coalesce(pending_uidvalidity,uidvalidity) FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
                 )
                 .bind(account_id)
                 .bind(&source.folder_path)
@@ -2738,14 +2875,17 @@ impl Db {
                 if matches!((uidvalidity, folder_uidvalidity), (Some(current), Some(saved)) if current != saved) {
                     return Err(crate::Error::ImapMessageIdentityChanged);
                 }
-                let mut old_ref: Option<CachedMessageBody> = sqlx::query_as(
-                    "SELECT id, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
-                     FROM messages WHERE folder_id=? AND uid=?",
-                )
-                .bind(folder_id)
-                .bind(source.uid as i64)
-                .fetch_optional(&mut *tx)
-                .await?;
+                let mut old_ref: Option<CachedMessageBody> = if let Some(remote_id) = &source.remote_id {
+                    sqlx::query_as(
+                        "SELECT id, uid, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                         FROM messages WHERE folder_id=? AND remote_id=? ORDER BY id LIMIT 1",
+                    ).bind(folder_id).bind(remote_id).fetch_optional(&mut *tx).await?
+                } else {
+                    sqlx::query_as(
+                        "SELECT id, uid, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                         FROM messages WHERE folder_id=? AND uid=? AND remote_id IS NULL",
+                    ).bind(folder_id).bind(i64::from(source.uid)).fetch_optional(&mut *tx).await?
+                };
                 if let Some(old) = &old_ref
                     && let Some(current_generation) = uidvalidity
                     && (old.imap_uidvalidity.is_some_and(|generation| generation != current_generation)
@@ -2774,6 +2914,16 @@ impl Db {
                          SET last_id=max(last_id,coalesce((SELECT max(id) FROM messages),0))+1
                          WHERE singleton=1 RETURNING last_id",
                     ).fetch_one(&mut *tx).await?,
+                };
+                let uid = if let Some(row) = &old_ref {
+                    row.uid
+                } else if source.remote_id.is_some() {
+                    let occupied: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE folder_id=? AND uid=?)",
+                    ).bind(folder_id).bind(i64::from(source.uid)).fetch_one(&mut *tx).await?;
+                    if occupied { i64::from(u32::MAX) + local_id } else { i64::from(source.uid) }
+                } else {
+                    i64::from(source.uid)
                 };
                 let effective_ref = if preserve_full_body {
                     old_ref
@@ -2820,7 +2970,7 @@ impl Db {
                         reply_to_addrs=excluded.reply_to_addrs,
                         silence_headers_known=CASE WHEN messages.silence_headers_known=1 THEN 1 ELSE excluded.silence_headers_known END"
                 ))
-                .bind(account_id).bind(folder_id).bind(source.uid as i64).bind(&source.remote_id).bind(&message_id)
+                .bind(account_id).bind(folder_id).bind(uid).bind(&source.remote_id).bind(&message_id)
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
@@ -4957,6 +5107,7 @@ impl Db {
                     .await?;
             queued.account(outcome);
         }
+        queued.undo_until = queued_move_deadline(&mut tx, &queued.operation_ids).await?;
         tx.commit().await?;
         Ok(queued)
     }
@@ -5007,6 +5158,7 @@ impl Db {
                     .await?;
             queued.account(outcome);
         }
+        queued.undo_until = queued_move_deadline(&mut tx, &queued.operation_ids).await?;
         tx.commit().await?;
         Ok(queued)
     }
@@ -5184,6 +5336,37 @@ impl Db {
         Ok(removed)
     }
 
+    pub async fn undo_move_operations(&self, operation_ids: &[i64]) -> Result<UndoMoveOutcome> {
+        let mut tx = self.begin_write().await?;
+        let mut outcome = UndoMoveOutcome::default();
+        for id in operation_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM outbox_ops WHERE id=? AND op_kind IN ('move','delete')",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match status.as_deref() {
+                Some("pending" | "retry") => {
+                    sqlx::query("DELETE FROM outbox_ops WHERE id=?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    outcome.cancelled += 1;
+                }
+                Some("processing") => outcome.processing += 1,
+                Some("failed") => outcome.failed += 1,
+                _ => outcome.completed += 1,
+            }
+        }
+        tx.commit().await?;
+        Ok(outcome)
+    }
+
     pub async fn claim_outbox_operations(
         &self,
         account_id: i64,
@@ -5322,10 +5505,15 @@ impl Db {
             // out-of-office.md S-048: окончательно отказавший автоответ
             // отправленным не считается. Иначе окно молчания на семь суток
             // закрывало бы адресата, так и не получившего ни одного ответа.
-            sqlx::query("UPDATE out_of_office_replies SET state='failed' WHERE operation_id=?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE out_of_office_replies SET state='failed'
+                         WHERE operation_id=? AND state<>'sent'
+                           AND EXISTS(SELECT 1 FROM outbox_ops WHERE id=? AND op_kind='send')",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -5678,12 +5866,6 @@ impl Db {
     // ---------- Правила обработки почты ----------
 
     pub async fn import_legacy_mail_rules(&self) -> Result<()> {
-        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM mail_rules")
-            .fetch_one(&self.pool)
-            .await?;
-        if count > 0 {
-            return Ok(());
-        }
         let Some(serialized) = self.setting("mail_rules_ui").await? else {
             return Ok(());
         };
@@ -5692,29 +5874,67 @@ impl Db {
             return Ok(());
         };
         let mut tx = self.begin_write().await?;
+        let has_existing_rules: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM mail_rules) AND NOT EXISTS(
+                SELECT 1 FROM storage_meta WHERE key='legacy_rules_import_started')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_existing_rules {
+            return Ok(());
+        }
+        sqlx::query("INSERT OR IGNORE INTO storage_meta(key,value) VALUES('legacy_rules_import_started','1')")
+            .execute(&mut *tx).await?;
+        let mut complete = true;
         for (sort_order, rule) in rules.into_iter().enumerate() {
             let string = |key: &str| rule.get(key).and_then(|value| value.as_str());
-            let Some(id) = string("id") else { continue };
-            let Some(name) = string("name") else { continue };
-            let Some(field) = string("field") else {
-                continue;
-            };
-            let Some(operator) = string("operator") else {
-                continue;
-            };
-            let Some(value) = string("value") else {
-                continue;
-            };
-            let Some(action) = string("action") else {
+            let (Some(id), Some(name), Some(field), Some(operator), Some(value), Some(action)) = (
+                string("id"),
+                string("name"),
+                string("field"),
+                string("operator"),
+                string("value"),
+                string("action"),
+            ) else {
+                complete = false;
                 continue;
             };
             if !matches!(field, "sender" | "subject")
                 || !matches!(operator, "contains" | "equals")
                 || !matches!(action, "move" | "archive" | "spam" | "trash")
             {
+                complete = false;
                 continue;
             }
-            sqlx::query(
+            let imported_key = format!("legacy_rule_imported:{id}");
+            let imported: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key=?)")
+                    .bind(&imported_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if imported {
+                continue;
+            }
+            let requested_account = rule.get("account_id").and_then(|value| value.as_i64());
+            let requested_folder = rule.get("folder_id").and_then(|value| value.as_i64());
+            let (account_id, folder_id): (Option<i64>, Option<i64>) = sqlx::query_as(
+                "SELECT (SELECT id FROM accounts WHERE id=?),
+                    (SELECT id FROM folders WHERE id=? AND (? IS NULL OR account_id=?))",
+            )
+            .bind(requested_account)
+            .bind(requested_folder)
+            .bind(requested_account)
+            .bind(requested_account)
+            .fetch_one(&mut *tx)
+            .await?;
+            let enabled = rule
+                .get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+                && (requested_account.is_none() || account_id.is_some())
+                && (action != "move" || folder_id.is_some());
+            let mut rule_tx = sqlx::Acquire::begin(&mut tx).await?;
+            let inserted = sqlx::query(
                 "INSERT OR IGNORE INTO mail_rules(
                     id, name, field, operator, value, account_id, action, folder_id,
                     enabled, progress_message_id, sort_order
@@ -5725,26 +5945,45 @@ impl Db {
             .bind(field)
             .bind(operator)
             .bind(value)
-            .bind(rule.get("account_id").and_then(|value| value.as_i64()))
+            .bind(account_id)
             .bind(action)
-            .bind(rule.get("folder_id").and_then(|value| value.as_i64()))
-            .bind(
-                rule.get("enabled")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(true),
-            )
+            .bind(folder_id)
+            .bind(enabled)
             .bind(
                 rule.get("last_id")
                     .and_then(|value| value.as_i64())
                     .unwrap_or(0),
             )
             .bind(sort_order as i64)
+            .execute(&mut *rule_tx)
+            .await;
+            match inserted {
+                Ok(_) => {
+                    sqlx::query("INSERT INTO storage_meta(key,value) VALUES(?,'1')")
+                        .bind(&imported_key)
+                        .execute(&mut *rule_tx)
+                        .await?;
+                    rule_tx.commit().await?;
+                }
+                Err(error) => {
+                    rule_tx.rollback().await?;
+                    complete = false;
+                    tracing::warn!(error = %crate::logging::mask_error_text(&error.to_string()),
+                        "старое правило не загружено");
+                }
+            }
+        }
+        if complete {
+            sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "DELETE FROM storage_meta WHERE key='legacy_rules_import_started'
+                OR key GLOB 'legacy_rule_imported:*'",
+            )
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
-            .execute(&mut *tx)
-            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -7561,6 +7800,33 @@ impl Db {
     }
 }
 
+async fn remember_dav_base(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    kind: &str,
+    url: Option<&str>,
+) -> Result<()> {
+    if let Some(url) = url {
+        crate::service_url::parse(url)?;
+        sqlx::query("INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(format!("dav_base:{account_id}:{kind}")).bind(url).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
+async fn queued_move_deadline(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ids: &[i64],
+) -> Result<Option<String>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',min(next_attempt_at)) FROM outbox_ops WHERE id IN ({})",
+        id_list(ids)
+    ))).fetch_one(&mut **tx).await?)
+}
+
 /// Привести условие умной папки к нынешнему словарю полей и значений.
 /// Ранние версии писали в базу русские названия полей ("Статус"), старые
 /// английские ("from", "status") и значения seen/not_seen, yes/no.
@@ -9305,18 +9571,22 @@ async fn clear_stage_result_of_operation(
     Ok(())
 }
 
-async fn infer_missing_folder_role(
+pub(crate) async fn infer_missing_folder_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
     role: &str,
 ) -> Result<()> {
-    let known: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM folders WHERE account_id=? AND role=? LIMIT 1")
-            .bind(account_id)
-            .bind(role)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if known.is_some() {
+    let known: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND role=?) OR
+                EXISTS(SELECT 1 FROM folder_role_overrides WHERE account_id=? AND role=?)",
+    )
+    .bind(account_id)
+    .bind(role)
+    .bind(account_id)
+    .bind(role)
+    .fetch_one(&mut **tx)
+    .await?;
+    if known {
         return Ok(());
     }
     let expected = FolderRole::parse(role);
@@ -9351,6 +9621,18 @@ pub(crate) async fn resolve_role_folder(
     account_id: i64,
     role: &str,
 ) -> Result<Option<(i64, String)>> {
+    let assigned: Option<(Option<i64>, Option<String>)> = sqlx::query_as(
+        "SELECT f.id,f.remote_path FROM folder_role_overrides o
+         LEFT JOIN folders f ON f.id=o.folder_id AND f.account_id=o.account_id
+         WHERE o.account_id=? AND o.role=?",
+    )
+    .bind(account_id)
+    .bind(role)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some((id, path)) = assigned {
+        return Ok(id.zip(path));
+    }
     let folders: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=? AND role=?")
             .bind(account_id)

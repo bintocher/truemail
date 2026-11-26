@@ -151,6 +151,16 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
     let cursor = &db.folder_sync_cursors(account).await.unwrap()["INBOX"];
     assert!(cursor.last_uid.is_none());
     assert!(cursor.sync_token.is_none());
+    assert_eq!(cursor.uidvalidity, Some(20));
+    assert!(
+        db.save_folder_sync_tokens(account, &[folder(21)])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.folder_sync_cursors(account).await.unwrap()["INBOX"].uidvalidity,
+        Some(20)
+    );
     db.reconcile_imap_snapshot(account, &[("INBOX".into(), vec![10, 25])], &[])
         .await
         .unwrap();

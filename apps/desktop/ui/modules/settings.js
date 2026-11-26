@@ -125,6 +125,29 @@ function renderAccountSettings(accounts,foldersByAccount,calendars){
   card.querySelector('.ch').addEventListener('click',event=>{if(event.target.closest('.account-actions'))return;setOpenAccountId(accountCards.nextOpenAccountId(openAccountId,account.id));});
   const chips=card.querySelector('.account-calendars');(accountCalendars.length?accountCalendars:[{name:L('Календарь ещё синхронизируется','Calendar is still syncing')}]).forEach(cal=>{const chip=document.createElement('span');chip.className='calendar-chip';chip.textContent=cal.name;chips.appendChild(chip);});
   renderAccountColorPicker(card,account);
+  if(account.backend_kind!=='jmap'&&['yandex','icloud','mailru','outlook','generic'].includes(account.provider)){
+    const addresses=document.createElement('details');
+    addresses.innerHTML=`<summary>${L('Адреса календаря и контактов','Calendar and contacts addresses')}</summary>
+      <p class="d">${L('Пустые поля означают автоматический поиск. Указывайте только серверы, которым доверяете учётные данные этого ящика.','Leave fields empty for automatic discovery. Enter only servers you trust with this account’s credentials.')}</p>
+      <label>CalDAV <input class="inp dav-calendar" type="url" placeholder="https://"></label>
+      <label>CardDAV <input class="inp dav-contacts" type="url" placeholder="https://"></label>
+      <button type="button" class="btn sm">${L('Сохранить адреса','Save addresses')}</button>`;
+    const calendar=addresses.querySelector('.dav-calendar'),contacts=addresses.querySelector('.dav-contacts');
+    calendar.value=account.caldav_url||'';
+    contacts.value=account.carddav_url||'';
+    const save=addresses.querySelector('button');
+    save.onclick=async()=>{
+      if(!calendar.reportValidity()||!contacts.reportValidity())return;
+      save.disabled=true;
+      try{
+        await window.tm.configureAccountDav(account.id,calendar.value.trim()||null,contacts.value.trim()||null);
+        await window.reloadCoreData();
+        showToast(L('Адреса сохранены','Addresses saved'));
+      }catch(error){showToast(error);}
+      finally{save.disabled=false;}
+    };
+    chips.after(addresses);
+  }
   // Глубина кэша: раскладываем retention_days на число + единицу (дни/недели/месяцы).
   // Проверка сертификата (issue #118): решение принадлежит ящику и хранится
   // в его записи. Отказ ядра возвращает переключатель в прежнее положение -

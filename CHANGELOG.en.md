@@ -7,6 +7,30 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-11-26
+
+### Drafts and messages
+
+- Yandex Mail's system Drafts folder is selected using the server marker. A custom folder with the same name is labelled separately.
+- "Edit draft" opens the regular composition form with recipients, subject, body and attachments. "New message" returns to the unfinished letter when the editor is occupied.
+- A queued version of a draft is protected against resending after a restart. Removing the source draft is queued with the send.
+- Keyboard shortcuts and the command palette act on the open message. Print and Unsubscribe in the list menu use the message under the pointer.
+- Outbox distinguishes a delivered message from a missing Sent copy. Retrying only saves the copy. A send timeout no longer stalls the rest of the queue.
+- Undo reflects the actual move status and is offered within the undo window. The sender-blocking dialog confirms the current address or domain selection.
+
+### Sync and storage
+
+- Editing a CalDAV occurrence preserves the other events in its series. If an event changed on the server, the app asks you to refresh before saving.
+- An incomplete CalDAV or CardDAV response no longer counts as a complete sync. Repeated saves of events or contacts are protected against duplicates.
+- Gmail, JMAP and Exchange distinguish messages by full server IDs. Gmail checks for deletions after history expires, and Exchange reports skipped folders and keeps older messages after a reset.
+- IMAP repeats reconciliation after an interruption when folder numbering changes. Retrying a move checks for an existing copy in the destination.
+- Importing old rules skips damaged entries. A failed data-folder move reopens the original storage. The old-attachment cleanup explains that it removes downloaded message content.
+
+### Data protection
+
+- CalDAV, CardDAV and JMAP send credentials only to the configured server.
+- Remote images are blocked in the reading pane and downloaded only with permission.
+
 ## [0.3.8] - 2026-11-26
 
 ### Fixed

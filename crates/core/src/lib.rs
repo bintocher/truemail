@@ -14,6 +14,7 @@ pub mod i18n;
 pub mod logging;
 pub mod model;
 pub mod search;
+mod service_url;
 pub mod storage;
 
 pub use error::{Error, ErrorKind, Result};

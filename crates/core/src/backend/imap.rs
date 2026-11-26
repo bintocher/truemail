@@ -224,6 +224,7 @@ pub struct ImapDiscovery {
     pub folders: Vec<DiscoveredFolder>,
     pub messages: Vec<DiscoveredMessage>,
     pub server_uids: Vec<(String, Vec<u32>)>,
+    pub server_remote_ids: Vec<(String, Vec<String>)>,
     pub reset_folders: Vec<String>,
     /// Complete set of remote IDs, when the provider returned a full snapshot.
     pub remote_snapshot: Option<Vec<String>>,
@@ -1066,11 +1067,8 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
                     .map_err(imap_outbox_error)?;
             } else {
                 require_uid_expunge(&capabilities)?;
-                session
-                    .uid_copy(uid.to_string(), target)
-                    .await
-                    .map_err(imap_outbox_error)?;
-                mark_deleted(&mut session, uid).await?;
+                copy_once_then_delete(&mut session, folder, target, uid, mailbox.uid_validity)
+                    .await?;
             }
         }
         "delete" => {
@@ -1086,6 +1084,81 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
     }
     let _ = session.logout().await;
     Ok(())
+}
+
+async fn copy_once_then_delete(
+    session: &mut OAuthSession,
+    source: &str,
+    target: &str,
+    uid: u32,
+    generation: Option<u32>,
+) -> Result<()> {
+    if source == target
+        || (source.eq_ignore_ascii_case("INBOX") && target.eq_ignore_ascii_case("INBOX"))
+    {
+        return Ok(());
+    }
+    let original = uid_body(session, uid)
+        .await?
+        .ok_or(Error::ImapMessageIdentityChanged)?;
+    let search = match mime_message_id(&original)
+        .filter(|id| !id.bytes().any(|byte| byte.is_ascii_control()))
+    {
+        Some(id) => {
+            let quoted = id.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("HEADER Message-ID \"{quoted}\"")
+        }
+        None => format!(
+            "LARGER {} SMALLER {}",
+            original.len().saturating_sub(1),
+            original.len().saturating_add(1)
+        ),
+    };
+    session.examine(target).await.map_err(imap_outbox_error)?;
+    let ids = session
+        .uid_search(search)
+        .await
+        .map_err(imap_outbox_error)?;
+    let mut copied = false;
+    for candidate in ids {
+        if uid_body(session, candidate).await?.as_deref() == Some(original.as_slice()) {
+            copied = true;
+            break;
+        }
+    }
+    let current = session.select(source).await.map_err(imap_outbox_error)?;
+    if generation.is_none()
+        || current.uid_validity != generation
+        || !session
+            .uid_search(format!("UID {uid}"))
+            .await
+            .map_err(imap_outbox_error)?
+            .contains(&uid)
+    {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
+    if !copied {
+        session
+            .uid_copy(uid.to_string(), target)
+            .await
+            .map_err(imap_outbox_error)?;
+    }
+    mark_deleted(session, uid).await
+}
+
+async fn uid_body(session: &mut OAuthSession, uid: u32) -> Result<Option<Vec<u8>>> {
+    let fetched = session
+        .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+        .await
+        .map_err(imap_outbox_error)?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(imap_outbox_error)?;
+    Ok(fetched
+        .iter()
+        .find(|message| message.uid == Some(uid))
+        .and_then(|message| message.body())
+        .map(<[u8]>::to_vec))
 }
 
 pub async fn apply_yandex_operation(
@@ -1263,7 +1336,10 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             } else {
                 None
             };
-            imap_list_folder(name.name().to_owned(), name.delimiter(), role)
+            (
+                imap_list_folder(name.name().to_owned(), name.delimiter(), role),
+                role,
+            )
         })
         .try_collect::<Vec<_>>()
         .await
@@ -1272,7 +1348,18 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             message: e.to_string(),
         })?;
 
-    let mut folders = names;
+    let declares_drafts = names
+        .iter()
+        .any(|(_, explicit)| *explicit == Some(FolderRole::Drafts));
+    let mut folders = names
+        .into_iter()
+        .map(|(mut folder, explicit)| {
+            if declares_drafts && folder.role == Some(FolderRole::Drafts) && explicit.is_none() {
+                folder.role = None;
+            }
+            folder
+        })
+        .collect::<Vec<_>>();
     for folder in &mut folders {
         let status = session
             .status(&folder.remote_path, "(MESSAGES UNSEEN)")
@@ -1725,6 +1812,7 @@ async fn discover_inbox(
     Ok(ImapDiscovery {
         folders,
         messages,
+        server_remote_ids: Vec::new(),
         server_uids: full_snapshot
             .then_some((path.clone(), uids))
             .into_iter()
@@ -2122,6 +2210,7 @@ async fn discover_with_auth(
     Ok(ImapDiscovery {
         folders,
         messages,
+        server_remote_ids: Vec::new(),
         server_uids,
         reset_folders,
         remote_snapshot: None,

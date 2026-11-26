@@ -2606,6 +2606,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_legacy_rule_import_does_not_restore_a_deleted_rule() {
+        let root = std::env::temp_dir().join(format!("truemail-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Db::open_with_database_key(
+            &root,
+            Arc::new(StorageCrypto::from_key(random_key())),
+            &DatabaseKey::from_key(random_key()),
+        )
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        db.set_setting(
+            "mail_rules_ui",
+            r#"[
+            {"id":"archive","name":"Archive","field":"subject","operator":"contains",
+             "value":"test","action":"archive"}, {"id":"unknown"}
+        ]"#,
+        )
+        .await
+        .unwrap();
+        db.import_legacy_mail_rules().await.unwrap();
+        let deleted = sqlx::query("DELETE FROM mail_rules WHERE id='archive'")
+            .execute(&db.write_pool)
+            .await
+            .unwrap();
+        assert_eq!(deleted.rows_affected(), 1);
+        db.import_legacy_mail_rules().await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM mail_rules")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(db.setting("mail_rules_ui").await.unwrap().is_some());
+        db.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn mail_rules_queue_each_matching_message_once() {
         use crate::model::{
             AuthKind, BackendKind, MailRuleAction, MailRuleCondition, MailRuleGroup, MailRuleInput,

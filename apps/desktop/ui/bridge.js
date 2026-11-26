@@ -36,6 +36,7 @@ window.corePageSize = null;
     chooseKeyBackup: (defaultPath) => tauri.dialog.open({ directory: false, multiple: false, defaultPath, filters: [{ name: "truemail key backup", extensions: ["tmkeys"] }] }),
     listAccounts: () => invoke("list_accounts"),
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
+    configureAccountDav: (accountId, caldav, carddav) => invoke("configure_account_dav", { accountId, caldav, carddav }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
     setAccountRetention: (accountId, days) => invoke("set_account_retention", { accountId, days }),
     setAccountTlsInsecure: (accountId, insecure) => invoke("set_account_tls_insecure", { accountId, insecure }),
@@ -146,11 +147,11 @@ window.corePageSize = null;
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
     setCalendarVisible: (calendarId, visible) => invoke("set_calendar_visible", { calendarId, visible }),
-    createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
+    createEvent: (accountId, calendarId, input, requestKey, retryUncertain) => invoke("create_event", { accountId, calendarId, input, requestKey, retryUncertain }),
     updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
     deleteEvent: (eventId) => invoke("delete_event", { eventId }),
     respondToEvent: (eventId, response) => invoke("respond_to_event", { eventId, response }),
-    createContact: (accountId, input) => invoke("create_contact", { accountId, input }),
+    createContact: (accountId, input, requestKey, retryUncertain) => invoke("create_contact", { accountId, input, requestKey, retryUncertain }),
     updateContact: (contactId, input) => invoke("update_contact", { contactId, input }),
     deleteContact: (contactId) => invoke("delete_contact", { contactId }),
     storageStatus: () => invoke("storage_status"),
@@ -165,8 +166,9 @@ window.corePageSize = null;
     startRealtime: () => invoke("start_realtime"),
     // Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
     // второй операции не создаёт (specs/undo-send.md, S-053).
-    sendMessage: (request, requestKey) => invoke("send_message", { request, requestKey }),
-    scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
+    sendMessage: (request, requestKey, draftId) => invoke("send_message", { request, requestKey, draftId }),
+    scheduleMessage: (request, sendAt, draftId) => invoke("schedule_message", { request, sendAt, draftId }),
+    draftAlreadySubmitted: draftId => invoke("draft_already_submitted", { draftId }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
     markFlagged: (messageIds, flagged, reason = "user") => invoke("mark_flagged", { messageIds: Array.isArray(messageIds) ? messageIds : [messageIds], flagged, reason }),
     setMessagesPinned: (messageIds, pinned) => invoke("set_messages_pinned", { messageIds, pinned }),
@@ -205,6 +207,7 @@ window.corePageSize = null;
     setKeybinding: (action, combo) => invoke("set_keybinding", { action, combo }),
     imageSenderTrusted: (sender) => invoke("image_sender_trusted", { sender }),
     setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
+    fetchMailImage: (sender, url) => invoke("fetch_mail_image", { sender, url }),
     allSettings: () => invoke("all_settings"),
     // Пределы приходят из ядра вместе с границами и подписями: в интерфейсе
     // своих чисел нет, иначе копии расходятся и отказ ядра нечем объяснить.
@@ -363,6 +366,9 @@ window.corePageSize = null;
       "The mail server does not support safe permanent deletion."));
   }).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
+  tauri.event?.listen("truemail-aux-write-sync-warning", () => {
+    showToast(L("Запись сохранена на сервере. Обновить список пока не удалось.", "The record was saved on the server. The list could not be refreshed yet."));
+  }).catch(console.error);
   // account-connect-progress.md, S-002, S-003: этап попытки подключения,
   // подтверждённый ядром в ходе одного вызова команды (например, переход к
   // ожиданию кода OAuth в браузере или к проверке сервера).

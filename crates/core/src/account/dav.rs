@@ -12,7 +12,6 @@ use hickory_resolver::proto::rr::RData;
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
 use std::collections::{HashMap, HashSet};
-use url::Url;
 
 /// Базовые адреса Яндекса по умолчанию - используются, если на аккаунте не
 /// задан свой caldav_url/carddav_url. Для Яндекса RFC 6764-обнаружение не
@@ -250,6 +249,7 @@ async fn dav_send(
     scheme: DavAuthScheme,
     auth: &DavAuth,
 ) -> Result<DavHttpResponse> {
+    let url = crate::service_url::parse(url)?;
     let request = apply_dav_auth(client.request(method.clone(), url), scheme, auth)
         .header("Depth", depth)
         .header("Content-Type", "application/xml; charset=utf-8")
@@ -337,13 +337,7 @@ async fn dav_request_optional(
 }
 
 fn resolve(base: &str, href: &str) -> Result<String> {
-    Url::parse(base)
-        .and_then(|url| url.join(href))
-        .map(String::from)
-        .map_err(|e| Error::Backend {
-            backend: "dav-url".into(),
-            message: e.to_string(),
-        })
+    crate::service_url::resolve(base, href).map(String::from)
 }
 
 async fn discover_home(
@@ -398,6 +392,7 @@ async fn discover_home(
 pub async fn validate_dav(auth: &DavAuth, caldav_base: &str, carddav_base: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|e| Error::Backend {
             backend: "dav".into(),
@@ -664,7 +659,12 @@ pub async fn discover_srv(domain: &str, service: &str) -> Option<String> {
     Some(base)
 }
 
-fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<(String, Option<String>, String)>> {
+struct MultigetResource {
+    href: String,
+    contents: Option<(Option<String>, String)>,
+}
+
+fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<MultigetResource>> {
     let doc = Document::parse(xml).map_err(|e| Error::Backend {
         backend: "dav-xml".into(),
         message: e.to_string(),
@@ -680,18 +680,54 @@ fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<(String, Option<Strin
             .and_then(|n| n.text())
             .unwrap_or("")
             .to_owned();
-        let etag = response
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "getetag")
-            .and_then(|n| n.text())
-            .map(str::to_owned);
-        if let Some(data) = response
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == data_tag)
-            .and_then(|n| n.text())
-        {
-            out.push((href, etag, data.to_owned()));
+        let status = response_status(response);
+        if href.is_empty() {
+            return Err(crate::Error::Other(
+                "Сервер не указал адрес одного из элементов коллекции".into(),
+            ));
         }
+        if status.and_then(dav_status_code) == Some(404) {
+            out.push(MultigetResource {
+                href,
+                contents: None,
+            });
+            continue;
+        }
+        if status.is_some_and(|status| !successful_dav_status(status)) {
+            return Err(crate::Error::Other(
+                "Сервер вернул ошибку для одного из элементов коллекции".into(),
+            ));
+        }
+        let mut properties = response
+            .children()
+            .filter(|node| node.has_tag_name("propstat"))
+            .filter(|node| response_status(*node).is_some_and(successful_dav_status))
+            .flat_map(|node| {
+                node.children()
+                    .filter(|node| node.has_tag_name("prop"))
+                    .flat_map(|prop| prop.children())
+            });
+        let mut etag = None;
+        let mut data = None;
+        for property in &mut properties {
+            if property.has_tag_name("getetag") {
+                etag = property.text().map(str::to_owned);
+            }
+            if property.has_tag_name(data_tag)
+                && data.replace(property.text().unwrap_or("")).is_some()
+            {
+                return Err(crate::Error::Other(
+                    "Сервер вернул элемент коллекции дважды".into(),
+                ));
+            }
+        }
+        let data = data.filter(|value| !value.is_empty()).ok_or_else(|| {
+            crate::Error::Other("Сервер не вернул содержимое одного из элементов коллекции".into())
+        })?;
+        out.push(MultigetResource {
+            href,
+            contents: Some((etag, data.to_owned())),
+        });
     }
     Ok(out)
 }
@@ -715,11 +751,35 @@ fn parse_collections(
         backend: "dav-xml".into(),
         message: e.to_string(),
     })?;
+    if doc.root_element().tag_name().name() != "multistatus" {
+        return Err(Error::Other(
+            "Сервер не подтвердил состав коллекций DAV".into(),
+        ));
+    }
     let mut collections = Vec::new();
     for response in doc
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "response")
     {
+        let status_failed = response_status(response)
+            .is_some_and(|status| !successful_dav_status(status))
+            || response
+                .children()
+                .filter(|node| node.tag_name().name() == "propstat")
+                .any(|prop| {
+                    response_status(prop).is_some_and(|status| {
+                        status
+                            .split_ascii_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .is_some_and(|code| code == 403 || code >= 500)
+                    })
+                });
+        if status_failed {
+            return Err(Error::Other(
+                "Сервер не подтвердил состав коллекций DAV".into(),
+            ));
+        }
         if !response
             .descendants()
             .any(|node| node.is_element() && node.tag_name().name() == resource_type)
@@ -787,6 +847,17 @@ fn response_status<'a, 'input>(response: roxmltree::Node<'a, 'input>) -> Option<
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "status")
         .and_then(|node| node.text())
+}
+
+fn successful_dav_status(status: &str) -> bool {
+    dav_status_code(status).is_some_and(|code| (200..300).contains(&code))
+}
+
+fn dav_status_code(status: &str) -> Option<u16> {
+    status
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
 }
 
 fn parse_sync_collection(xml: &str, collection_url: &str) -> Result<SyncCollectionDelta> {
@@ -919,11 +990,34 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
         backend: "dav-xml".into(),
         message: e.to_string(),
     })?;
+    if doc.root_element().tag_name().name() != "multistatus" {
+        return Err(Error::Other(
+            "Сервер не подтвердил состав коллекции DAV".into(),
+        ));
+    }
     let mut resources = Vec::new();
     for response in doc
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "response")
     {
+        let status = response_status(response);
+        if status.and_then(dav_status_code) == Some(404) {
+            continue;
+        }
+        if status.is_some_and(|status| !successful_dav_status(status))
+            || response
+                .children()
+                .filter(|node| node.is_element() && node.tag_name().name() == "propstat")
+                .any(|prop| {
+                    response_status(prop).is_none_or(|status| {
+                        !successful_dav_status(status) && dav_status_code(status) != Some(404)
+                    })
+                })
+        {
+            return Err(Error::Other(
+                "Не удалось подтвердить полный состав коллекции DAV".into(),
+            ));
+        }
         if response
             .descendants()
             .any(|node| node.is_element() && node.tag_name().name() == "collection")
@@ -935,7 +1029,9 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
             .find(|node| node.is_element() && node.tag_name().name() == "href")
             .and_then(|node| node.text())
         else {
-            continue;
+            return Err(Error::Other(
+                "Сервер не указал адрес ресурса в коллекции DAV".into(),
+            ));
         };
         let etag = response
             .descendants()
@@ -1129,6 +1225,7 @@ async fn multiget_changed(
     resources: &[ResourceRef],
     kind: MultigetKind,
     auth: &DavAuth,
+    deleted_urls: &mut Vec<String>,
 ) -> Result<Vec<(String, Option<String>, String)>> {
     let data_tag = match kind {
         MultigetKind::Calendar => "calendar-data",
@@ -1139,7 +1236,26 @@ async fn multiget_changed(
     for chunk in resources.chunks(100) {
         let body = multiget_body(kind, chunk);
         let xml = dav_request(client, "REPORT", collection_url, "0", &body, auth).await?;
-        parts.extend(response_parts(&xml, data_tag)?);
+        let mut requested: std::collections::HashSet<_> =
+            chunk.iter().map(|resource| resource.url.as_str()).collect();
+        let received = response_parts(&xml, data_tag)?;
+        for resource in received {
+            let url = resolve(collection_url, &resource.href)?;
+            if !requested.remove(url.as_str()) {
+                return Err(crate::Error::Other(
+                    "Сервер вернул неожиданный или повторный элемент коллекции".into(),
+                ));
+            }
+            match resource.contents {
+                Some((etag, data)) => parts.push((resource.href, etag, data)),
+                None => deleted_urls.push(url),
+            }
+        }
+        if !requested.is_empty() {
+            return Err(crate::Error::Other(
+                "Не все запрошенные элементы коллекции получены".into(),
+            ));
+        }
     }
     Ok(parts)
 }
@@ -1162,7 +1278,7 @@ fn decode_property(key: &str, value: &str) -> String {
         value.to_owned()
     }
 }
-fn prop(raw: &str, name: &str) -> Option<String> {
+pub(super) fn prop(raw: &str, name: &str) -> Option<String> {
     unfolded(raw).lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.split(';')
@@ -1490,13 +1606,14 @@ async fn sync_calendars(
     for collection in discovered_calendars {
         let collection_started = std::time::Instant::now();
         let cursor = cursors.calendars.get(&collection.url);
-        let sync = sync_collection_resources(client, &collection, cursor, auth).await?;
+        let mut sync = sync_collection_resources(client, &collection, cursor, auth).await?;
         let events: Vec<_> = multiget_changed(
             client,
             &collection.url,
             &sync.changed,
             MultigetKind::Calendar,
             auth,
+            &mut sync.deleted_urls,
         )
         .await?
         .into_iter()
@@ -1602,16 +1719,15 @@ async fn sync_contacts(
     for collection in discovered_addressbooks {
         let collection_started = std::time::Instant::now();
         let cursor = cursors.contact_collections.get(&collection.url);
-        let sync = sync_collection_resources(client, &collection, cursor, auth).await?;
+        let mut sync = sync_collection_resources(client, &collection, cursor, auth).await?;
         collection_scopes.push(sync.scope);
-        let deleted_count = sync.deleted_urls.len();
-        deleted_contact_urls.extend(sync.deleted_urls);
         let changed_contacts: Vec<_> = multiget_changed(
             client,
             &collection.url,
             &sync.changed,
             MultigetKind::AddressBook,
             auth,
+            &mut sync.deleted_urls,
         )
         .await?
         .into_iter()
@@ -1621,7 +1737,8 @@ async fn sync_contacts(
         })
         .collect();
         let changed = changed_contacts.len();
-        let deleted = deleted_count;
+        let deleted = sync.deleted_urls.len();
+        deleted_contact_urls.extend(sync.deleted_urls);
         let unchanged = changed == 0 && deleted == 0;
         if unchanged {
             tracing::debug!(
@@ -1703,6 +1820,7 @@ pub async fn sync_dav_account(
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(45))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|e| Error::Backend {
             backend: "dav".into(),
@@ -2121,6 +2239,40 @@ mod tests {
             "перекачивать неизменившийся ресурс незачем"
         );
         assert!(outcome.deleted_urls.is_empty());
+    }
+
+    #[test]
+    fn multiget_recognizes_resource_deletions_and_optional_properties() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+            <d:response><d:href>/gone.ics</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>
+            <d:response><d:href>/found.ics</d:href>
+                <d:propstat><d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>
+                <d:propstat><d:prop><c:calendar-data>event</c:calendar-data></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+            </d:response>
+        </d:multistatus>"#;
+        let parts = response_parts(xml, "calendar-data").unwrap();
+        assert_eq!(parts[0].href, "/gone.ics");
+        assert!(parts[0].contents.is_none());
+        assert_eq!(parts[1].contents, Some((None, "event".into())));
+        let incomplete = xml.replace("200 OK", "503 Service Unavailable");
+        assert!(response_parts(&incomplete, "calendar-data").is_err());
+    }
+
+    #[test]
+    fn partial_etag_listing_does_not_confirm_deletions() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:">
+            <d:response><d:href>/good.ics</d:href><d:propstat>
+                <d:prop><d:getetag>good</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status>
+            </d:propstat></d:response>
+            <d:response><d:href>/other.ics</d:href><d:propstat>
+                <d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status>
+            </d:propstat></d:response>
+        </d:multistatus>"#;
+        assert!(parse_etag_listing(xml, "https://dav.test/").is_err());
+        let missing_etag = xml.replace("503 Service Unavailable", "404 Not Found");
+        let resources = parse_etag_listing(&missing_etag, "https://dav.test/").unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[1].etag, None);
     }
 
     #[test]

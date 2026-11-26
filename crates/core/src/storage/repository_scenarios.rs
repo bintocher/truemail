@@ -43,6 +43,49 @@ async fn seed_folder(db: &Db, account_id: i64, path: &str, role: Option<&str>) -
 }
 
 #[tokio::test]
+async fn remote_ids_with_the_same_uid_keep_separate_cached_bodies() {
+    let db = open_test_db("remote-id-collision").await;
+    let account = seed_account(&db, "ids@example.test").await;
+    let folder = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let message = |id: &str, body_fetched| DiscoveredMessage {
+        folder_path: "INBOX".into(),
+        uid: 37,
+        uidvalidity: None,
+        remote_id: Some(id.into()),
+        size: None,
+        seen: false,
+        flagged: false,
+        answered: false,
+        draft: false,
+        raw: format!("Subject: {id}\r\nMessage-ID: <{id}@example.test>\r\n\r\nBody for {id}\r\n")
+            .into_bytes(),
+        body_fetched,
+        has_attachments: None,
+    };
+    db.save_discovered_messages(
+        account,
+        &[message("original", true), message("other", false)],
+        false,
+    )
+    .await
+    .unwrap();
+    let rows:Vec<(String,String,bool,String)>=sqlx::query_as(
+        "SELECT remote_id,subject,body_fetched,raw_blob_ref FROM messages WHERE folder_id=? ORDER BY remote_id",
+    ).bind(folder).fetch_all(&db.pool).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (&rows[0].0, &rows[0].1, rows[0].2),
+        (&"original".to_owned(), &"original".to_owned(), true)
+    );
+    assert_eq!(
+        (&rows[1].0, &rows[1].1, rows[1].2),
+        (&"other".to_owned(), &"other".to_owned(), false)
+    );
+    assert_ne!(rows[0].3, rows[1].3);
+    db.close().await;
+}
+
+#[tokio::test]
 async fn folder_refresh_recalculates_parents_for_existing_rows() {
     let db: TestDb = open_test_db("repo-folder-parents").await;
     let account = seed_account(&db, "repo@example.test").await;
@@ -368,6 +411,22 @@ async fn manual_trash_preserves_an_assigned_role_on_an_inbox_child() {
         db.folder(trash_id).await.unwrap().role,
         Some(FolderRole::Trash)
     );
+}
+
+#[tokio::test]
+async fn an_explicitly_unassigned_trash_role_is_not_inferred_again() {
+    let db = open_test_db("repo-explicitly-unassigned-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let trash = seed_folder(&db, account, "Trash", Some("trash")).await;
+    let message = seed_message(&db, account, inbox, 1, "Report").await;
+    db.set_folder_role(account, "trash", None).await.unwrap();
+
+    let skipped = db.queue_message_action(&[message], "trash").await.unwrap();
+
+    assert_eq!(skipped.skipped_no_folder, 1);
+    assert!(skipped.operation_ids.is_empty());
+    assert_eq!(db.folder(trash).await.unwrap().role, None);
 }
 
 #[tokio::test]

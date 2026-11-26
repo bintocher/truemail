@@ -39,33 +39,45 @@ async function openBlockSenderDialog(message){
     <p class="note-muted">${escapeHtml(L('Письма уходят только в корзину и восстанавливаются оттуда до её очистки.','Messages go to trash only and can be restored until it is emptied.'))}</p>`;
   const {overlay,close}=senderDialog(L('Заблокировать отправителя','Block sender'),body,L('Заблокировать','Block'));
   const kind=overlay.querySelector('.sender-kind'),counts=overlay.querySelector('.sender-counts'),consent=overlay.querySelector('.sender-sweep-consent');
-  let preview=null;
+  const apply=overlay.querySelector('.sender-apply');
+  let preview=null,previewRequest=0,saving=false;
   const refresh=async()=>{
+    const request=++previewRequest;
+    const selected=kind.value;
+    const value=selected==='domain'?choice.domain:choice.address;
+    preview=null;apply.disabled=true;
     counts.textContent=L('Считаю письма...','Counting messages...');
     try{
-      preview=await window.tm.previewSenderPolicy(kind.value,kind.value==='domain'?choice.domain:choice.address);
+      const current=await window.tm.previewSenderPolicy(selected,value);
+      if(request!==previewRequest||kind.value!==selected)return;
+      preview=current;
       const lines=preview.per_account.map(item=>`${item.email}: ${item.count}`).join('; ');
       counts.textContent=`${L('Уже получено писем','Messages already received')}: ${preview.total}${lines?` (${lines})`:''}`;
       if(preview.own_address)counts.textContent+=` - ${L('это адрес подключённого ящика, заблокировать его нельзя','this is a connected mailbox address and cannot be blocked')}`;
       else if(preview.own_domain)counts.textContent+=` - ${L('этому домену принадлежит адрес подключённого ящика, собственные адреса останутся доверенными','a connected mailbox belongs to this domain, your own addresses stay trusted')}`;
-    }catch(error){preview=null;counts.textContent=String(error?.message||error);}
+    }catch(error){if(request===previewRequest)counts.textContent=String(error?.message||error);}
+    finally{if(request===previewRequest)apply.disabled=saving||!preview||preview.own_address;}
   };
-  kind.onchange=refresh;await refresh();
-  overlay.querySelector('.sender-apply').onclick=async()=>{
-    if(!preview){showToast(L('Значение не подходит для списка','This value does not fit the list'));return;}
-    if(preview.own_address){showToast(L('Адрес подключённого ящика заблокировать нельзя','A connected mailbox address cannot be blocked'));return;}
-    // S-020: блокировка собственного домена требует отдельного подтверждения.
-    if(preview.own_domain&&!await confirmAction(L('Этому домену принадлежит адрес подключённого ящика. Собственные адреса останутся доверенными. Заблокировать домен?','A connected mailbox belongs to this domain. Your own addresses stay trusted. Block the domain?')))return;
+  kind.onchange=refresh;
+  apply.onclick=async()=>{
+    const current=preview;
+    if(saving||!current||current.kind!==kind.value||current.own_address)return;
+    saving=true;apply.disabled=true;kind.disabled=true;
     try{
-      const saved=await window.tm.saveSenderPolicy(preview.kind,preview.value,'blocked',Boolean(preview.own_domain));
+      // S-020: блокировка собственного домена требует отдельного подтверждения.
+      if(current.own_domain&&!await confirmAction(L('Этому домену принадлежит адрес подключённого ящика. Собственные адреса останутся доверенными. Заблокировать домен?','A connected mailbox belongs to this domain. Your own addresses stay trusted. Block the domain?')))return;
+      if(preview!==current||current.kind!==kind.value)return;
+      const saved=await window.tm.saveSenderPolicy(current.kind,current.value,'blocked',Boolean(current.own_domain));
       if(consent.checked){
-        const reports=await window.tm.startSenderPolicySweep(saved.id,preview.snapshot_key,true);
+        const reports=await window.tm.startSenderPolicySweep(saved.id,current.snapshot_key,true);
         const total=reports.reduce((sum,item)=>sum+(item.queued||0),0),left=reports.reduce((sum,item)=>sum+(item.remaining||0),0);
         showToast(`${L('Отправитель заблокирован','Sender blocked')}: ${L('поставлено перемещений','moves queued')} ${total}${left?`, ${L('осталось','left')} ${left}`:''}`);
       }else showToast(L('Отправитель заблокирован','Sender blocked'));
       close();await reloadSenderSections();
     }catch(error){showToast(error);}
+    finally{saving=false;kind.disabled=false;apply.disabled=!preview||preview.own_address;}
   };
+  await refresh();
 }
 
 /* Автоочистка писем отправителя: разовая уборка и три постоянных режима,

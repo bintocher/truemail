@@ -96,7 +96,21 @@ pub(crate) async fn transmit_with_backend(
             return 0;
         }
     };
-    let outcome = match backend.send(message, token).await {
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        backend.send(message, token),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(crate::backend::SendFailure::after_handoff(
+            crate::Error::classified_backend(
+                "send",
+                ErrorKind::Timeout,
+                "сервер не подтвердил отправку за отведённое время",
+            ),
+        ))
+    });
+    let outcome = match sent {
         Ok(outcome) => outcome,
         Err(failure) if !failure.after_handoff => {
             record_send_rejection(db, operation.id, &failure.error).await;
@@ -1484,6 +1498,16 @@ impl AccountManager {
     /// Дозагрузить только последние входящие и отдельно посчитать действительно
     /// новые письма. Exchange использует этот результат для watchdog-уведомлений.
     pub async fn sync_mail_inbox_delta(&self, account: &Account) -> Result<InboxSyncResult> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Mail,
+                self.sync_mail_inbox_delta_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_mail_inbox_delta_inner(&self, account: &Account) -> Result<InboxSyncResult> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;
@@ -1547,11 +1571,12 @@ impl AccountManager {
             .await?;
         let projections = self
             .db
-            .reconcile_remote_projections(
+            .reconcile_exact_remote_projections(
                 account.id,
                 &discovery.messages,
                 &discovery.changed_remote_ids,
                 discovery.remote_snapshot.as_deref(),
+                &discovery.server_remote_ids,
             )
             .await?;
         self.db
@@ -1862,16 +1887,20 @@ impl AccountManager {
         &self,
         account: &Account,
     ) -> Result<(Option<String>, Option<String>)> {
+        let mut caldav_url = self
+            .trusted_saved_dav_base(account, "caldav", account.caldav_url.as_deref())
+            .await?;
+        let mut carddav_url = self
+            .trusted_saved_dav_base(account, "carddav", account.carddav_url.as_deref())
+            .await?;
+        let verify_caldav = caldav_url.is_none() && account.caldav_url.is_some();
+        let verify_carddav = carddav_url.is_none() && account.carddav_url.is_some();
         if account.provider == Provider::Yandex {
-            let (cal, card) = dav::resolve_yandex_bases(
-                account.caldav_url.as_deref(),
-                account.carddav_url.as_deref(),
-            );
-            return Ok((Some(cal), Some(card)));
-        }
-        let mut caldav_url = account.caldav_url.clone();
-        let mut carddav_url = account.carddav_url.clone();
-        if let Some((_, domain)) = account.email.rsplit_once('@') {
+            let (cal, card) =
+                dav::resolve_yandex_bases(caldav_url.as_deref(), carddav_url.as_deref());
+            caldav_url = Some(cal);
+            carddav_url = Some(card);
+        } else if let Some((_, domain)) = account.email.rsplit_once('@') {
             let origin = format!("https://{domain}");
             if caldav_url.is_none() {
                 caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS).await;
@@ -1886,12 +1915,74 @@ impl AccountManager {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
             }
         }
-        if caldav_url != account.caldav_url || carddav_url != account.carddav_url {
+        if (verify_caldav && caldav_url != account.caldav_url)
+            || (verify_carddav && carddav_url != account.carddav_url)
+        {
+            return Err(crate::Error::Other(
+                "Не удалось подтвердить сохранённый адрес CalDAV или CardDAV. Проверьте адрес в настройках ящика.".into(),
+            ));
+        }
+        if caldav_url != account.caldav_url
+            || carddav_url != account.carddav_url
+            || verify_caldav
+            || verify_carddav
+        {
             self.db
-                .set_dav_urls(account.id, caldav_url.as_deref(), carddav_url.as_deref())
+                .set_dav_urls(
+                    account.id,
+                    caldav_url.as_deref(),
+                    carddav_url.as_deref(),
+                    Some((
+                        account.caldav_url.as_deref(),
+                        account.carddav_url.as_deref(),
+                    )),
+                )
                 .await?;
         }
         Ok((caldav_url, carddav_url))
+    }
+
+    pub async fn configure_dav_urls(
+        &self,
+        account_id: i64,
+        caldav: Option<&str>,
+        carddav: Option<&str>,
+    ) -> Result<()> {
+        let caldav = caldav.map(crate::service_url::parse).transpose()?;
+        let carddav = carddav.map(crate::service_url::parse).transpose()?;
+        self.db
+            .set_dav_urls(
+                account_id,
+                caldav.as_ref().map(url::Url::as_str),
+                carddav.as_ref().map(url::Url::as_str),
+                None,
+            )
+            .await
+    }
+
+    async fn trusted_saved_dav_base(
+        &self,
+        account: &Account,
+        kind: &str,
+        stored: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(value) = stored.filter(|url| crate::service_url::parse(url).is_ok()) else {
+            return Ok(None);
+        };
+        if self.db.is_known_dav_base(account.id, kind, value).await? {
+            return Ok(Some(value.to_owned()));
+        }
+        let same_domain = account.email.rsplit_once('@').is_some_and(|(_, domain)| {
+            crate::service_url::resolve(&format!("https://{domain}"), value).is_ok()
+        });
+        let yandex_default = if kind == "caldav" {
+            YANDEX_CALDAV_BASE
+        } else {
+            YANDEX_CARDDAV_BASE
+        };
+        let known_yandex = account.provider == Provider::Yandex
+            && crate::service_url::resolve(yandex_default, value).is_ok();
+        Ok((same_domain || known_yandex).then(|| value.to_owned()))
     }
 
     /// Обновить календарь и контакты по CalDAV/CardDAV, не запуская тяжёлую
@@ -2135,6 +2226,26 @@ impl AccountManager {
 
     /// Создать или изменить событие. Для Exchange - через EWS, для остальных -
     /// прежним путём (Google REST или CalDAV).
+    async fn check_dav_targets(
+        &self,
+        account: &Account,
+        calendar: bool,
+        targets: &[&str],
+    ) -> Result<()> {
+        if matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+            return Ok(());
+        }
+        let (cal, card) = self.resolve_dav_bases(account).await?;
+        let base = if calendar { cal } else { card }.ok_or_else(|| {
+            crate::Error::AccountConfig("Адрес службы календаря или контактов не настроен".into())
+        })?;
+        for target in targets {
+            crate::service_url::parse(target)?;
+            crate::service_url::resolve(&base, target)?;
+        }
+        Ok(())
+    }
+
     pub async fn write_event(
         &self,
         account: &Account,
@@ -2142,6 +2253,10 @@ impl AccountManager {
         remote: RemoteObject<'_>,
         input: &EventInput,
     ) -> Result<()> {
+        let destinations: Vec<_> = std::iter::once(calendar_source)
+            .chain(remote.remote_url)
+            .collect();
+        self.check_dav_targets(account, true, &destinations).await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             let backend = self.ews_backend(account)?;
@@ -2184,6 +2299,8 @@ impl AccountManager {
         remote_url: &str,
         etag: Option<&str>,
     ) -> Result<()> {
+        self.check_dav_targets(account, true, &[calendar_source, remote_url])
+            .await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             return self
@@ -2211,6 +2328,14 @@ impl AccountManager {
         remote: RemoteObject<'_>,
         input: &ContactInput,
     ) -> Result<()> {
+        let destinations: Vec<_> = collection_url
+            .into_iter()
+            .chain(remote.remote_url)
+            .collect();
+        if !destinations.is_empty() {
+            self.check_dav_targets(account, false, &destinations)
+                .await?;
+        }
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             let backend = self.ews_backend(account)?;
@@ -2249,6 +2374,8 @@ impl AccountManager {
         remote_url: &str,
         etag: Option<&str>,
     ) -> Result<()> {
+        self.check_dav_targets(account, false, &[remote_url])
+            .await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             return self
@@ -2289,18 +2416,9 @@ impl AccountManager {
         // auxiliary_credential (не oauth_access_token) - Яндекс всегда Oauth2,
         // но остальные DAV-провайдеры (iCloud, Mail.ru, generic) обычно идут
         // по паролю/app-password, и oauth_access_token для них упал бы.
-        let credential = self.auxiliary_credential(account).await?;
         let input = auxiliary::event_to_input(event, attendees.clone());
-        auxiliary::write_event(
-            account.provider,
-            account.auth_kind,
-            &account.email,
-            &credential,
-            calendar_source,
-            remote,
-            &input,
-        )
-        .await?;
+        self.write_event(account, calendar_source, remote, &input)
+            .await?;
         let own = attendees
             .iter()
             .find(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))
@@ -3510,11 +3628,12 @@ impl AccountManager {
                                 }
                                 match self
                                     .db
-                                    .reconcile_remote_projections(
+                                    .reconcile_exact_remote_projections(
                                         account.id,
                                         &imap.messages,
                                         &imap.changed_remote_ids,
                                         imap.remote_snapshot.as_deref(),
+                                        &imap.server_remote_ids,
                                     )
                                     .await
                                 {

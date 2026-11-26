@@ -82,6 +82,25 @@ const openListMenu = (ui, id) => {
   return menuActions(ui);
 };
 
+test('a draft opens in the writing form without sending and New keeps the edits', async () => {
+  const ui = await openMail();
+  await openLetter(ui, 21);
+  assert.ok(paneActions(ui).includes('edit-draft'));
+  ui.byId('threadEditDraft').click();
+  await settle();
+  assert.ok(ui.byId('composeView').classList.contains('active'));
+  assert.equal(ui.byId('compSubj').value, DRAFT.subject);
+  assert.equal(ui.evaluate('recipientModel.compTo.length'), 1);
+  assert.ok(ui.byId('compEdit').innerHTML.includes('Текст письма'));
+  assert.equal(sent(ui).length, 0);
+  ui.byId('compSubj').value = 'Моя правка';
+  ui.evaluate("showView('mailView')");
+  ui.byId('composeBtn').click();
+  await settle();
+  assert.ok(ui.byId('composeView').classList.contains('active'));
+  assert.equal(ui.byId('compSubj').value, 'Моя правка');
+});
+
 test('S-001: a draft is known by its flag or by its folder and keeps only the actions of a draft', () => {
   assert.equal(draftMessageModel.isDraftMessage(DRAFT, FOLDERS), true);
   assert.equal(draftMessageModel.isDraftMessage(UNADDRESSED, FOLDERS), true, 'a draft without the flag is not recognised by its folder');

@@ -105,7 +105,7 @@ function renderCmd(q='',coreResults=[]){const f=buildResults(q,coreResults);curr
   f.forEach((c,idx)=>{if(c.g!==lg){html+=`<div class="cmdgrp">${escapeHtml(c.g)}</div>`;lg=c.g;}const icon=Object.hasOwn(ic,c.i)?c.i:'inbox';
     html+=`<div class="cmdrow${idx===0?' sel':''}" data-idx="${idx}"><i data-i="${icon}"></i><span class="ctitle">${highlightMatch(c.t,q)}</span>${c.sub?`<span class="csub">${highlightMatch(c.sub,q)}</span>`:''}<span class="ck">${(c.k||[]).map(k=>`<span class="kbd">${escapeHtml(k)}</span>`).join('')}</span></div>`;});
   cmdlist.innerHTML=html||`<div class="cmdgrp">${smartIsEnglish()?'Nothing found':'Ничего не найдено'}</div>`;renderIcons(cmdlist);
-  cmdlist.querySelectorAll('.cmdrow').forEach(r=>r.onclick=()=>{const c=f[+r.dataset.idx];closeCmd();if(c&&c.a)c.a();});}
+  cmdlist.querySelectorAll('.cmdrow').forEach(r=>r.onclick=()=>{const c=f[+r.dataset.idx];closeCmd();window.restoreActiveToShown?.();c?.a?.();});}
 function openCmd(){overlay.classList.add('open');cmdInput.value='';renderCmd();cmdInput.focus();}
 function closeCmd(){overlay.classList.remove('open');}
 document.getElementById('searchBox').onclick=openCmd;
@@ -149,9 +149,10 @@ document.querySelectorAll('[data-key-clear]').forEach(button=>{button.addEventLi
 document.querySelectorAll('[data-key-action]').forEach(input=>{input.addEventListener('keydown',async event=>{event.preventDefault();event.stopPropagation();const combo=eventCombo(event);if(!combo)return;const previous=activeKeybindings.get(input.dataset.keyAction)||'';input.value=combo;input.disabled=true;try{await window.tm.setKeybinding(input.dataset.keyAction,combo);activeKeybindings.set(input.dataset.keyAction,combo);showToast(L('Сочетание сохранено','Shortcut saved'));}catch(error){input.value=previous;showToast(error);}finally{input.disabled=false;input.focus();}});});
 document.addEventListener('keydown',e=>{
   const target=e.target;if(target.matches?.('[data-key-action]'))return;
-  if(overlay.classList.contains('open')&&['ArrowDown','ArrowUp','Enter'].includes(e.key)){e.preventDefault();const rows=[...cmdlist.querySelectorAll('.cmdrow')];if(e.key==='Enter'){const command=currentCommands[sel];closeCmd();command?.a?.();return;}sel=e.key==='ArrowDown'?Math.min(rows.length-1,sel+1):Math.max(0,sel-1);rows.forEach((row,index)=>row.classList.toggle('sel',index===sel));rows[sel]?.scrollIntoView({block:'nearest'});return;}
+  if(overlay.classList.contains('open')&&['ArrowDown','ArrowUp','Enter'].includes(e.key)){e.preventDefault();const rows=[...cmdlist.querySelectorAll('.cmdrow')];if(e.key==='Enter'){const command=currentCommands[sel];closeCmd();window.restoreActiveToShown?.();command?.a?.();return;}sel=e.key==='ArrowDown'?Math.min(rows.length-1,sel+1):Math.max(0,sel-1);rows.forEach((row,index)=>row.classList.toggle('sel',index===sel));rows[sel]?.scrollIntoView({block:'nearest'});return;}
   if(bindingMatches('palette',e)){e.preventDefault();overlay.classList.contains('open')?closeCmd():openCmd();}
   if(!overlay.classList.contains('open')&&!target.matches('input,textarea,select,[contenteditable="true"]')){
+    window.restoreActiveToShown?.();
     const actions={compose:()=>document.getElementById('composeBtn').click(),reply:()=>openComposerForMessage('reply'),reply_all:()=>openComposerForMessage('replyall'),forward:()=>openComposerForMessage('forward'),archive:()=>performMessageAction('archive'),delete:()=>performMessageAction('trash'),snooze:()=>document.querySelector('[data-act="snooze"]')?.click()};
     const matched=Object.keys(actions).find(action=>bindingMatches(action,e));if(matched){e.preventDefault();actions[matched]();}
     const quickSlot=quickStepsModel.QUICK_STEP_SLOT_ACTIONS.find(action=>bindingMatches(action,e));if(quickSlot){e.preventDefault();window.executeQuickStepSlot?.(Number(quickSlot.slice(11)));}

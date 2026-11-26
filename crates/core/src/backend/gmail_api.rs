@@ -674,11 +674,12 @@ async fn list_backfill_page(
     client: &Client,
     access_token: &str,
     page_token: Option<&str>,
+    page_size: u32,
 ) -> Result<(Vec<String>, Option<String>)> {
     let mut list_url = url(&["messages"])?;
     list_url
         .query_pairs_mut()
-        .append_pair("maxResults", &BACKFILL_PAGE_SIZE.to_string())
+        .append_pair("maxResults", &page_size.to_string())
         .append_pair("includeSpamTrash", "true");
     if let Some(page_token) = page_token {
         list_url
@@ -702,6 +703,21 @@ async fn list_backfill_page(
     ids.sort();
     ids.dedup();
     Ok((ids, next_page_token))
+}
+
+async fn mailbox_snapshot(client: &Client, access_token: &str) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    let mut seen_pages = HashSet::new();
+    let mut next = None;
+    loop {
+        let (page, token) = list_backfill_page(client, access_token, next.as_deref(), 500).await?;
+        ids.extend(page);
+        let Some(token) = token else { return Ok(ids) };
+        if !seen_pages.insert(token.clone()) {
+            return Err(Error::Other("Gmail повторил страницу списка писем".into()));
+        }
+        next = Some(token);
+    }
 }
 
 fn collect_history_ids(records: Vec<HistoryRecord>) -> HashSet<String> {
@@ -939,33 +955,56 @@ pub async fn discover(
 
     // Always drain realtime history first. Backfill is independent and adds at
     // most one small page, whose nextPageToken is persisted in the same cursor.
-    let (mut ids, mut cursor) = if let Some(mut cursor) = stored_cursor {
+    let (mut ids, mut cursor, must_reconcile) = if let Some(mut cursor) = stored_cursor {
         match history_delta(&client, access_token, &cursor.history_id).await? {
             Some((ids, latest_history_id)) => {
                 cursor.history_id = latest_history_id;
-                (ids, cursor)
+                (ids, cursor, false)
             }
             None => {
                 let history_id = profile_history_id(&client, access_token).await?;
                 tracing::warn!(
                     "Gmail historyId устарел; backfill перезапущен небольшими страницами"
                 );
-                (Vec::new(), GmailSyncCursor::bootstrap(history_id))
+                (Vec::new(), GmailSyncCursor::bootstrap(history_id), true)
             }
         }
     } else {
         // Capture history before the first page. Mail arriving during the
         // page load is then observed by history.list on the next sync.
         let history_id = profile_history_id(&client, access_token).await?;
-        (Vec::new(), GmailSyncCursor::bootstrap(history_id))
+        (
+            Vec::new(),
+            GmailSyncCursor::bootstrap(history_id),
+            cursors.values().any(|cursor| !cursor.known_uids.is_empty()),
+        )
+    };
+    let mut snapshot = if must_reconcile {
+        let snapshot = mailbox_snapshot(&client, access_token).await?;
+        let (changes, history_id) = history_delta(&client, access_token, &cursor.history_id)
+            .await?
+            .ok_or_else(|| {
+                Error::Other(
+                    "Gmail изменил историю во время сверки. Список будет проверен снова".into(),
+                )
+            })?;
+        ids.extend(changes);
+        cursor.history_id = history_id;
+        Some(snapshot)
+    } else {
+        None
     };
 
     let history_count = ids.len();
     let mut backfill_count = 0;
     if !cursor.backfill_complete {
-        let (backfill_ids, next_page_token) =
-            list_backfill_page(&client, access_token, cursor.backfill_page_token.as_deref())
-                .await?;
+        let (backfill_ids, next_page_token) = list_backfill_page(
+            &client,
+            access_token,
+            cursor.backfill_page_token.as_deref(),
+            BACKFILL_PAGE_SIZE,
+        )
+        .await?;
         backfill_count = backfill_ids.len();
         ids.extend(backfill_ids);
         cursor.backfill_page_token = next_page_token;
@@ -975,7 +1014,13 @@ pub async fn discover(
     ids.dedup();
 
     let changed_remote_ids = ids.clone();
-    let (fetched, _not_found) = fetch_messages(&client, access_token, ids).await?;
+    let (fetched, not_found) = fetch_messages(&client, access_token, ids).await?;
+    if let Some(snapshot) = snapshot.as_mut() {
+        for deleted in not_found {
+            snapshot.remove(&deleted);
+        }
+        snapshot.extend(fetched.iter().map(|message| message.id.clone()));
+    }
     let messages = project_messages(fetched, &included)?;
     let sync_token = encode_sync_cursor(&cursor)?;
     for folder in &mut folders {
@@ -990,10 +1035,10 @@ pub async fn discover(
     Ok(ImapDiscovery {
         folders,
         messages,
+        server_remote_ids: Vec::new(),
         server_uids: Vec::new(),
         reset_folders: Vec::new(),
-        // A single backfill page is never a global mailbox snapshot.
-        remote_snapshot: None,
+        remote_snapshot: snapshot.map(|ids| ids.into_iter().collect()),
         changed_remote_ids,
         flag_updates: Vec::new(),
         deleted_uids: Vec::new(),
