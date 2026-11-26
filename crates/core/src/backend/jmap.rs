@@ -18,7 +18,7 @@ use url::Url;
 const CORE: &str = "urn:ietf:params:jmap:core";
 const MAIL: &str = "urn:ietf:params:jmap:mail";
 const SUBMISSION: &str = "urn:ietf:params:jmap:submission";
-const MAX_EMAILS_PER_MAILBOX: usize = 500;
+const EMAIL_QUERY_PAGE_SIZE: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct JmapBackend {
@@ -30,11 +30,20 @@ pub struct JmapBackend {
 #[serde(rename_all = "camelCase")]
 struct Session {
     capabilities: HashMap<String, Value>,
+    #[serde(default)]
+    accounts: HashMap<String, SessionAccount>,
     primary_accounts: HashMap<String, String>,
     api_url: String,
     download_url: String,
     upload_url: String,
     event_source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionAccount {
+    #[serde(default)]
+    is_read_only: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -61,8 +70,8 @@ struct JmapCursor {
 struct QueryResult {
     ids: Vec<String>,
     query_state: String,
-    total: usize,
     full: bool,
+    incremental: bool,
     removed: Vec<String>,
 }
 
@@ -212,7 +221,7 @@ impl JmapBackend {
                         "filter": {"inMailbox": mailbox_id},
                         "sort": [{"property": "receivedAt", "isAscending": false}],
                         "sinceQueryState": cursor.query_state,
-                        "maxChanges": MAX_EMAILS_PER_MAILBOX
+                        "maxChanges": EMAIL_QUERY_PAGE_SIZE
                     }, "query"])],
                 )
                 .await?;
@@ -227,36 +236,81 @@ impl JmapBackend {
                 return Ok(QueryResult {
                     ids,
                     query_state: required_string(args, "newQueryState")?,
-                    total: 0,
                     full: false,
+                    incremental: true,
                     removed,
                 });
             }
         }
 
-        let response = self
-            .api(
-                session,
-                password,
-                vec![json!(["Email/query", {
-                    "accountId": account_id,
-                    "filter": {"inMailbox": mailbox_id},
-                    "sort": [{"property": "receivedAt", "isAscending": false}],
-                    "limit": MAX_EMAILS_PER_MAILBOX,
-                    "calculateTotal": true
-                }, "query"])],
-            )
-            .await?;
-        let args = method_args(&response, "query")?;
-        let ids = string_array(&args["ids"]);
-        let total = args["total"].as_u64().unwrap_or(ids.len() as u64) as usize;
-        Ok(QueryResult {
-            full: ids.len() == total,
-            total,
-            ids,
-            query_state: required_string(args, "queryState")?,
-            removed: Vec::new(),
-        })
+        let mut ids = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut expected_state = None;
+        let mut total = None;
+        loop {
+            let response = self
+                .api(
+                    session,
+                    password,
+                    vec![json!(["Email/query", {
+                        "accountId": account_id,
+                        "filter": {"inMailbox": mailbox_id},
+                        "sort": [{"property": "receivedAt", "isAscending": false}],
+                        "position": ids.len(),
+                        "limit": EMAIL_QUERY_PAGE_SIZE,
+                        "calculateTotal": true
+                    }, "query"])],
+                )
+                .await?;
+            let args = method_args(&response, "query")?;
+            let state = required_string(args, "queryState")?;
+            if args["position"].as_u64() != Some(ids.len() as u64)
+                || expected_state
+                    .as_ref()
+                    .is_some_and(|expected| expected != &state)
+            {
+                return Err(backend_error(
+                    "query",
+                    "результат поиска изменился между страницами",
+                ));
+            }
+            expected_state = Some(state.clone());
+            if let Some(value) = args["total"].as_u64() {
+                if total.is_some_and(|expected| value != expected) {
+                    return Err(backend_error(
+                        "query",
+                        "число писем изменилось между страницами",
+                    ));
+                }
+                total = Some(value);
+            }
+            let page = required_ids(args, "ids")?;
+            let empty = page.is_empty();
+            for id in page {
+                if !seen_ids.insert(id.clone()) {
+                    return Err(backend_error(
+                        "query",
+                        "письмо повторяется на страницах поиска",
+                    ));
+                }
+                ids.push(id);
+            }
+            if total.is_some_and(|value| {
+                (ids.len() as u64) > value || (empty && (ids.len() as u64) < value)
+            }) {
+                return Err(backend_error("query", "поиск вернул неполный список писем"));
+            }
+            let full = total == Some(ids.len() as u64);
+            if full || empty {
+                return Ok(QueryResult {
+                    full,
+                    incremental: false,
+                    ids,
+                    query_state: state,
+                    removed: Vec::new(),
+                });
+            }
+        }
     }
 
     async fn email_changes(
@@ -269,25 +323,45 @@ impl JmapBackend {
         let Some(since_state) = since_state else {
             return Ok((HashSet::new(), None));
         };
-        let response = self
-            .api(
-                session,
-                password,
-                vec![json!(["Email/changes", {
-                    "accountId": account_id,
-                    "sinceState": since_state,
-                    "maxChanges": 2000
-                }, "changes"])],
-            )
-            .await?;
-        let Ok(args) = method_args(&response, "changes") else {
-            return Ok((HashSet::new(), None));
-        };
-        let ids = ["created", "updated", "destroyed"]
-            .into_iter()
-            .flat_map(|key| string_array(&args[key]))
-            .collect();
-        Ok((ids, args["newState"].as_str().map(str::to_owned)))
+        let mut state = since_state.to_owned();
+        let mut seen_states = HashSet::from([state.clone()]);
+        let mut ids = HashSet::new();
+        loop {
+            let response = self
+                .api(
+                    session,
+                    password,
+                    vec![json!(["Email/changes", {
+                        "accountId": account_id,
+                        "sinceState": state,
+                        "maxChanges": 2000
+                    }, "changes"])],
+                )
+                .await?;
+            let Ok(args) = method_args(&response, "changes") else {
+                return Ok((HashSet::new(), None));
+            };
+            for key in ["created", "updated", "destroyed"] {
+                ids.extend(required_ids(args, key)?);
+            }
+            if required_string(args, "oldState")? != state {
+                return Err(backend_error(
+                    "changes",
+                    "ответ не соответствует запрошенному состоянию",
+                ));
+            }
+            state = required_string(args, "newState")?;
+            match args["hasMoreChanges"].as_bool() {
+                Some(false) => return Ok((ids, Some(state))),
+                Some(true) if seen_states.insert(state.clone()) => {}
+                _ => {
+                    return Err(backend_error(
+                        "changes",
+                        "сервер не продвинул состояние изменений",
+                    ));
+                }
+            }
+        }
     }
 
     async fn get_emails(
@@ -354,6 +428,57 @@ impl JmapBackend {
         response_bytes(response, "download").await
     }
 
+    async fn discover_messages(
+        &self,
+        session: &Session,
+        password: &str,
+        account_id: &str,
+        ids: &[String],
+        mailbox: Option<&str>,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (values, _) = self.get_emails(session, password, account_id, ids).await?;
+        let downloads = stream::iter(values.into_iter().map(|value| async move {
+            let id = required_string(&value, "id")?;
+            let blob_id = required_string(&value, "blobId")?;
+            let raw = self
+                .download_raw(session, password, account_id, &blob_id)
+                .await?;
+            Ok::<_, Error>((value, id, raw))
+        }))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let mut messages = Vec::new();
+        for (value, id, raw) in downloads {
+            let keywords = value["keywords"].as_object();
+            for (mailbox_id, enabled) in value["mailboxIds"].as_object().into_iter().flatten() {
+                if enabled.as_bool() != Some(true) || mailbox.is_some_and(|id| id != mailbox_id) {
+                    continue;
+                }
+                messages.push(DiscoveredMessage {
+                    uidvalidity: None,
+                    folder_path: mailbox_id.to_owned(),
+                    uid: stable_uid(&id),
+                    remote_id: Some(id.clone()),
+                    size: value["size"]
+                        .as_u64()
+                        .and_then(|size| u32::try_from(size).ok()),
+                    seen: keyword(keywords, "$seen"),
+                    flagged: keyword(keywords, "$flagged"),
+                    answered: keyword(keywords, "$answered"),
+                    draft: keyword(keywords, "$draft"),
+                    raw: raw.clone(),
+                    body_fetched: true,
+                    has_attachments: None,
+                });
+            }
+        }
+        Ok(messages)
+    }
+
     async fn discover_scope(
         &self,
         password: &str,
@@ -379,16 +504,31 @@ impl JmapBackend {
                     .map(|parsed| (id.as_str(), parsed))
             })
             .collect();
-        let previous_email_state = parsed_cursors
-            .values()
+        let mut states = selected.iter().map(|mailbox| {
+            parsed_cursors
+                .get(mailbox.id.as_str())
+                .map(|cursor| cursor.email_state.as_str())
+        });
+        let previous_email_state = states
             .next()
-            .map(|cursor| cursor.email_state.as_str());
+            .flatten()
+            .filter(|state| states.all(|next| next == Some(*state)));
         let (mut changed_ids, changed_state) = self
             .email_changes(&session, password, &account_id, previous_email_state)
             .await?;
+        let had_email_changes = changed_state.is_some();
+        // Запоминаем состояние до чтения папок: изменения, пришедшие во время
+        // поиска или загрузки, попадут в следующий проход.
+        let email_state = match changed_state {
+            Some(state) => state,
+            None => {
+                self.get_emails(&session, password, &account_id, &[])
+                    .await?
+                    .1
+            }
+        };
 
         let mut query_results = HashMap::new();
-        let mut fetch_ids = HashSet::new();
         let mut all_full = !inbox_only;
         let mut snapshot = HashSet::new();
         let mut server_uids = Vec::new();
@@ -399,11 +539,19 @@ impl JmapBackend {
                     password,
                     &account_id,
                     &mailbox.id,
-                    parsed_cursors.get(mailbox.id.as_str()),
+                    parsed_cursors
+                        .get(mailbox.id.as_str())
+                        .filter(|_| had_email_changes),
                 )
                 .await?;
-            fetch_ids.extend(result.ids.iter().cloned());
-            changed_ids.extend(result.ids.iter().cloned());
+            if result.incremental {
+                changed_ids.extend(result.ids.iter().cloned());
+            } else {
+                // Полный список нужен для сверки удаления. Тела старых писем
+                // загружаются при прокрутке, чтобы начальная синхронизация
+                // большого ящика не держала все вложения одновременно в памяти.
+                changed_ids.extend(result.ids.iter().take(EMAIL_QUERY_PAGE_SIZE).cloned());
+            }
             changed_ids.extend(result.removed.iter().cloned());
             if result.full {
                 snapshot.extend(result.ids.iter().cloned());
@@ -414,60 +562,12 @@ impl JmapBackend {
             } else {
                 all_full = false;
             }
-            let _ = result.total;
             query_results.insert(mailbox.id.clone(), result);
         }
-        fetch_ids.extend(changed_ids.iter().cloned());
-        let fetch_ids: Vec<_> = fetch_ids.into_iter().collect();
-        let (email_values, get_state) = self
-            .get_emails(&session, password, &account_id, &fetch_ids)
+        let fetch_ids: Vec<_> = changed_ids.iter().cloned().collect();
+        let messages = self
+            .discover_messages(&session, password, &account_id, &fetch_ids, None)
             .await?;
-        let email_state = changed_state.unwrap_or(get_state);
-
-        let downloads = stream::iter(email_values.into_iter().map(|value| {
-            let backend = self.clone();
-            let session = session.clone();
-            let password = password.to_owned();
-            let account_id = account_id.clone();
-            async move {
-                let id = required_string(&value, "id")?;
-                let blob_id = required_string(&value, "blobId")?;
-                let raw = backend
-                    .download_raw(&session, &password, &account_id, &blob_id)
-                    .await?;
-                Ok::<_, Error>((value, id, raw))
-            }
-        }))
-        .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
-
-        let mut messages = Vec::new();
-        for (value, id, raw) in downloads {
-            let mailbox_ids = value["mailboxIds"].as_object();
-            let keywords = value["keywords"].as_object();
-            for mailbox_id in mailbox_ids
-                .into_iter()
-                .flatten()
-                .filter_map(|(id, enabled)| enabled.as_bool().unwrap_or(false).then_some(id))
-            {
-                messages.push(DiscoveredMessage {
-                    folder_path: mailbox_id.to_owned(),
-                    uid: stable_uid(&id),
-                    remote_id: Some(id.clone()),
-                    size: value["size"]
-                        .as_u64()
-                        .and_then(|size| u32::try_from(size).ok()),
-                    seen: keyword(keywords, "$seen"),
-                    flagged: keyword(keywords, "$flagged"),
-                    answered: keyword(keywords, "$answered"),
-                    draft: keyword(keywords, "$draft"),
-                    raw: raw.clone(),
-                    body_fetched: true,
-                    has_attachments: None,
-                });
-            }
-        }
 
         let folders = mailboxes
             .into_iter()
@@ -522,7 +622,20 @@ impl JmapBackend {
             )
             .await?;
         let args = method_args(&response, "set")?;
-        ensure_set_succeeded(args, "Email/set")
+        if destroy.is_empty() {
+            return ensure_set_succeeded(args, "Email/set");
+        }
+        let destroyed = string_array(&args["destroyed"]);
+        for id in destroy {
+            let failure = &args["notDestroyed"][&id];
+            if !destroyed.contains(&id) && failure["type"].as_str() != Some("notFound") {
+                return Err(backend_error(
+                    "set",
+                    format!("сервер не подтвердил безвозвратное удаление: {failure}"),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn send_message(&self, password: &str, message: OutgoingMessage) -> Result<()> {
@@ -619,6 +732,19 @@ impl JmapBackend {
 
 #[async_trait]
 impl MailBackend for JmapBackend {
+    async fn check_permanent_delete(&self, _email: &str, credential: &str) -> Result<()> {
+        let session = self.session(credential).await?;
+        let account = self.mail_account(&session)?;
+        if session
+            .accounts
+            .get(account)
+            .is_some_and(|account| account.is_read_only)
+        {
+            return Err(Error::PermanentDeleteUnavailable);
+        }
+        Ok(())
+    }
+
     fn provider_id(&self) -> &'static str {
         "jmap"
     }
@@ -720,26 +846,9 @@ impl MailBackend for JmapBackend {
                 );
             }
             "delete" => {
-                let session = self.session(credential).await?;
-                let trash = self
-                    .mailboxes(&session, credential)
-                    .await?
-                    .into_iter()
-                    .find(|mailbox| mailbox.role.as_deref() == Some("trash"));
-                let source = payload["folder_path"].as_str();
-                if source == trash.as_ref().map(|mailbox| mailbox.id.as_str()) || trash.is_none() {
-                    return self
-                        .email_set(credential, json!({}), vec![id.to_owned()])
-                        .await;
-                }
-                if let Some(source) = source {
-                    patch.insert(format!("mailboxIds/{}", patch_segment(source)), Value::Null);
-                }
-                let trash = trash.expect("checked above");
-                patch.insert(
-                    format!("mailboxIds/{}", patch_segment(&trash.id)),
-                    Value::Bool(true),
-                );
+                return self
+                    .email_set(credential, json!({}), vec![id.to_owned()])
+                    .await;
             }
             other => {
                 return Err(Error::AccountConfig(format!(
@@ -852,7 +961,7 @@ impl MailBackend for JmapBackend {
         _email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: super::ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         let id = remote_id.ok_or_else(|| Error::AccountConfig("JMAP: нет remote_id".into()))?;
@@ -866,6 +975,56 @@ impl MailBackend for JmapBackend {
             .and_then(|value| value["blobId"].as_str())
             .ok_or_else(|| backend_error("download", "Email/get не вернул blobId"))?;
         self.download_raw(&session, credential, &account_id, blob_id)
+            .await
+    }
+
+    async fn fetch_older_messages(
+        &self,
+        _email: &str,
+        credential: &str,
+        folder_path: &str,
+        before: &str,
+        limit: usize,
+        known_remote_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Vec<DiscoveredMessage>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let session = self.session(credential).await?;
+        let account_id = self.mail_account(&session)?;
+        if let Some(known) = known_remote_ids {
+            // Курсор интерфейса основан на Date письма, а JMAP сортирует
+            // по receivedAt. Дата также не различает письма одной секунды.
+            let page = self
+                .query_mailbox(&session, credential, account_id, folder_path, None)
+                .await?;
+            let ids = page
+                .ids
+                .into_iter()
+                .filter(|id| !known.contains(id))
+                .take(limit)
+                .collect::<Vec<_>>();
+            return self
+                .discover_messages(&session, credential, account_id, &ids, Some(folder_path))
+                .await;
+        }
+        let before = crate::storage::repo::parse_utc_time(before)
+            .ok_or_else(|| Error::AccountConfig("JMAP: неверная дата догрузки".into()))?
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let response = self
+            .api(
+                &session,
+                credential,
+                vec![json!(["Email/query", {
+                    "accountId": account_id,
+                    "filter": {"inMailbox": folder_path, "before": before},
+                    "sort": [{"property": "receivedAt", "isAscending": false}],
+                    "limit": limit
+                }, "older"])],
+            )
+            .await?;
+        let ids = required_ids(method_args(&response, "older")?, "ids")?;
+        self.discover_messages(&session, credential, account_id, &ids, Some(folder_path))
             .await
     }
 }
@@ -950,6 +1109,20 @@ fn required_string(value: &Value, key: &str) -> Result<String> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| backend_error("response", format!("нет поля {key}")))
+}
+
+fn required_ids(value: &Value, key: &str) -> Result<Vec<String>> {
+    value[key]
+        .as_array()
+        .ok_or_else(|| backend_error("response", format!("нет списка {key}")))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| backend_error("response", format!("неверный идентификатор в {key}")))
+        })
+        .collect()
 }
 
 fn string_array(value: &Value) -> Vec<String> {
@@ -1111,10 +1284,42 @@ mod tests {
                 ],
                 "notFound": []
             }),
-            "Email/query" => json!({
-                "accountId": "a1", "queryState": "q1", "canCalculateChanges": true,
-                "position": 0, "ids": ["email-1"], "total": 1
-            }),
+            "Email/query" => {
+                let position = call[1]["position"].as_u64().unwrap_or(0);
+                let mailbox = call[1]["filter"]["inMailbox"].as_str().unwrap();
+                let (ids, total) = match (mailbox, position) {
+                    ("large", 0) => ((0..500).map(|i| format!("email-{i}")).collect(), Some(501)),
+                    ("large", 500) => (vec!["email-500".to_owned()], Some(501)),
+                    ("without-total", 0) => (vec!["email-1".to_owned()], None),
+                    ("without-total", 1) => (vec![], None),
+                    ("archive-id", 0) => (vec![], Some(0)),
+                    ("inbox-id", 0) => (vec!["email-1".to_owned()], Some(1)),
+                    _ => panic!("неожиданная страница {mailbox} {position}"),
+                };
+                let mut args = json!({
+                    "accountId": "a1", "queryState": "q1", "canCalculateChanges": true,
+                    "position": position, "ids": ids
+                });
+                if let Some(total) = total {
+                    args["total"] = json!(total);
+                }
+                if tag == "older" {
+                    assert_eq!(call[1]["filter"]["before"], "2026-11-25T12:00:00Z");
+                    assert_eq!(call[1]["limit"], 10);
+                }
+                args
+            }
+            "Email/changes" => match call[1]["sinceState"].as_str().unwrap() {
+                "e1" => json!({
+                    "oldState":"e1","newState":"e2","hasMoreChanges":true,
+                    "created":["email-1"],"updated":[],"destroyed":[]
+                }),
+                "e2" => json!({
+                    "oldState":"e2","newState":"e3","hasMoreChanges":false,
+                    "created":[],"updated":["email-2"],"destroyed":["email-3"]
+                }),
+                other => panic!("неожиданное состояние {other}"),
+            },
             "Email/get" => json!({
                 "accountId": "a1", "state": "e1",
                 "list": [{
@@ -1134,16 +1339,27 @@ mod tests {
                 "accountId":"a1", "oldState":"s1", "newState":"s2",
                 "created":{"send":{"id":"submission-1"}}
             }),
-            "Email/set" => json!({
-                "accountId":"a1", "oldState":"e1", "newState":"e2",
-                "updated":{"email-1":null}, "notUpdated":{}, "notDestroyed":{}
-            }),
+            "Email/set" => {
+                if call[1]["destroy"]
+                    .as_array()
+                    .is_some_and(|ids| !ids.is_empty())
+                {
+                    assert_eq!(call[1]["destroy"], json!(["email-1"]));
+                    assert_eq!(call[1]["update"], json!({}));
+                }
+                json!({
+                    "accountId":"a1", "oldState":"e1", "newState":"e2",
+                    "updated":{"email-1":null}, "notUpdated":{},
+                    "destroyed":call[1]["destroy"], "notDestroyed":{}
+                })
+            }
             _ => json!({"type":"unknownMethod","description":name}),
         };
         let response_name = if matches!(
             name,
             "Mailbox/get"
                 | "Email/query"
+                | "Email/changes"
                 | "Email/get"
                 | "Email/import"
                 | "Identity/get"
@@ -1172,6 +1388,80 @@ mod tests {
         Json(json!({
             "accountId":"a1", "blobId":"blob-upload", "type":"message/rfc822", "size":100
         }))
+    }
+
+    #[tokio::test]
+    async fn mailbox_pages_changes_backfill_and_permanent_delete_use_jmap_modes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/jmap", get(mock_session))
+            .route("/api", post(mock_api))
+            .route("/download/{account}/{blob}/{name}", get(mock_download))
+            .with_state(base.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = JmapBackend {
+            session_url: format!("{base}/jmap"),
+            username: "user@example.test".into(),
+        };
+        let session = backend.session("password").await.unwrap();
+        let large = backend
+            .query_mailbox(&session, "password", "a1", "large", None)
+            .await
+            .unwrap();
+        assert!(large.full);
+        assert_eq!(large.ids.len(), 501);
+        assert_eq!(large.ids.last().unwrap(), "email-500");
+        let no_total = backend
+            .query_mailbox(&session, "password", "a1", "without-total", None)
+            .await
+            .unwrap();
+        assert!(!no_total.full);
+        assert_eq!(no_total.ids, ["email-1"]);
+        let (ids, state) = backend
+            .email_changes(&session, "password", "a1", Some("e1"))
+            .await
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("e3"));
+        assert_eq!(
+            ids,
+            HashSet::from_iter(["email-1", "email-2", "email-3"].map(str::to_owned))
+        );
+        let older = backend
+            .fetch_older_messages(
+                "user@example.test",
+                "password",
+                "inbox-id",
+                "2026-11-25 12:00:00",
+                10,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(older.len(), 1);
+        let known = HashSet::from(["email-1".to_owned()]);
+        let older = backend
+            .fetch_older_messages(
+                "user@example.test",
+                "password",
+                "inbox-id",
+                "2026-11-25 12:00:00",
+                10,
+                Some(&known),
+            )
+            .await
+            .unwrap();
+        assert!(older.is_empty());
+        backend
+            .apply_operation(
+                "user@example.test",
+                "password",
+                "delete",
+                r#"{"remote_id":"email-1","folder_path":"inbox-id"}"#,
+            )
+            .await
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

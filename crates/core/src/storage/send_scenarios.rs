@@ -82,6 +82,7 @@ enum Answer {
     FailBeforeHandoff,
     /// Отказ после передачи: письмо ушло, ответа на него нет.
     FailAfterHandoff,
+    Reject(crate::ErrorKind),
     /// Сервер принял письмо и сам сохранил копию.
     SavedOnServer,
     /// Сервер принял письмо, копию в папку кладёт сама программа.
@@ -222,6 +223,9 @@ impl MailBackend for FakeBackend {
                     "соединение оборвалось после передачи письма",
                 ),
             )),
+            Answer::Reject(kind) => Err(SendFailure::before_handoff(
+                crate::Error::classified_backend("fake", kind, "сервер отклонил письмо"),
+            )),
             Answer::SavedOnServer => Ok(SendOutcome::SavedOnServer),
             Answer::NeedsSentAppend => Ok(SendOutcome::NeedsSentAppend(b"MIME-BYTES".to_vec())),
         }
@@ -246,7 +250,7 @@ impl MailBackend for FakeBackend {
         _email: &str,
         _credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: crate::backend::ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> crate::Result<Vec<u8>> {
         unimplemented!("докачка письма в сценарии отправки не участвует")
@@ -487,6 +491,125 @@ async fn failure_before_the_handoff_retries_and_failure_after_it_stays_uncertain
             .is_none(),
         "неопределённый итог сам собой не повторяется"
     );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn server_rejections_spend_attempts_and_permanent_rejection_stops() {
+    let db: TestDb = open_test_db("send-server-rejection").await;
+    let email = "me@example.test";
+    let account = seed_account(&db, email).await;
+    let queued = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_ORDINARY, None, 0)
+        .await
+        .unwrap();
+    let temporary = FakeBackend::new(&db, Answer::Reject(crate::ErrorKind::ServerUnavailable));
+    let pool = &db.pool;
+    let backoff = |id| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT unixepoch(next_attempt_at)-unixepoch('now') FROM outbox_ops WHERE id=?",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(transmit(&db, account, email, &temporary).await, 0);
+    assert_eq!(status_of(&db, queued.operation_id).await, SEND_STATUS_RETRY);
+    assert_eq!(attempts_of(&db, queued.operation_id).await, 1);
+    let first_delay = backoff(queued.operation_id).await;
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+        .bind(queued.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    assert_eq!(transmit(&db, account, email, &temporary).await, 0);
+    assert!(backoff(queued.operation_id).await > first_delay);
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+        .bind(queued.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let permanent = FakeBackend::new(&db, Answer::Reject(crate::ErrorKind::Forbidden));
+    assert_eq!(transmit(&db, account, email, &permanent).await, 0);
+    assert_eq!(
+        status_of(&db, queued.operation_id).await,
+        SEND_STATUS_FAILED
+    );
+    assert_eq!(attempts_of(&db, queued.operation_id).await, 3);
+    assert!(db.claim_send_operation(account).await.unwrap().is_none());
+    db.close().await;
+}
+
+#[tokio::test]
+async fn clearing_mail_cache_keeps_unsent_mail_and_local_auxiliary_data() {
+    let db = open_test_db("clear-mail-cache").await;
+    let email = "me@example.test";
+    let account = seed_account(&db, email).await;
+    let folder: i64 = sqlx::query_scalar(
+        "INSERT INTO folders(account_id,remote_path,display_name,role,sync_token,uidvalidity)
+         VALUES(?,'Trash','Trash','trash','old',42) RETURNING id",
+    )
+    .bind(account)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    let cached = db.blobs.put(b"cache").unwrap();
+    let contact = db.blobs.put(b"contact").unwrap();
+    sqlx::query("INSERT INTO contacts(display_name,vcard_ref) VALUES('Local',?)")
+        .bind(&contact)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO calendars(name,kind) VALUES('Local','local')")
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let message: i64 = sqlx::query_scalar(
+        "INSERT INTO messages(account_id,folder_id,uid,raw_blob_ref,body_fetched)
+         VALUES(?,?,1,?,1) RETURNING id",
+    )
+    .bind(account)
+    .bind(folder)
+    .bind(&cached)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    let outgoing = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_ORDINARY, None, 0)
+        .await
+        .unwrap();
+    for status in ["pending", "retry", "processing", "uncertain", "failed"] {
+        sqlx::query("UPDATE outbox_ops SET status=? WHERE id=?")
+            .bind(status)
+            .bind(outgoing.operation_id)
+            .execute(&db.write_pool)
+            .await
+            .unwrap();
+        assert!(db.clear_cached_mail("all").await.is_err(), "{status}");
+        assert!(db.blobs.exists(&cached), "{status}");
+    }
+    db.clear_cached_mail("trash_spam").await.unwrap();
+    let after: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT f.sync_token,m.raw_blob_ref FROM messages m JOIN folders f ON f.id=m.folder_id
+         WHERE m.id=?",
+    )
+    .bind(message)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(after, (None, None));
+    assert!(!db.blobs.exists(&cached));
+    assert_eq!(
+        status_of(&db, outgoing.operation_id).await,
+        SEND_STATUS_FAILED
+    );
+    assert!(db.blobs.exists(&contact));
+    let calendars: i64 = sqlx::query_scalar("SELECT count(*) FROM calendars WHERE name='Local'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(calendars, 1);
     db.close().await;
 }
 

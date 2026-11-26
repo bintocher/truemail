@@ -230,6 +230,12 @@
       return null;
     }
     if ((step.actions || []).some(action => action.kind === 'delete')) {
+      try {
+        await context.bridge?.checkPermanentDelete?.(targets.ids);
+      } catch (error) {
+        context.notify?.(error?.message || String(error));
+        return null;
+      }
       const text = context.lang === 'en'
         ? `Permanently delete messages: ${targets.ids.length}?`
         : `Удалить навсегда писем: ${targets.ids.length}?`;

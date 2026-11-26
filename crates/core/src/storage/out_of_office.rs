@@ -359,8 +359,9 @@ impl Db {
                     m.reply_to_addrs, m.is_newsletter, m.auto_submitted, m.precedence,
                     m.return_path_empty, m.auto_response_suppress, m.silence_headers_known
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.id>? ORDER BY m.id LIMIT ?",
+              WHERE m.id>? AND coalesce(m.processing_origin_id,m.id)>? ORDER BY m.id LIMIT ?",
         )
+        .bind(cursor)
         .bind(cursor)
         .bind(self.limit(LIMIT_STAGE_BATCH))
         .fetch_all(&mut *tx)

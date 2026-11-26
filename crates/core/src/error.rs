@@ -179,6 +179,17 @@ pub enum Error {
     #[error("аккаунт не настроен: {0}")]
     AccountConfig(String),
 
+    #[error(
+        "Номер письма на сервере больше нельзя подтвердить. Обновите папку и повторите действие с найденным письмом."
+    )]
+    ImapMessageIdentityChanged,
+
+    #[error("Почтовый сервер не поддерживает безопасное безвозвратное удаление выбранных писем.")]
+    PermanentDeleteUnavailable,
+
+    #[error("SMTP отклонил отправку: {0}")]
+    SmtpRejected(String),
+
     #[error("нет доступа: право '{0}' не выдано")]
     Forbidden(String),
 
@@ -208,7 +219,10 @@ impl Error {
                 | std::io::ErrorKind::UnexpectedEof => ErrorKind::NetworkUnavailable,
                 _ => ErrorKind::StorageError,
             },
-            Self::Json(_) | Self::Other(_) => ErrorKind::Unknown,
+            Self::Json(_)
+            | Self::Other(_)
+            | Self::ImapMessageIdentityChanged
+            | Self::SmtpRejected(_) => ErrorKind::Unknown,
             Self::Backend { message, .. } => classify_backend_message(message),
             Self::Keyring(_) => ErrorKind::SecretStoreError,
             Self::Crypto(_) => ErrorKind::CryptoError,
@@ -216,6 +230,7 @@ impl Error {
             Self::RateLimited { .. } => ErrorKind::RateLimited,
             Self::AccountConfig(_) => ErrorKind::AccountConfig,
             Self::Forbidden(_) => ErrorKind::Forbidden,
+            Self::PermanentDeleteUnavailable => ErrorKind::Forbidden,
         }
     }
 

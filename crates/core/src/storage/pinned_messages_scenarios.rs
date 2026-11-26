@@ -105,6 +105,7 @@ fn discovered(folder: &str, uid: u32, message_id: &str) -> DiscoveredMessage {
         "From: Начальник <boss@example.test>\r\nTo: me@example.test\r\nSubject: Договор\r\nMessage-ID: {message_id}\r\nDate: Mon, 14 Sep 2026 10:00:00 +0000\r\n\r\nТекст письма\r\n"
     );
     DiscoveredMessage {
+        uidvalidity: None,
         folder_path: folder.to_owned(),
         uid,
         remote_id: Some(format!("remote-{folder}-{uid}")),
@@ -354,6 +355,16 @@ async fn a_pin_survives_every_path_that_drops_the_message_row() {
     let before_move = pinned_at(&db, moved).await.expect("время закрепления");
     let before_rebuild = pinned_at(&db, rebuilt).await.expect("время закрепления");
     let before_snapshot = pinned_at(&db, elsewhere).await.expect("время закрепления");
+    let label: i64 =
+        sqlx::query_scalar("INSERT INTO labels(name) VALUES('Move with message') RETURNING id")
+            .fetch_one(&db.write_pool)
+            .await
+            .unwrap();
+    for id in [moved, rebuilt, elsewhere] {
+        add_label(&db, id, label).await;
+        sqlx::query("UPDATE messages SET snoozed_until='2099-01-01 01:02:03',closed_by_stage='test' WHERE id=?")
+            .bind(id).execute(&db.write_pool).await.unwrap();
+    }
 
     // Путь первый: своя операция переноса. Очередь довела перенос до конца и
     // удалила прежнюю строку, а синхронизация принесла письмо из корзины.
@@ -376,6 +387,11 @@ async fn a_pin_survives_every_path_that_drops_the_message_row() {
             .await
             .expect("перенос выполнен на сервере");
     }
+    sqlx::query("UPDATE labels SET name='Renamed while moving' WHERE id=?")
+        .bind(label)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
     db.save_discovered_messages(
         account,
         &[discovered("Trash", 904, "<move@example.test>")],
@@ -427,6 +443,24 @@ async fn a_pin_survives_every_path_that_drops_the_message_row() {
         Some(before_snapshot.as_str()),
         "сверка снимка унесла закрепление вместе со строкой письма"
     );
+    for (old_id, new_id) in [
+        (moved, after_move),
+        (rebuilt, after_rebuild),
+        (elsewhere, after_snapshot),
+    ] {
+        assert_eq!(db.message_label_ids(new_id).await.unwrap(), vec![label]);
+        let (snoozed, closed, origin): (String, String, i64) = sqlx::query_as(
+            "SELECT snoozed_until,closed_by_stage,processing_origin_id FROM messages WHERE id=?",
+        )
+        .bind(new_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(snoozed, "2099-01-01 01:02:03");
+        assert_eq!(closed, "test");
+        assert_eq!(origin, old_id);
+        assert!(new_id > old_id);
+    }
     db.close().await;
 }
 

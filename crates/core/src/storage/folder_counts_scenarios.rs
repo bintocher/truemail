@@ -54,6 +54,7 @@ fn discovered(uid: u32, from: &str) -> DiscoveredMessage {
          Текст письма\r\n"
     );
     DiscoveredMessage {
+        uidvalidity: None,
         folder_path: "INBOX".to_owned(),
         uid,
         remote_id: Some(format!("remote-{uid}")),

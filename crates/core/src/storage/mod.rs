@@ -219,7 +219,13 @@ impl Db {
         // undo-send.md S-027: операция отправки, застигнутая аварийным
         // завершением в состоянии передачи, получает неопределённый итог. Её
         // повтор без решения пользователя отправил бы письмо второй раз.
-        self.recover_sending_operations().await?;
+        let uncertain_sends = self.recover_sending_operations().await?;
+        if uncertain_sends > 0 {
+            tracing::warn!(
+                uncertain_sends,
+                "предыдущий запуск завершился во время отправки писем"
+            );
+        }
         self.purge_send_request_keys().await?;
         // out-of-office.md S-050 и recipient-history.md S-010: память об
         // ответах и об отметках собственных отправок стареет фоновым
@@ -576,8 +582,20 @@ fn ensure_version_at_least(product: &str, actual: &str, minimum: (u64, u64, u64)
 
 async fn prepare_encrypted_database(path: &Path, database_key: &DatabaseKey) -> Result<()> {
     recover_interrupted_migration(path)?;
-    if path.is_file() && has_plaintext_sqlite_header(path)? {
-        migrate_plaintext_database(path, database_key).await?;
+    if path.is_file() {
+        if has_plaintext_sqlite_header(path)? {
+            migrate_plaintext_database(path, database_key).await?;
+        } else if migration_path(path, ".plaintext.migrating").exists() {
+            // Проверяем существующую замену с настоящим ключом, прежде чем
+            // уничтожить единственную открытую копию. WAL рабочей базы сохраняем.
+            if std::fs::metadata(path)?.len() == 0 {
+                return Err(crate::Error::Crypto(
+                    "после миграции зашифрованная база оказалась пустой".into(),
+                ));
+            }
+            verify_encrypted_file(path, database_key).await?;
+            purge_plaintext_backup(path);
+        }
     }
     Ok(())
 }
@@ -594,6 +612,11 @@ fn has_plaintext_sqlite_header(path: &Path) -> Result<bool> {
 async fn migrate_plaintext_database(path: &Path, database_key: &DatabaseKey) -> Result<()> {
     let encrypted = migration_path(path, ".sqlcipher.tmp");
     let backup = migration_path(path, ".plaintext.migrating");
+    if backup.exists() {
+        return Err(crate::Error::Crypto(
+            "рядом с открытой базой уже есть резервная копия миграции".into(),
+        ));
+    }
     remove_database_files(&encrypted)?;
     // Main connection deliberately has SQLITE_OPEN_CREATE disabled. ATTACH
     // inherits those flags, so create the empty destination ourselves first.
@@ -645,13 +668,14 @@ async fn migrate_plaintext_database(path: &Path, database_key: &DatabaseKey) -> 
 
     remove_sidecars(path)?;
     verify_encrypted_file(&encrypted, database_key).await?;
+    remove_sidecars(&encrypted)?;
 
     std::fs::rename(path, &backup)?;
     if let Err(error) = std::fs::rename(&encrypted, path) {
         let _ = std::fs::rename(&backup, path);
         return Err(error.into());
     }
-    secure_remove_file(&backup)?;
+    purge_plaintext_backup(path);
     tracing::info!(database = %path.display(), "plaintext SQLite migrated to SQLCipher");
     Ok(())
 }
@@ -669,8 +693,21 @@ async fn verify_encrypted_file(path: &Path, database_key: &DatabaseKey) -> Resul
         .await?;
     verify_sqlcipher(&pool).await?;
     pool.close().await;
-    remove_sidecars(path)?;
     Ok(())
+}
+
+fn purge_plaintext_backup(path: &Path) {
+    let backup = migration_path(path, ".plaintext.migrating");
+    for file in [
+        sidecar_path(&backup, "-wal"),
+        sidecar_path(&backup, "-shm"),
+        backup,
+    ] {
+        if let Err(error) = secure_remove_file(&file) {
+            tracing::error!(%error, "не удалось стереть открытую копию базы, повторим при запуске");
+            break;
+        }
+    }
 }
 
 fn recover_interrupted_migration(path: &Path) -> Result<()> {
@@ -1223,10 +1260,11 @@ mod tests {
             .expect("set user version");
         plaintext.close().await.expect("close plaintext database");
         assert!(has_plaintext_sqlite_header(&database_path).expect("read plaintext header"));
+        let original = std::fs::read(&database_path).unwrap();
 
         let crypto = Arc::new(StorageCrypto::from_key(random_key()));
         let database_key = DatabaseKey::from_key(random_key());
-        let db = Db::open_with_database_key(&root, crypto, &database_key)
+        let db = Db::open_with_database_key(&root, crypto.clone(), &database_key)
             .await
             .expect("migrate and open database");
         let (value,): (String,) = sqlx::query_as("SELECT value FROM legacy")
@@ -1241,6 +1279,23 @@ mod tests {
         assert_eq!(user_version, 7);
         db.close().await;
         assert!(!has_plaintext_sqlite_header(&database_path).expect("read encrypted header"));
+        let backup = migration_path(&database_path, ".plaintext.migrating");
+        std::fs::write(&backup, &original).unwrap();
+        let wrong_key = DatabaseKey::from_key(random_key());
+        assert!(
+            Db::open_with_database_key(&root, crypto.clone(), &wrong_key)
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        let reopened = Db::open_with_database_key(&root, crypto, &database_key)
+            .await
+            .unwrap();
+        assert!(
+            !backup.exists(),
+            "открытая копия остаётся рядом с исправной базой"
+        );
+        reopened.close().await;
         std::fs::remove_dir_all(root).expect("remove temp data dir");
     }
 
@@ -1421,6 +1476,7 @@ mod tests {
             .expect("insert Gmail projection");
         }
         let desired = DiscoveredMessage {
+            uidvalidity: None,
             folder_path: "INBOX".into(),
             uid: 2,
             remote_id: Some("remote-1".into()),
@@ -1512,6 +1568,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 5,
                 remote_id: Some("calendar-message".into()),
@@ -1580,6 +1637,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 5,
                 remote_id: Some("calendar-message".into()),
@@ -1601,7 +1659,7 @@ mod tests {
                 .await
                 .expect("read full-body locator")
                 .expect("full-body locator")
-                .4
+                .body_fetched
         );
         assert_eq!(
             db.message_raw_bytes(calendar_message_id)
@@ -1623,6 +1681,7 @@ mod tests {
         db.save_discovered_messages(
             account.id,
             &[DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 6,
                 remote_id: Some("metadata-only".into()),
@@ -1650,17 +1709,23 @@ mod tests {
                 .await
                 .expect("read metadata locator")
                 .expect("metadata locator")
-                .4
+                .body_fetched
         );
-        db.store_fetched_raw(metadata_message_id, b"Subject: Large\r\n\r\nfull body")
-            .await
-            .expect("store lazy full raw");
+        db.store_fetched_raw(
+            &db.message_fetch_locator(metadata_message_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"Subject: Large\r\n\r\nfull body",
+        )
+        .await
+        .expect("store lazy full raw");
         assert!(
             db.message_fetch_locator(metadata_message_id)
                 .await
                 .expect("read hydrated locator")
                 .expect("hydrated locator")
-                .4
+                .body_fetched
         );
 
         let custom_smart = crate::model::SmartFolder {

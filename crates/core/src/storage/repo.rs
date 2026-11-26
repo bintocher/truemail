@@ -318,7 +318,39 @@ fn classify_event_change(
 }
 
 /// Строка локатора письма: account_id, remote_path папки, uid, remote_id, raw_blob_ref.
-type MessageLocatorRow = (i64, String, i64, Option<String>, i64);
+#[derive(sqlx::FromRow)]
+pub(crate) struct MessageFetchLocator {
+    pub id: i64,
+    pub account_id: i64,
+    pub path: String,
+    pub uid: i64,
+    pub remote_id: Option<String>,
+    pub raw_blob_ref: Option<String>,
+    pub body_fetched: bool,
+    pub imap_uidvalidity: Option<i64>,
+    pub rfc822_message_id: Option<String>,
+}
+
+impl MessageFetchLocator {
+    pub(crate) fn imap_uid(&self) -> crate::backend::ImapUid<'_> {
+        crate::backend::ImapUid {
+            uid: u32::try_from(self.uid).unwrap_or_default(),
+            uidvalidity: self
+                .imap_uidvalidity
+                .and_then(|value| u32::try_from(value).ok()),
+            message_id: self.rfc822_message_id.as_deref(),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct CachedMessageBody {
+    id: i64,
+    raw_blob_ref: Option<String>,
+    body_fetched: bool,
+    imap_uidvalidity: Option<i64>,
+    rfc822_message_id: Option<String>,
+}
 
 /// Строка метаданных письма для уведомления: id, from_name, from_addr, subject, preview.
 type NotificationPreviewRow = (i64, Option<String>, Option<String>, String, Option<String>);
@@ -543,6 +575,85 @@ impl Db {
             }
         }
         Ok((removed, missing))
+    }
+
+    /// Сбросить загруженное содержимое писем, сохранив список писем,
+    /// локальные признаки, очередь, календари и контакты.
+    pub async fn clear_cached_mail(&self, scope: &str) -> Result<()> {
+        if !matches!(scope, "all" | "trash_spam" | "old_attachments") {
+            return Err(crate::Error::AccountConfig(
+                "неизвестный режим очистки".into(),
+            ));
+        }
+        let mut tx = self.begin_write().await?;
+        if scope == "all" {
+            let pending: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM outbox_ops WHERE op_kind='send'
+                   AND status IN ('pending','retry','processing','uncertain','failed'))",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if pending {
+                return Err(crate::Error::Other(
+                    "В исходящих есть письма. Отправьте их, верните в редактор или удалите перед очисткой."
+                        .into(),
+                ));
+            }
+        }
+        let messages: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT m.id, m.raw_blob_ref FROM messages m JOIN folders f ON f.id=m.folder_id
+             WHERE m.draft=0 AND coalesce(f.role,'') NOT IN ('sent','drafts','outbox')
+             AND (m.uid>0 OR m.remote_id IS NOT NULL)
+             AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id)
+             AND (?='all' OR (?='trash_spam' AND f.role IN ('trash','spam'))
+                  OR (?='old_attachments' AND m.has_attachments=1
+                      AND m.date<datetime('now','-1 year')))
+             AND (m.body_fetched=1 OR m.raw_blob_ref IS NOT NULL
+                  OR EXISTS(SELECT 1 FROM attachments a WHERE a.message_id=m.id AND a.blob_ref IS NOT NULL))",
+        )
+        .bind(scope)
+        .bind(scope)
+        .bind(scope)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut refs = Vec::new();
+        for (id, raw_ref) in messages {
+            refs.extend(raw_ref);
+            refs.extend(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT blob_ref FROM attachments WHERE message_id=? AND blob_ref IS NOT NULL",
+                )
+                .bind(id)
+                .fetch_all(&mut *tx)
+                .await?,
+            );
+            sqlx::query("UPDATE attachments SET blob_ref=NULL, fetched=0 WHERE message_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM message_content_cache WHERE message_id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE messages SET raw_blob_ref=NULL, body_fetched=0 WHERE id=?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if scope != "old_attachments" {
+            sqlx::query(
+                "UPDATE folders SET sync_token=NULL, highestmodseq=NULL
+                         WHERE uidvalidity IS NOT NULL AND (?='all' OR role IN ('trash','spam'))",
+            )
+            .bind(scope)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        for reference in refs {
+            self.blobs.remove(&reference)?;
+        }
+        Ok(())
     }
 
     // ---------- Аккаунты ----------
@@ -843,6 +954,8 @@ impl Db {
             return Ok(0);
         }
         let cutoff = format!("-{days} days");
+        let limits = self.limit_set();
+        let mut tx = self.begin_write().await?;
         // Чистим только входящие/архив/спам/корзину и папки без роли. Отправленные,
         // черновики и исходящие - пользовательский контент, их не трогаем никогда.
         let old: Vec<(i64, Option<String>)> = sqlx::query_as(
@@ -850,39 +963,39 @@ impl Db {
              JOIN folders f ON f.id = m.folder_id \
              WHERE m.account_id = ? AND m.date IS NOT NULL AND m.date < datetime('now', ?) \
              AND m.pinned_at IS NULL \
+             AND m.draft=0 AND m.snoozed_until IS NULL \
              AND NOT EXISTS(SELECT 1 FROM message_tasks t WHERE t.message_id=m.id \
                             AND t.state IN ('active','detached')) \
+             AND NOT EXISTS(SELECT 1 FROM message_labels l WHERE l.message_id=m.id) \
+             AND NOT EXISTS(SELECT 1 FROM outbox_ops o WHERE o.message_id=m.id) \
              AND (f.role IS NULL OR f.role NOT IN ('sent','drafts','outbox'))",
         )
         .bind(account_id)
         .bind(&cutoff)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         if old.is_empty() {
             return Ok(0);
         }
-        let mut tx = self.begin_write().await?;
+        let mut refs = Vec::new();
         for (id, raw_ref) in &old {
             let atts: Vec<(Option<String>,)> =
                 sqlx::query_as("SELECT blob_ref FROM attachments WHERE message_id = ?")
                     .bind(id)
                     .fetch_all(&mut *tx)
                     .await?;
-            for (blob,) in atts {
-                if let Some(reference) = blob {
-                    let _ = self.blobs.remove(&reference);
-                }
-            }
-            if let Some(reference) = raw_ref {
-                let _ = self.blobs.remove(reference);
-            }
-            // Удаляем запись письма (attachments/labels уйдут по ON DELETE CASCADE).
+            refs.extend(atts.into_iter().filter_map(|(reference,)| reference));
+            refs.extend(raw_ref.iter().cloned());
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id = ?")
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
         }
         tx.commit().await?;
+        for reference in refs {
+            self.blobs.remove(&reference)?;
+        }
         Ok(old.len())
     }
 
@@ -949,12 +1062,46 @@ impl Db {
         remote_path: &str,
         display_name: &str,
     ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let (old_path, account_id): (String, i64) =
+            sqlx::query_as("SELECT remote_path,account_id FROM folders WHERE id=?")
+                .bind(folder_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if old_path != remote_path {
+            let descendants: Vec<(i64, String)> = sqlx::query_as(
+                "WITH RECURSIVE children(id) AS (
+                     SELECT id FROM folders WHERE parent_id=? AND account_id=?
+                     UNION SELECT f.id FROM folders f JOIN children c ON f.parent_id=c.id
+                           WHERE f.account_id=?
+                 ) SELECT f.id,f.remote_path FROM folders f JOIN children c ON f.id=c.id",
+            )
+            .bind(folder_id)
+            .bind(account_id)
+            .bind(account_id)
+            .fetch_all(&mut *tx)
+            .await?;
+            for (id, path) in descendants {
+                if let Some(suffix) = path.strip_prefix(&old_path) {
+                    rename_folder_path(
+                        &mut tx,
+                        account_id,
+                        id,
+                        &path,
+                        &format!("{remote_path}{suffix}"),
+                    )
+                    .await?;
+                }
+            }
+            rename_folder_path(&mut tx, account_id, folder_id, &old_path, remote_path).await?;
+        }
         sqlx::query("UPDATE folders SET remote_path=?, display_name=?, last_synced=datetime('now') WHERE id=?")
             .bind(remote_path)
             .bind(display_name)
             .bind(folder_id)
-            .execute(&self.write_pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1007,6 +1154,21 @@ impl Db {
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
+            if let Some(uidvalidity) = folder.uidvalidity {
+                // После обновления поколения папки эти старые строки нельзя
+                // использовать даже если сверка писем прервётся до удаления.
+                sqlx::query(
+                    "UPDATE messages SET imap_uidvalidity=0
+                     WHERE imap_uidvalidity IS NULL AND folder_id=(
+                       SELECT id FROM folders WHERE account_id=? AND remote_path=?
+                         AND uidvalidity IS NOT NULL AND uidvalidity<>?)",
+                )
+                .bind(account_id)
+                .bind(&folder.remote_path)
+                .bind(i64::from(uidvalidity))
+                .execute(&mut *tx)
+                .await?;
+            }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO folders(account_id, remote_path, display_name, role, unread_count,
                                      total_count, uidvalidity, uidnext, highestmodseq)
@@ -1015,6 +1177,10 @@ impl Db {
                     display_name = excluded.display_name, role = coalesce(excluded.role, folders.role),
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
+                    sync_token = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
+                        THEN NULL ELSE folders.sync_token END,
+                    highestmodseq = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
+                        THEN NULL ELSE folders.highestmodseq END,
                     uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
                     last_synced = datetime('now')
@@ -1071,6 +1237,136 @@ impl Db {
         .await?)
     }
 
+    /// Сохранить папку при подтверждённом переименовании на сервере.
+    pub(crate) async fn reconcile_imap_folder_renames(
+        &self,
+        account_id: i64,
+        discovery: &crate::backend::ImapDiscovery,
+        previous: &std::collections::HashMap<String, crate::backend::FolderSyncCursor>,
+    ) -> Result<bool> {
+        use std::collections::{HashMap, HashSet};
+
+        let active: HashSet<_> = discovery
+            .folders
+            .iter()
+            .map(|folder| folder.remote_path.as_str())
+            .collect();
+        let absent: Vec<_> = previous
+            .iter()
+            .filter(|(path, cursor)| {
+                !active.contains(path.as_str()) && cursor.uidvalidity.is_some()
+            })
+            .collect();
+        if absent.is_empty() {
+            return Ok(false);
+        }
+        let mut incoming: HashMap<&str, HashMap<i64, String>> = HashMap::new();
+        let parser = mail_parser::MessageParser::default();
+        for message in &discovery.messages {
+            if message.uidvalidity.is_some()
+                && previous
+                    .get(&message.folder_path)
+                    .is_none_or(|c| c.uidvalidity.is_none() && c.sync_token.is_none())
+                && let Some(parsed) = parser.parse(&message.raw)
+                && let Some(id) = parsed.message_id()
+            {
+                incoming
+                    .entry(&message.folder_path)
+                    .or_default()
+                    .insert(i64::from(message.uid), id.to_owned());
+            }
+        }
+        if incoming.is_empty() {
+            return Ok(false);
+        }
+        let mut tx = self.begin_write().await?;
+        let mut matches = Vec::new();
+        for folder in &discovery.folders {
+            let path = folder.remote_path.as_str();
+            let Some(messages) = incoming.get(path) else {
+                continue;
+            };
+            // UIDVALIDITY у разных папок может совпасть. Сопоставляем только
+            // новые папки с полным совпадением UID и Message-ID всего набора.
+            if !discovery
+                .server_uids
+                .iter()
+                .any(|(name, uids)| name == path && uids.len() == messages.len())
+            {
+                continue;
+            }
+            for (old_path, cursor) in &absent {
+                if cursor.uidvalidity != folder.uidvalidity {
+                    continue;
+                }
+                let Some(old_id) = sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM folders WHERE account_id=? AND remote_path=?",
+                )
+                .bind(account_id)
+                .bind(old_path)
+                .fetch_optional(&mut *tx)
+                .await?
+                else {
+                    continue;
+                };
+                let rows: Vec<(i64, Option<String>)> =
+                    sqlx::query_as("SELECT uid,rfc822_message_id FROM messages WHERE folder_id=?")
+                        .bind(old_id)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                if rows.len() == messages.len()
+                    && rows
+                        .iter()
+                        .all(|(uid, id)| messages.get(uid) == id.as_ref())
+                {
+                    matches.push((old_id, old_path.as_str(), path));
+                }
+            }
+        }
+        let mut renamed = false;
+        for (old_id, old_path, new_path) in &matches {
+            if matches
+                .iter()
+                .filter(|(id, _, path)| id == old_id || path == new_path)
+                .count()
+                != 1
+            {
+                continue;
+            }
+            let placeholder: Option<i64> = sqlx::query_scalar(
+                "SELECT f.id FROM folders f WHERE f.account_id=? AND f.remote_path=?
+                  AND f.sync_token IS NULL
+                  AND NOT EXISTS(SELECT 1 FROM messages WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM unified_sources WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM mail_rule_actions WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM quick_step_actions WHERE folder_id=f.id)
+                  AND NOT EXISTS(SELECT 1 FROM outbox_ops WHERE account_id=f.account_id AND op_kind='move'
+                    AND json_extract(payload,'$.target_folder_id')=f.id)",
+            )
+            .bind(account_id)
+            .bind(new_path)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(placeholder) = placeholder else {
+                continue;
+            };
+            sqlx::query("UPDATE folders SET parent_id=? WHERE parent_id=? AND id<>?")
+                .bind(old_id)
+                .bind(placeholder)
+                .bind(old_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM folders WHERE id=?")
+                .bind(placeholder)
+                .execute(&mut *tx)
+                .await?;
+            rename_folder_path(&mut tx, account_id, *old_id, old_path, new_path).await?;
+            renamed = true;
+        }
+        tx.commit().await?;
+        Ok(renamed)
+    }
+
     /// Remove remote folders absent from a complete provider discovery.
     pub async fn reconcile_discovered_folders(
         &self,
@@ -1084,6 +1380,8 @@ impl Db {
             .iter()
             .map(|folder| folder.remote_path.as_str())
             .collect::<std::collections::HashSet<_>>();
+        let limits = self.limit_set();
+        let mut tx = self.begin_write().await?;
         let blob_refs: Vec<(i64, String)> = sqlx::query_as(
             "SELECT f.id, m.raw_blob_ref
              FROM folders f JOIN messages m ON m.folder_id=f.id
@@ -1096,9 +1394,8 @@ impl Db {
         )
         .bind(account_id)
         .bind(account_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        let mut tx = self.begin_write().await?;
         let existing: Vec<(i64, String)> =
             sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=?")
                 .bind(account_id)
@@ -1119,6 +1416,14 @@ impl Db {
                 .await?;
         }
         for id in &stale_ids {
+            let messages: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=?")
+                    .bind(id)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for message_id in messages {
+                preserve_message_traits(&mut tx, message_id, &limits, None).await?;
+            }
             sqlx::query("DELETE FROM folders WHERE id=? AND account_id=?")
                 .bind(id)
                 .bind(account_id)
@@ -1178,6 +1483,7 @@ impl Db {
             "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid),
                     f.highestmodseq, f.sync_token
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
+                 AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              WHERE f.account_id=?
              GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token",
         )
@@ -1206,7 +1512,9 @@ impl Db {
         let known_uid_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT f.remote_path, m.uid
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE f.account_id=? ORDER BY f.remote_path, m.uid",
+             WHERE f.account_id=?
+               AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
+             ORDER BY f.remote_path, m.uid",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
@@ -1298,7 +1606,7 @@ impl Db {
             }
             // Проекция письма убрана провайдером - строка уходит, а сроки дела
             // и закрепление остаются: письмо то же самое.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1328,8 +1636,10 @@ impl Db {
         let mut delete_ids = Vec::new();
         let mut blob_refs = Vec::new();
         for (path, server_uids) in snapshots {
-            let rows: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
-                "SELECT m.id, m.uid, m.raw_blob_ref FROM messages m
+            let rows: Vec<(i64, i64, Option<String>, bool)> = sqlx::query_as(
+                "SELECT m.id, m.uid, m.raw_blob_ref,
+                        m.imap_uidvalidity IS NOT NULL AND f.uidvalidity IS NOT NULL
+                        AND m.imap_uidvalidity<>f.uidvalidity FROM messages m
                  JOIN folders f ON f.id=m.folder_id
                  WHERE m.account_id=? AND f.remote_path=?",
             )
@@ -1338,8 +1648,12 @@ impl Db {
             .fetch_all(&mut *tx)
             .await?;
             let server: HashSet<i64> = server_uids.iter().map(|uid| i64::from(*uid)).collect();
-            for (id, uid, reference) in rows {
-                if reset.contains(path.as_str()) || !server.contains(&uid) {
+            for (id, uid, reference, prior_generation) in rows {
+                let reset_identity = reset.contains(path.as_str()) || prior_generation;
+                if reset_identity || !server.contains(&uid) {
+                    if reset_identity {
+                        detach_stale_imap_operations(&mut tx, id).await?;
+                    }
                     delete_ids.push(id);
                     if let Some(reference) = reference {
                         blob_refs.push(reference);
@@ -1357,7 +1671,7 @@ impl Db {
             // Сверка снимка и смена признака действительности папки удаляют
             // строку письма, которое на сервере осталось: приметы сохраняются
             // ровно как при своём переносе.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1488,7 +1802,7 @@ impl Db {
         for id in &delete_ids {
             // Письмо исчезло из этой папки, но в ящике оно чаще всего уже
             // лежит на новом месте: приметы уходят туда, а не пропадают.
-            preserve_message_traits(&mut tx, *id, &limits).await?;
+            preserve_message_traits(&mut tx, *id, &limits, None).await?;
             sqlx::query("DELETE FROM messages WHERE id=?")
                 .bind(id)
                 .execute(&mut *tx)
@@ -2412,30 +2726,59 @@ impl Db {
                 silence,
                 ) in batch
                 {
-                let folder: Option<(i64,)> = sqlx::query_as(
-                    "SELECT id FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
+                let folder: Option<(i64, Option<i64>)> = sqlx::query_as(
+                    "SELECT id, uidvalidity FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
                 )
                 .bind(account_id)
                 .bind(&source.folder_path)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let Some((folder_id,)) = folder else { continue };
-                let old_ref: Option<(Option<String>, i64)> = sqlx::query_as(
-                    "SELECT raw_blob_ref, body_fetched FROM messages WHERE folder_id=? AND uid=?",
+                let Some((folder_id, folder_uidvalidity)) = folder else { continue };
+                let uidvalidity = source.uidvalidity.map(i64::from);
+                if matches!((uidvalidity, folder_uidvalidity), (Some(current), Some(saved)) if current != saved) {
+                    return Err(crate::Error::ImapMessageIdentityChanged);
+                }
+                let mut old_ref: Option<CachedMessageBody> = sqlx::query_as(
+                    "SELECT id, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                     FROM messages WHERE folder_id=? AND uid=?",
                 )
                 .bind(folder_id)
                 .bind(source.uid as i64)
                 .fetch_optional(&mut *tx)
                 .await?;
+                if let Some(old) = &old_ref
+                    && let Some(current_generation) = uidvalidity
+                    && (old.imap_uidvalidity.is_some_and(|generation| generation != current_generation)
+                        || (old.imap_uidvalidity.is_none() && old.rfc822_message_id != message_id))
+                {
+                    detach_stale_imap_operations(&mut tx, old.id).await?;
+                    preserve_message_traits(&mut tx, old.id, &limits, None).await?;
+                    let attachments = sqlx::query_scalar::<_, String>(
+                        "SELECT blob_ref FROM attachments WHERE message_id=? AND blob_ref IS NOT NULL",
+                    ).bind(old.id).fetch_all(&mut *tx).await?;
+                    stale_refs.extend(attachments);
+                    stale_refs.extend(old.raw_blob_ref.iter().cloned());
+                    sqlx::query("DELETE FROM messages WHERE id=?")
+                        .bind(old.id).execute(&mut *tx).await?;
+                    old_ref = None;
+                }
                 let is_new_message = old_ref.is_none();
                 let preserve_full_body = !source.body_fetched
                     && old_ref
                         .as_ref()
-                        .is_some_and(|(_, body_fetched)| *body_fetched != 0);
+                        .is_some_and(|row| row.body_fetched);
+                let local_id = match &old_ref {
+                    Some(row) => row.id,
+                    None => sqlx::query_scalar(
+                        "UPDATE message_id_sequence
+                         SET last_id=max(last_id,coalesce((SELECT max(id) FROM messages),0))+1
+                         WHERE singleton=1 RETURNING last_id",
+                    ).fetch_one(&mut *tx).await?,
+                };
                 let effective_ref = if preserve_full_body {
                     old_ref
                         .as_ref()
-                        .and_then(|(reference, _)| reference.clone())
+                        .and_then(|row| row.raw_blob_ref.clone())
                         .unwrap_or_else(|| raw_ref.clone())
                 } else {
                     raw_ref.clone()
@@ -2444,9 +2787,10 @@ impl Db {
                     // backfilled намеренно не входит в DO UPDATE SET: письмо,
                     // уже лежавшее в базе, не должно стать "догруженным" из-за
                     // перекрытия страниц - иначе правила его больше не увидят.
-                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled, is_newsletter, auto_submitted, precedence, return_path_empty, auto_response_suppress, reply_to_addrs, silence_headers_known)
-                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "INSERT INTO messages(account_id, folder_id, uid, remote_id, rfc822_message_id, in_reply_to, references_ids, from_name, from_addr, to_addrs, cc_addrs, subject, preview, date, size, seen, flagged, answered, draft, has_attachments, dkim_pass, spf_pass, dmarc_pass, raw_blob_ref, body_fetched, backfilled, is_newsletter, auto_submitted, precedence, return_path_empty, auto_response_suppress, reply_to_addrs, silence_headers_known, imap_uidvalidity, id)
+                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT(folder_id, uid) DO UPDATE SET
+                        imap_uidvalidity=coalesce(excluded.imap_uidvalidity,messages.imap_uidvalidity),
                         remote_id=coalesce(excluded.remote_id,messages.remote_id), rfc822_message_id=excluded.rfc822_message_id, in_reply_to=excluded.in_reply_to,
                         references_ids=excluded.references_ids, from_name=excluded.from_name,
                         from_addr=excluded.from_addr, to_addrs=excluded.to_addrs, cc_addrs=excluded.cc_addrs,
@@ -2491,23 +2835,20 @@ impl Db {
                 .bind(&silence.precedence).bind(silence.return_path_empty as i64)
                 .bind(&silence.auto_response_suppress).bind(&silence.reply_to_json)
                 .bind(silence.known as i64)
+                .bind(uidvalidity)
+                .bind(local_id)
                 .execute(&mut *tx).await?;
                 active_refs.insert(effective_ref.clone());
                 if preserve_full_body {
                     if raw_ref != effective_ref {
                         stale_refs.push(raw_ref);
                     }
-                } else if let Some((Some(reference), _)) = old_ref
+                } else if let Some(reference) = old_ref.and_then(|row| row.raw_blob_ref)
                     && reference != effective_ref
                 {
                     stale_refs.push(reference);
                 }
-                let (message_row_id,): (i64,) =
-                    sqlx::query_as("SELECT id FROM messages WHERE folder_id = ? AND uid = ?")
-                        .bind(folder_id)
-                        .bind(source.uid as i64)
-                        .fetch_one(&mut *tx)
-                        .await?;
+                let message_row_id = local_id;
                 if let Some(fixed_id) = message_id.as_deref() {
                     restore_transferred_message_traits(
                         &mut tx,
@@ -2754,6 +3095,20 @@ impl Db {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(value.flatten().filter(|date| !date.is_empty()))
+    }
+
+    pub(crate) async fn folder_remote_message_ids(
+        &self,
+        folder_id: i64,
+    ) -> Result<std::collections::HashSet<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT remote_id FROM messages WHERE folder_id=? AND remote_id IS NOT NULL",
+        )
+        .bind(folder_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .collect())
     }
 
     /// Cursor page ordered by `(date DESC, id DESC)`. Unlike OFFSET this stays
@@ -3085,6 +3440,33 @@ impl Db {
             .collect::<Vec<_>>();
         self.attach_labels(&mut messages).await?;
         Ok(messages)
+    }
+
+    /// Вернуть письма страницы JMAP, включая те, что уже за границей
+    /// курсора списка по дате и номеру строки. Скрытые письма не выдаём.
+    pub(crate) async fn list_backfilled_folder_messages(
+        &self,
+        folder_id: i64,
+        remote_ids: &[&str],
+    ) -> Result<Vec<MessageMeta>> {
+        if remote_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT id FROM messages WHERE pinned_at IS NULL
+               AND (snoozed_until IS NULL OR snoozed_until <= datetime('now'))
+               AND NOT EXISTS (SELECT 1 FROM outbox_ops o WHERE o.message_id=messages.id
+                 AND o.op_kind IN ('move','delete') AND o.status IN ('pending','processing','retry'))
+               AND folder_id=",
+        );
+        query.push_bind(folder_id).push(" AND remote_id IN (");
+        let mut ids = query.separated(",");
+        for id in remote_ids {
+            ids.push_bind(*id);
+        }
+        ids.push_unseparated(") ORDER BY date DESC,id DESC");
+        let ids = query.build_query_scalar().fetch_all(&self.pool).await?;
+        self.list_messages_by_ids(&ids).await
     }
 
     /// Закрепить или открепить пачку писем. Предел считается отдельно для
@@ -3628,22 +4010,19 @@ impl Db {
         Ok(task)
     }
 
-    /// Данные для докачки письма с сервера, когда полный MIME ещё не загружен:
-    /// (account_id, remote_path папки, uid, remote_id, загружено ли тело).
-    pub async fn message_fetch_locator(
+    /// Данные для докачки письма с сервера, когда полный MIME ещё не загружен.
+    pub(crate) async fn message_fetch_locator(
         &self,
         message_id: i64,
-    ) -> Result<Option<(i64, String, i64, Option<String>, bool)>> {
-        let row: Option<MessageLocatorRow> = sqlx::query_as(
-            "SELECT m.account_id, f.remote_path, m.uid, m.remote_id, m.body_fetched \
+    ) -> Result<Option<MessageFetchLocator>> {
+        Ok(sqlx::query_as(
+            "SELECT m.id, m.account_id, f.remote_path AS path, m.uid, m.remote_id,
+                    m.raw_blob_ref, m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
              FROM messages m JOIN folders f ON f.id = m.folder_id WHERE m.id = ?",
         )
         .bind(message_id)
         .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(account_id, path, uid, remote_id, body_fetched)| {
-            (account_id, path, uid, remote_id, body_fetched != 0)
-        }))
+        .await?)
     }
 
     /// Письма аккаунта, у которых нет тела: их надо докачать заранее, чтобы
@@ -3651,20 +4030,26 @@ impl Db {
     /// `retention_days` = 0 - без ограничения по времени. Письма больше
     /// `max_size_bytes` пропускаем: их качают по открытию.
     /// Порядок - от новых к старым.
-    pub async fn messages_missing_body(
+    pub(crate) async fn messages_missing_body(
         &self,
         account_id: i64,
         retention_days: i64,
         max_size_bytes: i64,
         limit: i64,
-    ) -> Result<Vec<(i64, String, i64, Option<String>)>> {
+    ) -> Result<Vec<MessageFetchLocator>> {
         let cutoff = if retention_days > 0 {
             Some(format!("-{retention_days} days"))
         } else {
             None
         };
-        let rows: Vec<(i64, String, i64, Option<String>)> = sqlx::query_as(
-            "SELECT m.id, f.remote_path, m.uid, m.remote_id              FROM messages m JOIN folders f ON f.id = m.folder_id              WHERE m.account_id = ? AND m.body_fetched = 0                AND (m.size IS NULL OR m.size <= ?)                AND (? IS NULL OR (m.date IS NOT NULL AND m.date >= datetime('now', ?)))              ORDER BY m.date DESC, m.id DESC LIMIT ?",
+        let rows = sqlx::query_as(
+            "SELECT m.id, m.account_id, f.remote_path AS path, m.uid, m.remote_id,
+                    m.raw_blob_ref, m.body_fetched, m.imap_uidvalidity, m.rfc822_message_id
+             FROM messages m JOIN folders f ON f.id = m.folder_id
+             WHERE m.account_id = ? AND m.body_fetched = 0
+               AND (m.size IS NULL OR m.size <= ?)
+               AND (? IS NULL OR (m.date IS NOT NULL AND m.date >= datetime('now', ?)))
+             ORDER BY m.date DESC, m.id DESC LIMIT ?",
         )
         .bind(account_id)
         .bind(max_size_bytes)
@@ -3678,14 +4063,36 @@ impl Db {
 
     /// Сохранить докачанный с сервера сырой MIME и пометить тело загруженным.
     /// Свежий blob не удаляется прунингом текущей сессии (prune только на старте).
-    pub async fn store_fetched_raw(&self, message_id: i64, raw: &[u8]) -> Result<()> {
+    pub(crate) async fn store_fetched_raw(
+        &self,
+        locator: &MessageFetchLocator,
+        raw: &[u8],
+    ) -> Result<()> {
         let reference = self.blobs.put(raw)?;
-        sqlx::query("UPDATE messages SET raw_blob_ref = ?, body_fetched = 1 WHERE id = ?")
-            .bind(&reference)
-            .bind(message_id)
-            .execute(&self.write_pool)
-            .await?;
-        Ok(())
+        let saved = sqlx::query(
+            "UPDATE messages SET raw_blob_ref=?, body_fetched=1 WHERE id=? AND account_id=?
+               AND folder_id=(SELECT id FROM folders WHERE account_id=? AND remote_path=?)
+               AND uid=? AND remote_id IS ? AND imap_uidvalidity IS ? AND rfc822_message_id IS ?",
+        )
+        .bind(&reference)
+        .bind(locator.id)
+        .bind(locator.account_id)
+        .bind(locator.account_id)
+        .bind(&locator.path)
+        .bind(locator.uid)
+        .bind(&locator.remote_id)
+        .bind(locator.imap_uidvalidity)
+        .bind(&locator.rfc822_message_id)
+        .execute(&self.write_pool)
+        .await;
+        match saved {
+            Ok(result) if result.rows_affected() == 1 => Ok(()),
+            other => {
+                self.blobs.remove(&reference)?;
+                other?;
+                Err(crate::Error::ImapMessageIdentityChanged)
+            }
+        }
     }
 
     pub async fn get_message(&self, message_id: i64) -> Result<MessageFull> {
@@ -4468,10 +4875,13 @@ impl Db {
                     .and_then(serde_json::Value::as_bool)
             })
             .unwrap_or(false);
+        let (uidvalidity, rfc822_message_id) = outbox_message_identity(tx, message_id).await?;
         let payload = serde_json::json!({
             "message_id": message_id,
             "folder_path": folder_path,
             "uid": uid,
+            "uidvalidity": uidvalidity,
+            "rfc822_message_id": rfc822_message_id,
             "remote_id": remote_id,
             "seen": seen,
             "flagged": flagged,
@@ -4609,7 +5019,8 @@ impl Db {
         let changed = sqlx::query(
             "UPDATE outbox_ops SET status='retry', attempts=0, last_error=NULL,
                     next_attempt_at=datetime('now')
-              WHERE id=? AND status='failed' AND op_kind IN ('move','delete')",
+              WHERE id=? AND status='failed' AND op_kind IN ('move','delete')
+                AND coalesce(json_extract(payload,'$.imap_identity_stale'),0)=0",
         )
         .bind(operation_id)
         .execute(&mut *tx)
@@ -4620,6 +5031,105 @@ impl Db {
             ));
         }
         clear_stage_result_of_operation(&mut tx, operation_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn invalidate_imap_folder(&self, account_id: i64, path: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE folders SET sync_token=NULL, highestmodseq=NULL
+                     WHERE account_id=? AND remote_path=?",
+        )
+        .bind(account_id)
+        .bind(path)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn reject_stale_imap_operation(
+        &self,
+        operation: &OutboxOperation,
+    ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query("UPDATE outbox_ops SET status='failed', next_attempt_at=NULL, last_error=?,
+                     attempts=attempts+1, message_id=NULL, payload=json_set(payload,'$.imap_identity_stale',1)
+                     WHERE id=? AND status='processing'")
+            .bind(crate::Error::ImapMessageIdentityChanged.to_string())
+            .bind(operation.id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE folders SET sync_token=NULL, highestmodseq=NULL WHERE account_id=?
+                     AND remote_path=json_extract(?, '$.folder_path')",
+        )
+        .bind(operation.account_id)
+        .bind(&operation.payload)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Привязать отказавшее действие к единственному подтверждённому письму
+    /// после сверки. Действие остаётся отказавшим до ручного повтора.
+    pub(crate) async fn rebind_stale_imap_operations(&self, account_id: i64) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let failed: Vec<(i64, String, String, Option<i64>, String)> = sqlx::query_as(
+            "SELECT id, op_kind, json_extract(payload,'$.rfc822_message_id'),
+                    json_extract(payload,'$.target_folder_id'), json_extract(payload,'$.folder_path')
+             FROM outbox_ops
+             WHERE account_id=? AND status='failed' AND message_id IS NULL
+               AND json_extract(payload,'$.imap_identity_stale')=1
+               AND json_extract(payload,'$.rfc822_message_id') IS NOT NULL
+               AND json_extract(payload,'$.folder_path') IS NOT NULL",
+        )
+        .bind(account_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (operation_id, kind, message_id, target_id, original_path) in failed {
+            let candidates: Vec<(i64, i64, i64, Option<i64>, String)> = sqlx::query_as(
+                "SELECT m.id, m.folder_id, m.uid,
+                        CASE WHEN f.uidvalidity=m.imap_uidvalidity AND f.sync_token IS NOT NULL
+                             THEN m.imap_uidvalidity END,
+                        f.remote_path
+                 FROM messages m JOIN folders f ON f.id=m.folder_id
+                 WHERE m.account_id=? AND m.rfc822_message_id=? AND f.remote_path=? LIMIT 2",
+            )
+            .bind(account_id)
+            .bind(message_id)
+            .bind(original_path)
+            .fetch_all(&mut *tx)
+            .await?;
+            let [(message_id, folder_id, uid, Some(uidvalidity), path)] = candidates.as_slice()
+            else {
+                continue;
+            };
+            let target: Option<String> = if kind == "move" {
+                let target: Option<String> = sqlx::query_scalar(
+                    "SELECT remote_path FROM folders WHERE id=? AND account_id=? AND id<>?",
+                )
+                .bind(target_id)
+                .bind(account_id)
+                .bind(folder_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                if target.is_none() {
+                    continue;
+                }
+                target
+            } else {
+                None
+            };
+            sqlx::query(
+                "UPDATE outbox_ops SET message_id=?, payload=json_remove(json_set(payload,
+                       '$.message_id',?, '$.folder_id',?, '$.folder_path',?,
+                       '$.uid',?, '$.uidvalidity',?, '$.target_folder_path',?), '$.imap_identity_stale')
+                 WHERE id=? AND NOT EXISTS(SELECT 1 FROM outbox_ops WHERE message_id=?
+                    AND (op_kind=? OR (op_kind IN ('move','delete') AND ? IN ('move','delete'))))",
+            )
+            .bind(message_id).bind(message_id).bind(folder_id).bind(path).bind(uid).bind(uidvalidity)
+            .bind(target).bind(operation_id).bind(message_id).bind(&kind).bind(&kind)
+            .execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -4739,9 +5249,13 @@ impl Db {
             // Отказ переноса примет не отменяет завершения операции: письмо на
             // сервере уже переехало, и откат вернул бы строку письма на старое
             // место, а операцию оставил бы в состоянии выполнения навсегда.
+            let target_folder = serde_json::from_str::<serde_json::Value>(&operation.payload)
+                .ok()
+                .and_then(|payload| payload["target_folder_id"].as_i64());
             if operation.op_kind == "move"
                 && let Err(error) =
-                    preserve_message_traits(&mut tx, message_id, &self.limit_set()).await
+                    preserve_message_traits(&mut tx, message_id, &self.limit_set(), target_folder)
+                        .await
             {
                 tracing::warn!(
                     message_id,
@@ -4766,15 +5280,24 @@ impl Db {
     }
 
     pub async fn fail_outbox_operation(&self, id: i64, error: &str) -> Result<()> {
+        self.record_outbox_failure(id, error, false).await
+    }
+
+    pub async fn reject_outbox_operation(&self, id: i64, error: &str) -> Result<()> {
+        self.record_outbox_failure(id, error, true).await
+    }
+
+    async fn record_outbox_failure(&self, id: i64, error: &str, permanent: bool) -> Result<()> {
+        let mut tx = self.begin_write().await?;
         let attempts: (i64,) = sqlx::query_as("SELECT attempts+1 FROM outbox_ops WHERE id=?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
         let delay = (5_i64.saturating_mul(1_i64 << attempts.0.min(9))).min(3600);
         // Сколько раз повторять действие - настройка: на неустойчивой связи
         // восьми попыток мало, а на устойчивой сбой означает отказ сервера, и
         // повторять его восемь раз незачем.
-        let status = if attempts.0 >= self.limit(LIMIT_OPERATION_ATTEMPTS) {
+        let status = if permanent || attempts.0 >= self.limit(LIMIT_OPERATION_ATTEMPTS) {
             "failed"
         } else {
             "retry"
@@ -4782,7 +5305,7 @@ impl Db {
         // S-084: поле последней ошибки названо среди маскируемого, а сервер
         // охотно повторяет в ней адрес письма.
         let reason = crate::logging::mask_error_text(error);
-        let mut tx = self.begin_write().await?;
+        let next_attempt = (status == "retry").then(|| format!("+{delay} seconds"));
         sqlx::query(
             "UPDATE outbox_ops SET attempts=?, last_error=?, status=?,
                     next_attempt_at=datetime('now', ?)
@@ -4791,7 +5314,7 @@ impl Db {
         .bind(attempts.0)
         .bind(reason.chars().take(1000).collect::<String>())
         .bind(status)
-        .bind(format!("+{delay} seconds"))
+        .bind(next_attempt)
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -5721,7 +6244,9 @@ impl Db {
             // сохранение одного правила с отметкой "применить к уже
             // загруженным" опускает границу пачки, и остальные правила заново
             // разбирают всю историю писем.
-            if mode == RuleRunMode::Automatic && snapshot.id <= rule.progress_message_id {
+            if mode == RuleRunMode::Automatic
+                && snapshot.processing_origin_id <= rule.progress_message_id
+            {
                 continue;
             }
             if !rule_matches(rule, snapshot) {
@@ -7507,7 +8032,7 @@ impl From<FolderRow> for Folder {
     }
 }
 
-fn parse_utc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+pub(crate) fn parse_utc_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(value)
         .map(|time| time.with_timezone(&chrono::Utc))
         .or_else(|_| {
@@ -7623,6 +8148,18 @@ async fn read_message_task(
 struct TransferredMessageTraits {
     pinned_at: Option<String>,
     task: Option<MessageTask>,
+    #[serde(default)]
+    labels: Vec<(i64, String)>,
+    #[serde(default)]
+    snoozed_until: Option<String>,
+    #[serde(default)]
+    closed_by_stage: Option<String>,
+    #[serde(default)]
+    processing_origin_id: Option<i64>,
+    #[serde(default)]
+    backfilled: bool,
+    #[serde(default)]
+    target_folder: Option<i64>,
     /// Время, когда приметы отложены. Письмо может не вернуться вовсе, и без
     /// срока годности запись лежала бы вечно, а письмо с повторяющимся
     /// заголовком однажды унаследовало бы чужое закрепление.
@@ -7650,15 +8187,11 @@ async fn store_transferred_message_traits(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
     fixed_id: &str,
-    pinned_at: Option<String>,
-    task: Option<MessageTask>,
+    mut traits: TransferredMessageTraits,
 ) -> Result<()> {
     let key = transferred_traits_key(account_id, fixed_id);
-    let value = serde_json::to_string(&TransferredMessageTraits {
-        pinned_at,
-        task,
-        saved_at: Some(chrono::Utc::now().format(TASK_TIME_FORMAT).to_string()),
-    })?;
+    traits.saved_at = Some(chrono::Utc::now().format(TASK_TIME_FORMAT).to_string());
+    let value = serde_json::to_string(&traits)?;
     sqlx::query(
         "INSERT INTO storage_meta(key,value) VALUES(?,?)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -7772,57 +8305,76 @@ async fn preserve_message_traits(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     message_id: i64,
     limits: &LimitSet,
+    target_folder: Option<i64>,
 ) -> Result<()> {
-    let source: Option<(i64, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT account_id,rfc822_message_id,pinned_at FROM messages WHERE id=?")
-            .bind(message_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some((account_id, Some(fixed_id), pinned_at)) = source else {
-        return Ok(());
-    };
-    let task: Option<MessageTask> = sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
-        .bind(message_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .map(Into::into);
-    if pinned_at.is_none() && task.is_none() {
-        return Ok(());
+    #[derive(sqlx::FromRow)]
+    struct Source {
+        account_id: i64,
+        rfc822_message_id: String,
+        pinned_at: Option<String>,
+        snoozed_until: Option<String>,
+        closed_by_stage: Option<String>,
+        processing_origin_id: i64,
+        backfilled: bool,
     }
-    let candidates: Vec<(i64,)> = sqlx::query_as(
-        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>?",
+    let source: Option<Source> = sqlx::query_as(
+        "SELECT account_id,rfc822_message_id,pinned_at,snoozed_until,closed_by_stage,
+                coalesce(processing_origin_id,id) AS processing_origin_id,backfilled
+         FROM messages WHERE id=? AND rfc822_message_id IS NOT NULL",
     )
-    .bind(account_id)
-    .bind(&fixed_id)
     .bind(message_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(source) = source else { return Ok(()) };
+    let candidates: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=? AND id<>?
+          AND (? IS NULL OR folder_id=?) LIMIT 2",
+    )
+    .bind(source.account_id)
+    .bind(&source.rfc822_message_id)
+    .bind(message_id)
+    .bind(target_folder)
+    .bind(target_folder)
     .fetch_all(&mut **tx)
     .await?;
-    if candidates.len() == 1 {
-        let target_id = candidates[0].0;
-        if task.is_some() {
-            sqlx::query(
-                "INSERT INTO message_tasks(message_id,start_at,due_at,reminder_at,state,
-                                           completed_at,reminder_shown_at,created_at,updated_at)
-                 SELECT ?,start_at,due_at,reminder_at,state,completed_at,
-                        reminder_shown_at,created_at,updated_at
-                   FROM message_tasks WHERE message_id=?
-                 ON CONFLICT(message_id) DO UPDATE SET
-                    start_at=excluded.start_at,due_at=excluded.due_at,
-                    reminder_at=excluded.reminder_at,state=excluded.state,
-                    completed_at=excluded.completed_at,
-                    reminder_shown_at=excluded.reminder_shown_at,
-                    updated_at=excluded.updated_at",
-            )
-            .bind(target_id)
+    if candidates.len() > 1 {
+        // Даже в папке назначения Message-ID может принадлежать нескольким
+        // письмам. Позднее исчезновение одной копии не подтверждает другую.
+        return Ok(());
+    }
+    let traits = TransferredMessageTraits {
+        pinned_at: source.pinned_at,
+        snoozed_until: source.snoozed_until,
+        closed_by_stage: source.closed_by_stage,
+        processing_origin_id: Some(source.processing_origin_id),
+        backfilled: source.backfilled,
+        target_folder,
+        task: sqlx::query_as::<_, MessageTaskRow>(MESSAGE_TASK_BY_ID_SQL)
             .bind(message_id)
-            .execute(&mut **tx)
+            .fetch_optional(&mut **tx)
+            .await?
+            .map(Into::into),
+        labels: sqlx::query_as(
+            "SELECT l.id,l.transfer_identity FROM message_labels ml JOIN labels l ON l.id=ml.label_id
+             WHERE ml.message_id=?",
+        )
+        .bind(message_id)
+        .fetch_all(&mut **tx)
+        .await?,
+        saved_at: None,
+    };
+    if let [target_id] = candidates.as_slice() {
+        if traits.pinned_at.is_some() {
+            // Строку источника удалит вызывающая операция. Освобождаем её место в лимите.
+            sqlx::query("UPDATE messages SET pinned_at=NULL WHERE id=?")
+                .bind(message_id)
+                .execute(&mut **tx)
+                .await?;
+        }
+        apply_transferred_message_traits(tx, *target_id, traits, limits).await?;
+    } else {
+        store_transferred_message_traits(tx, source.account_id, &source.rfc822_message_id, traits)
             .await?;
-        }
-        if let Some(pinned_at) = pinned_at.as_deref() {
-            set_pinned_within_limit(tx, target_id, pinned_at, limits).await?;
-        }
-    } else if candidates.is_empty() {
-        store_transferred_message_traits(tx, account_id, &fixed_id, pinned_at, task).await?;
     }
     Ok(())
 }
@@ -7884,12 +8436,58 @@ async fn restore_transferred_message_traits(
             chrono::Utc::now().signed_duration_since(saved)
                 > chrono::Duration::days(limits.get(LIMIT_MESSAGE_TRAITS_DAYS))
         });
-    if expired {
-        sqlx::query("DELETE FROM storage_meta WHERE key=?")
-            .bind(key)
-            .execute(&mut **tx)
-            .await?;
-        return Ok(());
+    if !expired {
+        let copies: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM messages WHERE account_id=? AND rfc822_message_id=?
+             AND (? IS NULL OR folder_id=?) LIMIT 2",
+        )
+        .bind(account_id)
+        .bind(fixed_id)
+        .bind(traits.target_folder)
+        .bind(traits.target_folder)
+        .fetch_all(&mut **tx)
+        .await?;
+        if copies.as_slice() != [message_id] {
+            return Ok(());
+        }
+        apply_transferred_message_traits(tx, message_id, traits, limits).await?;
+    }
+    sqlx::query("DELETE FROM storage_meta WHERE key=?")
+        .bind(key)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn apply_transferred_message_traits(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+    traits: TransferredMessageTraits,
+    limits: &LimitSet,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE messages SET snoozed_until=coalesce(snoozed_until,?),
+           closed_by_stage=coalesce(closed_by_stage,?),
+           processing_origin_id=min(coalesce(processing_origin_id,id),coalesce(?,id)),
+           backfilled=max(backfilled,?) WHERE id=?",
+    )
+    .bind(traits.snoozed_until)
+    .bind(traits.closed_by_stage)
+    .bind(traits.processing_origin_id)
+    .bind(traits.backfilled)
+    .bind(message_id)
+    .execute(&mut **tx)
+    .await?;
+    for (label_id, identity) in traits.labels {
+        sqlx::query(
+            "INSERT OR IGNORE INTO message_labels(message_id,label_id)
+                     SELECT ?,id FROM labels WHERE id=? AND transfer_identity=?",
+        )
+        .bind(message_id)
+        .bind(label_id)
+        .bind(identity)
+        .execute(&mut **tx)
+        .await?;
     }
     if let Some(pinned_at) = traits.pinned_at {
         set_pinned_within_limit(tx, message_id, &pinned_at, limits).await?;
@@ -7902,7 +8500,7 @@ async fn restore_transferred_message_traits(
              ON CONFLICT(message_id) DO UPDATE SET start_at=excluded.start_at,
                  due_at=excluded.due_at,reminder_at=excluded.reminder_at,state=excluded.state,
                  completed_at=excluded.completed_at,reminder_shown_at=excluded.reminder_shown_at,
-                 updated_at=excluded.updated_at",
+                 updated_at=excluded.updated_at WHERE message_tasks.updated_at<=excluded.updated_at",
         )
         .bind(message_id)
         .bind(task.start_at)
@@ -7916,10 +8514,6 @@ async fn restore_transferred_message_traits(
         .execute(&mut **tx)
         .await?;
     }
-    sqlx::query("DELETE FROM storage_meta WHERE key=?")
-        .bind(key)
-        .execute(&mut **tx)
-        .await?;
     Ok(())
 }
 
@@ -8210,6 +8804,7 @@ struct MailRuleJobRow {
 #[derive(sqlx::FromRow)]
 struct RuleSnapshotRow {
     id: i64,
+    processing_origin_id: i64,
     account_id: i64,
     folder_id: i64,
     uid: i64,
@@ -8257,6 +8852,7 @@ impl From<RuleSnapshotRow> for RuleMessageSnapshot {
         );
         Self {
             id: row.id,
+            processing_origin_id: row.processing_origin_id,
             account_id: row.account_id,
             folder_id: row.folder_id,
             uid: row.uid,
@@ -8548,6 +9144,7 @@ pub(crate) struct TakeawayMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct RuleMessageSnapshot {
     pub id: i64,
+    processing_origin_id: i64,
     pub account_id: i64,
     pub folder_id: i64,
     pub uid: i64,
@@ -8609,7 +9206,8 @@ async fn load_rule_snapshots(
     limit: i64,
 ) -> Result<Vec<RuleMessageSnapshot>> {
     let sql = format!(
-        "SELECT m.id, m.account_id, m.folder_id, m.uid, f.remote_path, f.display_name,
+        "SELECT m.id, coalesce(m.processing_origin_id,m.id) AS processing_origin_id,
+                m.account_id, m.folder_id, m.uid, f.remote_path, f.display_name,
                 f.role, a.email, m.remote_id, m.from_name, m.from_addr, m.to_addrs,
                 m.cc_addrs, m.subject, m.preview, m.date, m.size, m.seen, m.flagged,
                 m.answered, m.draft, m.has_attachments,
@@ -8819,11 +9417,14 @@ pub(crate) async fn queue_takeaway_operation(
         TakeawayTarget::Delete => ("delete", None, None),
         TakeawayTarget::Folder { id, path } => ("move", Some(*id), Some(path.as_str())),
     };
+    let (uidvalidity, rfc822_message_id) = outbox_message_identity(tx, message.id).await?;
     let payload = serde_json::json!({
         "message_id": message.id,
         "folder_id": message.folder_id,
         "folder_path": message.remote_path,
         "uid": message.uid,
+        "uidvalidity": uidvalidity,
+        "rfc822_message_id": rfc822_message_id,
         "remote_id": message.remote_id,
         "target_folder_id": target_id,
         "target_folder_path": target_path,
@@ -8849,6 +9450,69 @@ pub(crate) async fn queue_takeaway_operation(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+async fn outbox_message_identity(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+) -> Result<(Option<i64>, Option<String>)> {
+    Ok(
+        sqlx::query_as("SELECT imap_uidvalidity, rfc822_message_id FROM messages WHERE id=?")
+            .bind(message_id)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
+async fn detach_stale_imap_operations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    message_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE outbox_ops SET status='failed', next_attempt_at=NULL, last_error=?,
+             message_id=NULL, payload=json_set(payload,'$.imap_identity_stale',1)
+         WHERE message_id=? AND op_kind IN ('move','delete','flag')",
+    )
+    .bind(crate::Error::ImapMessageIdentityChanged.to_string())
+    .bind(message_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn rename_folder_path(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    folder_id: i64,
+    old_path: &str,
+    new_path: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE folders SET remote_path=? WHERE id=?")
+        .bind(new_path)
+        .bind(folder_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query(
+        "UPDATE outbox_ops SET payload=json_set(payload,'$.folder_path',?)
+         WHERE account_id=? AND op_kind IN ('flag','move','delete')
+           AND json_extract(payload,'$.folder_path')=?",
+    )
+    .bind(new_path)
+    .bind(account_id)
+    .bind(old_path)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE outbox_ops SET payload=json_set(payload,'$.target_folder_path',?)
+         WHERE account_id=? AND op_kind='move'
+           AND json_extract(payload,'$.target_folder_path')=?",
+    )
+    .bind(new_path)
+    .bind(account_id)
+    .bind(old_path)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Правило применимо к письму: совпала хотя бы одна обычная группа и не
@@ -9561,7 +10225,7 @@ mod notification_lookup_tests {
             .await
             .expect("select messages without body")
             .into_iter()
-            .map(|(id, _, _, _)| id)
+            .map(|locator| locator.id)
             .collect::<Vec<_>>();
         // S-004: сначала новые. S-002: старше глубины хранения не берём.
         // S-006: слишком большие пропускаем. S-011: письмо с телом не берём.
@@ -9576,7 +10240,7 @@ mod notification_lookup_tests {
             .await
             .expect("select without retention")
             .into_iter()
-            .map(|(id, _, _, _)| id)
+            .map(|locator| locator.id)
             .collect::<Vec<_>>();
         assert_eq!(unlimited, vec![fresh, older, beyond_retention]);
 
@@ -9586,8 +10250,8 @@ mod notification_lookup_tests {
             .await
             .expect("select with limit");
         assert_eq!(limited.len(), 1);
-        assert_eq!(limited[0].0, fresh);
-        assert_eq!(limited[0].1, "INBOX");
+        assert_eq!(limited[0].id, fresh);
+        assert_eq!(limited[0].path, "INBOX");
         db.close().await;
     }
 
@@ -11281,6 +11945,7 @@ mod charset_repair_tests {
         db.save_discovered_messages(
             account_id,
             &[crate::backend::DiscoveredMessage {
+                uidvalidity: None,
                 folder_path: "INBOX".into(),
                 uid: 1,
                 remote_id: Some("iso-2022-jp-1".into()),

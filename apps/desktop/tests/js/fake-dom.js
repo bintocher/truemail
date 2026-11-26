@@ -461,9 +461,12 @@ class FakeNode {
   // Событие идёт от узла вверх по дереву, как в браузере: обработчики
   // композера и списка висят на окне, а не на самой строке.
   dispatch(type, event = {}) {
+    const path = [];
+    for (let node = this; node; node = node.parent) path.push(node);
     const payload = {
       type,
       target: this,
+      composedPath: () => path.slice(),
       preventDefault() {
         payload.defaultPrevented = true;
       },
@@ -474,13 +477,11 @@ class FakeNode {
       propagationStopped: false,
       ...event,
     };
-    let node = this;
-    while (node) {
+    for (const node of path) {
       (node.listeners[type] || []).forEach(handler => handler.call(node, payload));
       const inline = node[`on${type}`];
       if (typeof inline === 'function') inline.call(node, payload);
       if (payload.propagationStopped) break;
-      node = node.parent;
     }
     return payload;
   }

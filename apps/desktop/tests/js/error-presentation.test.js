@@ -368,6 +368,93 @@ test('S-005, S-019: ошибка идёт в строку статуса и жу
   assert.equal(shown[0].querySelector('.activity-entry-action').textContent, ru('errorActionRetry'));
 });
 
+test('щелчок по тексту открывает журнал, щелчок снаружи закрывает его', async () => {
+  const app = await errorApp();
+  app.sandbox.window.showToast('Ранее');
+  app.sandbox.window.showToast('Сейчас');
+  const panel = app.document.getElementById('activityPanel');
+  app.document.querySelector('#statusbarText .statusbar-entry-text').click();
+  assert.equal(panel.classList.contains('hidden'), false);
+  assert.deepEqual(entries(app).map(entryText), ['Сейчас', 'Ранее']);
+  app.document.getElementById('statusbar').click();
+  assert.equal(panel.classList.contains('hidden'), true);
+});
+
+test('журнал загружает записи с диска, не переносит их в строку и сохраняет новые', async () => {
+  const app = await errorApp({bridge: {
+    readUiActivity: () => [{id:'earlier/1',time:Date.now()-3600000,level:'error',text:'Прежний сбой',count:1}],
+  }});
+  app.document.getElementById('statusbarText').click();
+  await app.settle(3);
+  assert.equal(statusText(app), '');
+  assert.equal(entryText(entries(app)[0]), 'Прежний сбой');
+  app.sandbox.window.showToast('Новое событие');
+  await app.settle(3);
+  assert.deepEqual(entries(app).map(entryText), ['Новое событие', 'Прежний сбой']);
+  assert.equal(app.calls.find(call=>call.command==='recordUiActivity')?.args[0].text, 'Новое событие');
+  app.document.querySelector('#activityPanel .activity-clear').click();
+  await app.settle(3);
+  assert.equal(entries(app).length, 0);
+  assert.ok(app.calls.some(call=>call.command==='recordUiActivity'&&call.args[0]===null));
+});
+
+test('успех почты убирает сбой только восстановившегося ящика, прежний текст остаётся в журнале', async () => {
+  const app = await errorApp({accounts:[ACCOUNT,{id:2,email:'second@example.test',display_name:'Второй ящик'}]});
+  const sync = app.sandbox.window.handleSyncState;
+  const failure = {scope:'mail',status:'error',error_kind:'network_unavailable',retries_exhausted:true};
+  sync({...failure,account_id:1});
+  sync({...failure,account_id:2});
+  assert.match(statusText(app), /Мой ящик.*Второй ящик/);
+  sync({account_id:1,scope:'all',status:'ready',auxiliary_synced:true});
+  assert.match(statusText(app), /Мой ящик.*Второй ящик/, 'успех календаря не скрывает ошибку почты');
+  sync({account_id:1,scope:'all',status:'ready',mail_synced:true});
+  assert.doesNotMatch(statusText(app), /Мой ящик/);
+  assert.match(statusText(app), /Второй ящик/);
+  sync({account_id:2,scope:'mail',status:'ready'});
+  assert.equal(statusText(app), '');
+  assert.match(entryText(entries(app)[0]), /Мой ящик.*Второй ящик/);
+  assert.equal(entries(app)[0].querySelector('.activity-entry-action'), null);
+  sync({...failure,account_id:1});
+  assert.match(statusText(app), /Мой ящик/);
+  assert.equal(entries(app).length, 2);
+});
+
+test('позднее событие об успехе не скрывает более свежий сбой', async () => {
+  const app = await errorApp();
+  const sync = app.sandbox.window.handleSyncState;
+  sync({account_id:1,scope:'mail',status:'retrying',attempted_at:new Date(2000).toISOString(),
+    error_kind:'network_unavailable',retries_exhausted:true});
+  sync({account_id:1,scope:'all',status:'ready',mail_synced:true,mail_finished_at:1000});
+  assert.match(statusText(app), /Нет соединения с сетью/);
+  sync({account_id:1,scope:'all',status:'ready',mail_synced:true,mail_finished_at:3000});
+  assert.equal(statusText(app), '');
+});
+
+test('после общего сбоя почта и календарь восстанавливаются отдельно', async () => {
+  const app = await errorApp();
+  const sync = app.sandbox.window.handleSyncState;
+  sync({account_id:1,scope:'all',status:'error',error_kind:'network_unavailable',retries_exhausted:true,
+    mail_finished_at:1000,auxiliary_finished_at:2000,
+    warnings:[{kind:'server_unavailable',sync_scope:'auxiliary'}]});
+  assert.match(statusText(app), /Нет соединения с сетью/);
+  sync({account_id:1,scope:'all',status:'ready',mail_synced:true,mail_finished_at:3000});
+  assert.match(statusText(app), /сервер/i);
+  sync({account_id:1,scope:'auxiliary',status:'ready',auxiliary_finished_at:1500});
+  assert.match(statusText(app), /сервер/i);
+  sync({account_id:1,scope:'auxiliary',status:'ready',auxiliary_finished_at:4000});
+  assert.equal(statusText(app), '');
+});
+
+test('сообщение о двух неподтверждённых отправках открывает исходящие', async () => {
+  const app = await errorApp({bridge:{startupSendState:()=>({pending:[],expired:0,uncertain:2})}});
+  await app.sandbox.window.restoreUndoWindows();
+  assert.match(statusText(app), /2.*Отправленные/);
+  app.document.querySelector('#statusbarText .statusbar-entry-action').click();
+  await app.settle(3);
+  assert.ok(app.document.getElementById('set-outbox').classList.contains('active'));
+  assert.ok(app.document.getElementById('settingsView').classList.contains('active'));
+});
+
 test('S-008: повтор той же ошибки показывает счётчик, а не вторую запись', async () => {
   const app = await errorApp();
   const failure = {kind: 'timeout', account_id: 1, message: 'raw'};

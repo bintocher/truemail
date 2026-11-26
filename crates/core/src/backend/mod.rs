@@ -9,11 +9,11 @@ mod smtp;
 pub use ews::{EwsBackend, EwsTimeouts, OofState, discover_ews_url};
 pub use imap::{
     DiscoveredFlagUpdate, DiscoveredFolder, DiscoveredMessage, FolderSyncCursor, ImapDiscovery,
-    apply_gmail_operation, apply_password_operation, apply_yandex_operation, discover_gmail,
-    discover_gmail_folders, discover_gmail_inbox, discover_password, discover_password_folders,
-    discover_password_inbox, discover_yandex, discover_yandex_folders, discover_yandex_inbox,
-    validate_gmail, validate_password, validate_yandex, wait_for_gmail_change,
-    wait_for_password_change, wait_for_yandex_change,
+    ImapUid, apply_gmail_operation, apply_password_operation, apply_yandex_operation,
+    discover_gmail, discover_gmail_folders, discover_gmail_inbox, discover_password,
+    discover_password_folders, discover_password_inbox, discover_yandex, discover_yandex_folders,
+    discover_yandex_inbox, validate_gmail, validate_password, validate_yandex,
+    wait_for_gmail_change, wait_for_password_change, wait_for_yandex_change,
 };
 pub use jmap::{JmapBackend, probe_session_url as probe_jmap_session_url};
 pub use smtp::{
@@ -298,6 +298,10 @@ pub trait MailBackend: Send + Sync {
         new_name: &str,
     ) -> Result<String>;
     async fn delete_folder(&self, email: &str, credential: &str, remote_path: &str) -> Result<()>;
+
+    async fn check_permanent_delete(&self, _email: &str, _credential: &str) -> Result<()> {
+        Ok(())
+    }
     async fn wait_for_change(&self, email: &str, credential: &str) -> Result<()>;
     /// Передать письмо серверу. Отказ несёт признак точки, в которой он
     /// случился: повторять можно только отказ до передачи письма (S-049).
@@ -314,7 +318,7 @@ pub trait MailBackend: Send + Sync {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>>;
     /// Догрузить более старые письма папки (бесконечная прокрутка): строго
@@ -327,6 +331,7 @@ pub trait MailBackend: Send + Sync {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         let _ = (email, credential, folder_path, before, limit);
         Ok(Vec::new())
@@ -351,6 +356,9 @@ pub struct GenericImapBackend {
 
 #[async_trait]
 impl MailBackend for YandexBackend {
+    async fn check_permanent_delete(&self, email: &str, credential: &str) -> Result<()> {
+        imap::check_oauth_delete("imap.yandex.com", email, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "yandex"
     }
@@ -440,7 +448,7 @@ impl MailBackend for YandexBackend {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_oauth_message_raw("imap.yandex.com", email, credential, folder_path, uid).await
@@ -453,6 +461,7 @@ impl MailBackend for YandexBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_oauth(
             "imap.yandex.com",
@@ -568,7 +577,7 @@ impl MailBackend for GmailBackend {
         email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         let _ = email;
@@ -582,6 +591,9 @@ impl MailBackend for GmailBackend {
 
 #[async_trait]
 impl MailBackend for OutlookBackend {
+    async fn check_permanent_delete(&self, email: &str, credential: &str) -> Result<()> {
+        imap::check_oauth_delete("outlook.office365.com", email, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "outlook"
     }
@@ -704,7 +716,7 @@ impl MailBackend for OutlookBackend {
         email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_oauth_message_raw("outlook.office365.com", email, credential, folder_path, uid)
@@ -718,6 +730,7 @@ impl MailBackend for OutlookBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_oauth(
             "outlook.office365.com",
@@ -733,6 +746,9 @@ impl MailBackend for OutlookBackend {
 
 #[async_trait]
 impl MailBackend for GenericImapBackend {
+    async fn check_permanent_delete(&self, _email: &str, credential: &str) -> Result<()> {
+        imap::check_password_delete(&self.imap, &self.username, credential).await
+    }
     fn provider_id(&self) -> &'static str {
         "generic-imap"
     }
@@ -923,7 +939,7 @@ impl MailBackend for GenericImapBackend {
         _email: &str,
         credential: &str,
         folder_path: &str,
-        uid: u32,
+        uid: ImapUid<'_>,
         _remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         imap::fetch_password_message_raw(
@@ -946,6 +962,7 @@ impl MailBackend for GenericImapBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         imap::fetch_older_password(
             &self.imap.host,

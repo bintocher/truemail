@@ -70,33 +70,40 @@ pub struct DiagnosticsBundle {
     pub replacement_counts: BTreeMap<String, u64>,
 }
 
-/// Собирает архив диагностики из `data_dir/logs` в `data_dir/diagnostics`.
+/// Собирает архив из действующего каталога журналов в `data_dir/diagnostics`.
 /// `app_version`/`os_label` идут в `manifest.json` как есть - в них нет
 /// пользовательских данных. Ошибка - как в спецификации: без временного
 /// файла и без частично записанного `.zip` (S-009, S-016).
 pub fn collect_diagnostics_bundle(
     data_dir: &Path,
+    logs_dir: &Path,
     app_version: &str,
     os_label: &str,
 ) -> Result<DiagnosticsBundle, String> {
-    collect_diagnostics_bundle_with_limit(data_dir, app_version, os_label, MAX_ARCHIVE_BYTES)
+    collect_diagnostics_bundle_with_limit(
+        data_dir,
+        logs_dir,
+        app_version,
+        os_label,
+        MAX_ARCHIVE_BYTES,
+    )
 }
 
 /// Тот же сбор с настраиваемым пределом размера архива - предел вынесен
 /// параметром только ради проверки S-015 без записи реальных 200 МиБ в тесте.
 fn collect_diagnostics_bundle_with_limit(
     data_dir: &Path,
+    logs_dir: &Path,
     app_version: &str,
     os_label: &str,
     max_archive_bytes: u64,
 ) -> Result<DiagnosticsBundle, String> {
-    let logs_dir = data_dir.join("logs");
     let diagnostics_dir = data_dir.join("diagnostics");
     fs::create_dir_all(&diagnostics_dir)
         .map_err(|error| format!("не удалось создать папку diagnostics: {error}"))?;
     cleanup_stale_tmp(&diagnostics_dir);
 
-    let (candidates, foreign_names) = discover_log_candidates(&logs_dir)
+    let (candidates, foreign_names) = discover_log_candidates(logs_dir)
         .map_err(|error| format!("не удалось прочитать каталог журналов: {error}"))?;
 
     let file_name = format!(
@@ -522,9 +529,10 @@ pub async fn create_diagnostics_bundle(
         .flatten()
         .unwrap_or_else(crate::default_data_dir);
     let app_version = app.package_info().version.to_string();
+    let logs_dir = state.log_dir.clone();
     let os_label = std::env::consts::OS.to_owned();
     let outcome = tokio::task::spawn_blocking(move || {
-        collect_diagnostics_bundle(&data_dir, &app_version, &os_label)
+        collect_diagnostics_bundle(&data_dir, &logs_dir, &app_version, &os_label)
     })
     .await;
     state
@@ -628,7 +636,9 @@ mod tests {
         let root = temp_dir("no-logs");
         let data_dir = root.join("data");
         fs::create_dir_all(data_dir.join("logs")).unwrap();
-        let error = collect_diagnostics_bundle(&data_dir, "0.0.0-test", "test-os").unwrap_err();
+        let error =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "0.0.0-test", "test-os")
+                .unwrap_err();
         assert!(error.contains("журналы недоступны"));
         let diagnostics_dir = data_dir.join("diagnostics");
         let leftovers: Vec<_> = fs::read_dir(&diagnostics_dir)
@@ -646,7 +656,9 @@ mod tests {
         let root = temp_dir("missing-dir");
         let data_dir = root.join("data");
         fs::create_dir_all(&data_dir).unwrap();
-        let error = collect_diagnostics_bundle(&data_dir, "0.0.0-test", "test-os").unwrap_err();
+        let error =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "0.0.0-test", "test-os")
+                .unwrap_err();
         assert!(error.contains("журналы недоступны"));
         let _ = fs::remove_dir_all(&root);
     }
@@ -662,7 +674,9 @@ mod tests {
             b"account_id=1 email ivan@example.com host mail.example.com\n",
         )
         .unwrap();
-        let result = collect_diagnostics_bundle(&data_dir, "1.2.3", "windows-11").unwrap();
+        let result =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "1.2.3", "windows-11")
+                .unwrap();
         assert!(
             result
                 .archive_path
@@ -727,7 +741,9 @@ mod tests {
         {
             let _ = std::os::unix::fs::symlink(&target, logs_dir.join("truemail.log.2026-01-01"));
         }
-        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        let result =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "1.0.0", "test-os")
+                .unwrap();
         assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
         let content = read_zip_entry(&result.archive_path, "truemail.log");
         assert_eq!(content.trim_end(), "regular ok");
@@ -746,7 +762,9 @@ mod tests {
         fs::write(logs_dir.join("truemail.log"), b"ok line\n").unwrap();
         let foreign_name = "truemail.log-user@example.com";
         fs::write(logs_dir.join(foreign_name), "постороннее содержимое\n").unwrap();
-        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        let result =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "1.0.0", "test-os")
+                .unwrap();
         assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
         assert_eq!(result.skipped_files, 0);
         let names = read_zip_names(&result.archive_path);
@@ -767,7 +785,9 @@ mod tests {
         let logs_dir = data_dir.join("logs");
         fs::create_dir_all(&logs_dir).unwrap();
         fs::write(logs_dir.join("truemail.log.2026-09-15"), b"old day\n").unwrap();
-        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        let result =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "1.0.0", "test-os")
+                .unwrap();
         assert_eq!(
             result.included_files,
             vec!["truemail.log.2026-09-15".to_owned()]
@@ -785,7 +805,9 @@ mod tests {
         // Каталог со строгим именем даты (F2) не должен читаться как файл -
         // это тоже "не обычный файл" по S-002, что и создаёт частичный сбор.
         fs::create_dir_all(logs_dir.join("truemail.log.2026-01-02")).unwrap();
-        let result = collect_diagnostics_bundle(&data_dir, "1.0.0", "test-os").unwrap();
+        let result =
+            collect_diagnostics_bundle(&data_dir, &data_dir.join("logs"), "1.0.0", "test-os")
+                .unwrap();
         assert_eq!(result.included_files, vec!["truemail.log".to_owned()]);
         assert_eq!(result.skipped_files, 1);
         let _ = fs::remove_dir_all(&root);
@@ -800,8 +822,14 @@ mod tests {
         // Строка длиннее заведомо крошечного предела архива - запись в zip
         // обязана упасть ещё на первом файле.
         fs::write(logs_dir.join("truemail.log"), "x".repeat(4096) + "\n").unwrap();
-        let error =
-            collect_diagnostics_bundle_with_limit(&data_dir, "1.0.0", "test-os", 256).unwrap_err();
+        let error = collect_diagnostics_bundle_with_limit(
+            &data_dir,
+            &data_dir.join("logs"),
+            "1.0.0",
+            "test-os",
+            256,
+        )
+        .unwrap_err();
         assert!(
             error.contains("недоступны") || error.contains("архив") || error.contains("zip"),
             "неожиданный текст ошибки: {error}"
@@ -844,8 +872,14 @@ mod tests {
             }
         }
         fs::write(logs_dir.join("truemail.log.2026-02-02"), second + "\n").unwrap();
-        let error =
-            collect_diagnostics_bundle_with_limit(&data_dir, "1.0.0", "test-os", 512).unwrap_err();
+        let error = collect_diagnostics_bundle_with_limit(
+            &data_dir,
+            &data_dir.join("logs"),
+            "1.0.0",
+            "test-os",
+            512,
+        )
+        .unwrap_err();
         assert!(error.contains("zip"), "неожиданный текст ошибки: {error}");
         let diagnostics_dir = data_dir.join("diagnostics");
         let leftovers: Vec<_> = fs::read_dir(&diagnostics_dir)

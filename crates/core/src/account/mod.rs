@@ -99,7 +99,7 @@ pub(crate) async fn transmit_with_backend(
     let outcome = match backend.send(message, token).await {
         Ok(outcome) => outcome,
         Err(failure) if !failure.after_handoff => {
-            defer_send(db, operation.id, &failure.error).await;
+            record_send_rejection(db, operation.id, &failure.error).await;
             return 0;
         }
         Err(failure) => {
@@ -217,10 +217,37 @@ async fn defer_send(db: &Db, operation_id: i64, reason: &crate::Error) {
     }
 }
 
-/// Отказ, зависящий от содержимого письма: попытку он расходует (S-048).
+async fn record_send_rejection(db: &Db, operation_id: i64, reason: &crate::Error) {
+    if matches!(reason, crate::Error::SmtpRejected(_)) {
+        fail_send(db, operation_id, reason).await;
+        return;
+    }
+    match reason.kind() {
+        ErrorKind::NetworkUnavailable
+        | ErrorKind::InvalidCredentials
+        | ErrorKind::NeedsReauth
+        | ErrorKind::RateLimited
+        | ErrorKind::SecretStoreError => defer_send(db, operation_id, reason).await,
+        ErrorKind::ServerUnavailable | ErrorKind::Timeout | ErrorKind::Unknown => {
+            if let Err(error) = db
+                .fail_outbox_operation(operation_id, &reason.to_string())
+                .await
+            {
+                tracing::warn!(
+                    operation = operation_id,
+                    error_kind = error.code(),
+                    "повтор отправки не записан"
+                );
+            }
+        }
+        _ => fail_send(db, operation_id, reason).await,
+    }
+}
+
+/// Окончательный отказ. Письмо остаётся в исходящих для ручного решения.
 async fn fail_send(db: &Db, operation_id: i64, reason: &crate::Error) {
     if let Err(error) = db
-        .fail_outbox_operation(operation_id, &reason.to_string())
+        .reject_outbox_operation(operation_id, &reason.to_string())
         .await
     {
         tracing::warn!(
@@ -470,6 +497,8 @@ fn apply_skipped_folders(
 pub struct BackfillPage {
     pub fetched: usize,
     pub oldest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<crate::model::MessageMeta>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1488,6 +1517,15 @@ impl AccountManager {
         self.db
             .save_discovered_folders(account.id, &discovery.folders)
             .await?;
+        if self
+            .db
+            .reconcile_imap_folder_renames(account.id, &discovery, &cursors)
+            .await?
+        {
+            self.db
+                .save_discovered_folders(account.id, &discovery.folders)
+                .await?;
+        }
         let folders_changed = self.db.folder_state_signature(account.id).await? != folders_before;
         let snapshot_removed = self
             .db
@@ -1522,6 +1560,7 @@ impl AccountManager {
         self.db
             .save_folder_sync_tokens(account.id, &discovery.folders)
             .await?;
+        self.db.rebind_stale_imap_operations(account.id).await?;
         let rules_applied = match self.db.process_sync_batch_stages().await {
             Ok(count) => count,
             Err(error) => {
@@ -1574,12 +1613,15 @@ impl AccountManager {
     /// по глубине хранения, письмо докачивается с сервера и сохраняется, чтобы
     /// открыться мгновенно в этой сессии (prune действует только на старте).
     pub async fn ensure_message_raw(&self, message_id: i64) -> Result<()> {
-        let Some((account_id, folder_path, uid, remote_id, has_raw)) =
-            self.db.message_fetch_locator(message_id).await?
-        else {
+        let Some(locator) = self.db.message_fetch_locator(message_id).await? else {
             return Ok(());
         };
-        if has_raw {
+        if locator.body_fetched
+            && locator
+                .raw_blob_ref
+                .as_deref()
+                .is_some_and(|reference| self.db.blobs.exists(reference))
+        {
             return Ok(());
         }
         let Some(account) = self
@@ -1587,22 +1629,28 @@ impl AccountManager {
             .list_accounts()
             .await?
             .into_iter()
-            .find(|item| item.id == account_id)
+            .find(|item| item.id == locator.account_id)
         else {
             return Ok(());
         };
         let access_token = self.mail_credential(&account).await?;
         let backend = Self::mail_backend(&account)?;
-        let raw = backend
+        let result = backend
             .fetch_message_raw(
                 &account.email,
                 &access_token,
-                &folder_path,
-                uid as u32,
-                remote_id.as_deref(),
+                &locator.path,
+                locator.imap_uid(),
+                locator.remote_id.as_deref(),
             )
-            .await?;
-        self.db.store_fetched_raw(message_id, &raw).await?;
+            .await;
+        if matches!(result, Err(crate::Error::ImapMessageIdentityChanged)) {
+            self.db
+                .invalidate_imap_folder(account.id, &locator.path)
+                .await?;
+            let _ = self.sync_mail_account(&account).await;
+        }
+        self.db.store_fetched_raw(&locator, &result?).await?;
         tracing::info!(message_id, account = %crate::logging::mask_email(&account.email), "письмо докачано с сервера (вне кэша)");
         Ok(())
     }
@@ -1633,29 +1681,34 @@ impl AccountManager {
         };
         // Запросы идут по одному (S-007): фоновая догрузка не должна вытеснять
         // обычную синхронизацию из квоты почтового сервиса.
-        for (message_id, folder_path, uid, remote_id) in pending {
+        for locator in pending {
             match backend
                 .fetch_message_raw(
                     &account.email,
                     &access_token,
-                    &folder_path,
-                    uid as u32,
-                    remote_id.as_deref(),
+                    &locator.path,
+                    locator.imap_uid(),
+                    locator.remote_id.as_deref(),
                 )
                 .await
             {
                 Ok(raw) => {
-                    self.db.store_fetched_raw(message_id, &raw).await?;
+                    self.db.store_fetched_raw(&locator, &raw).await?;
                     result.fetched += 1;
                     result.remaining -= 1;
                 }
                 Err(error) => {
+                    if matches!(error, crate::Error::ImapMessageIdentityChanged) {
+                        self.db
+                            .invalidate_imap_folder(account.id, &locator.path)
+                            .await?;
+                    }
                     // Ограничение частоты обращений: прекращаем до следующего
                     // прохода, иначе квота уйдёт на повторные отказы (S-009).
                     let rate_limited = matches!(error, crate::Error::RateLimited { .. });
                     self.remember_gmail_rate_limit(account, &error).await;
                     tracing::warn!(
-                        message_id,
+                        message_id = locator.id,
                         account = %crate::logging::mask_email(&account.email),
                         %error,
                         "фоновая догрузка тела письма не удалась"
@@ -1700,6 +1753,11 @@ impl AccountManager {
         tracing::info!(folder_id, before, provider = ?account.provider, remote_path = %folder.remote_path, "догрузка: запрос старых писем с сервера");
         let credential = self.mail_credential(&account).await?;
         let backend = Self::mail_backend(&account)?;
+        let known_ids = if account.backend_kind == BackendKind::Jmap {
+            Some(self.db.folder_remote_message_ids(folder.id).await?)
+        } else {
+            None
+        };
         let messages = backend
             .fetch_older_messages(
                 &account.email,
@@ -1707,6 +1765,7 @@ impl AccountManager {
                 &folder.remote_path,
                 before,
                 limit,
+                known_ids.as_ref(),
             )
             .await?;
         tracing::info!(
@@ -1720,6 +1779,7 @@ impl AccountManager {
             return Ok(BackfillPage {
                 fetched: 0,
                 oldest: self.db.folder_oldest_message_date(folder_id).await?,
+                messages: None,
             });
         }
         let count = messages.len();
@@ -1729,10 +1789,24 @@ impl AccountManager {
             .save_discovered_messages(account.id, &messages, true)
             .await?;
         self.db.process_backfill_stages().await?;
+        let visible = if known_ids.is_some() {
+            let remote_ids = messages
+                .iter()
+                .filter_map(|message| message.remote_id.as_deref())
+                .collect::<Vec<_>>();
+            Some(
+                self.db
+                    .list_backfilled_folder_messages(folder_id, &remote_ids)
+                    .await?,
+            )
+        } else {
+            None
+        };
         tracing::info!(folder_id, count, account = %crate::logging::mask_email(&account.email), "догружены более старые письма папки");
         Ok(BackfillPage {
             fetched: count,
             oldest: self.db.folder_oldest_message_date(folder_id).await?,
+            messages: visible,
         })
     }
 
@@ -2449,6 +2523,44 @@ impl AccountManager {
             .await
     }
 
+    /// Проверить возможность удаления до показа подтверждения.
+    pub async fn check_permanent_delete(&self, ids: &[i64]) -> Result<()> {
+        let mut account_ids = std::collections::HashSet::new();
+        for &id in ids {
+            let locator = self.db.message_fetch_locator(id).await?.ok_or_else(|| {
+                crate::Error::Other(
+                    "Письмо больше недоступно. Обновите список перед удалением.".into(),
+                )
+            })?;
+            account_ids.insert(locator.account_id);
+        }
+        for account in self.db.list_accounts().await? {
+            if !account_ids.contains(&account.id) {
+                continue;
+            }
+            let check = async {
+                let token = self.mail_credential(&account).await?;
+                Self::mail_backend(&account)?
+                    .check_permanent_delete(&account.email, &token)
+                    .await
+            };
+            // Вне сети действие по-прежнему можно поставить в очередь.
+            // При подключении серверный модуль вновь проверит возможность.
+            if let Ok(Err(error)) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), check).await
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::NetworkUnavailable
+                        | ErrorKind::Timeout
+                        | ErrorKind::ServerUnavailable
+                )
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Доставить накопленные локальные операции с ограниченным retry/backoff.
     pub async fn process_mail_outbox(&self, account: &Account) -> Result<usize> {
         if account.provider == Provider::Exchange
@@ -2479,6 +2591,8 @@ impl AccountManager {
         // Не трогаем transport/OAuth/quota gate, когда отправлять нечего.
         let token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
+        let mut stale_identity = false;
+        let mut delete_unavailable = false;
         for operation in operations {
             let applied = if operation.op_kind == "append_sent" {
                 match self.sent_append_bytes_of(&operation).await {
@@ -2495,17 +2609,28 @@ impl AccountManager {
                     )
                     .await
             };
-            match applied {
-                Ok(()) => {
-                    self.db.complete_outbox_operation(&operation).await?;
-                    completed += 1;
+            let recorded = match applied {
+                Ok(()) => self
+                    .db
+                    .complete_outbox_operation(&operation)
+                    .await
+                    .map(|()| completed += 1),
+                Err(crate::Error::ImapMessageIdentityChanged) => {
+                    stale_identity = true;
+                    self.db.reject_stale_imap_operation(&operation).await
+                }
+                Err(error @ crate::Error::PermanentDeleteUnavailable) => {
+                    delete_unavailable = true;
+                    self.db
+                        .reject_outbox_operation(operation.id, &error.to_string())
+                        .await
                 }
                 Err(error) => {
                     // S-084: текст ошибки сервера маскируется и в журнале, и в
                     // поле последней ошибки очереди - он повторяет адреса и
                     // тему письма.
                     let reason = crate::logging::mask_error_text(&error.to_string());
-                    self.db.fail_outbox_operation(operation.id, &reason).await?;
+                    let result = self.db.fail_outbox_operation(operation.id, &reason).await;
                     tracing::warn!(
                         account = %crate::logging::mask_email(&account.email),
                         operation = operation.id,
@@ -2513,8 +2638,29 @@ impl AccountManager {
                         last_error = %reason,
                         "операция outbox будет повторена"
                     );
+                    result
                 }
+            };
+            if let Err(error) = recorded {
+                tracing::warn!(
+                    operation = operation.id,
+                    error_kind = error.code(),
+                    "итог операции не записан, она снова станет доступна после истечения срока"
+                );
             }
+        }
+        if stale_identity {
+            if let Err(error) = self.sync_mail_account(account).await {
+                tracing::warn!(
+                    account_id = account.id,
+                    error_kind = error.code(),
+                    "сверка папки IMAP будет повторена при следующей синхронизации"
+                );
+            }
+            return Err(crate::Error::ImapMessageIdentityChanged);
+        }
+        if delete_unavailable {
+            return Err(crate::Error::PermanentDeleteUnavailable);
         }
         Ok(completed)
     }
@@ -2536,14 +2682,14 @@ impl AccountManager {
                 // S-028, S-048: отказ учётных данных и недоступность сети не
                 // сжигают восемь попыток на заведомо неверный пароль и не
                 // теряют письмо при суточном отсутствии связи.
-                defer_send(&self.db, operation.id, &error).await;
+                record_send_rejection(&self.db, operation.id, &error).await;
                 return Ok(0);
             }
         };
         let backend = match Self::mail_backend(account) {
             Ok(backend) => backend,
             Err(error) => {
-                defer_send(&self.db, operation.id, &error).await;
+                record_send_rejection(&self.db, operation.id, &error).await;
                 return Ok(0);
             }
         };
@@ -3310,6 +3456,15 @@ impl AccountManager {
                     .await
                 {
                     Ok(()) => {
+                        if self
+                            .db
+                            .reconcile_imap_folder_renames(account.id, &imap, &cursors)
+                            .await?
+                        {
+                            self.db
+                                .save_discovered_folders(account.id, &imap.folders)
+                                .await?;
+                        }
                         match self
                             .db
                             .reconcile_imap_snapshot(
@@ -3383,6 +3538,11 @@ impl AccountManager {
                                                     .await
                                                 {
                                                     Ok(()) => {
+                                                        self.db
+                                                            .rebind_stale_imap_operations(
+                                                                account.id,
+                                                            )
+                                                            .await?;
                                                         if let Err(error) = self
                                                             .db
                                                             .process_sync_batch_stages()

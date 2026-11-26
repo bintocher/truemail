@@ -687,8 +687,7 @@ pub const LIMITS: &[LimitSpec] = &[
         min: 1,
         max: 8760,
     },
-    // Журнал событий в строке статуса живёт только в памяти окна; ядро его не
-    // читает, предел нужен интерфейсу (specs/status-activity-log.md).
+    // Пределы панели журнала событий (specs/status-activity-log.md).
     LimitSpec {
         key: LIMIT_ACTIVITY_LOG_ENTRIES,
         section: "maintenance",

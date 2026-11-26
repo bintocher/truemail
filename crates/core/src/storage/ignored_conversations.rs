@@ -1252,11 +1252,12 @@ impl Db {
         let sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.id>? AND m.closed_by_stage IS NULL
+              WHERE m.id>? AND coalesce(m.processing_origin_id,m.id)>? AND m.closed_by_stage IS NULL
                 AND (f.role IS NULL OR f.role NOT IN ('drafts','archive','spam','trash'))
               ORDER BY m.id LIMIT ?"
         );
         let batch = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(sql))
+            .bind(cursor)
             .bind(cursor)
             .bind(self.limit(LIMIT_STAGE_BATCH))
             .fetch_all(&mut *tx)

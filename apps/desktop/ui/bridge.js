@@ -59,6 +59,8 @@ window.corePageSize = null;
     // называет ядро, а не запасное число моста.
     fetchOlderMessages: (folderId, before, limit = null) => invoke("fetch_older_messages", { folderId, before, limit }),
     uiLog: (message) => invoke("ui_log", { message }).catch(() => {}),
+    recordUiActivity: (record) => invoke("record_ui_activity", { record }),
+    readUiActivity: (limit) => invoke("read_ui_activity", { limit }),
     getMessage: (messageId) => invoke("get_message", { messageId }),
     messageRaw: (messageId) => invoke("message_raw", { messageId }),
     exportMessageEml: (messageId, destPath) => invoke("export_message_eml", { messageId, destPath }),
@@ -193,6 +195,7 @@ window.corePageSize = null;
     listMessageTemplates: (accountId) => invoke("list_message_templates", { accountId }),
     saveMessageTemplate: (template) => invoke("save_message_template", template),
     deleteMessageTemplate: (id, accountId) => invoke("delete_message_template", { id, accountId }),
+    checkPermanentDelete: messageIds => invoke("check_permanent_delete", { messageIds }),
     messageAction: (messageIds, action) => invoke("message_action", { messageIds, action }),
     moveMessagesToFolder: (messageIds, folderId) => invoke("move_messages_to_folder", { messageIds, folderId }),
     undoMessageAction: (operationIds) => invoke("undo_message_action", { operationIds }),
@@ -351,6 +354,14 @@ window.corePageSize = null;
     if (reloadPending) scheduleReload(0);
   });
   tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
+  tauri.event?.listen("truemail-imap-action-rejected", () => {
+    showToast(L("Действие с письмом остановлено. Сервер изменил номера писем. Обновите папку и проверьте письмо перед повтором.",
+      "An action was stopped because the server changed message identifiers. Refresh the folder and check the message before retrying."));
+  }).catch(console.error);
+  tauri.event?.listen("truemail-permanent-delete-unavailable", () => {
+    showToast(L("Почтовый сервер не поддерживает безопасное удаление письма навсегда.",
+      "The mail server does not support safe permanent deletion."));
+  }).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
   // account-connect-progress.md, S-002, S-003: этап попытки подключения,
   // подтверждённый ядром в ходе одного вызова команды (например, переход к

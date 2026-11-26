@@ -799,11 +799,12 @@ impl Db {
         let fresh_sql = format!(
             "SELECT {STAGE_MESSAGE_COLUMNS}
                FROM messages m JOIN folders f ON f.id=m.folder_id
-              WHERE m.id>?
+              WHERE m.id>? AND coalesce(m.processing_origin_id,m.id)>?
                 AND m.backfilled=0 AND m.closed_by_stage IS NULL AND {WORKING_FOLDERS}
               ORDER BY m.id LIMIT ?"
         );
         let fresh = sqlx::query_as::<_, StageMessage>(AssertSqlSafe(fresh_sql))
+            .bind(cursor)
             .bind(cursor)
             .bind(limit - batch.len() as i64)
             .fetch_all(&mut *tx)

@@ -32,6 +32,7 @@ fn discovered(uid: u32) -> DiscoveredMessage {
          Date: Mon, 14 Sep 2026 10:00:00 +0000\r\n\r\nСроки {BODY_WORD} уточнены\r\n"
     );
     DiscoveredMessage {
+        uidvalidity: None,
         folder_path: "INBOX".to_owned(),
         uid,
         remote_id: Some(format!("remote-{uid}")),

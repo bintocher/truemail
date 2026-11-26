@@ -26,6 +26,7 @@ fn discovered(uid: u32) -> DiscoveredMessage {
          Текст письма\r\n"
     );
     DiscoveredMessage {
+        uidvalidity: None,
         folder_path: "INBOX".to_owned(),
         uid,
         remote_id: Some(format!("remote-{uid}")),
@@ -85,6 +86,134 @@ async fn make_ready(db: &Db, operation_id: i64) {
         .execute(&db.write_pool)
         .await
         .expect("сдвинуть срок попытки");
+}
+
+#[tokio::test]
+async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() {
+    let db = open_test_db("imap-stale-action").await;
+    let account = seed_account(&db, "changed@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", "inbox").await;
+    let archive = seed_folder(&db, account, "Archive", "archive").await;
+    let folder = |uidvalidity| crate::backend::DiscoveredFolder {
+        remote_path: "INBOX".into(),
+        display_name: "INBOX".into(),
+        role: Some(FolderRole::Inbox),
+        parent_remote_path: None,
+        unread_count: 1,
+        total_count: 1,
+        uidvalidity: Some(uidvalidity),
+        uidnext: None,
+        highestmodseq: None,
+        sync_token: Some("imap-reconcile:1".into()),
+    };
+    let original = crate::backend::DiscoveredMessage {
+        uidvalidity: Some(20),
+        remote_id: None,
+        ..discovered(10)
+    };
+    db.save_discovered_folders(account, &[folder(20)])
+        .await
+        .unwrap();
+    db.save_discovered_messages(account, &[original], false)
+        .await
+        .unwrap();
+    db.save_folder_sync_tokens(account, &[folder(20)])
+        .await
+        .unwrap();
+    let old_id: i64 = sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=? AND uid=10")
+        .bind(inbox)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let queued = db.queue_message_action(&[old_id], "delete").await.unwrap();
+    let operation_id = queued.operation_ids[0];
+    make_ready(&db, operation_id).await;
+    let operation = db
+        .claim_outbox_operations(account, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let payload: serde_json::Value = serde_json::from_str(&operation.payload).unwrap();
+    assert_eq!(payload["uidvalidity"], 20);
+    assert_eq!(payload["uid"], 10);
+    db.reject_stale_imap_operation(&operation).await.unwrap();
+    let rejected = db.failed_takeaway_operations().await.unwrap().remove(0);
+    assert_eq!(rejected.id, operation_id);
+    assert!(
+        rejected
+            .last_error
+            .is_some_and(|text| text.contains("Номер письма"))
+    );
+    assert!(db.retry_failed_operation(operation_id).await.is_err());
+    db.save_discovered_folders(account, &[folder(21)])
+        .await
+        .unwrap();
+    let cursor = &db.folder_sync_cursors(account).await.unwrap()["INBOX"];
+    assert!(cursor.last_uid.is_none());
+    assert!(cursor.sync_token.is_none());
+    db.reconcile_imap_snapshot(account, &[("INBOX".into(), vec![10, 25])], &[])
+        .await
+        .unwrap();
+    sqlx::query("UPDATE folders SET uidvalidity=92,sync_token='imap-reconcile:1' WHERE id=?")
+        .bind(archive)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let copy = crate::backend::DiscoveredMessage {
+        folder_path: "Archive".into(),
+        uid: 3,
+        uidvalidity: Some(92),
+        remote_id: None,
+        ..discovered(10)
+    };
+    db.save_discovered_messages(account, &[copy], false)
+        .await
+        .unwrap();
+    db.rebind_stale_imap_operations(account).await.unwrap();
+    assert!(db.retry_failed_operation(operation_id).await.is_err());
+    let unrelated = crate::backend::DiscoveredMessage {
+        uid: 10,
+        uidvalidity: Some(21),
+        remote_id: None,
+        ..discovered(99)
+    };
+    let matching = crate::backend::DiscoveredMessage {
+        uid: 25,
+        uidvalidity: Some(21),
+        remote_id: None,
+        ..discovered(10)
+    };
+    db.save_discovered_messages(account, &[unrelated, matching], false)
+        .await
+        .unwrap();
+    db.save_folder_sync_tokens(account, &[folder(21)])
+        .await
+        .unwrap();
+    db.rebind_stale_imap_operations(account).await.unwrap();
+    assert!(
+        db.claim_outbox_operations(account, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    db.retry_failed_operation(operation_id).await.unwrap();
+    let retried = db
+        .claim_outbox_operations(account, 1)
+        .await
+        .unwrap()
+        .remove(0);
+    let payload: serde_json::Value = serde_json::from_str(&retried.payload).unwrap();
+    assert_eq!(payload["uid"], 25);
+    assert_eq!(payload["uidvalidity"], 21);
+    let matching_id: i64 =
+        sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=? AND uid=25")
+            .bind(inbox)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_ne!(matching_id, old_id);
+    assert_eq!(retried.message_id, Some(matching_id));
+    db.close().await;
 }
 
 /// Виден ли пользователь письмо: список папки, сводный список последних писем

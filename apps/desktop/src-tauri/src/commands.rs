@@ -40,6 +40,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 /// Общее состояние приложения — ядро.
 pub struct AppState {
+    pub log_dir: std::path::PathBuf,
     pub core: tokio::sync::RwLock<Option<Arc<Core>>>,
     pub oauth: tokio::sync::Mutex<HashMap<String, PendingOAuth>>,
     pub syncing: Arc<tokio::sync::Mutex<HashSet<i64>>>,
@@ -48,6 +49,7 @@ pub struct AppState {
     pub syncing_aux: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub watching: Arc<tokio::sync::Mutex<HashSet<i64>>>,
     pub generation: Arc<std::sync::atomic::AtomicU64>,
+    pub outbox_work: Arc<tokio::sync::RwLock<()>>,
     pub api_server: Arc<tokio::sync::Mutex<Option<truemail_core::api::RunningApiServer>>>,
     pub shortcut_actions: Arc<std::sync::RwLock<HashMap<String, String>>>,
     // true, когда пользователь выбрал "Выход" из трея: закрытие окна тогда
@@ -422,7 +424,7 @@ impl From<truemail_core::Error> for ApiError {
     }
 }
 
-type CmdResult<T> = Result<T, ApiError>;
+pub(crate) type CmdResult<T> = Result<T, ApiError>;
 
 fn api_error(message: impl Into<String>) -> ApiError {
     ApiError {
@@ -522,6 +524,10 @@ fn sync_warning_values(
                 .as_object_mut()
                 .expect("SyncWarning всегда сериализуется в объект");
             object.insert("attempted_at".into(), attempted_at.into());
+            object.insert(
+                "sync_scope".into(),
+                if scope == "all" { "mail" } else { scope }.into(),
+            );
             if let Some(server) = account_server_address(account, scope, warning.backend.as_deref())
             {
                 object.insert("server".into(), server.into());
@@ -906,7 +912,7 @@ pub struct SendMessageRequest {
     attachments: Vec<SendAttachmentRequest>,
 }
 
-async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
+pub(crate) async fn core(state: &State<'_, AppState>) -> CmdResult<Arc<Core>> {
     state.core.read().await.clone().ok_or_else(|| ApiError {
         message: "Хранилище ещё не создано. Завершите первоначальную настройку.".into(),
     })
@@ -1558,7 +1564,7 @@ async fn gmail_realtime_loop(
                 continue;
             }
             let synced = core.accounts.sync_mail_inbox(&account).await;
-            syncing.lock().await.remove(&account.id);
+            let mail_finished_at = chrono::Utc::now().timestamp_millis();
             // F4: постоянное состояние синхронизации почты аккаунта пишем и
             // публикуем по фактическому исходу этого прохода - как и общий
             // цикл sync_accounts, и наблюдатель за почтой у остальных
@@ -1579,8 +1585,9 @@ async fn gmail_realtime_loop(
                     reset_mail_failures(&mail_failures, account.id).await;
                     let _ = app.emit(
                         "truemail-sync-state",
-                        serde_json::json!({"account_id": account.id, "scope": "mail", "status": "ready"}),
+                        serde_json::json!({"account_id": account.id, "scope": "mail", "status": "ready", "mail_finished_at": mail_finished_at}),
                     );
+                    syncing.lock().await.remove(&account.id);
                     let _ = app.emit("truemail-data-changed", account.id);
                     notify_new_mail(
                         &app,
@@ -1601,14 +1608,16 @@ async fn gmail_realtime_loop(
                         mail_failure_threshold(&core),
                     )
                     .await;
-                    let state = account_sync_error_state(
+                    let mut state = account_sync_error_state(
                         &account,
                         "mail",
                         "error",
                         &error,
                         retries_exhausted,
                     );
+                    state["mail_finished_at"] = mail_finished_at.into();
                     let _ = app.emit("truemail-sync-state", state);
+                    syncing.lock().await.remove(&account.id);
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "Gmail realtime: не удалось загрузить новые письма");
                 }
             }
@@ -3916,6 +3925,7 @@ pub async fn move_storage(
     state: State<'_, AppState>,
     target: String,
 ) -> CmdResult<()> {
+    let _guards = lock_storage_maintenance(&state).await?;
     let source = truemail_core::crypto::load_data_dir()?.unwrap_or_else(super::default_data_dir);
     let target = PathBuf::from(target.trim());
     if !target.is_absolute() || target == source {
@@ -3929,15 +3939,6 @@ pub async fn move_storage(
     if target.join("truemail.db").exists() || target.join("blobs").exists() {
         return Err(ApiError {
             message: "В выбранной папке уже есть данные truemail".into(),
-        });
-    }
-    // Не даём фоновой синхронизации начать запись между checkpoint и
-    // переключением Core. Активную синхронизацию пользователь может повторить
-    // после её завершения, без риска получить неполную копию.
-    let sync_guard = state.syncing.lock().await;
-    if !sync_guard.is_empty() {
-        return Err(ApiError {
-            message: "Дождитесь окончания текущей синхронизации и повторите перенос".into(),
         });
     }
     let old_core = state.core.write().await.take().ok_or_else(|| ApiError {
@@ -4011,7 +4012,6 @@ pub async fn move_storage(
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.watching.lock().await.clear();
-    drop(sync_guard);
     let _ = app.emit(
         "truemail-storage-moved",
         target.to_string_lossy().into_owned(),
@@ -4049,50 +4049,33 @@ pub async fn open_data_dir(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn clear_local_data(state: State<'_, AppState>, scope: String) -> CmdResult<()> {
-    let core = core(&state).await?;
-    match scope.as_str() {
-        "trash_spam" => {
-            sqlx::query("DELETE FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE role IN ('trash','spam'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
-        }
-        "all" => {
-            let mut tx = core.db.begin_write().await?;
-            sqlx::query("DELETE FROM outbox_ops")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM messages")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM attachments")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM contacts")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM calendars")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            sqlx::query("DELETE FROM folders")
-                .execute(&mut *tx)
-                .await
-                .map_err(truemail_core::Error::from)?;
-            tx.commit().await.map_err(truemail_core::Error::from)?;
-            core.db.blobs.clear()?;
-        }
-        "old_attachments" => {
-            sqlx::query("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE date < datetime('now','-1 year'))").execute(&core.db.write_pool).await.map_err(truemail_core::Error::from)?;
-        }
-        _ => {
-            return Err(ApiError {
-                message: "Неизвестный режим очистки".into(),
-            });
-        }
-    }
+    let _guards = lock_storage_maintenance(&state).await?;
+    core(&state).await?.db.clear_cached_mail(&scope).await?;
     Ok(())
+}
+
+struct StorageMaintenance<'a> {
+    _mail: tokio::sync::MutexGuard<'a, HashSet<i64>>,
+    _aux: tokio::sync::MutexGuard<'a, HashSet<i64>>,
+    _outbox: tokio::sync::RwLockWriteGuard<'a, ()>,
+}
+
+async fn lock_storage_maintenance(state: &AppState) -> CmdResult<StorageMaintenance<'_>> {
+    let busy = || ApiError {
+        message: "Дождитесь окончания синхронизации и отправки писем, затем повторите действие"
+            .into(),
+    };
+    let mail = state.syncing.lock().await;
+    let aux = state.syncing_aux.lock().await;
+    if !mail.is_empty() || !aux.is_empty() {
+        return Err(busy());
+    }
+    let outbox = state.outbox_work.try_write().map_err(|_| busy())?;
+    Ok(StorageMaintenance {
+        _mail: mail,
+        _aux: aux,
+        _outbox: outbox,
+    })
 }
 
 #[tauri::command]
@@ -4151,6 +4134,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     | truemail_core::model::Provider::Exchange
             );
             let mail = sync_core.accounts.sync_mail_account(&account).await;
+            let mail_finished_at = chrono::Utc::now().timestamp_millis();
             // Постоянное состояние пишем по фактическому исходу sync_mail_account,
             // а не по итоговому статусу события ниже - они расходятся при
             // частичном исходе цикла, когда почта не синхронизировалась, а
@@ -4169,6 +4153,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
             } else {
                 Ok(truemail_core::storage::repo::AuxiliarySaveResult::default())
             };
+            let auxiliary_finished_at = chrono::Utc::now().timestamp_millis();
             // Тела писем, пришедших без содержимого (Gmail отдаёт при
             // синхронизации только заголовки), догружаем сразу после успешной
             // синхронизации - иначе первое открытие каждого письма упирается в
@@ -4179,7 +4164,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                 tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "фоновая догрузка тел писем отложена");
             }
             let attempted_at = chrono::Utc::now().to_rfc3339();
-            let state = match (mail, auxiliary) {
+            let mut state = match (mail, auxiliary) {
                 (Ok(result), Ok(aux)) => {
                     if !aux.changes.is_empty() {
                         tracing::debug!(account = %truemail_core::logging::mask_email(&account.email), changes = aux.changes.len(), "обнаружены изменения календаря");
@@ -4202,23 +4187,29 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     // Предупреждения успешного прохода сбоем почты не считаются:
                     // retries_exhausted тут всегда false, а не признак исчерпания
                     // повторов (G1).
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": false, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "mail_synced": true, "auxiliary_synced": supports_auxiliary, "warnings": warnings, "retries_exhausted": false, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
-                (Ok(mut result), Err(error)) => {
+                (Ok(result), Err(error)) => {
                     tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "почта обновлена, вспомогательный sync будет повторён");
                     // Почта прошла успешно (сбоил только вспомогательный sync) -
                     // счёт сбоев почты обнуляется (G1).
                     reset_mail_failures(&sync_mail_failures, account.id).await;
-                    result.warnings.push(truemail_core::account::SyncWarning {
+                    let warning = truemail_core::account::SyncWarning {
                         kind: error.code().to_owned(),
                         message: truemail_core::error::sanitize_error_message(&error.to_string()),
                         backend: error.backend().map(str::to_owned),
                         response_code: error.response_code(),
                         sync_phase: None,
-                    });
-                    let warnings =
-                        sync_warning_values(&account, "auxiliary", &result.warnings, &attempted_at);
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": false})
+                    };
+                    let mut warnings =
+                        sync_warning_values(&account, "all", &result.warnings, &attempted_at);
+                    warnings.extend(sync_warning_values(
+                        &account,
+                        "auxiliary",
+                        &[warning],
+                        &attempted_at,
+                    ));
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "mail_synced": true, "warnings": warnings, "retries_exhausted": false})
                 }
                 (Err(mail_error), Ok(aux)) if supports_auxiliary => {
                     let message =
@@ -4251,7 +4242,7 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         sync_phase: Some("regular"),
                     };
                     let warnings = sync_warning_values(&account, "all", &[warning], &attempted_at);
-                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": retries_exhausted, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
+                    serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "auxiliary_synced": true, "warnings": warnings, "retries_exhausted": retries_exhausted, "calendars": aux.calendars, "events": aux.events, "contacts": aux.contacts})
                 }
                 (Err(mail_error), Err(auxiliary_error)) => {
                     let error = truemail_core::error::sanitize_error_message(&format!(
@@ -4271,10 +4262,18 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                         &mail_error,
                         retries_exhausted,
                     );
-                    if let Some(object) = state.as_object_mut() {
-                        object.insert("error".into(), error.clone().into());
-                        object.insert("error_message".into(), error.into());
-                    }
+                    let warning = truemail_core::account::SyncWarning {
+                        kind: auxiliary_error.code().to_owned(),
+                        message: truemail_core::error::sanitize_error_message(
+                            &auxiliary_error.to_string(),
+                        ),
+                        backend: auxiliary_error.backend().map(str::to_owned),
+                        response_code: auxiliary_error.response_code(),
+                        sync_phase: None,
+                    };
+                    state["warnings"] =
+                        sync_warning_values(&account, "auxiliary", &[warning], &attempted_at)
+                            .into();
                     state
                 }
                 (Err(error), Ok(_)) => {
@@ -4290,8 +4289,12 @@ pub async fn sync_accounts(app: AppHandle, state: State<'_, AppState>) -> CmdRes
                     account_sync_error_state(&account, "all", "error", &error, retries_exhausted)
                 }
             };
-            sync_set.lock().await.remove(&account.id);
+            state["mail_finished_at"] = mail_finished_at.into();
+            if supports_auxiliary {
+                state["auxiliary_finished_at"] = auxiliary_finished_at.into();
+            }
             let _ = sync_app.emit("truemail-sync-state", state);
+            sync_set.lock().await.remove(&account.id);
             let _ = sync_app.emit("truemail-data-changed", account.id);
         });
     }
@@ -4328,7 +4331,8 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
         tokio::spawn(async move {
             tracing::info!(account = %truemail_core::logging::mask_email(&account.email), provider = ?account.provider, "aux-sync начат");
             let sync_result = sync_core.accounts.sync_auxiliary_account(&account).await;
-            let state = match sync_result {
+            let auxiliary_finished_at = chrono::Utc::now().timestamp_millis();
+            let mut state = match sync_result {
                 Ok(aux) => {
                     if !aux.changes.is_empty() {
                         tracing::debug!(account = %truemail_core::logging::mask_email(&account.email), changes = aux.changes.len(), "обнаружены изменения календаря");
@@ -4352,8 +4356,9 @@ pub async fn sync_auxiliary_accounts(app: AppHandle, state: State<'_, AppState>)
                     account_sync_error_state(&account, "auxiliary", "error", &error, true)
                 }
             };
-            sync_set.lock().await.remove(&account.id);
+            state["auxiliary_finished_at"] = auxiliary_finished_at.into();
             let _ = sync_app.emit("truemail-sync-state", state);
+            sync_set.lock().await.remove(&account.id);
             let _ = sync_app.emit("truemail-data-changed", account.id);
         });
     }
@@ -4456,6 +4461,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                             } else {
                                 watch_core.accounts.sync_mail_inbox(&watch_account).await
                             };
+                            let mail_finished_at = chrono::Utc::now().timestamp_millis();
                             // Постоянное состояние - по фактическому исходу этого
                             // прохода (mail-sync-visible-state.md, S-002, S-003);
                             // обрыв ожидания IDLE ("retrying" ниже) - отдельное
@@ -4547,14 +4553,16 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                     );
                                 }
                             }
-                            watch_syncing.lock().await.remove(&watch_account.id);
-                            let state = error_state.unwrap_or_else(|| serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            let mut state = error_state.unwrap_or_else(|| serde_json::json!({"account_id": watch_account.id, "scope": "mail", "status": "ready"}));
+                            state["mail_finished_at"] = mail_finished_at.into();
                             let _ = watch_app.emit("truemail-sync-state", state);
+                            watch_syncing.lock().await.remove(&watch_account.id);
                             if mail_changed {
                                 let _ = watch_app.emit("truemail-data-changed", watch_account.id);
                             }
                         }
                         Err(error) => {
+                            let mail_finished_at = chrono::Utc::now().timestamp_millis();
                             // Разрыв простаивающего IDLE сервером/NAT (10054, close_notify,
                             // unexpected eof, connection reset) - ожидаемое поведение, а не
                             // сбой: логируем на debug, чтобы не пугать в логе. Остальные
@@ -4598,13 +4606,14 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                                 mail_failure_threshold(&watch_core),
                             )
                             .await;
-                            let state = account_sync_error_state(
+                            let mut state = account_sync_error_state(
                                 &watch_account,
                                 "mail",
                                 "retrying",
                                 &error,
                                 retries_exhausted,
                             );
+                            state["mail_finished_at"] = mail_finished_at.into();
                             let _ = watch_app.emit("truemail-sync-state", state);
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(60));
@@ -4619,9 +4628,11 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
         let send_wakeup = state.send_wakeup.clone();
         let outbox_app = app.clone();
         let outbox_generation = state.generation.clone();
+        let outbox_work = state.outbox_work.clone();
         let generation = outbox_generation.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
             loop {
+                let work = outbox_work.read().await;
                 if outbox_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
                     break;
                 }
@@ -4639,6 +4650,14 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                         let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
                     }
                     Ok(_) => {}
+                    Err(truemail_core::Error::ImapMessageIdentityChanged) => {
+                        let _ = outbox_app.emit("truemail-imap-action-rejected", outbox_account.id);
+                        let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
+                    }
+                    Err(truemail_core::Error::PermanentDeleteUnavailable) => {
+                        let _ = outbox_app.emit("truemail-permanent-delete-unavailable", ());
+                        let _ = outbox_app.emit("truemail-data-changed", outbox_account.id);
+                    }
                     Err(error) => tracing::warn!(
                         account = %truemail_core::logging::mask_email(&outbox_account.email),
                         %error,
@@ -4658,6 +4677,7 @@ pub async fn start_realtime(app: AppHandle, state: State<'_, AppState>) -> CmdRe
                     .unwrap_or(None)
                     .map(|seconds| seconds.clamp(1, 10))
                     .unwrap_or(10);
+                drop(work);
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(wakeup as u64)) => {}
                     _ = wakeup_signal => {}
@@ -4737,10 +4757,23 @@ pub fn resolve_undo_windows_on_quit(app: &AppHandle) {
         return;
     }
     tauri::async_runtime::block_on(async move {
+        let Ok(shared_work) = state.outbox_work.try_read() else {
+            return;
+        };
+        let Some(core) = state.core.read().await.clone() else {
+            return;
+        };
         if let Err(error) = core.db.release_undo_windows().await {
             tracing::warn!(%error, "окна отмены не отпущены при выходе");
             return;
         }
+        drop(shared_work);
+        let Ok(_exclusive_work) = state.outbox_work.try_write() else {
+            return;
+        };
+        let Some(core) = state.core.read().await.clone() else {
+            return;
+        };
         let Ok(accounts) = core.db.list_accounts().await else {
             return;
         };
@@ -5384,6 +5417,19 @@ pub async fn delete_message_template(
 }
 
 #[tauri::command]
+pub async fn check_permanent_delete(
+    state: State<'_, AppState>,
+    message_ids: Vec<i64>,
+) -> CmdResult<()> {
+    core(&state)
+        .await?
+        .accounts
+        .check_permanent_delete(&message_ids)
+        .await
+        .map_err(|error| api_error(error.to_string()))
+}
+
+#[tauri::command]
 pub async fn message_action(
     state: State<'_, AppState>,
     message_ids: Vec<i64>,
@@ -5877,6 +5923,7 @@ async fn spawn_initial_mail_sync(
     );
     tokio::spawn(async move {
         let mail_result = core.accounts.sync_initial_mail_account(&account).await;
+        let mail_finished_at = chrono::Utc::now().timestamp_millis();
         // Постоянное состояние - по факту Ok/Err этого прохода (S-002, S-003).
         if let Err(error) = core
             .db
@@ -5885,7 +5932,7 @@ async fn spawn_initial_mail_sync(
         {
             tracing::warn!(account = %truemail_core::logging::mask_email(&account.email), %error, "не удалось сохранить состояние синхронизации почты");
         }
-        let sync_state = match &mail_result {
+        let mut sync_state = match &mail_result {
             Ok(result) => {
                 tracing::info!(account = %truemail_core::logging::mask_email(&account.email), folders = result.mail_folders, "первая синхронизация почты завершена");
                 // Почта прошла успешно - счёт сбоев подряд обнуляется (G1).
@@ -5898,7 +5945,7 @@ async fn spawn_initial_mail_sync(
                 // сразу после подключения, человек ждёт результата на экране,
                 // и предупреждение уместно показать сразу же (G1,
                 // error-kinds-and-messages.md, S-022).
-                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "warnings": warnings, "retries_exhausted": true, "initial_sync": true})
+                serde_json::json!({"account_id": account.id, "scope": "all", "status": "ready", "mail_synced": true, "warnings": warnings, "retries_exhausted": true, "initial_sync": true})
             }
             Err(error) => {
                 let safe_error = truemail_core::error::sanitize_error_message(&error.to_string());
@@ -5914,6 +5961,7 @@ async fn spawn_initial_mail_sync(
                 account_sync_error_state(&account, "all", "error", error, retries_exhausted)
             }
         };
+        sync_state["mail_finished_at"] = mail_finished_at.into();
         let _ = sync_app.emit("truemail-sync-state", sync_state);
         sync_set.lock().await.remove(&account.id);
         let _ = sync_app.emit("truemail-data-changed", account.id);
@@ -5925,16 +5973,21 @@ async fn spawn_initial_mail_sync(
                 return;
             }
             drop(syncing_aux);
-            match core.accounts.sync_auxiliary_account(&account).await {
+            let result = core.accounts.sync_auxiliary_account(&account).await;
+            let auxiliary_finished_at = chrono::Utc::now().timestamp_millis();
+            let mut state = match result {
                 // Первая синхронизация - полный снимок (SyncScope::Full),
                 // changes для него намеренно пуст (см. задачу A в repo.rs).
-                Ok(aux) => tracing::info!(
-                    account = %truemail_core::logging::mask_email(&account.email),
-                    calendars = aux.calendars,
-                    events = aux.events,
-                    contacts = aux.contacts,
-                    "первая синхронизация календарей и контактов завершена"
-                ),
+                Ok(aux) => {
+                    tracing::info!(
+                        account = %truemail_core::logging::mask_email(&account.email),
+                        calendars = aux.calendars,
+                        events = aux.events,
+                        contacts = aux.contacts,
+                        "первая синхронизация календарей и контактов завершена"
+                    );
+                    serde_json::json!({"account_id": account.id, "scope": "auxiliary", "status": "ready"})
+                }
                 Err(error) => {
                     let safe_error =
                         truemail_core::error::sanitize_error_message(&error.to_string());
@@ -5943,9 +5996,12 @@ async fn spawn_initial_mail_sync(
                         error_kind = error.code(),
                         error = %safe_error,
                         "первая синхронизация календарей и контактов не удалась"
-                    )
+                    );
+                    account_sync_error_state(&account, "auxiliary", "error", &error, true)
                 }
-            }
+            };
+            state["auxiliary_finished_at"] = auxiliary_finished_at.into();
+            let _ = sync_app.emit("truemail-sync-state", state);
             aux_sync_set.lock().await.remove(&account.id);
             let _ = sync_app.emit("truemail-data-changed", account.id);
         }

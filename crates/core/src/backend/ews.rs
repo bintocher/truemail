@@ -1787,6 +1787,7 @@ fn parse_messages(xml: &str, folder_path: &str) -> Result<Vec<DiscoveredMessage>
             }
         };
         messages.push(DiscoveredMessage {
+            uidvalidity: None,
             folder_path: folder_path.to_owned(),
             uid: stable_uid(id),
             remote_id: Some(id.to_owned()),
@@ -3402,7 +3403,7 @@ impl MailBackend for EwsBackend {
             "delete" => (
                 "DeleteItem",
                 format!(
-                    r#"<m:DeleteItem DeleteType="MoveToDeletedItems"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
+                    r#"<m:DeleteItem DeleteType="HardDelete"><m:ItemIds><t:ItemId Id="{}"/></m:ItemIds></m:DeleteItem>"#,
                     escape(item_id)
                 ),
             ),
@@ -3480,7 +3481,7 @@ impl MailBackend for EwsBackend {
         _email: &str,
         credential: &str,
         _folder_path: &str,
-        _uid: u32,
+        _uid: super::ImapUid<'_>,
         remote_id: Option<&str>,
     ) -> Result<Vec<u8>> {
         self.raw_item(
@@ -3497,6 +3498,7 @@ impl MailBackend for EwsBackend {
         folder_path: &str,
         before: &str,
         limit: usize,
+        _known_remote_ids: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<DiscoveredMessage>> {
         self.older_messages_in_folder(credential, folder_path, before, limit)
             .await

@@ -67,6 +67,25 @@ async function openList() {
 
 const rowOf = ui => ui.query('#msgs .msg[data-message-id="11"]');
 
+test('догрузка возвращает письма JMAP с той же датой и продолжает прокрутку', async () => {
+  const ui = await openList();
+  ui.evaluate(`
+    coreFolders.find(folder=>folder.id===2).total_count=3;
+    let nextBackfillId=12;
+    window.tm={
+      listMessagesPage:async()=>[],
+      fetchOlderMessages:async()=>{
+        const id=nextBackfillId++;
+        return {fetched:1,messages:[{...messages[0],id,subject:'Догружено '+id}]};
+      },
+    };
+  `);
+  await ui.evaluate('loadNextMessagePage(true)');
+  assert.equal(ui.evaluate('ordinaryPageCursors.get(2).id'), 11);
+  await ui.evaluate('loadNextMessagePage(true)');
+  assert.equal(ui.evaluate('messages.map(message=>message.id).sort().join(",")'), '11,12,13');
+});
+
 // Новое письмо приходит из ядра при перезагрузке данных - то же самое делает
 // applyListOptions после любого события в списке.
 function addMessage(ui) {

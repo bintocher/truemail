@@ -1,6 +1,7 @@
 //! truemail — десктоп-приложение (Tauri v2). Тонкий клиент над ядром.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod commands;
 mod diagnostics;
 
@@ -198,7 +199,7 @@ fn run() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("не удалось установить TLS crypto provider aws-lc-rs"))?;
 
     // Логи пишем и в stdout (виден при запуске из терминала), и в файл в
-    // data_dir/logs/ - у GUI-сборки на Windows stdout не отображается, поэтому
+    // постоянный каталог приложения - у GUI-сборки на Windows stdout не отображается, поэтому
     // файл единственный способ увидеть диагностику. В отладочной сборке
     // по умолчанию включаем debug для ядра, чтобы IMAP-операции (удаление
     // папок и т.п.) логировались из коробки. В релизе дефолт - info: debug
@@ -206,14 +207,15 @@ fn run() -> anyhow::Result<()> {
     // RUST_LOG пользователя в любом случае имеет приоритет над этим дефолтом.
     use tracing_appender::rolling::{Builder, Rotation};
     use tracing_subscriber::fmt::writer::MakeWriterExt;
-    let log_dir = data_dir().join("logs");
+    let log_dir = default_data_dir().join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
+    activity::prune_logs(&log_dir, chrono::Utc::now().date_naive());
     // Ротация суточная, но без ограничения файлы копились бесконечно (у
     // пользователя за 6 дней набежало 4+ МБ). Храним последнюю неделю.
     let file_appender = Builder::new()
         .rotation(Rotation::DAILY)
         .filename_prefix("truemail.log")
-        .max_log_files(7)
+        .max_log_files(activity::LOG_DAYS as usize)
         .build(&log_dir);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if cfg!(debug_assertions) {
@@ -252,6 +254,7 @@ fn run() -> anyhow::Result<()> {
     // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
     // работающей программой.
     let state = AppState {
+        log_dir,
         core: tokio::sync::RwLock::new(None),
         notify_anchor: Arc::new(std::sync::Mutex::new(
             commands::NotifyAnchor::platform_default(),
@@ -263,6 +266,7 @@ fn run() -> anyhow::Result<()> {
         quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
         api_server: Arc::new(tokio::sync::Mutex::new(None)),
         shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
@@ -538,6 +542,8 @@ fn run() -> anyhow::Result<()> {
             commands::label_message_counts,
             commands::fetch_older_messages,
             commands::ui_log,
+            activity::record_ui_activity,
+            activity::read_ui_activity,
             commands::get_message,
             commands::message_raw,
             commands::export_message_eml,
@@ -655,6 +661,7 @@ fn run() -> anyhow::Result<()> {
             commands::list_message_templates,
             commands::save_message_template,
             commands::delete_message_template,
+            commands::check_permanent_delete,
             commands::message_action,
             commands::move_messages_to_folder,
             commands::undo_message_action,

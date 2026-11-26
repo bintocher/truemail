@@ -4,9 +4,12 @@ use crate::model::Security;
 use crate::{Error, Result};
 use lettre::message::header::{HeaderName, HeaderValue};
 use lettre::message::{Attachment, Mailbox, Message, MultiPart, SinglePart, header::ContentType};
-use lettre::transport::smtp::authentication::{Credentials, Mechanism};
-use lettre::transport::smtp::client::{Tls, TlsParameters};
-use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
+use lettre::transport::smtp::authentication::{Credentials, DEFAULT_MECHANISMS, Mechanism};
+use lettre::transport::smtp::client::{AsyncSmtpConnection, TlsParameters};
+use lettre::transport::smtp::commands::{Data, Mail, Rcpt};
+use lettre::transport::smtp::extension::{ClientId, Extension, MailBodyParameter, MailParameter};
+use lettre::transport::smtp::response::Severity;
+use std::time::Duration;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutgoingAttachment {
@@ -380,29 +383,39 @@ fn smtp_error(backend: &str, error: lettre::transport::smtp::Error) -> Error {
     } else if error.is_tls() {
         ErrorKind::CertificateError
     } else if let Some(code) = error.status() {
-        use lettre::transport::smtp::response::Severity;
         match (code.severity, code.to_string().as_str()) {
             // 535 и 534 - отказ проверки подлинности, 530 - сервер требует входа.
             (_, "535" | "534" | "530") => ErrorKind::InvalidCredentials,
             (Severity::TransientNegativeCompletion, _) => ErrorKind::ServerUnavailable,
+            (Severity::PermanentNegativeCompletion, _) => {
+                return Error::SmtpRejected(error.to_string());
+            }
             _ => ErrorKind::Unknown,
         }
-    } else if error.is_client() || error.is_transport_shutdown() {
+    } else if error.is_response()
+        && std::error::Error::source(&error)
+            .is_some_and(|source| source.to_string() == "incomplete response")
+    {
+        // Lettre 0.11.24 сообщает так о закрывшемся соединении без ответа.
         ErrorKind::NetworkUnavailable
+    } else if error.is_client() {
+        ErrorKind::AccountConfig
+    } else if error.is_response() {
+        ErrorKind::ServerUnavailable
     } else {
-        ErrorKind::Unknown
+        ErrorKind::NetworkUnavailable
     };
     Error::classified_backend(backend, kind, error.to_string())
 }
 
-/// Отказ SMTP вместе с точкой, в которой он случился. Обрыв соединения и
-/// истечение времени ожидания застают передачу уже начатой: байты письма могли
-/// дойти до сервера, и повтор доставил бы получателю второй экземпляр. Ответ
-/// сервера с кодом, отказ входа и отказ TLS приходят до передачи письма, и
-/// такой отказ повторяется обычным порядком очереди (S-048, S-049).
+/// После DATA отсутствие явного отказа означает, что сервер мог принять письмо.
 fn smtp_failure(backend: &str, error: lettre::transport::smtp::Error) -> super::SendFailure {
-    let after_handoff = error.is_timeout() || error.is_transport_shutdown();
-    let error = smtp_error(backend, error);
+    let after_handoff = !error.is_transient() && !error.is_permanent();
+    let error = if error.is_permanent() {
+        Error::SmtpRejected(error.to_string())
+    } else {
+        smtp_error(backend, error)
+    };
     if after_handoff {
         super::SendFailure::after_handoff(error)
     } else {
@@ -591,60 +604,178 @@ pub(crate) async fn send_oauth_with_raw(
     port: u16,
     security: Security,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
-    // Отправка по OAuth идёт к известным серверам с настоящим сертификатом.
-    let tls_insecure = false;
-    let from = message.from.clone();
+    let credentials = Credentials::new(message.from.clone(), access_token.to_owned());
+    send_smtp(
+        message,
+        host,
+        port,
+        security,
+        false,
+        credentials,
+        &[Mechanism::Xoauth2],
+    )
+    .await
+}
+
+const SMTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn send_smtp(
+    message: OutgoingMessage,
+    host: &str,
+    port: u16,
+    security: Security,
+    tls_insecure: bool,
+    credentials: Credentials,
+    mechanisms: &[Mechanism],
+) -> std::result::Result<Vec<u8>, super::SendFailure> {
+    if security == Security::None {
+        return Err(Error::AccountConfig(
+            "незашифрованный SMTP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
+        )
+        .into());
+    }
     let email = build_message(message)?;
     let raw = email.formatted();
-    let credentials = Credentials::new(from, access_token.to_owned());
-    let builder = if security == Security::Starttls {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
+    let hello = ClientId::default();
+    let mut tls = TlsParameters::builder(host.to_owned());
+    if tls_insecure {
+        tracing::warn!(%host, "сертификат сервера отправки не проверяется по решению пользователя");
+        tls = tls
+            .dangerous_accept_invalid_certs(true)
+            .dangerous_accept_invalid_hostnames(true);
+    }
+    let tls = tls.build().map_err(|error| smtp_error("smtp", error))?;
+    let wrapper = (security == Security::Ssl).then(|| tls.clone());
+    // Подключение, приветствие, TLS и вход происходят до команд отправки.
+    let connect = async {
+        let mut connection = AsyncSmtpConnection::connect_tokio1(
+            (host, port),
+            Some(SMTP_TIMEOUT),
+            &hello,
+            wrapper,
+            None,
+        )
+        .await?;
+        if security == Security::Starttls {
+            connection.starttls(tls, &hello).await?;
+        }
+        connection.auth(mechanisms, &credentials).await?;
+        Ok::<_, lettre::transport::smtp::Error>(connection)
     };
-    let builder = match insecure_tls(host, security, tls_insecure) {
-        Some(tls) => builder.map(|builder| builder.tls(tls)),
-        None => builder,
-    };
-    let transport = builder
-        .map_err(|error| smtp_failure("smtp", error))?
-        .port(port)
-        .credentials(credentials)
-        .authentication(vec![Mechanism::Xoauth2])
-        .timeout(Some(std::time::Duration::from_secs(30)))
-        .build();
-    transport
-        .send_raw(email.envelope(), &raw)
+    let mut connection = tokio::time::timeout(SMTP_TIMEOUT, connect)
         .await
-        .map_err(|error| smtp_failure("smtp", error))?;
+        .map_err(|_| {
+            Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::NetworkUnavailable,
+                "сервер не ответил при подключении",
+            )
+        })?
+        .map_err(|error| {
+            if error.is_timeout() {
+                Error::classified_backend(
+                    "smtp",
+                    crate::ErrorKind::NetworkUnavailable,
+                    error.to_string(),
+                )
+            } else {
+                smtp_error("smtp", error)
+            }
+        })?;
+    submit_smtp(&mut connection, email.envelope(), &raw).await?;
     Ok(raw)
 }
 
-/// Настройки TLS для узла, сертификат которого человек решил не проверять
-/// (issue #118). `None` - узел проверяется как обычно, и строитель остаётся
-/// при своих настройках по умолчанию.
-fn insecure_tls(host: &str, security: Security, tls_insecure: bool) -> Option<Tls> {
-    if !tls_insecure {
-        return None;
-    }
-    match TlsParameters::builder(host.to_owned())
-        .dangerous_accept_invalid_certs(true)
-        .dangerous_accept_invalid_hostnames(true)
-        .build()
+async fn submit_smtp(
+    connection: &mut AsyncSmtpConnection,
+    envelope: &lettre::address::Envelope,
+    raw: &[u8],
+) -> std::result::Result<(), super::SendFailure> {
+    let mut options = Vec::new();
+    if envelope
+        .from()
+        .into_iter()
+        .chain(envelope.to())
+        .any(|address| !AsRef::<str>::as_ref(address).is_ascii())
     {
-        Ok(params) => {
-            tracing::warn!(%host, "сертификат сервера отправки не проверяется по решению пользователя");
-            Some(if security == Security::Starttls {
-                Tls::Required(params)
-            } else {
-                Tls::Wrapper(params)
-            })
+        if !connection
+            .server_info()
+            .supports_feature(Extension::SmtpUtfEight)
+        {
+            return Err(Error::AccountConfig(
+                "сервер не поддерживает SMTPUTF8 для адреса письма".into(),
+            )
+            .into());
         }
-        Err(error) => {
-            tracing::warn!(%host, %error, "не удалось собрать настройки TLS без проверки, идём обычным путём");
-            None
-        }
+        options.push(MailParameter::SmtpUtfEight);
     }
+    if !raw.is_ascii() {
+        if !connection
+            .server_info()
+            .supports_feature(Extension::EightBitMime)
+        {
+            return Err(Error::AccountConfig(
+                "сервер не поддерживает 8BITMIME для содержимого письма".into(),
+            )
+            .into());
+        }
+        options.push(MailParameter::Body(MailBodyParameter::EightBitMime));
+    }
+    let begin = async {
+        connection
+            .command(Mail::new(envelope.from().cloned(), options))
+            .await
+            .map_err(|error| smtp_error("smtp", error))?;
+        for address in envelope.to() {
+            connection
+                .command(Rcpt::new(address.clone(), Vec::new()))
+                .await
+                .map_err(|error| smtp_error("smtp", error))?;
+        }
+        let response = connection
+            .command(Data)
+            .await
+            .map_err(|error| smtp_error("smtp", error))?;
+        if u16::from(response.code()) != 354 {
+            return Err(Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::ServerUnavailable,
+                "неожиданный ответ на команду DATA",
+            ));
+        }
+        Ok(())
+    };
+    tokio::time::timeout(SMTP_TIMEOUT, begin)
+        .await
+        .map_err(|_| {
+            Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::Timeout,
+                "сервер не ответил до передачи письма",
+            )
+        })??;
+    let response = tokio::time::timeout(SMTP_TIMEOUT, connection.message(raw))
+        .await
+        .map_err(|_| {
+            super::SendFailure::after_handoff(Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::Timeout,
+                "сервер не подтвердил передачу письма",
+            ))
+        })?
+        .map_err(|error| smtp_failure("smtp", error))?;
+    if response.code().severity != Severity::PositiveCompletion {
+        return Err(super::SendFailure::after_handoff(
+            Error::classified_backend(
+                "smtp",
+                crate::ErrorKind::Unknown,
+                "сервер не подтвердил приём письма",
+            ),
+        ));
+    }
+    // Ответ о приёме получен. Сбой при закрытии уже не меняет итог передачи.
+    let _ = tokio::time::timeout(Duration::from_secs(2), connection.quit()).await;
+    Ok(())
 }
 
 pub async fn send_yandex(message: OutgoingMessage, access_token: &str) -> Result<()> {
@@ -712,39 +843,107 @@ pub(crate) async fn send_password_with_raw(
     security: Security,
     tls_insecure: bool,
 ) -> std::result::Result<Vec<u8>, super::SendFailure> {
-    if security == Security::None {
-        return Err(Error::AccountConfig(
-            "незашифрованный SMTP не поддерживается; выберите SSL/TLS или STARTTLS".into(),
-        )
-        .into());
-    }
-    let email = build_message(message)?;
-    let raw = email.formatted();
-    let builder = if security == Security::Starttls {
-        AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)
-    } else {
-        AsyncSmtpTransport::<Tokio1Executor>::relay(host)
-    }
-    .map_err(|error| smtp_failure("smtp", error))?;
-    let builder = match insecure_tls(host, security, tls_insecure) {
-        Some(tls) => builder.tls(tls),
-        None => builder,
-    };
-    let transport = builder
-        .port(port)
-        .credentials(Credentials::new(username.to_owned(), password.to_owned()))
-        .timeout(Some(std::time::Duration::from_secs(30)))
-        .build();
-    transport
-        .send_raw(email.envelope(), &raw)
-        .await
-        .map_err(|error| smtp_failure("smtp", error))?;
-    Ok(raw)
+    send_smtp(
+        message,
+        host,
+        port,
+        security,
+        tls_insecure,
+        Credentials::new(username.to_owned(), password.to_owned()),
+        DEFAULT_MECHANISMS,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn smtp_loss_of_final_reply_and_explicit_rejections_are_distinct() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        for (drop_before_data, reply, ambiguous, kind) in [
+            (
+                true,
+                None,
+                false,
+                Some(crate::ErrorKind::NetworkUnavailable),
+            ),
+            (false, None, true, None),
+            (
+                false,
+                Some("451 Temporary failure\r\n"),
+                false,
+                Some(crate::ErrorKind::ServerUnavailable),
+            ),
+            (
+                false,
+                Some("550 Rejected\r\n"),
+                false,
+                Some(crate::ErrorKind::Unknown),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = tokio::spawn(async move {
+                let (connection, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(connection);
+                stream
+                    .get_mut()
+                    .write_all(b"220 test SMTP\r\n")
+                    .await
+                    .unwrap();
+                let mut in_data = false;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).await.unwrap() > 0);
+                    if drop_before_data && line.starts_with("MAIL FROM:") {
+                        break;
+                    }
+                    if in_data {
+                        if line == ".\r\n" {
+                            if let Some(reply) = reply {
+                                stream.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                            }
+                            break;
+                        }
+                    } else {
+                        let response: &[u8] = if line == "DATA\r\n" {
+                            in_data = true;
+                            b"354 Continue\r\n"
+                        } else {
+                            b"250 OK\r\n"
+                        };
+                        stream.get_mut().write_all(response).await.unwrap();
+                    }
+                }
+            });
+            let mut connection = AsyncSmtpConnection::connect_tokio1(
+                ("127.0.0.1", port),
+                Some(Duration::from_secs(5)),
+                &ClientId::default(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let letter = build_message(sample_message(None, Vec::new())).unwrap();
+            let failure = submit_smtp(&mut connection, letter.envelope(), &letter.formatted())
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert_eq!(failure.after_handoff, ambiguous);
+            if let Some(kind) = kind {
+                assert_eq!(failure.error.kind(), kind);
+            }
+            if reply == Some("550 Rejected\r\n") {
+                assert!(matches!(failure.error, Error::SmtpRejected(_)));
+            }
+        }
+    }
 
     #[test]
     fn rejects_message_without_recipients_before_network() {
