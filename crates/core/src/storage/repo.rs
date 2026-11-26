@@ -1031,16 +1031,27 @@ impl Db {
         account_id: i64,
         caldav_url: Option<&str>,
         carddav_url: Option<&str>,
+        previous: Option<(Option<&str>, Option<&str>)>,
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        sqlx::query(
-            "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
+        let (previous_caldav, previous_carddav) = previous.unwrap_or_default();
+        let updated = sqlx::query(
+            "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now')
+             WHERE id=? AND enabled=1 AND (? OR (caldav_url IS ? AND carddav_url IS ?))",
         )
         .bind(caldav_url)
         .bind(carddav_url)
         .bind(account_id)
+        .bind(previous.is_none())
+        .bind(previous_caldav)
+        .bind(previous_carddav)
         .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() != 1 {
+            return Err(crate::Error::AccountConfig(
+                "Настройки ящика изменились. Обновите список и повторите".into(),
+            ));
+        }
         remember_dav_base(&mut tx, account_id, "caldav", caldav_url).await?;
         remember_dav_base(&mut tx, account_id, "carddav", carddav_url).await?;
         tx.commit().await?;
@@ -9606,6 +9617,18 @@ pub(crate) async fn resolve_role_folder(
     account_id: i64,
     role: &str,
 ) -> Result<Option<(i64, String)>> {
+    let assigned = sqlx::query_as(
+        "SELECT f.id,f.remote_path FROM folder_role_overrides o
+         JOIN folders f ON f.id=o.folder_id AND f.account_id=o.account_id
+         WHERE o.account_id=? AND o.role=?",
+    )
+    .bind(account_id)
+    .bind(role)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if assigned.is_some() {
+        return Ok(assigned);
+    }
     let folders: Vec<(i64, String)> =
         sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=? AND role=?")
             .bind(account_id)

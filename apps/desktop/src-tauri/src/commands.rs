@@ -2086,6 +2086,24 @@ pub async fn list_accounts(state: State<'_, AppState>) -> CmdResult<Vec<Account>
 }
 
 #[tauri::command]
+pub async fn configure_account_dav(
+    state: State<'_, AppState>,
+    account_id: i64,
+    caldav: Option<String>,
+    carddav: Option<String>,
+) -> CmdResult<()> {
+    let core = core(&state).await?;
+    let account = account_by_id(&core, account_id).await?;
+    if !is_dav_capable(&account) {
+        return Err(api_error("Этот ящик не использует CalDAV и CardDAV"));
+    }
+    Ok(core
+        .accounts
+        .configure_dav_urls(account_id, caldav.as_deref(), carddav.as_deref())
+        .await?)
+}
+
+#[tauri::command]
 pub async fn rename_account(
     state: State<'_, AppState>,
     account_id: i64,

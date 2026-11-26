@@ -356,7 +356,8 @@ async function renderHtmlMessage(container,html,sender,stillCurrent){
         else {
           const address=mailWebUrl(src)||mailWebUrl(srcset.trim().split(/\s+|,/)[0]);
           if(address&&allowRemote&&window.tm?.fetchMailImage&&external.length<12){
-            external.push([node,address.toString()]);
+            node.dataset.mailImage=String(external.length);
+            external.push(address.toString());
           }else if(src||srcset){
             blocked=true;
             if(!node.getAttribute('alt'))node.setAttribute('alt',L('Внешнее изображение заблокировано','Remote image blocked'));
@@ -368,14 +369,6 @@ async function renderHtmlMessage(container,html,sender,stillCurrent){
     }
   }
   sanitize(root);
-  await Promise.all(external.map(async ([node,url])=>{
-    try{
-      const data=await window.tm.fetchMailImage(normalizedSender,url);
-      if(mailRasterData.test(data))node.setAttribute('src',data);
-    }catch(_){
-      if(!node.getAttribute('alt'))node.setAttribute('alt',L('Не удалось загрузить изображение','Could not load image'));
-    }
-  }));
   if(stillCurrent&&!stillCurrent())return;
   container.classList.add('html');
   if(blocked&&!allowRemote&&normalizedSender){
@@ -398,7 +391,26 @@ async function renderHtmlMessage(container,html,sender,stillCurrent){
   frame.setAttribute('sandbox','allow-same-origin allow-popups');
   const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}img{height:auto}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';
   frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">${styles}</head><body>${inertHtml(root)}</body></html>`;
-  frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindFrameNavigationKeys(frame.contentDocument);bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};
+  frame.onload=()=>{
+    try{
+      const doc=frame.contentDocument;
+      const resize=()=>{frame.style.height=`${Math.max(120,doc.documentElement.scrollHeight+8)}px`;};
+      resize();bindFrameNavigationKeys(doc);bindExternalLinks(doc);
+      if(stillCurrent&&!stillCurrent())return;
+      for(const node of doc.querySelectorAll('img[data-mail-image]')){
+        const url=external[Number(node.dataset.mailImage)];
+        node.removeAttribute('data-mail-image');
+        if(!url)continue;
+        window.tm.fetchMailImage(normalizedSender,url).then(data=>{
+          if(!frame.isConnected||(stillCurrent&&!stillCurrent())||!mailRasterData.test(data))return;
+          node.addEventListener('load',resize,{once:true});
+          node.setAttribute('src',data);
+        }).catch(()=>{
+          if(!node.getAttribute('alt'))node.setAttribute('alt',L('Не удалось загрузить изображение','Could not load image'));
+        });
+      }
+    }catch(_){frame.style.height='480px';}
+  };
   container.appendChild(frame);
 }
 // Беседы (threading): по цепочке ответов (thread_id) в пределах аккаунта. Одна

@@ -36,6 +36,7 @@ window.corePageSize = null;
     chooseKeyBackup: (defaultPath) => tauri.dialog.open({ directory: false, multiple: false, defaultPath, filters: [{ name: "truemail key backup", extensions: ["tmkeys"] }] }),
     listAccounts: () => invoke("list_accounts"),
     renameAccount: (accountId, displayName) => invoke("rename_account", { accountId, displayName }),
+    configureAccountDav: (accountId, caldav, carddav) => invoke("configure_account_dav", { accountId, caldav, carddav }),
     setAccountColor: (accountId, color) => invoke("set_account_color", { accountId, color }),
     setAccountRetention: (accountId, days) => invoke("set_account_retention", { accountId, days }),
     setAccountTlsInsecure: (accountId, insecure) => invoke("set_account_tls_insecure", { accountId, insecure }),

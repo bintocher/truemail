@@ -271,8 +271,8 @@ impl Db {
                         .bind(operation_id).execute(&mut *tx).await?;
                 }
                 if let Some(key) = request_key.as_deref() {
-                    sqlx::query("UPDATE send_request_keys SET draft_recorded=1, draft_cleanup_failed=? WHERE request_key=?")
-                        .bind(draft_cleanup_failed).bind(key).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE send_request_keys SET draft_recorded=1, draft_cleanup_failed=? WHERE request_key=? AND account_id=?")
+                        .bind(draft_cleanup_failed).bind(key).bind(account_id).execute(&mut *tx).await?;
                 }
             }
             tx.commit().await?;

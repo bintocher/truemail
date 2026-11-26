@@ -15,11 +15,25 @@ fn public_address(address: IpAddr) -> bool {
                     || (a == 198 && (b == 18 || b == 19))
                     || (a == 192 && b == 0 && c == 0))
         }
-        IpAddr::V6(ip) => ip
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .map_or_else(|| ip.segments()[0] & 0xe000 == 0x2000, public_address),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return public_address(IpAddr::V4(mapped));
+            }
+            let [first, second, ..] = ip.segments();
+            first & 0xe000 == 0x2000
+                && first != 0x2002
+                && !(first == 0x2001 && (second < 0x0200 || second == 0x0db8))
+        }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn image_loading_rejects_ipv6_transition_and_nonpublic_ranges() {
+    for address in ["2002::1", "2001::1", "::ffff:192.0.0.3", "fd00::1", "::1"] {
+        assert!(!public_address(address.parse().unwrap()));
+    }
+    assert!(public_address("2606:4700::1111".parse().unwrap()));
 }
 
 pub async fn fetch_remote_mail_image(value: &str) -> Result<(String, Vec<u8>)> {

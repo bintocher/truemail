@@ -1893,12 +1893,14 @@ impl AccountManager {
         let mut carddav_url = self
             .trusted_saved_dav_base(account, "carddav", account.carddav_url.as_deref())
             .await?;
+        let verify_caldav = caldav_url.is_none() && account.caldav_url.is_some();
+        let verify_carddav = carddav_url.is_none() && account.carddav_url.is_some();
         if account.provider == Provider::Yandex {
             let (cal, card) =
                 dav::resolve_yandex_bases(caldav_url.as_deref(), carddav_url.as_deref());
-            return Ok((Some(cal), Some(card)));
-        }
-        if let Some((_, domain)) = account.email.rsplit_once('@') {
+            caldav_url = Some(cal);
+            carddav_url = Some(card);
+        } else if let Some((_, domain)) = account.email.rsplit_once('@') {
             let origin = format!("https://{domain}");
             if caldav_url.is_none() {
                 caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS).await;
@@ -1913,19 +1915,49 @@ impl AccountManager {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
             }
         }
-        if (caldav_url.is_none() && account.caldav_url.is_some())
-            || (carddav_url.is_none() && account.carddav_url.is_some())
+        if (verify_caldav && caldav_url != account.caldav_url)
+            || (verify_carddav && carddav_url != account.carddav_url)
         {
             return Err(crate::Error::Other(
                 "Не удалось подтвердить сохранённый адрес CalDAV или CardDAV. Проверьте адрес в настройках ящика.".into(),
             ));
         }
-        if caldav_url != account.caldav_url || carddav_url != account.carddav_url {
+        if caldav_url != account.caldav_url
+            || carddav_url != account.carddav_url
+            || verify_caldav
+            || verify_carddav
+        {
             self.db
-                .set_dav_urls(account.id, caldav_url.as_deref(), carddav_url.as_deref())
+                .set_dav_urls(
+                    account.id,
+                    caldav_url.as_deref(),
+                    carddav_url.as_deref(),
+                    Some((
+                        account.caldav_url.as_deref(),
+                        account.carddav_url.as_deref(),
+                    )),
+                )
                 .await?;
         }
         Ok((caldav_url, carddav_url))
+    }
+
+    pub async fn configure_dav_urls(
+        &self,
+        account_id: i64,
+        caldav: Option<&str>,
+        carddav: Option<&str>,
+    ) -> Result<()> {
+        let caldav = caldav.map(crate::service_url::parse).transpose()?;
+        let carddav = carddav.map(crate::service_url::parse).transpose()?;
+        self.db
+            .set_dav_urls(
+                account_id,
+                caldav.as_ref().map(url::Url::as_str),
+                carddav.as_ref().map(url::Url::as_str),
+                None,
+            )
+            .await
     }
 
     async fn trusted_saved_dav_base(

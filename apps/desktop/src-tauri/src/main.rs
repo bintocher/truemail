@@ -521,6 +521,7 @@ fn run() -> anyhow::Result<()> {
             commands::restore_key_backup,
             commands::list_accounts,
             commands::rename_account,
+            commands::configure_account_dav,
             commands::set_account_color,
             commands::set_account_retention,
             commands::set_account_tls_insecure,
