@@ -436,7 +436,7 @@ function expandConversationIds(ids){
 window.expandConversationIds=expandConversationIds;
 let lastListRows=[],lastListTitle='';
 function toggleConversation(key){if(expandedConversations.has(key))expandedConversations.delete(key);else expandedConversations.add(key);renderMessageList(lastListRows,lastListTitle);}
-async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;const destination=mailFolderPathLabel(folder);try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showToast(L(`Письма перемещены в «${destination}»`,`Messages moved to “${destination}”`),L('Отменить','Undo'),()=>undoQueuedMove(queued.operation_ids));}catch(error){showToast(error);}}
+async function moveMessagesByDrop(ids,folder){const unique=[...new Set(ids.map(Number).filter(Number.isFinite))];if(!unique.length||unique.every(id=>messages.find(message=>message.id===id)?.folder_id===folder.id))return;const destination=mailFolderPathLabel(folder);try{const queued=await window.tm.moveMessagesToFolder(unique,folder.id);clearMessageSelection();activeMessage=null;activeFullMessage=null;window.forgetShownLetter?.();window.refreshToolbarForMessage?.();window.forgetMessages?.(unique);await window.reloadCoreData();window.showSkippedMessages?.(queued);showMoveUndoToast(L(`Письма перемещены в «${destination}»`,`Messages moved to “${destination}”`),queued);}catch(error){showToast(error);}}
 // Метки письма в списке (issue #86, specs/message-labels-visible.md). Разбор
 // вынесен в messageLabels: там чистые функции без DOM, их покрывают проверки.
 // Метка "открыта" только когда не открыты папка и умная папка: переход по
@@ -791,8 +791,8 @@ async function showMessage(message){
     if(!stillCurrent())return;
     activeFullMessage=full;body.innerHTML='';const article=document.createElement('article');article.className='mail-content';
     if(draftMessageModel.isDraftMessage(full?.meta,coreFolders)&&window.tm?.draftAlreadySubmitted){
-      window.tm.draftAlreadySubmitted(message.id).then(submitted=>{
-        if(submitted){window.sentDrafts?.add(message.id);window.refreshToolbarForMessage?.();}
+      Promise.resolve(window.tm.draftAlreadySubmitted(message.id)).then(submitted=>{
+        if(submitted===true){window.sentDrafts?.add(message.id);window.refreshToolbarForMessage?.();}
       }).catch(console.error);
     }
     const head=document.createElement('header');head.innerHTML=`<div class="mail-fromline">${L('От:','From:')} <b class="mail-from"></b> <span class="mail-address"></span></div>`;

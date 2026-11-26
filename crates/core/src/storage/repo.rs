@@ -38,6 +38,7 @@ macro_rules! flag_op_changes_flag_sql {
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
+    pub undo_until: Option<String>,
     /// Письма, пропущенные из-за уже стоящей по ним операции увода (S-005).
     pub skipped: usize,
     /// Из них письма, которые прямо сейчас переносятся на сервере (S-006).
@@ -93,6 +94,7 @@ pub struct UndoMoveOutcome {
     pub cancelled: usize,
     pub processing: usize,
     pub completed: usize,
+    pub failed: usize,
 }
 
 /// Результат сохранения календарей/контактов провайдера: счётчики плюс
@@ -1645,13 +1647,14 @@ impl Db {
             return Ok(0);
         }
 
+        let mut tx = self.begin_write().await?;
         let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
             "SELECT m.id, m.remote_id, f.remote_path, m.raw_blob_ref
              FROM messages m JOIN folders f ON f.id=m.folder_id
              WHERE m.account_id=? AND m.remote_id IS NOT NULL",
         )
         .bind(account_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
         let mut delete_rows = Vec::new();
         for (id, remote_id, folder_path, raw_ref) in rows {
@@ -1677,7 +1680,6 @@ impl Db {
             }
         }
 
-        let mut tx = self.begin_write().await?;
         let mut blob_refs = Vec::new();
         for (id, raw_ref) in &delete_rows {
             let attachment_refs: Vec<(Option<String>,)> =
@@ -5056,6 +5058,7 @@ impl Db {
                     .await?;
             queued.account(outcome);
         }
+        queued.undo_until = queued_move_deadline(&mut tx, &queued.operation_ids).await?;
         tx.commit().await?;
         Ok(queued)
     }
@@ -5106,6 +5109,7 @@ impl Db {
                     .await?;
             queued.account(outcome);
         }
+        queued.undo_until = queued_move_deadline(&mut tx, &queued.operation_ids).await?;
         tx.commit().await?;
         Ok(queued)
     }
@@ -5306,6 +5310,7 @@ impl Db {
                     outcome.cancelled += 1;
                 }
                 Some("processing") => outcome.processing += 1,
+                Some("failed") => outcome.failed += 1,
                 _ => outcome.completed += 1,
             }
         }
@@ -7718,6 +7723,19 @@ impl Db {
         }
         Ok(())
     }
+}
+
+async fn queued_move_deadline(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ids: &[i64],
+) -> Result<Option<String>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%SZ',min(next_attempt_at)) FROM outbox_ops WHERE id IN ({})",
+        id_list(ids)
+    ))).fetch_one(&mut **tx).await?)
 }
 
 /// Привести условие умной папки к нынешнему словарю полей и значений.

@@ -317,14 +317,21 @@ function showApiError(error,context={}){return logActivity(errorToastItem(error,
 // переноса с одинаковым текстом дают две отмены, а не одну. Поэтому у него
 // собственный ключ предмета, и склеиваются только сообщения без действия.
 let activityActionSequence=0;
-function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action,key:action?`action-${++activityActionSequence}`:null});}
+function showToast(message,actionLabel,action,actionUntil=null){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action,actionUntil,key:action?`action-${++activityActionSequence}`:null});}
+function showMoveUndoToast(text,queued){
+  const ids=queued?.operation_ids||[];
+  const deadline=Date.parse(queued?.undo_until||'');
+  if(!ids.length)return;
+  showToast(text,L('Отменить','Undo'),()=>undoQueuedMove(ids),Number.isFinite(deadline)?deadline:null);
+}
 async function undoQueuedMove(ids){
   const result=await window.tm.undoMessageAction(ids);
   await window.reloadCoreData();
-  if(!result?.processing&&!result?.completed)return;
+  if(!result?.processing&&!result?.completed&&!result?.failed)return;
   const detail=[];
   if(result.cancelled)detail.push(L(`Отменено: ${result.cancelled}.`,`Cancelled: ${result.cancelled}.`));
   if(result.processing)detail.push(L(`Перенос уже начался: ${result.processing}.`,`Moves already started: ${result.processing}.`));
+  if(result.failed)detail.push(L(`Перенос не выполнен: ${result.failed}.`,`Moves failed: ${result.failed}.`));
   if(result.completed)detail.push(L('Перенос уже завершён. Откройте папку назначения и переместите письмо обратно.','The move has already finished. Open the destination and move the message back.'));
   throw new Error(detail.join(' '));
 }
@@ -439,7 +446,7 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
     // Письмо, по которому уже стоит незавершённая операция увода, пропущено
     // ограничением очереди (S-005) - об этом честно говорим вместе с причиной.
     showSkippedMessages(queued);
-    showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),()=>undoQueuedMove(queued.operation_ids));}catch(error){showToast(error);}}
+    showMoveUndoToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),queued);}catch(error){showToast(error);}}
 window.performMessageActionForIds=performMessageActionForIds;
 /* Пропуски называются причиной: занятое письмо, письмо с отказавшей операцией и
    письмо без единственной папки нужного типа - разные беды (S-005, S-006,
@@ -1217,7 +1224,7 @@ window.restoreDraftLink=messageId=>{
       // The link comes back only while the letter is still a draft.
       if(draftMessageModel.isDraftMessage(full?.meta,coreFolders))link=messageId;
     }catch(error){link=null;}
-    if(window.tm?.draftAlreadySubmitted&&await window.tm.draftAlreadySubmitted(messageId).catch(()=>false)){
+    if(window.tm?.draftAlreadySubmitted&&(await Promise.resolve(window.tm.draftAlreadySubmitted(messageId)).catch(()=>false))===true){
       if(generation===composerGeneration){resetComposer();clearSavedLetter();showToast(L('Этот черновик уже поставлен в очередь отправки','This draft has already been queued for sending'));}
       return;
     }
