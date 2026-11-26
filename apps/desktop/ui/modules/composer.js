@@ -866,6 +866,7 @@ async function restoreUndoWindows(){
   if(!window.tm?.startupSendState)return;
   const state=await window.tm.startupSendState();
   const lang=composerLang();
+  if((state.pending||[]).some(queued=>queued.draft_cleanup_failed))showDraftCleanupWarning();
   (state.pending||[]).forEach(queued=>{
     // Тема и адресаты ожидающего письма в список не передаются: карточка
     // показывает то, что уже известно очереди.
@@ -1141,11 +1142,17 @@ async function discardSentDraft(messageId){
 // stayed in its folder must not be sent a second time.
 const sentDrafts=new Set();
 window.sentDrafts=sentDrafts;
+window.draftSubmissionGeneration=0;
+function showDraftCleanupWarning(){
+  showToast(L('Не удалось запланировать перенос исходного черновика в корзину. После отправки его можно удалить вручную.',
+    'The original draft could not be scheduled for Trash. You can remove it manually after sending.'));
+}
 function draftQueued(messageId,recorded=false,cleanupFailed=false){
+  window.draftSubmissionGeneration++;
   sentDrafts.add(messageId);
   forgetSentDraft(messageId);
   if(!recorded)discardSentDraft(messageId);
-  else if(cleanupFailed)showToast(L('Письмо в очереди. Исходный черновик остался в папке.','The message is queued. The original draft remains in its folder.'));
+  else if(cleanupFailed)showDraftCleanupWarning();
 }
 // Drafts that are being read for sending right now.
 const draftsInFlight=new Set();

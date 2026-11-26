@@ -96,6 +96,61 @@ async fn a_submitted_draft_keeps_its_send_and_cleanup_in_the_same_transaction() 
     db.close().await;
 }
 
+#[tokio::test]
+async fn draft_cleanup_warning_survives_a_repeat_request_after_operation_removal() {
+    let db = open_test_db("draft-cleanup-warning").await;
+    let account = seed_account(&db, "draft@example.test").await;
+    let folder: i64 = sqlx::query_scalar(
+        "INSERT INTO folders(account_id,remote_path,display_name,role)
+         VALUES(?,'Drafts','Drafts','drafts') RETURNING id",
+    )
+    .bind(account)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    let reference = db.blobs.put(b"Subject: test\r\n\r\nDraft body").unwrap();
+    let draft: i64 = sqlx::query_scalar(
+        "INSERT INTO messages(account_id,folder_id,uid,draft,raw_blob_ref,body_fetched)
+         VALUES(?,?,1,1,?,1) RETURNING id",
+    )
+    .bind(account)
+    .bind(folder)
+    .bind(reference)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    let queued = db
+        .queue_draft_send(
+            account,
+            letter("draft@example.test"),
+            Some("draft-send".into()),
+            draft,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(queued.draft_cleanup_failed);
+    assert!(db.startup_send_state().await.unwrap().pending[0].draft_cleanup_failed);
+    sqlx::query("DELETE FROM outbox_ops WHERE id=?")
+        .bind(queued.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let again = db
+        .queue_draft_send(
+            account,
+            letter("draft@example.test"),
+            Some("draft-send".into()),
+            draft,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(again.duplicate && again.draft_recorded && again.draft_cleanup_failed);
+    assert!(db.draft_already_submitted(draft).await.unwrap());
+    db.close().await;
+}
+
 fn letter(from: &str) -> OutgoingMessage {
     OutgoingMessage {
         from: from.to_owned(),

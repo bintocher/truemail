@@ -255,12 +255,24 @@ impl Db {
                 if let Some((target_id,path))=resolve_role_folder(&mut tx,source.account_id,"trash").await? {
                     let message=TakeawayMessage { id, account_id:source.account_id,folder_id:source.folder_id,
                         uid:source.uid,remote_path:source.remote_path,remote_id:source.remote_id };
-                    if let TakeawayOutcome::Queued(cleanup)=queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
+                    match queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
                         TakeawayActor::Stage,None,0).await? {
-                        sqlx::query("UPDATE draft_submissions SET cleanup_operation_id=? WHERE operation_id=?")
-                            .bind(cleanup).bind(operation_id).execute(&mut *tx).await?;
-                        draft_cleanup_failed=false;
+                        TakeawayOutcome::Queued(cleanup) => {
+                            sqlx::query("UPDATE draft_submissions SET cleanup_operation_id=? WHERE operation_id=?")
+                                .bind(cleanup).bind(operation_id).execute(&mut *tx).await?;
+                            draft_cleanup_failed=false;
+                        }
+                        TakeawayOutcome::Unchanged => draft_cleanup_failed=false,
+                        _ => {}
                     }
+                }
+                if draft_cleanup_failed {
+                    sqlx::query("UPDATE draft_submissions SET cleanup_failed=1 WHERE operation_id=?")
+                        .bind(operation_id).execute(&mut *tx).await?;
+                }
+                if let Some(key) = request_key.as_deref() {
+                    sqlx::query("UPDATE send_request_keys SET draft_recorded=1, draft_cleanup_failed=? WHERE request_key=?")
+                        .bind(draft_cleanup_failed).bind(key).execute(&mut *tx).await?;
                 }
             }
             tx.commit().await?;
@@ -304,11 +316,12 @@ impl Db {
         account_id: i64,
         request_key: &str,
     ) -> Result<Option<SendQueued>> {
-        let row: Option<(i64, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        let row: Option<(i64, Option<String>, Option<String>, bool, bool)> = sqlx::query_as(
             "SELECT k.operation_id, k.cancel_until, o.status,
-                    EXISTS(SELECT 1 FROM draft_submissions WHERE operation_id=k.operation_id)
+                    k.draft_recorded, k.draft_cleanup_failed
                FROM send_request_keys k
-               LEFT JOIN outbox_ops o ON o.id = k.operation_id
+               LEFT JOIN outbox_ops o ON o.id=k.operation_id AND o.account_id=k.account_id
+                    AND o.op_kind='send' AND o.request_key=k.request_key
               WHERE k.request_key=? AND k.account_id=?",
         )
         .bind(request_key)
@@ -316,15 +329,17 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
-            |(operation_id, cancel_until, status, draft_recorded)| SendQueued {
-                operation_id,
-                account_id,
-                status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
-                cancel_until: cancel_until.unwrap_or_default(),
-                undo_seconds: 0,
-                duplicate: true,
-                draft_recorded,
-                draft_cleanup_failed: false,
+            |(operation_id, cancel_until, status, draft_recorded, draft_cleanup_failed)| {
+                SendQueued {
+                    operation_id,
+                    account_id,
+                    status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
+                    cancel_until: cancel_until.unwrap_or_default(),
+                    undo_seconds: 0,
+                    duplicate: true,
+                    draft_recorded,
+                    draft_cleanup_failed,
+                }
             },
         ))
     }
@@ -784,12 +799,14 @@ impl Db {
         .unwrap_or((0, 0));
         // Незакончившиеся окна отмены восстанавливаются карточкой с фактически
         // оставшимся временем (S-034).
-        let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
-            "SELECT id, account_id, status, cancel_until
-               FROM outbox_ops
-              WHERE op_kind='send' AND status='pending' AND send_origin='ordinary'
-                AND cancel_until > datetime('now')
-              ORDER BY cancel_until",
+        let rows: Vec<(i64, i64, String, String, bool, bool)> = sqlx::query_as(
+            "SELECT o.id, o.account_id, o.status, o.cancel_until,
+                    d.draft_id IS NOT NULL, coalesce(d.cleanup_failed,0)
+               FROM outbox_ops o
+               LEFT JOIN draft_submissions d ON d.operation_id=o.id
+              WHERE o.op_kind='send' AND o.status='pending' AND o.send_origin='ordinary'
+                AND o.cancel_until > datetime('now')
+              ORDER BY o.cancel_until",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -799,15 +816,22 @@ impl Db {
             pending: rows
                 .into_iter()
                 .map(
-                    |(operation_id, account_id, status, cancel_until)| SendQueued {
+                    |(
+                        operation_id,
+                        account_id,
+                        status,
+                        cancel_until,
+                        draft_recorded,
+                        draft_cleanup_failed,
+                    )| SendQueued {
                         operation_id,
                         account_id,
                         status,
                         cancel_until,
                         undo_seconds: 0,
                         duplicate: false,
-                        draft_recorded: false,
-                        draft_cleanup_failed: false,
+                        draft_recorded,
+                        draft_cleanup_failed,
                     },
                 )
                 .collect(),

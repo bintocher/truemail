@@ -792,7 +792,9 @@ async function showMessage(message){
     if(!stillCurrent())return;
     activeFullMessage=full;body.innerHTML='';const article=document.createElement('article');article.className='mail-content';
     if(draftMessageModel.isDraftMessage(full?.meta,coreFolders)&&window.tm?.draftAlreadySubmitted){
+      const submissionGeneration=window.draftSubmissionGeneration;
       Promise.resolve(window.tm.draftAlreadySubmitted(message.id)).then(submitted=>{
+        if(!stillCurrent()||submissionGeneration!==window.draftSubmissionGeneration)return;
         if(submitted===true){window.sentDrafts?.add(message.id);window.refreshToolbarForMessage?.();}
         if(submitted===false){window.sentDrafts?.delete(message.id);window.refreshToolbarForMessage?.();}
       }).catch(console.error);
