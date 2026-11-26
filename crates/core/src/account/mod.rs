@@ -1498,6 +1498,16 @@ impl AccountManager {
     /// Дозагрузить только последние входящие и отдельно посчитать действительно
     /// новые письма. Exchange использует этот результат для watchdog-уведомлений.
     pub async fn sync_mail_inbox_delta(&self, account: &Account) -> Result<InboxSyncResult> {
+        self.sync_registry
+            .exclusive(
+                account.id,
+                SyncKind::Mail,
+                self.sync_mail_inbox_delta_inner(account),
+            )
+            .await
+    }
+
+    async fn sync_mail_inbox_delta_inner(&self, account: &Account) -> Result<InboxSyncResult> {
         let access_token = self.mail_credential(account).await?;
         let backend = Self::mail_backend(account)?;
         let cursors = self.db.folder_sync_cursors(account.id).await?;

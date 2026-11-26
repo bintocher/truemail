@@ -1193,7 +1193,7 @@ impl Db {
             }
             let id: i64 = sqlx::query_scalar(
                 "INSERT INTO folders(account_id, remote_path, display_name, role, unread_count,
-                                     total_count, uidvalidity, uidnext, highestmodseq)
+                                     total_count, pending_uidvalidity, uidnext, highestmodseq)
                  VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, remote_path) DO UPDATE SET
                     display_name = excluded.display_name,
@@ -1201,11 +1201,10 @@ impl Db {
                            THEN NULL ELSE coalesce(excluded.role, folders.role) END,
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
-                    sync_token = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
-                        THEN NULL ELSE folders.sync_token END,
-                    highestmodseq = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
-                        THEN NULL ELSE folders.highestmodseq END,
-                    uidvalidity = coalesce(excluded.uidvalidity, folders.uidvalidity),
+                    pending_uidvalidity = CASE WHEN excluded.pending_uidvalidity IS NULL
+                        THEN folders.pending_uidvalidity
+                        WHEN excluded.pending_uidvalidity IS NOT folders.uidvalidity
+                        THEN excluded.pending_uidvalidity END,
                     uidnext = coalesce(excluded.uidnext, folders.uidnext),
                     last_synced = datetime('now')
                  RETURNING id",
@@ -1501,11 +1500,16 @@ impl Db {
             let Some(sync_token) = folder.sync_token.as_deref() else {
                 continue;
             };
-            sqlx::query(
+            let saved = sqlx::query(
                 "UPDATE folders SET sync_token=?, uidvalidity=coalesce(?, uidvalidity),
+                    pending_uidvalidity=NULL,
                     uidnext=coalesce(?, uidnext),
                     highestmodseq=coalesce(?, highestmodseq), last_synced=datetime('now')
-                 WHERE account_id=? AND remote_path=?",
+                 WHERE account_id=? AND remote_path=?
+                   AND (pending_uidvalidity IS NULL OR (
+                     pending_uidvalidity=? AND NOT EXISTS(SELECT 1 FROM messages m
+                      WHERE m.folder_id=folders.id AND m.imap_uidvalidity IS NOT folders.pending_uidvalidity)
+                   ))",
             )
             .bind(sync_token)
             .bind(folder.uidvalidity.map(i64::from))
@@ -1517,8 +1521,12 @@ impl Db {
             )
             .bind(account_id)
             .bind(&folder.remote_path)
+            .bind(folder.uidvalidity.map(i64::from))
             .execute(&mut *tx)
             .await?;
+            if saved.rows_affected() == 0 {
+                return Err(crate::Error::ImapMessageIdentityChanged);
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -1530,11 +1538,13 @@ impl Db {
     ) -> Result<std::collections::HashMap<String, crate::backend::FolderSyncCursor>> {
         let rows: Vec<FolderCursorRow> = sqlx::query_as(
             "SELECT f.remote_path, f.uidvalidity, min(m.uid), max(m.uid),
-                    f.highestmodseq, f.sync_token
+                    CASE WHEN f.pending_uidvalidity IS NULL THEN f.highestmodseq END,
+                    CASE WHEN f.pending_uidvalidity IS NULL THEN f.sync_token END
              FROM folders f LEFT JOIN messages m ON m.folder_id=f.id
+                 AND f.pending_uidvalidity IS NULL
                  AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              WHERE f.account_id=?
-             GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token",
+             GROUP BY f.id, f.remote_path, f.uidvalidity, f.highestmodseq, f.sync_token, f.pending_uidvalidity",
         )
         .bind(account_id)
         .fetch_all(&self.pool)
@@ -1561,7 +1571,7 @@ impl Db {
         let known_uid_rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT f.remote_path, m.uid
              FROM messages m JOIN folders f ON f.id=m.folder_id
-             WHERE f.account_id=?
+             WHERE f.account_id=? AND f.pending_uidvalidity IS NULL
                AND (m.imap_uidvalidity IS NULL OR f.uidvalidity IS NULL OR m.imap_uidvalidity=f.uidvalidity)
              ORDER BY f.remote_path, m.uid",
         )
@@ -1713,8 +1723,9 @@ impl Db {
         for (path, server_uids) in snapshots {
             let rows: Vec<(i64, i64, Option<String>, bool)> = sqlx::query_as(
                 "SELECT m.id, m.uid, m.raw_blob_ref,
-                        m.imap_uidvalidity IS NOT NULL AND f.uidvalidity IS NOT NULL
-                        AND m.imap_uidvalidity<>f.uidvalidity FROM messages m
+                        COALESCE(f.pending_uidvalidity,f.uidvalidity) IS NOT NULL
+                        AND (f.pending_uidvalidity IS NOT NULL OR m.imap_uidvalidity IS NOT NULL)
+                        AND m.imap_uidvalidity IS NOT COALESCE(f.pending_uidvalidity,f.uidvalidity) FROM messages m
                  JOIN folders f ON f.id=m.folder_id
                  WHERE m.account_id=? AND f.remote_path=?",
             )
@@ -2802,7 +2813,7 @@ impl Db {
                 ) in batch
                 {
                 let folder: Option<(i64, Option<i64>)> = sqlx::query_as(
-                    "SELECT id, uidvalidity FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
+                    "SELECT id, coalesce(pending_uidvalidity,uidvalidity) FROM folders WHERE account_id = ? AND remote_path = ? LIMIT 1",
                 )
                 .bind(account_id)
                 .bind(&source.folder_path)

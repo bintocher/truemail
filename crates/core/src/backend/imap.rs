@@ -1067,11 +1067,8 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
                     .map_err(imap_outbox_error)?;
             } else {
                 require_uid_expunge(&capabilities)?;
-                session
-                    .uid_copy(uid.to_string(), target)
-                    .await
-                    .map_err(imap_outbox_error)?;
-                mark_deleted(&mut session, uid).await?;
+                copy_once_then_delete(&mut session, folder, target, uid, mailbox.uid_validity)
+                    .await?;
             }
         }
         "delete" => {
@@ -1087,6 +1084,78 @@ async fn apply_operation(mut session: OAuthSession, op_kind: &str, payload: &str
     }
     let _ = session.logout().await;
     Ok(())
+}
+
+async fn copy_once_then_delete(
+    session: &mut OAuthSession,
+    source: &str,
+    target: &str,
+    uid: u32,
+    generation: Option<u32>,
+) -> Result<()> {
+    if source == target
+        || (source.eq_ignore_ascii_case("INBOX") && target.eq_ignore_ascii_case("INBOX"))
+    {
+        return Ok(());
+    }
+    let original = uid_body(session, uid)
+        .await?
+        .ok_or(Error::ImapMessageIdentityChanged)?;
+    let message_id = mime_message_id(&original).ok_or_else(|| {
+        Error::AccountConfig(
+            "Сервер не поддерживает перенос, а у письма нет идентификатора для проверки копии"
+                .into(),
+        )
+    })?;
+    if message_id.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
+    let search = message_id.replace('\\', "\\\\").replace('"', "\\\"");
+    session.examine(target).await.map_err(imap_outbox_error)?;
+    let ids = session
+        .uid_search(format!("HEADER Message-ID \"{search}\""))
+        .await
+        .map_err(imap_outbox_error)?;
+    let mut copied = false;
+    for candidate in ids {
+        if uid_body(session, candidate).await?.as_deref() == Some(original.as_slice()) {
+            copied = true;
+            break;
+        }
+    }
+    let current = session.select(source).await.map_err(imap_outbox_error)?;
+    if generation.is_none()
+        || current.uid_validity != generation
+        || !session
+            .uid_search(format!("UID {uid}"))
+            .await
+            .map_err(imap_outbox_error)?
+            .contains(&uid)
+    {
+        return Err(Error::ImapMessageIdentityChanged);
+    }
+    if !copied {
+        session
+            .uid_copy(uid.to_string(), target)
+            .await
+            .map_err(imap_outbox_error)?;
+    }
+    mark_deleted(session, uid).await
+}
+
+async fn uid_body(session: &mut OAuthSession, uid: u32) -> Result<Option<Vec<u8>>> {
+    let fetched = session
+        .uid_fetch(uid.to_string(), "(UID BODY.PEEK[])")
+        .await
+        .map_err(imap_outbox_error)?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(imap_outbox_error)?;
+    Ok(fetched
+        .iter()
+        .find(|message| message.uid == Some(uid))
+        .and_then(|message| message.body())
+        .map(<[u8]>::to_vec))
 }
 
 pub async fn apply_yandex_operation(
