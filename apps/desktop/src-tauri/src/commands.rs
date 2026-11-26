@@ -3595,6 +3595,22 @@ async fn claim_auxiliary_creation(
         return Err(api_error("Неверный номер запроса на создание"));
     }
     let mut tx = core.db.begin_write().await?;
+    let similar_pending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM auxiliary_create_requests
+         WHERE account_id=? AND kind=? AND request_signature=? AND saved=0 AND request_key<>?)",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(signature)
+    .bind(key)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    if similar_pending {
+        return Err(api_error(
+            "Такая запись уже сохранялась, но сервер не подтвердил результат. Обновите список и проверьте, появилась ли запись",
+        ));
+    }
     let insert = sqlx::query(
         "INSERT OR IGNORE INTO auxiliary_create_requests(account_id,kind,request_key,request_signature)
             VALUES(?,?,?,?)",
