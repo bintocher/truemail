@@ -282,51 +282,118 @@ function bindExternalLinks(scope){
   });
 }
 
-/* Проверка href/src/xlink:href на опасность (замена дырявой регулярки, которая ловила только
-   "data:text/html:" с двоеточием после mime, хотя реальные data-URI используют ";" или ",").
-   Перед проверкой нормализуем значение: декодируем HTML-entity (числовые "&#106;" и именованные
-   "&amp;"), убираем управляющие символы и пробелы по всей строке (не только в начале) - иначе
-   "java\tscript:" и "&#106;avascript:" браузер схлопнет и выполнит, а наша проверка их пропустит.
-   data: разрешаем только для картиночных mime-типов: repo.rs инлайнит вложения как
-   data:<mime>;base64,... прямо из письма без белого списка, и вредоносное вложение может прийти
-   с mime "text/html" - это должно быть отловлено именно здесь. */
-function isDangerousUrl(value){
-  let s=String(value||'');
-  s=s.replace(/&#x([0-9a-f]+);?/gi,(_,hex)=>String.fromCodePoint(parseInt(hex,16)))
-     .replace(/&#(\d+);?/g,(_,dec)=>String.fromCodePoint(parseInt(dec,10)))
-     .replace(/&amp;/gi,'&');
-  s=s.replace(/[\x00-\x20\x7f]+/g,'').toLowerCase();
-  const schemeMatch=s.match(/^([a-z][a-z0-9+.-]*):/);
-  if(!schemeMatch)return false;
-  const scheme=schemeMatch[1];
-  if(['javascript','vbscript','file','blob'].includes(scheme))return true;
-  if(scheme==='data'){
-    // Белый список, а не черный: единственный легитимный data: в письме - инлайн-вложение
-    // картинки (repo.rs собирает data:<mime>;base64). Все остальное (text/html, svg с скриптами,
-    // xml с XSLT, pdf) браузер может трактовать как активный документ, поэтому отсекаем по умолчанию.
-    const rest=s.slice(scheme.length+1);
-    const mime=rest.split(',')[0].split(';')[0];
-    return !['image/png','image/jpeg','image/jpg','image/gif','image/webp','image/bmp','image/x-icon','image/vnd.microsoft.icon','image/avif','image/tiff'].includes(mime);
-  }
-  return false;
+const mailHtmlTags=new Set('a abbr b bdi bdo blockquote br caption center code col colgroup dd del div dl dt em font h1 h2 h3 h4 h5 h6 hr i img ins li mark ol p pre q s small span strong sub sup table tbody td tfoot th thead tr tt u ul wbr'.split(' '));
+const mailHtmlDrop=new Set('script style link meta base svg math iframe object embed form input button select textarea audio video image template title'.split(' '));
+const mailHtmlAttrs=new Set('alt title width height colspan rowspan align valign dir lang face color size cellspacing cellpadding border'.split(' '));
+const mailRasterData=/^data:image\/(?:png|jpe?g|gif|webp|bmp|avif|tiff|x-icon|vnd\.microsoft\.icon);base64,[a-z0-9+/=\s]+$/i;
+
+function mailWebUrl(value){
+  const address=String(value||'').trim().replace(/[\t\r\n]/g,'');
+  try{
+    const url=new URL(address.startsWith('//')?'https:'+address:address);
+    return /^https?:$/.test(url.protocol)&&!url.username&&!url.password?url:null;
+  }catch(_){return null;}
 }
-// stillCurrent - проверка актуальности показа: тяжёлое письмо с картинками ждёт
-// ещё и ответа о доверии отправителю и дорисовывается заметно позже лёгкого,
-// выбранного следом (S-002).
+
 async function renderHtmlMessage(container,html,sender,stillCurrent){
   const normalizedSender=String(sender||'').trim().toLocaleLowerCase();
   const allowRemote=Boolean(normalizedSender)&&await window.tm?.imageSenderTrusted(normalizedSender).catch(()=>false);
   if(stillCurrent&&!stillCurrent())return;
-  const parsed=new DOMParser().parseFromString(html,'text/html');
-  parsed.querySelectorAll('script,iframe,object,embed,form,input,button,textarea,select,base,link,meta,audio,video').forEach(node=>node.remove());
+  const root=parseInert(html);
   let blocked=false;
-  parsed.querySelectorAll('style').forEach(node=>{node.textContent=node.textContent.replace(/url\(\s*(['"]?)https?:[^)]*\)/gi,'none');});
-  parsed.querySelectorAll('*').forEach(node=>{[...node.attributes].forEach(attr=>{const name=attr.name.toLowerCase(),value=attr.value.trim();if(name.startsWith('on')||['srcdoc','formaction','integrity','nonce'].includes(name)||((name==='href'||name==='src'||name==='xlink:href')&&isDangerousUrl(value)))node.removeAttribute(attr.name);else if(name==='style')node.setAttribute('style',value.replace(/url\(\s*(['"]?)https?:[^)]*\)/gi,'none'));});});
-  parsed.querySelectorAll('a').forEach(link=>{link.target='_blank';link.rel='noopener noreferrer';try{const url=new URL(link.href);[...url.searchParams.keys()].filter(key=>key.toLowerCase().startsWith('utm_')||['fbclid','gclid'].includes(key.toLowerCase())).forEach(key=>url.searchParams.delete(key));link.href=url.toString();}catch(_){}});
-  parsed.querySelectorAll('img,source').forEach(image=>{const src=image.getAttribute('src')||image.getAttribute('srcset')||'';if(/^https?:/i.test(src)&&!allowRemote){blocked=true;image.removeAttribute('src');image.removeAttribute('srcset');image.setAttribute('alt',image.getAttribute('alt')||L('Удалённое изображение заблокировано','Remote image blocked'));}image.setAttribute('loading','lazy');image.setAttribute('referrerpolicy','no-referrer');image.style.maxWidth='100%';image.style.height='auto';});
+  const external=[];
+  function sanitize(parent){
+    for(const node of [...(parent.children||[])]){
+      const tag=String(node.tagName).toLowerCase();
+      if(mailHtmlDrop.has(tag)){
+        if(tag==='svg'||(tag==='style'&&/url\s*\(/i.test(node.textContent)))blocked=true;
+        node.remove();
+        continue;
+      }
+      if(!mailHtmlTags.has(tag)){
+        sanitize(node);
+        while(node.firstChild)node.before(node.firstChild);
+        node.remove();
+        continue;
+      }
+      const src=node.getAttribute('src')||'';
+      const srcset=node.getAttribute('srcset')||'';
+      const href=node.getAttribute('href')||'';
+      for(const rawName of attributeNames(node)){
+        const name=rawName.toLowerCase();
+        if(name==='background')blocked=true;
+        if(name==='style'){
+          const value=node.getAttribute(rawName);
+          if(/url\s*\(/i.test(value))blocked=true;
+          const style=safeStyle(value);
+          if(style)node.setAttribute('style',style);
+          else node.removeAttribute(rawName);
+        }else if(!mailHtmlAttrs.has(name)){
+          node.removeAttribute(rawName);
+        }
+      }
+      if(tag==='a'){
+        const link=mailWebUrl(href);
+        if(link){
+          for(const key of [...link.searchParams.keys()]){
+            if(key.toLowerCase().startsWith('utm_')||['fbclid','gclid'].includes(key.toLowerCase()))link.searchParams.delete(key);
+          }
+          node.setAttribute('href',link.toString());
+          node.setAttribute('target','_blank');
+          node.setAttribute('rel','noopener noreferrer');
+        }else if(/^mailto:[^\x00-\x20]+$/i.test(href)){
+          node.setAttribute('href',href);
+        }
+      }
+      if(tag==='img'){
+        if(mailRasterData.test(src))node.setAttribute('src',src);
+        else {
+          const address=mailWebUrl(src)||mailWebUrl(srcset.trim().split(/\s+|,/)[0]);
+          if(address&&allowRemote&&window.tm?.fetchMailImage&&external.length<12){
+            external.push([node,address.toString()]);
+          }else if(src||srcset){
+            blocked=true;
+            if(!node.getAttribute('alt'))node.setAttribute('alt',L('Внешнее изображение заблокировано','Remote image blocked'));
+          }
+        }
+        if(srcset&&!allowRemote)blocked=true;
+      }
+      sanitize(node);
+    }
+  }
+  sanitize(root);
+  await Promise.all(external.map(async ([node,url])=>{
+    try{
+      const data=await window.tm.fetchMailImage(normalizedSender,url);
+      if(mailRasterData.test(data))node.setAttribute('src',data);
+    }catch(_){
+      if(!node.getAttribute('alt'))node.setAttribute('alt',L('Не удалось загрузить изображение','Could not load image'));
+    }
+  }));
+  if(stillCurrent&&!stillCurrent())return;
   container.classList.add('html');
-  if(blocked){const notice=document.createElement('div');notice.className='blocked';const text=document.createElement('span');text.textContent=L('Удалённые изображения заблокированы для защиты от отслеживания.','Remote images are blocked to prevent tracking.');const button=document.createElement('button');button.type='button';button.textContent=L(`Показывать от ${sender}`,`Always show from ${sender}`);button.onclick=async()=>{await window.tm?.setImageSenderTrusted(normalizedSender,true);container.replaceChildren();await renderHtmlMessage(container,html,sender,stillCurrent);};notice.append(text,button);container.appendChild(notice);}
-  const frame=document.createElement('iframe');frame.className='mail-html-frame';frame.title=L('Содержимое HTML-письма','HTML message content');frame.setAttribute('sandbox','allow-same-origin allow-popups');const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><base target="_blank">${styles}${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindFrameNavigationKeys(frame.contentDocument);bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};container.appendChild(frame);
+  if(blocked&&!allowRemote&&normalizedSender){
+    const notice=document.createElement('div');notice.className='blocked';
+    const text=document.createElement('span');text.textContent=L('Внешние изображения заблокированы для защиты от отслеживания.','Remote images are blocked to prevent tracking.');
+    const button=document.createElement('button');button.type='button';button.textContent=L('Показывать изображения этого отправителя','Always show images from this sender');
+    button.onclick=async()=>{
+      button.disabled=true;
+      try{
+        await window.tm.setImageSenderTrusted(normalizedSender,true);
+        if(stillCurrent&&!stillCurrent())return;
+        container.replaceChildren();await renderHtmlMessage(container,html,sender,stillCurrent);
+      }catch(error){showToast(error);button.disabled=false;}
+    };
+    notice.append(text,button);container.appendChild(notice);
+  }
+  const frame=document.createElement('iframe');
+  frame.className='mail-html-frame';
+  frame.title=L('Содержимое HTML-письма','HTML message content');
+  frame.setAttribute('sandbox','allow-same-origin allow-popups');
+  const styles='<style>html,body{margin:0;padding:0;max-width:100%;overflow-wrap:anywhere;color:#17181c;font:14px/1.55 Arial,sans-serif}*{box-sizing:border-box}img,table{max-width:100%}img{height:auto}a{color:#4b52c0}pre{white-space:pre-wrap}</style>';
+  frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">${styles}</head><body>${inertHtml(root)}</body></html>`;
+  frame.onload=()=>{try{frame.style.height=`${Math.max(120,frame.contentDocument.documentElement.scrollHeight+8)}px`;bindFrameNavigationKeys(frame.contentDocument);bindExternalLinks(frame.contentDocument);}catch(_){frame.style.height='480px';}};
+  container.appendChild(frame);
 }
 // Беседы (threading): по цепочке ответов (thread_id) в пределах аккаунта. Одна
 // строка на беседу со счётчиком, разворот показывает письма.
@@ -718,6 +785,11 @@ async function showMessage(message){
     // шапки, ни activeFullMessage от устаревшего запроса на экране быть не должно.
     if(!stillCurrent())return;
     activeFullMessage=full;body.innerHTML='';const article=document.createElement('article');article.className='mail-content';
+    if(draftMessageModel.isDraftMessage(full?.meta,coreFolders)&&window.tm?.draftAlreadySubmitted){
+      window.tm.draftAlreadySubmitted(message.id).then(submitted=>{
+        if(submitted){window.sentDrafts?.add(message.id);window.refreshToolbarForMessage?.();}
+      }).catch(console.error);
+    }
     const head=document.createElement('header');head.innerHTML=`<div class="mail-fromline">${L('От:','From:')} <b class="mail-from"></b> <span class="mail-address"></span></div>`;
     const fromName=full.meta.from?.name||'',fromEmail=full.meta.from?.email||'';
     head.querySelector('.mail-from').textContent=fromName||fromEmail;

@@ -664,11 +664,8 @@ fn replace_dav_event(original: &str, uid: &str, input: &EventInput) -> Result<St
                     }
                 }
             }
-            "END:VCALENDAR" => {
-                if calendar_end.replace(offset).is_some() {
-                    return Err(invalid());
-                }
-            }
+            "END:VCALENDAR" if calendar_end.is_some() => return Err(invalid()),
+            "END:VCALENDAR" => calendar_end = Some(offset),
             _ => {}
         }
         offset = end;

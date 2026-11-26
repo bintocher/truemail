@@ -1063,8 +1063,8 @@ async function readDraftLetterParts(full){
   }
   return {request,problem:null};
 }
-async function queueLetter(request){
-  const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+async function queueLetter(request,draftId=null){
+  const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`,draftId);
   showUndoSendCard(queued,request);
 }
 function showDraftComposer(hint){
@@ -1136,7 +1136,7 @@ window.sentDrafts=sentDrafts;
 function draftQueued(messageId){
   sentDrafts.add(messageId);
   forgetSentDraft(messageId);
-  discardSentDraft(messageId);
+  if(!window.tm?.draftAlreadySubmitted)discardSentDraft(messageId);
 }
 // Drafts that are being read for sending right now.
 const draftsInFlight=new Set();
@@ -1187,7 +1187,7 @@ async function sendDraftMessage(message=activeMessage){
       // A hidden copy alone is not enough to send in one click: the user sees no addressee on the letter.
       ||(!letter.request.to.length&&!letter.request.cc.length?L('Укажите получателя в поле "Кому" и отправьте письмо','Add a recipient to To and send the letter'):null);
     if(!problem){
-      try{await queueLetter(letter.request);}
+      try{await queueLetter(letter.request,message.id);}
       catch(error){
         // A letter the core refuses to take (an address, the size) is finished in
         // the editor; any other refusal is only reported, the draft stays untouched.
@@ -1209,6 +1209,10 @@ let draftLinkCheck=null;
 window.restoreDraftLink=messageId=>{
   const generation=composerGeneration;
   const check=(async()=>{
+    if(await window.tm?.draftAlreadySubmitted?.(messageId).catch(()=>false)){
+      if(generation===composerGeneration){resetComposer();clearSavedLetter();showToast(L('Этот черновик уже поставлен в очередь отправки','This draft has already been queued for sending'));}
+      return;
+    }
     let link=null;
     try{
       const full=await window.tm.getMessage(messageId);
@@ -1258,7 +1262,7 @@ document.getElementById('compSend').onclick=async()=>{
   const sentDraft=draftBeingSent;
   let queued;
   handingOverGeneration=generation;
-  try{queued=await window.tm.sendMessage(request,composerRequestKey);}
+  try{queued=await window.tm.sendMessage(request,composerRequestKey,sentDraft);}
   catch(error){
     // S-003: письмо не принято - композер и черновик остаются нетронутыми.
     showToast(error);return;
@@ -1290,7 +1294,7 @@ document.getElementById('compSendLater').onclick=async()=>{
       const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));
       // The draft of this letter is captured before the wait: another letter may take the editor.
       const sentDraft=draftBeingSent;
-      const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString());
+      const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString(),sentDraft);
       // Taken by the queue: its draft leaves the folder at once.
       if(sentDraft!==null)draftQueued(sentDraft);
       if(generation===composerGeneration){

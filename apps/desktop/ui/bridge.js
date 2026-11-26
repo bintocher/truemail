@@ -165,8 +165,9 @@ window.corePageSize = null;
     startRealtime: () => invoke("start_realtime"),
     // Ключ запроса отправки: повторное нажатие "Отправить" узнаётся по нему и
     // второй операции не создаёт (specs/undo-send.md, S-053).
-    sendMessage: (request, requestKey) => invoke("send_message", { request, requestKey }),
-    scheduleMessage: (request, sendAt) => invoke("schedule_message", { request, sendAt }),
+    sendMessage: (request, requestKey, draftId) => invoke("send_message", { request, requestKey, draftId }),
+    scheduleMessage: (request, sendAt, draftId) => invoke("schedule_message", { request, sendAt, draftId }),
+    draftAlreadySubmitted: draftId => invoke("draft_already_submitted", { draftId }),
     markSeen: (messageId, seen) => invoke("mark_seen", { messageId, seen }),
     markFlagged: (messageIds, flagged, reason = "user") => invoke("mark_flagged", { messageIds: Array.isArray(messageIds) ? messageIds : [messageIds], flagged, reason }),
     setMessagesPinned: (messageIds, pinned) => invoke("set_messages_pinned", { messageIds, pinned }),
@@ -205,6 +206,7 @@ window.corePageSize = null;
     setKeybinding: (action, combo) => invoke("set_keybinding", { action, combo }),
     imageSenderTrusted: (sender) => invoke("image_sender_trusted", { sender }),
     setImageSenderTrusted: (sender, allow) => invoke("set_image_sender_trusted", { sender, allow }),
+    fetchMailImage: (sender, url) => invoke("fetch_mail_image", { sender, url }),
     allSettings: () => invoke("all_settings"),
     // Пределы приходят из ядра вместе с границами и подписями: в интерфейсе
     // своих чисел нет, иначе копии расходятся и отказ ядра нечем объяснить.

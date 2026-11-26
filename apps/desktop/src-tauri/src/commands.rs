@@ -4834,6 +4834,7 @@ pub async fn send_message(
     state: State<'_, AppState>,
     request: SendMessageRequest,
     request_key: Option<String>,
+    draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
@@ -4846,20 +4847,34 @@ pub async fn send_message(
             message: "Аккаунт отправителя не найден".into(),
         })?;
     let outgoing = outgoing_message(&account, request);
-    let queued = core
-        .accounts
-        .queue_outgoing(
-            account.id,
-            outgoing,
-            truemail_core::model::SEND_ORIGIN_ORDINARY,
-            request_key,
-        )
-        .await?;
+    let queued = if let Some(draft_id) = draft_id {
+        core.db
+            .queue_draft_send(account.id, outgoing, request_key, draft_id, None)
+            .await?
+    } else {
+        core.accounts
+            .queue_outgoing(
+                account.id,
+                outgoing,
+                truemail_core::model::SEND_ORIGIN_ORDINARY,
+                request_key,
+            )
+            .await?
+    };
     // S-024: передача начинается не позднее чем через секунду после срока
     // отмены, а работник в этот момент может спать до десяти секунд.
     state.send_wakeup.notify_waiters();
     let _ = app.emit("truemail-data-changed", account.id);
     Ok(queued)
+}
+
+#[tauri::command]
+pub async fn draft_already_submitted(state: State<'_, AppState>, draft_id: i64) -> CmdResult<bool> {
+    Ok(core(&state)
+        .await?
+        .db
+        .draft_already_submitted(draft_id)
+        .await?)
 }
 
 /// Письма внутри окна отмены при выходе из программы через меню трея.
@@ -5211,6 +5226,7 @@ pub async fn schedule_message(
     state: State<'_, AppState>,
     request: SendMessageRequest,
     send_at: String,
+    draft_id: Option<i64>,
 ) -> CmdResult<i64> {
     let core = core(&state).await?;
     let account = core
@@ -5231,20 +5247,21 @@ pub async fn schedule_message(
         });
     }
     let outgoing = outgoing_message(&account, request);
-    let operation_id = core
-        .db
-        .queue_scheduled_send(
-            account.id,
-            outgoing,
-            &send_at
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string(),
-        )
-        .await?
-        .operation_id;
+    let scheduled = send_at
+        .with_timezone(&chrono::Utc)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let queued = if let Some(draft_id) = draft_id {
+        core.db
+            .queue_draft_send(account.id, outgoing, None, draft_id, Some(&scheduled))
+            .await?
+    } else {
+        core.db
+            .queue_scheduled_send(account.id, outgoing, &scheduled)
+            .await?
+    };
     state.send_wakeup.notify_waiters();
-    Ok(operation_id)
+    Ok(queued.operation_id)
 }
 
 #[tauri::command]
@@ -5746,6 +5763,25 @@ pub async fn set_keybinding(
 #[tauri::command]
 pub async fn image_sender_trusted(state: State<'_, AppState>, sender: String) -> CmdResult<bool> {
     Ok(core(&state).await?.db.image_sender_trusted(&sender).await?)
+}
+
+#[tauri::command]
+pub async fn fetch_mail_image(
+    state: State<'_, AppState>,
+    sender: String,
+    url: String,
+) -> CmdResult<String> {
+    use base64::Engine as _;
+    if !core(&state).await?.db.image_sender_trusted(&sender).await? {
+        return Err(api_error(
+            "Для этого отправителя внешние изображения запрещены",
+        ));
+    }
+    let (kind, bytes) = truemail_core::backend::fetch_remote_mail_image(&url).await?;
+    Ok(format!(
+        "data:{kind};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 #[tauri::command]

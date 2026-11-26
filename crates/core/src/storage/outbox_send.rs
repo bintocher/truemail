@@ -10,7 +10,20 @@ use super::Db;
 use crate::Result;
 use crate::backend::{OutgoingAttachment, OutgoingMessage};
 use crate::model::*;
-use crate::storage::repo::OutboxOperation;
+use crate::storage::repo::{
+    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayTarget, queue_takeaway_operation,
+    resolve_role_folder,
+};
+
+#[derive(sqlx::FromRow)]
+struct DraftSource {
+    account_id: i64,
+    folder_id: i64,
+    uid: i64,
+    remote_path: String,
+    remote_id: Option<String>,
+    raw_blob_ref: Option<String>,
+}
 
 /// Как долго операция отправки считается захваченной работником. То же число,
 /// что и у остальных видов операций; в автоматический захват операция отправки
@@ -54,8 +67,15 @@ impl Db {
         request_key: Option<String>,
         undo_seconds: i64,
     ) -> Result<SendQueued> {
-        self.queue_send(account_id, message, origin, request_key, undo_seconds, None)
-            .await
+        self.queue_send(
+            account_id,
+            message,
+            origin,
+            request_key,
+            (undo_seconds, None),
+            None,
+        )
+        .await
     }
 
     /// Отложенная отправка по времени: передача начинается в заданное время, а
@@ -73,10 +93,59 @@ impl Db {
             message,
             SEND_ORIGIN_SCHEDULED,
             None,
-            0,
-            Some(send_at),
+            (0, Some(send_at)),
+            None,
         )
         .await
+    }
+
+    pub async fn queue_draft_send(
+        &self,
+        account_id: i64,
+        message: OutgoingMessage,
+        request_key: Option<String>,
+        draft_id: i64,
+        send_at: Option<&str>,
+    ) -> Result<SendQueued> {
+        let (origin, undo) = if send_at.is_some() {
+            (SEND_ORIGIN_SCHEDULED, 0)
+        } else {
+            (SEND_ORIGIN_ORDINARY, self.undo_send_seconds().await?)
+        };
+        self.queue_send(
+            account_id,
+            message,
+            origin,
+            request_key,
+            (undo, send_at),
+            Some(draft_id),
+        )
+        .await
+    }
+
+    pub async fn draft_already_submitted(&self, draft_id: i64) -> Result<bool> {
+        let reference: Option<Option<String>> =
+            sqlx::query_scalar("SELECT raw_blob_ref FROM messages WHERE id=?")
+                .bind(draft_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        let version = reference
+            .flatten()
+            .and_then(|reference| self.draft_version(&reference).ok());
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM draft_submissions WHERE draft_id=?
+                    AND (? IS NULL OR version=?))",
+        )
+        .bind(draft_id)
+        .bind(&version)
+        .bind(&version)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    fn draft_version(&self, reference: &str) -> Result<String> {
+        use sha2::{Digest, Sha256};
+        Ok(format!("{:x}", Sha256::digest(self.blobs.get(reference)?)))
     }
 
     /// Общий приём письма в очередь. Срок передачи известен до записи и
@@ -89,9 +158,10 @@ impl Db {
         message: OutgoingMessage,
         origin: &str,
         request_key: Option<String>,
-        undo_seconds: i64,
-        send_at: Option<&str>,
+        timing: (i64, Option<&str>),
+        draft_id: Option<i64>,
     ) -> Result<SendQueued> {
+        let (undo_seconds, send_at) = timing;
         // S-005: адресаты проверяются до записи операции, поэтому непригодный
         // адрес не создаёт ожидающего письма вовсе.
         crate::backend::validate_outgoing(&message)?;
@@ -144,6 +214,22 @@ impl Db {
                 raw_ref: None,
             };
             let mut tx = self.begin_write().await?;
+            let draft = if let Some(id)=draft_id {
+                let source: DraftSource=sqlx::query_as(
+                    "SELECT m.account_id,m.folder_id,m.uid,f.remote_path,m.remote_id,m.raw_blob_ref
+                     FROM messages m JOIN folders f ON f.id=m.folder_id
+                     WHERE m.id=? AND (m.draft=1 OR f.role='drafts')",
+                ).bind(id).fetch_optional(&mut *tx).await?.ok_or_else(|| {
+                    crate::Error::AccountConfig("Черновик больше недоступен. Обновите папку перед отправкой".into())
+                })?;
+                let version=self.draft_version(source.raw_blob_ref.as_deref().ok_or_else(|| {
+                    crate::Error::AccountConfig("Сначала загрузите содержимое черновика".into())
+                })?)?;
+                let exists:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM draft_submissions WHERE draft_id=? AND version=?)")
+                    .bind(id).bind(&version).fetch_one(&mut *tx).await?;
+                if exists {return Err(crate::Error::Other("Эта версия черновика уже поставлена в очередь отправки".into()));}
+                Some((id,source,version))
+            } else {None};
             let (operation_id, cancel_until) = insert_send_operation(
                 &mut tx,
                 account_id,
@@ -154,6 +240,17 @@ impl Db {
                 send_at,
             )
             .await?;
+            if let Some((id,source,version))=draft {
+                sqlx::query("INSERT INTO draft_submissions(draft_id,account_id,version,operation_id) VALUES(?,?,?,?)")
+                    .bind(id).bind(source.account_id).bind(version).bind(operation_id)
+                    .execute(&mut *tx).await?;
+                if let Some((target_id,path))=resolve_role_folder(&mut tx,source.account_id,"trash").await? {
+                    let message=TakeawayMessage { id, account_id:source.account_id,folder_id:source.folder_id,
+                        uid:source.uid,remote_path:source.remote_path,remote_id:source.remote_id };
+                    queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
+                        TakeawayActor::Stage,None,0).await?;
+                }
+            }
             tx.commit().await?;
             Ok::<SendQueued, crate::Error>(SendQueued {
                 operation_id,
