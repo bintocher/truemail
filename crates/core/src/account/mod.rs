@@ -1913,6 +1913,13 @@ impl AccountManager {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
             }
         }
+        if (caldav_url.is_none() && account.caldav_url.is_some())
+            || (carddav_url.is_none() && account.carddav_url.is_some())
+        {
+            return Err(Error::Other(
+                "Не удалось подтвердить сохранённый адрес CalDAV или CardDAV. Проверьте адрес в настройках ящика.".into(),
+            ));
+        }
         if caldav_url != account.caldav_url || carddav_url != account.carddav_url {
             self.db
                 .set_dav_urls(account.id, caldav_url.as_deref(), carddav_url.as_deref())

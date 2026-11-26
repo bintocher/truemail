@@ -5855,17 +5855,6 @@ impl Db {
     // ---------- Правила обработки почты ----------
 
     pub async fn import_legacy_mail_rules(&self) -> Result<()> {
-        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM mail_rules")
-            .fetch_one(&self.pool)
-            .await?;
-        let started: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key='legacy_rules_import_started')",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        if count > 0 && !started {
-            return Ok(());
-        }
         let Some(serialized) = self.setting("mail_rules_ui").await? else {
             return Ok(());
         };
@@ -5874,6 +5863,15 @@ impl Db {
             return Ok(());
         };
         let mut tx = self.begin_write().await?;
+        let has_existing_rules: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM mail_rules) AND NOT EXISTS(
+                SELECT 1 FROM storage_meta WHERE key='legacy_rules_import_started')",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_existing_rules {
+            return Ok(());
+        }
         sqlx::query("INSERT OR IGNORE INTO storage_meta(key,value) VALUES('legacy_rules_import_started','1')")
             .execute(&mut *tx).await?;
         let mut complete = true;
@@ -5895,6 +5893,15 @@ impl Db {
                 || !matches!(action, "move" | "archive" | "spam" | "trash")
             {
                 complete = false;
+                continue;
+            }
+            let imported_key = format!("legacy_rule_imported:{id}");
+            let imported: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key=?)")
+                    .bind(&imported_key)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            if imported {
                 continue;
             }
             let requested_account = rule.get("account_id").and_then(|value| value.as_i64());
@@ -5940,7 +5947,13 @@ impl Db {
             .execute(&mut *rule_tx)
             .await;
             match inserted {
-                Ok(_) => rule_tx.commit().await?,
+                Ok(_) => {
+                    sqlx::query("INSERT INTO storage_meta(key,value) VALUES(?,'1')")
+                        .bind(&imported_key)
+                        .execute(&mut *rule_tx)
+                        .await?;
+                    rule_tx.commit().await?;
+                }
                 Err(error) => {
                     rule_tx.rollback().await?;
                     complete = false;
@@ -5953,9 +5966,12 @@ impl Db {
             sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("DELETE FROM storage_meta WHERE key='legacy_rules_import_started'")
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "DELETE FROM storage_meta WHERE key='legacy_rules_import_started'
+                OR key GLOB 'legacy_rule_imported:*'",
+            )
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())

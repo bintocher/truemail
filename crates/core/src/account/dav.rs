@@ -831,11 +831,14 @@ fn response_status<'a, 'input>(response: roxmltree::Node<'a, 'input>) -> Option<
 }
 
 fn successful_dav_status(status: &str) -> bool {
+    dav_status_code(status).is_some_and(|code| (200..300).contains(&code))
+}
+
+fn dav_status_code(status: &str) -> Option<u16> {
     status
         .split_ascii_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
-        .is_some_and(|code| (200..300).contains(&code))
 }
 
 fn parse_sync_collection(xml: &str, collection_url: &str) -> Result<SyncCollectionDelta> {
@@ -978,7 +981,20 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "response")
     {
-        if response_status(response).is_some_and(|status| !successful_dav_status(status)) {
+        let status = response_status(response);
+        if status.and_then(dav_status_code) == Some(404) {
+            continue;
+        }
+        if status.is_some_and(|status| !successful_dav_status(status))
+            || response
+                .children()
+                .filter(|node| node.is_element() && node.tag_name().name() == "propstat")
+                .any(|prop| {
+                    response_status(prop).is_none_or(|status| {
+                        !successful_dav_status(status) && dav_status_code(status) != Some(404)
+                    })
+                })
+        {
             return Err(Error::Other(
                 "Не удалось подтвердить полный состав коллекции DAV".into(),
             ));
@@ -994,7 +1010,9 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
             .find(|node| node.is_element() && node.tag_name().name() == "href")
             .and_then(|node| node.text())
         else {
-            continue;
+            return Err(Error::Other(
+                "Сервер не указал адрес ресурса в коллекции DAV".into(),
+            ));
         };
         let etag = response
             .descendants()
@@ -2196,6 +2214,23 @@ mod tests {
             "перекачивать неизменившийся ресурс незачем"
         );
         assert!(outcome.deleted_urls.is_empty());
+    }
+
+    #[test]
+    fn partial_etag_listing_does_not_confirm_deletions() {
+        let xml = r#"<d:multistatus xmlns:d="DAV:">
+            <d:response><d:href>/good.ics</d:href><d:propstat>
+                <d:prop><d:getetag>good</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status>
+            </d:propstat></d:response>
+            <d:response><d:href>/other.ics</d:href><d:propstat>
+                <d:prop><d:getetag/></d:prop><d:status>HTTP/1.1 503 Service Unavailable</d:status>
+            </d:propstat></d:response>
+        </d:multistatus>"#;
+        assert!(parse_etag_listing(xml, "https://dav.test/").is_err());
+        let missing_etag = xml.replace("503 Service Unavailable", "404 Not Found");
+        let resources = parse_etag_listing(&missing_etag, "https://dav.test/").unwrap();
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[1].etag, None);
     }
 
     #[test]
