@@ -910,7 +910,13 @@ async function submitAuxiliary(form,status,save,success){
   status.textContent=L('Сохраняю на сервере...','Saving to the server...');
   status.dataset.kind='';
   try{
-    await save(key);
+    try{await save(key,false);}catch(error){
+      if(error?.kind!=='auxiliary_create_uncertain')throw error;
+      const confirmed=await confirmAction(L('Повторите сохранение только после того, как проверите список на сервере и убедитесь, что записи там нет. Продолжить?',
+        'Retry only after checking that the record is absent from the server. Continue?'));
+      if(!confirmed)throw error;
+      await save(key,true);
+    }
     if(auxEditorKey===key)closeAuxEditor(true);
     showToast(success);
     try{await window.reloadCoreData();}catch(error){showToast(error);}
@@ -1008,8 +1014,8 @@ eventForm.onsubmit=async event=>{
   const input=eventInputFromForm(existing);
   const accountId=Number(document.getElementById('eventAccount').value);
   const calendarId=Number(document.getElementById('eventCalendar').value);
-  await submitAuxiliary(eventForm,document.getElementById('eventStatus'),key=>
-    existing?window.tm.updateEvent(existing.id,input):window.tm.createEvent(accountId,calendarId,input,key),
+  await submitAuxiliary(eventForm,document.getElementById('eventStatus'),(key,retry)=>
+    existing?window.tm.updateEvent(existing.id,input):window.tm.createEvent(accountId,calendarId,input,key,retry),
   L('Событие сохранено','Event saved'));
 };
 document.getElementById('eventDelete').onclick=async()=>{if(!editingEvent||editingEvent.recurrence_id||!await confirmAction(editingEvent.rrule?L('Удалить всю серию встреч на сервере?','Delete the entire series on the server?'):L('Удалить событие или задачу на сервере?','Delete this event or task on the server?')))return;const status=document.getElementById('eventStatus');status.textContent=L('Удаляю…','Deleting…');try{await window.tm.deleteEvent(editingEvent.id);await window.reloadCoreData();closeAuxEditor();showToast(L('Удалено на сервере','Deleted on the server'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};
@@ -1018,8 +1024,8 @@ contactForm.onsubmit=async event=>{
   const existing=editingContact;
   const accountId=Number(document.getElementById('contactAccount').value);
   const input={display_name:document.getElementById('contactDisplayName').value.trim(),first_name:document.getElementById('contactFirstName').value.trim()||null,last_name:document.getElementById('contactLastName').value.trim()||null,organization:document.getElementById('contactOrganization').value.trim()||null,emails:document.getElementById('contactEmails').value.split(/[\n,;]/).map(value=>value.trim()).filter(Boolean),phones:contactPhonesFromForm(),addresses:contactAddressesFromForm()};
-  await submitAuxiliary(contactForm,document.getElementById('contactStatus'),key=>
-    existing?window.tm.updateContact(existing.id,input):window.tm.createContact(accountId,input,key),
+  await submitAuxiliary(contactForm,document.getElementById('contactStatus'),(key,retry)=>
+    existing?window.tm.updateContact(existing.id,input):window.tm.createContact(accountId,input,key,retry),
   L('Контакт сохранён','Contact saved'));
 };
 document.getElementById('contactDelete').onclick=async()=>{if(!editingContact||!await confirmAction(L('Удалить контакт?','Delete this contact?')))return;const status=document.getElementById('contactStatus');status.textContent=L('Удаляю…','Deleting…');try{await window.tm.deleteContact(editingContact.id);await window.reloadCoreData();closeAuxEditor();showToast(L('Контакт удалён','Contact deleted'));}catch(error){status.textContent=String(error);status.dataset.kind='error';}};

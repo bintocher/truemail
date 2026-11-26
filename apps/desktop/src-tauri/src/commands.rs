@@ -3578,14 +3578,22 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
     Ok(())
 }
 
+enum AuxiliaryCreation {
+    Save { key: Option<String> },
+    Saved,
+}
+
 async fn claim_auxiliary_creation(
     core: &Core,
     account_id: i64,
     kind: &str,
     key: Option<&str>,
     signature: &str,
-) -> CmdResult<bool> {
-    let Some(key) = key else { return Ok(true) };
+    retry_uncertain: bool,
+) -> CmdResult<AuxiliaryCreation> {
+    let Some(key) = key else {
+        return Ok(AuxiliaryCreation::Save { key: None });
+    };
     if key.is_empty()
         || key.len() > 64
         || !key
@@ -3595,20 +3603,48 @@ async fn claim_auxiliary_creation(
         return Err(api_error("Неверный номер запроса на создание"));
     }
     let mut tx = core.db.begin_write().await?;
-    let similar_pending: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM auxiliary_create_requests
-         WHERE account_id=? AND kind=? AND request_signature=? AND saved=0 AND request_key<>?)",
+    let similar_pending: Option<(String, bool)> = sqlx::query_as(
+        "SELECT request_key, uncertain=1 OR created_at<=datetime('now','-10 minutes')
+         FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_signature=?
+           AND saved=0 ORDER BY created_at LIMIT 1",
     )
     .bind(account_id)
     .bind(kind)
     .bind(signature)
-    .bind(key)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(truemail_core::Error::from)?;
-    if similar_pending {
+    if let Some((pending_key, can_retry)) = similar_pending {
+        if !can_retry {
+            return Err(api_error(
+                "Запись ещё сохраняется. Проверьте список и повторите позже",
+            ));
+        }
+        if !retry_uncertain {
+            return Err(ApiError::from_parts(
+                "Сервер не подтвердил сохранение. Проверьте, появилась ли запись",
+                "auxiliary_create_uncertain",
+                Some(account_id),
+                None,
+            ));
+        }
+        sqlx::query(
+            "UPDATE auxiliary_create_requests SET uncertain=0, created_at=datetime('now')
+                     WHERE kind=? AND request_key=?",
+        )
+        .bind(kind)
+        .bind(&pending_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(truemail_core::Error::from)?;
+        tx.commit().await.map_err(truemail_core::Error::from)?;
+        return Ok(AuxiliaryCreation::Save {
+            key: Some(pending_key),
+        });
+    }
+    if retry_uncertain {
         return Err(api_error(
-            "Такая запись уже сохранялась, но сервер не подтвердил результат. Обновите список и проверьте, появилась ли запись",
+            "Состояние предыдущего сохранения изменилось. Обновите список",
         ));
     }
     let insert = sqlx::query(
@@ -3623,7 +3659,7 @@ async fn claim_auxiliary_creation(
     .await
     .map_err(truemail_core::Error::from)?;
     let owned = insert.rows_affected() == 1;
-    let (owner,data,saved):(i64,String,bool)=sqlx::query_as("SELECT account_id,request_signature,saved FROM auxiliary_create_requests WHERE kind=? AND request_key=?")
+    let (owner,data):(i64,String)=sqlx::query_as("SELECT account_id,request_signature FROM auxiliary_create_requests WHERE kind=? AND request_key=?")
         .bind(kind).bind(key).fetch_one(&mut *tx).await.map_err(truemail_core::Error::from)?;
     tx.commit().await.map_err(truemail_core::Error::from)?;
     if owner != account_id || data != signature {
@@ -3631,12 +3667,13 @@ async fn claim_auxiliary_creation(
             "Предыдущая попытка сохраняла другой вариант. Проверьте её результат в списке записей",
         ));
     }
-    if !owned && !saved {
-        return Err(api_error(
-            "Подтверждение предыдущего сохранения ещё не получено. Обновите список и проверьте, появилась ли запись",
-        ));
-    }
-    Ok(owned)
+    Ok(if owned {
+        AuxiliaryCreation::Save {
+            key: Some(key.to_owned()),
+        }
+    } else {
+        AuxiliaryCreation::Saved
+    })
 }
 
 async fn record_auxiliary_creation(
@@ -3647,10 +3684,10 @@ async fn record_auxiliary_creation(
     result: truemail_core::Result<()>,
 ) -> CmdResult<()> {
     if let Some(key) = key {
-        let mutation = match &result {
-            Ok(()) => Some(
-                "UPDATE auxiliary_create_requests SET saved=1 WHERE account_id=? AND kind=? AND request_key=?",
-            ),
+        let statement = match &result {
+            Ok(()) => {
+                "UPDATE auxiliary_create_requests SET saved=1 WHERE account_id=? AND kind=? AND request_key=?"
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -3663,19 +3700,18 @@ async fn record_auxiliary_creation(
                     Some(400 | 401 | 403 | 404 | 409 | 412 | 422)
                 ) =>
             {
-                Some(
-                    "DELETE FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?",
-                )
+                "DELETE FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?"
             }
-            _ => None,
+            _ => {
+                "UPDATE auxiliary_create_requests SET uncertain=1 WHERE account_id=? AND kind=? AND request_key=?"
+            }
         };
-        if let Some(statement) = mutation
-            && let Err(error) = sqlx::query(statement)
-                .bind(account_id)
-                .bind(kind)
-                .bind(key)
-                .execute(&core.db.write_pool)
-                .await
+        if let Err(error) = sqlx::query(statement)
+            .bind(account_id)
+            .bind(kind)
+            .bind(key)
+            .execute(&core.db.write_pool)
+            .await
         {
             tracing::warn!(%error,"результат создания календарной записи или контакта не записан");
         }
@@ -3739,6 +3775,7 @@ pub async fn create_event(
     calendar_id: i64,
     input: EventInput,
     request_key: Option<String>,
+    retry_uncertain: Option<bool>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
@@ -3757,24 +3794,25 @@ pub async fn create_event(
     // ews_url и username из аккаунта, которых у свободной функции нет.
     let signature =
         serde_json::to_string(&(calendar_id, &input)).map_err(truemail_core::Error::from)?;
-    if !claim_auxiliary_creation(
+    let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
         &core,
         account_id,
         "event",
         request_key.as_deref(),
         &signature,
+        retry_uncertain.unwrap_or_default(),
     )
     .await?
-    {
+    else {
         return Ok(());
-    }
+    };
     let result = core
         .accounts
         .write_event(
             &account,
             &calendar.1,
             RemoteObject {
-                uid: request_key.as_deref(),
+                uid: key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
@@ -3782,7 +3820,7 @@ pub async fn create_event(
         )
         .await;
     let recorded =
-        record_auxiliary_creation(&core, account_id, "event", request_key.as_deref(), result).await;
+        record_auxiliary_creation(&core, account_id, "event", key.as_deref(), result).await;
     refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
     recorded
 }
@@ -3919,29 +3957,30 @@ pub async fn create_contact(
     account_id: i64,
     input: ContactInput,
     request_key: Option<String>,
+    retry_uncertain: Option<bool>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
     let signature = serde_json::to_string(&input).map_err(truemail_core::Error::from)?;
     if !(account.provider == Provider::Gmail || is_dav_capable(&account)) {
-        if !claim_auxiliary_creation(
+        let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
             &core,
             account_id,
             "contact",
             request_key.as_deref(),
             &signature,
+            retry_uncertain.unwrap_or_default(),
         )
         .await?
-        {
+        else {
             return Ok(());
-        }
+        };
         let saved = core
             .db
             .save_local_contact(account_id, None, &input)
             .await
             .map(|_| ());
-        record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), saved)
-            .await?;
+        record_auxiliary_creation(&core, account_id, "contact", key.as_deref(), saved).await?;
         let _ = app.emit("truemail-data-changed", account_id);
         return Ok(());
     }
@@ -3974,24 +4013,25 @@ pub async fn create_contact(
     if collection.is_none() && !matches!(account.provider, Provider::Gmail | Provider::Exchange) {
         return Err(api_error("Сначала синхронизируйте адресную книгу"));
     }
-    if !claim_auxiliary_creation(
+    let AuxiliaryCreation::Save { key } = claim_auxiliary_creation(
         &core,
         account_id,
         "contact",
         request_key.as_deref(),
         &signature,
+        retry_uncertain.unwrap_or_default(),
     )
     .await?
-    {
+    else {
         return Ok(());
-    }
+    };
     let result = core
         .accounts
         .write_contact(
             &account,
             collection.as_deref(),
             RemoteObject {
-                uid: request_key.as_deref(),
+                uid: key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
@@ -3999,8 +4039,7 @@ pub async fn create_contact(
         )
         .await;
     let recorded =
-        record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), result)
-            .await;
+        record_auxiliary_creation(&core, account_id, "contact", key.as_deref(), result).await;
     refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
     recorded
 }
