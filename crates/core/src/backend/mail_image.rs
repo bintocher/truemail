@@ -13,7 +13,10 @@ fn public_address(address: IpAddr) -> bool {
                     || a >= 224
                     || (a == 100 && (64..=127).contains(&b))
                     || (a == 198 && (b == 18 || b == 19))
-                    || (a == 192 && b == 0 && c == 0))
+                    || matches!(
+                        (a, b, c),
+                        (192, 0, 0 | 2) | (192, 88, 99) | (198, 51, 100) | (203, 0, 113)
+                    ))
         }
         IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
@@ -23,6 +26,7 @@ fn public_address(address: IpAddr) -> bool {
             first & 0xe000 == 0x2000
                 && first != 0x2002
                 && !(first == 0x2001 && (second < 0x0200 || second == 0x0db8))
+                && !(first == 0x3fff && second < 0x1000)
         }
     }
 }
@@ -30,7 +34,17 @@ fn public_address(address: IpAddr) -> bool {
 #[cfg(test)]
 #[test]
 fn image_loading_rejects_ipv6_transition_and_nonpublic_ranges() {
-    for address in ["2002::1", "2001::1", "::ffff:192.0.0.3", "fd00::1", "::1"] {
+    for address in [
+        "2002::1",
+        "2001::1",
+        "::ffff:192.0.0.3",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "3fff::1",
+        "fd00::1",
+        "::1",
+    ] {
         assert!(!public_address(address.parse().unwrap()));
     }
     assert!(public_address("2606:4700::1111".parse().unwrap()));
