@@ -146,11 +146,11 @@ window.corePageSize = null;
     search: (query) => invoke("search", { query }),
     listCalendarData: () => invoke("list_calendar_data"),
     setCalendarVisible: (calendarId, visible) => invoke("set_calendar_visible", { calendarId, visible }),
-    createEvent: (accountId, calendarId, input) => invoke("create_event", { accountId, calendarId, input }),
+    createEvent: (accountId, calendarId, input, requestKey) => invoke("create_event", { accountId, calendarId, input, requestKey }),
     updateEvent: (eventId, input) => invoke("update_event", { eventId, input }),
     deleteEvent: (eventId) => invoke("delete_event", { eventId }),
     respondToEvent: (eventId, response) => invoke("respond_to_event", { eventId, response }),
-    createContact: (accountId, input) => invoke("create_contact", { accountId, input }),
+    createContact: (accountId, input, requestKey) => invoke("create_contact", { accountId, input, requestKey }),
     updateContact: (contactId, input) => invoke("update_contact", { contactId, input }),
     deleteContact: (contactId) => invoke("delete_contact", { contactId }),
     storageStatus: () => invoke("storage_status"),
@@ -363,6 +363,9 @@ window.corePageSize = null;
       "The mail server does not support safe permanent deletion."));
   }).catch(console.error);
   tauri.event?.listen("truemail-sync-state", event => window.handleSyncState?.(event.payload)).catch(console.error);
+  tauri.event?.listen("truemail-aux-write-sync-warning", () => {
+    showToast(L("Запись сохранена на сервере. Обновить список пока не удалось.", "The record was saved on the server. The list could not be refreshed yet."));
+  }).catch(console.error);
   // account-connect-progress.md, S-002, S-003: этап попытки подключения,
   // подтверждённый ядром в ходе одного вызова команды (например, переход к
   // ожиданию кода OAuth в браузере или к проверке сервера).

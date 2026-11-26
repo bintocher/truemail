@@ -1207,7 +1207,7 @@ fn decode_property(key: &str, value: &str) -> String {
         value.to_owned()
     }
 }
-fn prop(raw: &str, name: &str) -> Option<String> {
+pub(super) fn prop(raw: &str, name: &str) -> Option<String> {
     unfolded(raw).lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
         key.split(';')

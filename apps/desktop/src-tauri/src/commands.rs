@@ -3578,6 +3578,109 @@ async fn refresh_auxiliary(core: &Core, account: &Account) -> CmdResult<()> {
     Ok(())
 }
 
+async fn claim_auxiliary_creation(
+    core: &Core,
+    account_id: i64,
+    kind: &str,
+    key: Option<&str>,
+) -> CmdResult<bool> {
+    let Some(key) = key else { return Ok(true) };
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(api_error("Неверный номер запроса на создание"));
+    }
+    let mut tx = core.db.begin_write().await?;
+    let insert = sqlx::query(
+        "INSERT OR IGNORE INTO auxiliary_create_requests(account_id,kind,request_key)
+            VALUES(?,?,?)",
+    )
+    .bind(account_id)
+    .bind(kind)
+    .bind(key)
+    .execute(&mut *tx)
+    .await
+    .map_err(truemail_core::Error::from)?;
+    let owned = insert.rows_affected() == 1;
+    let saved:bool=sqlx::query_scalar("SELECT saved FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?")
+        .bind(account_id).bind(kind).bind(key).fetch_one(&mut *tx).await.map_err(truemail_core::Error::from)?;
+    tx.commit().await.map_err(truemail_core::Error::from)?;
+    if !owned && !saved {
+        return Err(api_error(
+            "Подтверждение предыдущего сохранения ещё не получено. Обновите список и проверьте, появилась ли запись",
+        ));
+    }
+    Ok(owned)
+}
+
+async fn record_auxiliary_creation(
+    core: &Core,
+    account_id: i64,
+    kind: &str,
+    key: Option<&str>,
+    result: truemail_core::Result<()>,
+) -> CmdResult<()> {
+    if let Some(key) = key {
+        let mutation = match &result {
+            Ok(()) => Some(
+                "UPDATE auxiliary_create_requests SET saved=1 WHERE account_id=? AND kind=? AND request_key=?",
+            ),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    truemail_core::ErrorKind::AccountConfig
+                        | truemail_core::ErrorKind::InvalidCredentials
+                        | truemail_core::ErrorKind::NeedsReauth
+                ) =>
+            {
+                Some(
+                    "DELETE FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?",
+                )
+            }
+            _ => None,
+        };
+        if let Some(statement) = mutation
+            && let Err(error) = sqlx::query(statement)
+                .bind(account_id)
+                .bind(kind)
+                .bind(key)
+                .execute(&core.db.write_pool)
+                .await
+        {
+            tracing::warn!(%error,"результат создания календарной записи или контакта не записан");
+        }
+    }
+    Ok(result?)
+}
+
+fn refresh_auxiliary_after_write(
+    app: AppHandle,
+    state: &AppState,
+    core: Arc<Core>,
+    account: Account,
+) {
+    let active = state.syncing_aux.clone();
+    tokio::spawn(async move {
+        if !active.lock().await.insert(account.id) {
+            return;
+        }
+        let result = refresh_auxiliary(&core, &account).await;
+        active.lock().await.remove(&account.id);
+        match result {
+            Ok(()) => {
+                let _ = app.emit("truemail-data-changed", account.id);
+            }
+            Err(error) => {
+                tracing::warn!(account_id=account.id, message=%error.safe_message(),"запись сохранена, обновить список не удалось");
+                let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+            }
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn create_event(
     app: AppHandle,
@@ -3585,6 +3688,7 @@ pub async fn create_event(
     account_id: i64,
     calendar_id: i64,
     input: EventInput,
+    request_key: Option<String>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
@@ -3601,20 +3705,24 @@ pub async fn create_event(
     }
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    core.accounts
+    if !claim_auxiliary_creation(&core, account_id, "event", request_key.as_deref()).await? {
+        return Ok(());
+    }
+    let result = core
+        .accounts
         .write_event(
             &account,
             &calendar.1,
             RemoteObject {
-                uid: None,
+                uid: request_key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
             &input,
         )
-        .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account_id);
+        .await;
+    record_auxiliary_creation(&core, account_id, "event", request_key.as_deref(), result).await?;
+    refresh_auxiliary_after_write(app, &state, core, account);
     Ok(())
 }
 
@@ -3649,8 +3757,7 @@ pub async fn update_event(
             &input,
         )
         .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account.id);
+    refresh_auxiliary_after_write(app, &state, core, account);
     Ok(())
 }
 
@@ -3745,6 +3852,7 @@ pub async fn create_contact(
     state: State<'_, AppState>,
     account_id: i64,
     input: ContactInput,
+    request_key: Option<String>,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
@@ -3779,20 +3887,24 @@ pub async fn create_contact(
     };
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    core.accounts
+    if !claim_auxiliary_creation(&core, account_id, "contact", request_key.as_deref()).await? {
+        return Ok(());
+    }
+    let result = core
+        .accounts
         .write_contact(
             &account,
             collection.as_deref(),
             RemoteObject {
-                uid: None,
+                uid: request_key.as_deref(),
                 remote_url: None,
                 etag: None,
             },
             &input,
         )
-        .await?;
-    refresh_auxiliary(&core, &account).await?;
-    let _ = app.emit("truemail-data-changed", account_id);
+        .await;
+    record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), result).await?;
+    refresh_auxiliary_after_write(app, &state, core, account);
     Ok(())
 }
 

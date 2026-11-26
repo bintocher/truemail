@@ -403,7 +403,7 @@ pub(crate) fn dav_event_body(uid: &str, input: &EventInput) -> String {
         "VERSION:2.0".to_owned(),
         "PRODID:-//truemail//EN".to_owned(),
         "BEGIN:VEVENT".to_owned(),
-        format!("UID:{uid}"),
+        format!("UID:{}", ical_escape(uid)),
         format!("{start_key}:{}", ical_date(&input.dtstart, input.all_day)),
         format!("SUMMARY:{}", ical_escape(&input.summary)),
     ];
@@ -420,7 +420,12 @@ pub(crate) fn dav_event_body(uid: &str, input: &EventInput) -> String {
         lines.push(format!("RRULE:{rrule}"));
     }
     if let Some(recurrence_id) = &input.recurrence_id {
-        lines.push(format!("RECURRENCE-ID:{recurrence_id}"));
+        let property = if input.all_day {
+            "RECURRENCE-ID;VALUE=DATE"
+        } else {
+            "RECURRENCE-ID"
+        };
+        lines.push(format!("{property}:{}", ical_escape(recurrence_id)));
     }
     if let Some(exdates) = &input.exdates {
         lines.extend(recurrence_lines("EXDATE", exdates));
@@ -568,16 +573,147 @@ async fn write_dav_event(
             .map(String::from)
             .map_err(|error| backend_error("dav-caldav", error.to_string()))?,
     };
+    crate::service_url::resolve(calendar_source, &url)?;
+    let (body, etag) = if create {
+        (dav_event_body(&uid, input), None)
+    } else {
+        let checked = crate::service_url::parse(&url)?;
+        let response = apply_dav_auth(client()?.get(checked), auth.scheme, auth)
+            .send()
+            .await
+            .map_err(|error| Error::from_reqwest("caldav", error))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::from_http_status(
+                "caldav",
+                status.as_u16(),
+                "Не удалось прочитать календарное событие".into(),
+            ));
+        }
+        let etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .filter(|value| value.starts_with('"') && value.ends_with('"'))
+            .ok_or_else(|| {
+                Error::AccountConfig(
+                    "Сервер не вернул версию события. Без неё запись может затереть чужую правку"
+                        .into(),
+                )
+            })?
+            .to_owned();
+        if remote.etag.is_some_and(|known| known != etag) {
+            return Err(Error::AccountConfig(
+                "Событие изменилось на сервере. Обновите календарь перед правкой".into(),
+            ));
+        }
+        let original = response
+            .text()
+            .await
+            .map_err(|error| Error::from_reqwest("caldav", error))?;
+        (replace_dav_event(&original, &uid, input)?, Some(etag))
+    };
     dav_write(
         Method::PUT,
         &url,
         auth,
         Some("text/calendar; charset=utf-8"),
-        Some(dav_event_body(&uid, input)),
-        remote.etag,
+        Some(body),
+        etag.as_deref(),
         create,
     )
     .await
+}
+
+fn replace_dav_event(original: &str, uid: &str, input: &EventInput) -> Result<String> {
+    let invalid =
+        || Error::AccountConfig("Не удалось однозначно найти встречу в календарном файле".into());
+    let mut normalized = input.clone();
+    if normalized.recurrence_id.is_some() {
+        normalized.rrule = None;
+        normalized.exdates = None;
+        normalized.rdates = None;
+    }
+    let replacement = dav_event_body(uid, &normalized);
+    let replacement = replacement
+        .strip_prefix("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//truemail//EN\r\n")
+        .and_then(|raw| raw.strip_suffix("END:VCALENDAR\r\n"))
+        .ok_or_else(invalid)?;
+    let original = original.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut start = None;
+    let mut target = None;
+    let mut master_found = false;
+    let mut calendar_end = None;
+    let mut offset = 0;
+    for line in original.split_inclusive("\r\n") {
+        let end = offset + line.len();
+        match line.trim_end_matches("\r\n").to_ascii_uppercase().as_str() {
+            "BEGIN:VEVENT" => {
+                if start.replace(offset).is_some() {
+                    return Err(invalid());
+                }
+            }
+            "END:VEVENT" => {
+                let begin = start.take().ok_or_else(invalid)?;
+                let component = &original[begin..end];
+                if super::dav::prop(component, "UID").as_deref() == Some(uid) {
+                    let occurrence = super::dav::prop(component, "RECURRENCE-ID");
+                    master_found |= occurrence.is_none();
+                    if occurrence == input.recurrence_id && target.replace((begin, end)).is_some() {
+                        return Err(invalid());
+                    }
+                }
+            }
+            "END:VCALENDAR" => {
+                if calendar_end.replace(offset).is_some() {
+                    return Err(invalid());
+                }
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    if start.is_some() {
+        return Err(invalid());
+    }
+    let calendar_end = calendar_end.ok_or_else(invalid)?;
+    let (begin, end) = target
+        .or_else(|| {
+            (master_found && input.recurrence_id.is_some()).then_some((calendar_end, calendar_end))
+        })
+        .ok_or_else(invalid)?;
+    if end > calendar_end {
+        return Err(invalid());
+    }
+    Ok(format!(
+        "{}{replacement}{}",
+        &original[..begin],
+        &original[end..]
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn editing_an_occurrence_preserves_the_series_and_the_other_occurrence() {
+    let original = "BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Somewhere\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:s\r\nRRULE:FREQ=DAILY\r\nSUMMARY:Main\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID:20261127T090000Z\r\nSUMMARY:Old\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:s\r\nRECURRENCE-ID:20261128T090000Z\r\nSUMMARY:Other\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let input = EventInput {
+        summary: "Edited".into(),
+        dtstart: "2026-11-27T10:00:00Z".into(),
+        recurrence_id: Some("20261127T090000Z".into()),
+        ..Default::default()
+    };
+    let edited = replace_dav_event(original, "s", &input).unwrap();
+    assert!(edited.contains("SUMMARY:Edited"));
+    assert!(!edited.contains("SUMMARY:Old"));
+    for line in [
+        "SUMMARY:Main",
+        "SUMMARY:Other",
+        "TZID:Somewhere",
+        "RRULE:FREQ=DAILY",
+    ] {
+        assert!(edited.contains(line));
+    }
+    assert_eq!(edited.matches("BEGIN:VEVENT").count(), 3);
 }
 
 /// Создать или изменить событие/задачу на сервере.
