@@ -7,6 +7,19 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-11-26
+
+### Fixed
+
+- A message is not automatically resent if the connection drops after its contents are handed off and the server does not confirm receipt. Permanent refusals appear in Outbox, and temporary refusals are retried with increasing delays.
+- Clearing downloaded mail keeps outgoing messages, drafts, sent messages, contacts and calendars. If any outgoing messages are waiting to be sent or need a decision, the app asks you to resolve them first.
+- IMAP verifies message identity before running a queued action or downloading a message body. The first message in a previously empty folder now appears during regular sync.
+- Labels, pins, tasks and snoozes survive moves and folder rebuilds when the message can be matched unambiguously.
+- JMAP loads mail beyond the first 500 messages, including messages with the same date. Sync reads all pages of changes.
+- "Delete permanently" removes a message from the server in Exchange and JMAP. Moving to Trash is a separate action.
+- After an interrupted migration to encryption, the app checks the encrypted database and removes the remaining unencrypted copy.
+- Clicking the status bar opens the event history. A successful sync clears the warning from the status bar and records the failure and recovery in the history. The default retention is seven days.
+
 ## [0.3.7] - 2026-11-24
 
 ### Fixed
