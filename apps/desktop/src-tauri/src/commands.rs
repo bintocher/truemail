@@ -5227,7 +5227,7 @@ pub async fn schedule_message(
     request: SendMessageRequest,
     send_at: String,
     draft_id: Option<i64>,
-) -> CmdResult<i64> {
+) -> CmdResult<truemail_core::model::SendQueued> {
     let core = core(&state).await?;
     let account = core
         .db
@@ -5261,7 +5261,7 @@ pub async fn schedule_message(
             .await?
     };
     state.send_wakeup.notify_waiters();
-    Ok(queued.operation_id)
+    Ok(queued)
 }
 
 #[tauri::command]

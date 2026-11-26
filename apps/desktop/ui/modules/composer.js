@@ -1066,6 +1066,7 @@ async function readDraftLetterParts(full){
 async function queueLetter(request,draftId=null){
   const queued=await window.tm.sendMessage(request,`send-${Date.now()}-${Math.random().toString(16).slice(2)}`,draftId);
   showUndoSendCard(queued,request);
+  return queued;
 }
 function showDraftComposer(hint){
   document.getElementById('compTitle').textContent=L('Черновик','Draft');
@@ -1133,10 +1134,10 @@ async function discardSentDraft(messageId){
 // stayed in its folder must not be sent a second time.
 const sentDrafts=new Set();
 window.sentDrafts=sentDrafts;
-function draftQueued(messageId){
+function draftQueued(messageId,recorded=false){
   sentDrafts.add(messageId);
   forgetSentDraft(messageId);
-  if(!window.tm?.draftAlreadySubmitted)discardSentDraft(messageId);
+  if(!recorded)discardSentDraft(messageId);
 }
 // Drafts that are being read for sending right now.
 const draftsInFlight=new Set();
@@ -1187,7 +1188,8 @@ async function sendDraftMessage(message=activeMessage){
       // A hidden copy alone is not enough to send in one click: the user sees no addressee on the letter.
       ||(!letter.request.to.length&&!letter.request.cc.length?L('Укажите получателя в поле "Кому" и отправьте письмо','Add a recipient to To and send the letter'):null);
     if(!problem){
-      try{await queueLetter(letter.request,message.id);}
+      let queued;
+      try{queued=await queueLetter(letter.request,message.id);}
       catch(error){
         // A letter the core refuses to take (an address, the size) is finished in
         // the editor; any other refusal is only reported, the draft stays untouched.
@@ -1195,7 +1197,7 @@ async function sendDraftMessage(message=activeMessage){
         else showToast(error);
         return;
       }
-      draftQueued(message.id);
+      draftQueued(message.id,queued?.draft_recorded);
       return;
     }
     finishDraftInEditor(message,letter.request,problem,letter.textMissing===true);
@@ -1209,16 +1211,16 @@ let draftLinkCheck=null;
 window.restoreDraftLink=messageId=>{
   const generation=composerGeneration;
   const check=(async()=>{
-    if(await window.tm?.draftAlreadySubmitted?.(messageId).catch(()=>false)){
-      if(generation===composerGeneration){resetComposer();clearSavedLetter();showToast(L('Этот черновик уже поставлен в очередь отправки','This draft has already been queued for sending'));}
-      return;
-    }
     let link=null;
     try{
       const full=await window.tm.getMessage(messageId);
       // The link comes back only while the letter is still a draft.
       if(draftMessageModel.isDraftMessage(full?.meta,coreFolders))link=messageId;
     }catch(error){link=null;}
+    if(window.tm?.draftAlreadySubmitted&&await window.tm.draftAlreadySubmitted(messageId).catch(()=>false)){
+      if(generation===composerGeneration){resetComposer();clearSavedLetter();showToast(L('Этот черновик уже поставлен в очередь отправки','This draft has already been queued for sending'));}
+      return;
+    }
     if(link!==null&&generation===composerGeneration&&draftBeingSent===null)draftBeingSent=link;
   })();
   draftLinkCheck={generation,check};
@@ -1276,7 +1278,7 @@ document.getElementById('compSend').onclick=async()=>{
     resetComposer();showView('mailView');clearSavedLetter();
   }else saveLetterOfEditor();
   showUndoSendCard(queued,request);
-  if(sentDraft!==null)draftQueued(sentDraft);
+  if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded);
 };
 document.getElementById('compSendLater').onclick=async()=>{
   const generation=composerGeneration;
@@ -1294,9 +1296,10 @@ document.getElementById('compSendLater').onclick=async()=>{
       const date=new Date(input.value);if(Number.isNaN(date.getTime()))throw new Error(L('Выберите дату и время','Choose a date and time'));
       // The draft of this letter is captured before the wait: another letter may take the editor.
       const sentDraft=draftBeingSent;
-      const id=await window.tm.scheduleMessage(composerRequest(),date.toISOString(),sentDraft);
+      const queued=await window.tm.scheduleMessage(composerRequest(),date.toISOString(),sentDraft);
+      const id=queued?.operation_id??queued;
       // Taken by the queue: its draft leaves the folder at once.
-      if(sentDraft!==null)draftQueued(sentDraft);
+      if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded);
       if(generation===composerGeneration){
         // No other sending of this letter, by either button.
         handedOverGeneration=generation;

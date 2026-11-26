@@ -121,7 +121,12 @@ function folderTitle(folder){
   const names=wizardLocale==='en'?{inbox:'Inbox',sent:'Sent',drafts:'Drafts',archive:'Archive',spam:'Spam',trash:'Trash'}:{inbox:'Входящие',sent:'Отправленные',drafts:'Черновики',archive:'Архив',spam:'Спам',trash:'Удалённые'};
   const roleTitle=names[folder?.role];
   if(roleTitle&&!coreFolders.some(other=>other.id!==folder.id&&other.account_id===folder.account_id&&other.role===folder.role))return roleTitle;
-  return folder?.display_name||folder?.remote_path||'';
+  const name=folder?.display_name||folder?.remote_path||'';
+  if(!folder?.role&&name.toLocaleLowerCase()===names.drafts.toLocaleLowerCase()
+      &&coreFolders.some(other=>other.account_id===folder.account_id&&other.role==='drafts')){
+    return `${name} (${L('обычная папка','custom folder')})`;
+  }
+  return name;
 }
 function mailFolderPathLabel(folder){
   return folderNames.folderPathLabel(folder,new Map(coreFolders.map(item=>[item.id,item])),folderTitle);

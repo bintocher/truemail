@@ -144,8 +144,10 @@ impl Db {
     }
 
     fn draft_version(&self, reference: &str) -> Result<String> {
+        use base64::Engine as _;
         use sha2::{Digest, Sha256};
-        Ok(format!("{:x}", Sha256::digest(self.blobs.get(reference)?)))
+        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(self.blobs.get(reference)?)))
     }
 
     /// Общий приём письма в очередь. Срок передачи известен до записи и
@@ -259,6 +261,7 @@ impl Db {
                 cancel_until,
                 undo_seconds,
                 duplicate: false,
+                draft_recorded: draft_id.is_some(),
             })
         }
         .await;
@@ -290,8 +293,9 @@ impl Db {
         account_id: i64,
         request_key: &str,
     ) -> Result<Option<SendQueued>> {
-        let row: Option<(i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT k.operation_id, k.cancel_until, o.status
+        let row: Option<(i64, Option<String>, Option<String>, bool)> = sqlx::query_as(
+            "SELECT k.operation_id, k.cancel_until, o.status,
+                    EXISTS(SELECT 1 FROM draft_submissions WHERE operation_id=k.operation_id)
                FROM send_request_keys k
                LEFT JOIN outbox_ops o ON o.id = k.operation_id
               WHERE k.request_key=? AND k.account_id=?",
@@ -300,14 +304,17 @@ impl Db {
         .bind(account_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(operation_id, cancel_until, status)| SendQueued {
-            operation_id,
-            account_id,
-            status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
-            cancel_until: cancel_until.unwrap_or_default(),
-            undo_seconds: 0,
-            duplicate: true,
-        }))
+        Ok(row.map(
+            |(operation_id, cancel_until, status, draft_recorded)| SendQueued {
+                operation_id,
+                account_id,
+                status: status.unwrap_or_else(|| SEND_STATUS_PENDING.to_owned()),
+                cancel_until: cancel_until.unwrap_or_default(),
+                undo_seconds: 0,
+                duplicate: true,
+                draft_recorded,
+            },
+        ))
     }
 
     /// Захватить одну готовую операцию отправки. Операции отправки берутся по
@@ -775,6 +782,7 @@ impl Db {
                         cancel_until,
                         undo_seconds: 0,
                         duplicate: false,
+                        draft_recorded: false,
                     },
                 )
                 .collect(),
