@@ -224,6 +224,7 @@ pub struct ImapDiscovery {
     pub folders: Vec<DiscoveredFolder>,
     pub messages: Vec<DiscoveredMessage>,
     pub server_uids: Vec<(String, Vec<u32>)>,
+    pub server_remote_ids: Vec<(String, Vec<String>)>,
     pub reset_folders: Vec<String>,
     /// Complete set of remote IDs, when the provider returned a full snapshot.
     pub remote_snapshot: Option<Vec<String>>,
@@ -1739,6 +1740,7 @@ async fn discover_inbox(
     Ok(ImapDiscovery {
         folders,
         messages,
+        server_remote_ids: Vec::new(),
         server_uids: full_snapshot
             .then_some((path.clone(), uids))
             .into_iter()
@@ -2136,6 +2138,7 @@ async fn discover_with_auth(
     Ok(ImapDiscovery {
         folders,
         messages,
+        server_remote_ids: Vec::new(),
         server_uids,
         reset_folders,
         remote_snapshot: None,

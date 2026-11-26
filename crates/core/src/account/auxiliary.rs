@@ -587,7 +587,7 @@ async fn write_dav_event(
             return Err(Error::from_http_status(
                 "caldav",
                 status.as_u16(),
-                "Не удалось прочитать календарное событие".into(),
+                "Не удалось прочитать календарное событие",
             ));
         }
         let etag = response

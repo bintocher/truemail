@@ -407,11 +407,14 @@ fn fault_error_kind(fault: &str) -> Option<ErrorKind> {
     None
 }
 
-fn response_error(body: &str) -> Option<String> {
+fn response_error(body: &str, allow_missing_item: bool) -> Option<String> {
     let document = Document::parse(body).ok()?;
-    let response = document
-        .descendants()
-        .find(|node| node.is_element() && node.attribute("ResponseClass") == Some("Error"))?;
+    let response = document.descendants().find(|node| {
+        node.is_element()
+            && node.attribute("ResponseClass") == Some("Error")
+            && !(allow_missing_item
+                && node_text(*node, "ResponseCode") == Some("ErrorItemNotFound"))
+    })?;
     let code = node_text(response, "ResponseCode");
     let text = node_text(response, "MessageText");
     Some(match (code, text) {
@@ -680,7 +683,7 @@ impl EwsBackend {
             // какой именно запрос сервер счёл неверным (issue #82).
             return Err(status_error(response.status, &response.body).with_operation(action));
         }
-        if let Some(error) = response_error(&response.body) {
+        if let Some(error) = response_error(&response.body, action == "GetItem") {
             if is_server_busy(&error) {
                 // SOAP-отказ приходит при HTTP 200 (см. проверку выше) -
                 // настоящего кода ответа, отражающего занятость, тут нет.
@@ -960,6 +963,8 @@ impl EwsBackend {
             .map(|id| (id, Vec::new()))
             .collect::<Vec<_>>();
         let mut reset_folders = deleted_folder_ids.into_iter().collect::<Vec<_>>();
+        let mut server_remote_ids = Vec::new();
+        let mut skipped_folders = Vec::new();
         let mut changed_remote_ids = HashSet::new();
         for folder in &mut folders {
             let folder_started = std::time::Instant::now();
@@ -976,17 +981,29 @@ impl EwsBackend {
                 Ok(sync) => sync,
                 Err(error) => {
                     tracing::warn!(folder = %folder.display_name, %error, "EWS: инкрементальная синхронизация папки пропущена");
+                    skipped_folders.push(folder.display_name.clone());
+                    continue;
+                }
+            };
+            let fetched = if sync.initial {
+                self.recent_messages_in_folder(password, folder, 500, Some(retention_days))
+                    .await
+            } else {
+                self.messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
+                    .await
+            };
+            let mut found = match fetched {
+                Ok(messages) => messages,
+                Err(error) => {
+                    tracing::warn!(folder=%folder.display_name,error_kind=error.code(),"EWS: не удалось загрузить письма папки");
+                    skipped_folders.push(folder.display_name.clone());
                     continue;
                 }
             };
             changed_remote_ids.extend(sync.deleted_ids.iter().cloned());
-            let mut found = if sync.initial {
-                self.recent_messages_in_folder(password, folder, 500, Some(retention_days))
-                    .await?
-            } else {
-                self.messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
-                    .await?
-            };
+            if !sync.initial {
+                changed_remote_ids.extend(sync.changed_ids.iter().cloned());
+            }
             let changed_ids_count = sync.changed_ids.len();
             let deleted_ids_count = sync.deleted_ids.len();
             let downloaded_count = found.len();
@@ -1018,11 +1035,7 @@ impl EwsBackend {
             changed_remote_ids.extend(found.iter().filter_map(|message| message.remote_id.clone()));
             messages.append(&mut found);
             if sync.initial {
-                server_uids.push((
-                    folder.remote_path.clone(),
-                    sync.changed_ids.iter().map(|id| stable_uid(id)).collect(),
-                ));
-                reset_folders.push(folder.remote_path.clone());
+                server_remote_ids.push((folder.remote_path.clone(), sync.changed_ids));
             }
             folder.sync_token = Some(encode_mail_sync_token(&MailSyncToken {
                 hierarchy: Some(hierarchy.sync_state.clone()),
@@ -1036,13 +1049,14 @@ impl EwsBackend {
         Ok(ImapDiscovery {
             folders,
             messages,
+            server_remote_ids,
             server_uids,
             reset_folders,
             remote_snapshot: None,
             changed_remote_ids,
             flag_updates: Vec::new(),
             deleted_uids: Vec::new(),
-            skipped_folders: Vec::new(),
+            skipped_folders,
         })
     }
 
@@ -1069,6 +1083,7 @@ impl EwsBackend {
             return Ok(ImapDiscovery {
                 folders,
                 messages,
+                server_remote_ids: Vec::new(),
                 server_uids: Vec::new(),
                 reset_folders: Vec::new(),
                 remote_snapshot: None,
@@ -1085,19 +1100,11 @@ impl EwsBackend {
         let messages = self
             .messages_by_ids(password, &folder.remote_path, &sync.changed_ids)
             .await?;
-        let server_uids = if sync.initial {
-            vec![(
-                folder.remote_path.clone(),
-                sync.changed_ids.iter().map(|id| stable_uid(id)).collect(),
-            )]
+        let server_remote_ids = if sync.initial {
+            vec![(folder.remote_path.clone(), sync.changed_ids.clone())]
         } else {
             Vec::new()
         };
-        let reset_folders = sync
-            .initial
-            .then(|| folder.remote_path.clone())
-            .into_iter()
-            .collect();
         let mut changed_remote_ids = sync.changed_ids.clone();
         changed_remote_ids.extend(sync.deleted_ids);
         changed_remote_ids.sort();
@@ -1109,8 +1116,9 @@ impl EwsBackend {
         Ok(ImapDiscovery {
             folders,
             messages,
-            server_uids,
-            reset_folders,
+            server_remote_ids,
+            server_uids: Vec::new(),
+            reset_folders: Vec::new(),
             remote_snapshot: None,
             changed_remote_ids,
             flag_updates: Vec::new(),
@@ -3882,7 +3890,7 @@ mod tests {
  <MessageText>The synchronization state data is invalid.</MessageText>
  <ResponseCode>ErrorInvalidSyncStateData</ResponseCode>
 </SyncFolderItemsResponseMessage>"#;
-        let error = response_error(xml).expect("response error");
+        let error = response_error(xml, false).expect("response error");
         assert!(error.contains("ErrorInvalidSyncStateData"));
         assert!(error.contains("synchronization state data is invalid"));
     }

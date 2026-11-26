@@ -534,7 +534,7 @@ impl JmapBackend {
         let mut query_results = HashMap::new();
         let mut all_full = !inbox_only;
         let mut snapshot = HashSet::new();
-        let mut server_uids = Vec::new();
+        let mut server_remote_ids = Vec::new();
         for mailbox in &selected {
             let result = self
                 .query_mailbox(
@@ -558,10 +558,7 @@ impl JmapBackend {
             changed_ids.extend(result.removed.iter().cloned());
             if result.full {
                 snapshot.extend(result.ids.iter().cloned());
-                server_uids.push((
-                    mailbox.id.clone(),
-                    result.ids.iter().map(|id| stable_uid(id)).collect(),
-                ));
+                server_remote_ids.push((mailbox.id.clone(), result.ids.clone()));
             } else {
                 all_full = false;
             }
@@ -600,7 +597,8 @@ impl JmapBackend {
         Ok(ImapDiscovery {
             folders,
             messages,
-            server_uids,
+            server_remote_ids,
+            server_uids: Vec::new(),
             reset_folders: Vec::new(),
             remote_snapshot: all_full.then(|| snapshot.into_iter().collect()),
             changed_remote_ids: changed_ids.into_iter().collect(),

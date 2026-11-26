@@ -1561,11 +1561,12 @@ impl AccountManager {
             .await?;
         let projections = self
             .db
-            .reconcile_remote_projections(
+            .reconcile_exact_remote_projections(
                 account.id,
                 &discovery.messages,
                 &discovery.changed_remote_ids,
                 discovery.remote_snapshot.as_deref(),
+                &discovery.server_remote_ids,
             )
             .await?;
         self.db
@@ -3555,11 +3556,12 @@ impl AccountManager {
                                 }
                                 match self
                                     .db
-                                    .reconcile_remote_projections(
+                                    .reconcile_exact_remote_projections(
                                         account.id,
                                         &imap.messages,
                                         &imap.changed_remote_ids,
                                         imap.remote_snapshot.as_deref(),
+                                        &imap.server_remote_ids,
                                     )
                                     .await
                                 {

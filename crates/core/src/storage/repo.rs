@@ -353,6 +353,7 @@ impl MessageFetchLocator {
 #[derive(sqlx::FromRow)]
 struct CachedMessageBody {
     id: i64,
+    uid: i64,
     raw_blob_ref: Option<String>,
     body_fetched: bool,
     imap_uidvalidity: Option<i64>,
@@ -1591,6 +1592,24 @@ impl Db {
         changed_remote_ids: &[String],
         remote_snapshot: Option<&[String]>,
     ) -> Result<usize> {
+        self.reconcile_exact_remote_projections(
+            account_id,
+            messages,
+            changed_remote_ids,
+            remote_snapshot,
+            &[],
+        )
+        .await
+    }
+
+    pub(crate) async fn reconcile_exact_remote_projections(
+        &self,
+        account_id: i64,
+        messages: &[crate::backend::DiscoveredMessage],
+        changed_remote_ids: &[String],
+        remote_snapshot: Option<&[String]>,
+        folder_snapshots: &[(String, Vec<String>)],
+    ) -> Result<usize> {
         // Снимок пределов берётся до цикла: клонировать его на каждое
         // письмо незачем, значение за один проход не меняется.
         let limits = self.limit_set();
@@ -1608,7 +1627,11 @@ impl Db {
         let changed: HashSet<&str> = changed_remote_ids.iter().map(String::as_str).collect();
         let snapshot: Option<HashSet<&str>> =
             remote_snapshot.map(|ids| ids.iter().map(String::as_str).collect());
-        if changed.is_empty() && snapshot.is_none() {
+        let exact_folders: HashMap<&str, HashSet<&str>> = folder_snapshots
+            .iter()
+            .map(|(path, ids)| (path.as_str(), ids.iter().map(String::as_str).collect()))
+            .collect();
+        if changed.is_empty() && snapshot.is_none() && exact_folders.is_empty() {
             return Ok(0);
         }
 
@@ -1622,13 +1645,17 @@ impl Db {
         .await?;
         let mut delete_rows = Vec::new();
         for (id, remote_id, folder_path, raw_ref) in rows {
-            let should_check = snapshot.is_some() || changed.contains(remote_id.as_str());
+            let folder_snapshot = exact_folders.get(folder_path.as_str());
+            let should_check = snapshot.is_some()
+                || folder_snapshot.is_some()
+                || changed.contains(remote_id.as_str());
             if !should_check {
                 continue;
             }
             let absent_from_server = snapshot
                 .as_ref()
-                .is_some_and(|ids| !ids.contains(remote_id.as_str()));
+                .is_some_and(|ids| !ids.contains(remote_id.as_str()))
+                || folder_snapshot.is_some_and(|ids| !ids.contains(remote_id.as_str()));
             let stale_projection = desired
                 .get(remote_id.as_str())
                 .is_some_and(|paths| !paths.contains(folder_path.as_str()));
@@ -2786,14 +2813,17 @@ impl Db {
                 if matches!((uidvalidity, folder_uidvalidity), (Some(current), Some(saved)) if current != saved) {
                     return Err(crate::Error::ImapMessageIdentityChanged);
                 }
-                let mut old_ref: Option<CachedMessageBody> = sqlx::query_as(
-                    "SELECT id, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
-                     FROM messages WHERE folder_id=? AND uid=?",
-                )
-                .bind(folder_id)
-                .bind(source.uid as i64)
-                .fetch_optional(&mut *tx)
-                .await?;
+                let mut old_ref: Option<CachedMessageBody> = if let Some(remote_id) = &source.remote_id {
+                    sqlx::query_as(
+                        "SELECT id, uid, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                         FROM messages WHERE folder_id=? AND remote_id=? ORDER BY id LIMIT 1",
+                    ).bind(folder_id).bind(remote_id).fetch_optional(&mut *tx).await?
+                } else {
+                    sqlx::query_as(
+                        "SELECT id, uid, raw_blob_ref, body_fetched, imap_uidvalidity, rfc822_message_id
+                         FROM messages WHERE folder_id=? AND uid=? AND remote_id IS NULL",
+                    ).bind(folder_id).bind(i64::from(source.uid)).fetch_optional(&mut *tx).await?
+                };
                 if let Some(old) = &old_ref
                     && let Some(current_generation) = uidvalidity
                     && (old.imap_uidvalidity.is_some_and(|generation| generation != current_generation)
@@ -2822,6 +2852,16 @@ impl Db {
                          SET last_id=max(last_id,coalesce((SELECT max(id) FROM messages),0))+1
                          WHERE singleton=1 RETURNING last_id",
                     ).fetch_one(&mut *tx).await?,
+                };
+                let uid = if let Some(row) = &old_ref {
+                    row.uid
+                } else if source.remote_id.is_some() {
+                    let occupied: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM messages WHERE folder_id=? AND uid=?)",
+                    ).bind(folder_id).bind(i64::from(source.uid)).fetch_one(&mut *tx).await?;
+                    if occupied { i64::from(u32::MAX) + local_id } else { i64::from(source.uid) }
+                } else {
+                    i64::from(source.uid)
                 };
                 let effective_ref = if preserve_full_body {
                     old_ref
@@ -2868,7 +2908,7 @@ impl Db {
                         reply_to_addrs=excluded.reply_to_addrs,
                         silence_headers_known=CASE WHEN messages.silence_headers_known=1 THEN 1 ELSE excluded.silence_headers_known END"
                 ))
-                .bind(account_id).bind(folder_id).bind(source.uid as i64).bind(&source.remote_id).bind(&message_id)
+                .bind(account_id).bind(folder_id).bind(uid).bind(&source.remote_id).bind(&message_id)
                 .bind(&in_reply_to).bind(&references).bind(from_name).bind(from_addr).bind(to).bind(cc)
                 .bind(&subject).bind(&preview).bind(&date).bind(source.size.map(i64::from))
                 .bind(source.seen as i64).bind(source.flagged as i64).bind(source.answered as i64)
