@@ -792,7 +792,12 @@ pub async fn send_gmail(message: OutgoingMessage, access_token: &str) -> Result<
 pub(crate) async fn send_gmail_raw(raw: &[u8], access_token: &str) -> Result<()> {
     use base64::Engine as _;
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| Error::from_reqwest("gmail-send", error))?;
+    let response = client
         .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
         .bearer_auth(access_token)
         .json(&serde_json::json!({"raw":raw}))

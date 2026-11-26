@@ -1263,7 +1263,10 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             } else {
                 None
             };
-            imap_list_folder(name.name().to_owned(), name.delimiter(), role)
+            (
+                imap_list_folder(name.name().to_owned(), name.delimiter(), role),
+                role,
+            )
         })
         .try_collect::<Vec<_>>()
         .await
@@ -1272,7 +1275,18 @@ async fn list_oauth_folders(session: &mut OAuthSession) -> Result<Vec<Discovered
             message: e.to_string(),
         })?;
 
-    let mut folders = names;
+    let declares_drafts = names
+        .iter()
+        .any(|(_, explicit)| *explicit == Some(FolderRole::Drafts));
+    let mut folders = names
+        .into_iter()
+        .map(|(mut folder, explicit)| {
+            if declares_drafts && folder.role == Some(FolderRole::Drafts) && explicit.is_none() {
+                folder.role = None;
+            }
+            folder
+        })
+        .collect::<Vec<_>>();
     for folder in &mut folders {
         let status = session
             .status(&folder.remote_path, "(MESSAGES UNSEEN)")

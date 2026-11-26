@@ -96,7 +96,21 @@ pub(crate) async fn transmit_with_backend(
             return 0;
         }
     };
-    let outcome = match backend.send(message, token).await {
+    let sent = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        backend.send(message, token),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(crate::backend::SendFailure::after_handoff(
+            crate::Error::classified_backend(
+                "send",
+                ErrorKind::Timeout,
+                "сервер не подтвердил отправку за отведённое время",
+            ),
+        ))
+    });
+    let outcome = match sent {
         Ok(outcome) => outcome,
         Err(failure) if !failure.after_handoff => {
             record_send_rejection(db, operation.id, &failure.error).await;

@@ -1140,6 +1140,15 @@ impl Db {
                 return Err(crate::Error::Other("папка аккаунта не найдена".into()));
             }
         }
+        sqlx::query(
+            "INSERT INTO folder_role_overrides(account_id,role,folder_id) VALUES(?,?,?)
+             ON CONFLICT(account_id,role) DO UPDATE SET folder_id=excluded.folder_id",
+        )
+        .bind(account_id)
+        .bind(role)
+        .bind(folder_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1152,6 +1161,11 @@ impl Db {
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
+        let canonical_drafts = folders
+            .iter()
+            .filter(|folder| folder.role == Some(FolderRole::Drafts))
+            .count()
+            == 1;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
             if let Some(uidvalidity) = folder.uidvalidity {
@@ -1174,7 +1188,9 @@ impl Db {
                                      total_count, uidvalidity, uidnext, highestmodseq)
                  VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, remote_path) DO UPDATE SET
-                    display_name = excluded.display_name, role = coalesce(excluded.role, folders.role),
+                    display_name = excluded.display_name,
+                    role = CASE WHEN ? AND excluded.role IS NULL AND folders.role='drafts'
+                           THEN NULL ELSE coalesce(excluded.role, folders.role) END,
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
                     sync_token = CASE WHEN excluded.uidvalidity<>folders.uidvalidity
@@ -1195,6 +1211,11 @@ impl Db {
             .bind(folder.uidvalidity.map(i64::from))
             .bind(folder.uidnext.map(i64::from))
             .bind(folder.highestmodseq.map(|value| value as i64))
+            .bind(
+                canonical_drafts
+                    && crate::model::infer_folder_role("", &folder.display_name)
+                        == Some(FolderRole::Drafts),
+            )
             .fetch_one(&mut *tx)
             .await?;
             folder_ids.insert(folder.remote_path.as_str(), id);
@@ -1209,6 +1230,26 @@ impl Db {
                 sqlx::query("UPDATE folders SET parent_id=? WHERE id=?")
                     .bind(parent_id)
                     .bind(folder_ids[folder.remote_path.as_str()])
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        let overrides: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT role,folder_id FROM folder_role_overrides WHERE account_id=?")
+                .bind(account_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (role, folder_id) in overrides {
+            sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
+                .bind(account_id)
+                .bind(&role)
+                .execute(&mut *tx)
+                .await?;
+            if let Some(folder_id) = folder_id {
+                sqlx::query("UPDATE folders SET role=? WHERE account_id=? AND id=?")
+                    .bind(role)
+                    .bind(account_id)
+                    .bind(folder_id)
                     .execute(&mut *tx)
                     .await?;
             }
