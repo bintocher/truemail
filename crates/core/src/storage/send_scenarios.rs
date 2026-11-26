@@ -30,6 +30,60 @@ async fn seed_account(db: &Db, email: &str) -> i64 {
     .0
 }
 
+#[tokio::test]
+async fn a_submitted_draft_keeps_its_send_and_cleanup_in_the_same_transaction() {
+    let db = open_test_db("draft-submission").await;
+    let account = seed_account(&db, "draft@example.test").await;
+    let drafts: i64 = sqlx::query_scalar(
+        "INSERT INTO folders(account_id,remote_path,display_name,role)
+         VALUES(?,'Drafts','Drafts','drafts') RETURNING id",
+    )
+    .bind(account)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO folders(account_id,remote_path,display_name,role)
+         VALUES(?,'Trash','Trash','trash')",
+    )
+    .bind(account)
+    .execute(&db.write_pool)
+    .await
+    .unwrap();
+    let reference = db.blobs.put(b"Subject: test\r\n\r\nDraft body").unwrap();
+    let draft: i64 = sqlx::query_scalar(
+        "INSERT INTO messages(account_id,folder_id,uid,draft,raw_blob_ref,body_fetched)
+         VALUES(?,?,1,1,?,1) RETURNING id",
+    )
+    .bind(account)
+    .bind(drafts)
+    .bind(reference)
+    .fetch_one(&db.write_pool)
+    .await
+    .unwrap();
+    let queued = db
+        .queue_draft_send(account, letter("draft@example.test"), None, draft, None)
+        .await
+        .unwrap();
+    assert!(queued.draft_recorded);
+    assert!(db.draft_already_submitted(draft).await.unwrap());
+    assert!(
+        db.queue_draft_send(account, letter("draft@example.test"), None, draft, None)
+            .await
+            .is_err()
+    );
+    let actions: Vec<(String, Option<i64>)> =
+        sqlx::query_as("SELECT op_kind,message_id FROM outbox_ops ORDER BY id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        actions,
+        vec![("send".into(), None), ("move".into(), Some(draft))]
+    );
+    db.close().await;
+}
+
 fn letter(from: &str) -> OutgoingMessage {
     OutgoingMessage {
         from: from.to_owned(),

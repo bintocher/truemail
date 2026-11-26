@@ -1249,11 +1249,13 @@ impl Db {
                 .fetch_all(&mut *tx)
                 .await?;
         for (role, folder_id) in overrides {
-            sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
-                .bind(account_id)
-                .bind(&role)
-                .execute(&mut *tx)
-                .await?;
+            if folder_id.is_none() || role == "drafts" {
+                sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
+                    .bind(account_id)
+                    .bind(&role)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             if let Some(folder_id) = folder_id {
                 sqlx::query("UPDATE folders SET role=? WHERE account_id=? AND id=?")
                     .bind(role)
