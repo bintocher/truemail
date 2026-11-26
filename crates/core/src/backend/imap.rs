@@ -1101,19 +1101,22 @@ async fn copy_once_then_delete(
     let original = uid_body(session, uid)
         .await?
         .ok_or(Error::ImapMessageIdentityChanged)?;
-    let message_id = mime_message_id(&original).ok_or_else(|| {
-        Error::AccountConfig(
-            "Сервер не поддерживает перенос, а у письма нет идентификатора для проверки копии"
-                .into(),
-        )
-    })?;
-    if message_id.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(Error::ImapMessageIdentityChanged);
-    }
-    let search = message_id.replace('\\', "\\\\").replace('"', "\\\"");
+    let search = match mime_message_id(&original)
+        .filter(|id| !id.bytes().any(|byte| byte.is_ascii_control()))
+    {
+        Some(id) => {
+            let quoted = id.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("HEADER Message-ID \"{quoted}\"")
+        }
+        None => format!(
+            "LARGER {} SMALLER {}",
+            original.len().saturating_sub(1),
+            original.len().saturating_add(1)
+        ),
+    };
     session.examine(target).await.map_err(imap_outbox_error)?;
     let ids = session
-        .uid_search(format!("HEADER Message-ID \"{search}\""))
+        .uid_search(search)
         .await
         .map_err(imap_outbox_error)?;
     let mut copied = false;

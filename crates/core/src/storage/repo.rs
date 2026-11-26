@@ -716,6 +716,8 @@ impl Db {
                 smtp_security = excluded.smtp_security,
                 ews_url = excluded.ews_url,
                 jmap_url = excluded.jmap_url,
+                caldav_url = coalesce(excluded.caldav_url, accounts.caldav_url),
+                carddav_url = coalesce(excluded.carddav_url, accounts.carddav_url),
                 username = excluded.username,
                 secret_ref = excluded.secret_ref,
                 enabled = 1,
@@ -735,9 +737,7 @@ impl Db {
         .bind(security(input.smtp.as_ref()))
         .bind(input.ews_url.as_deref())
         .bind(input.jmap_url.as_deref())
-        // caldav_url/carddav_url нарочно не входят в ON CONFLICT UPDATE SET
-        // (как и color ниже): переподключение того же email не должно
-        // затирать уже обнаруженные DAV-адреса значением NULL из NewAccount.
+        // Пустые поля при переподключении не затирают найденные DAV-адреса.
         .bind(input.caldav_url.as_deref())
         .bind(input.carddav_url.as_deref())
         .bind(input.username.as_deref())
@@ -746,11 +746,23 @@ impl Db {
         .execute(&self.write_pool)
         .await?;
 
-        self.list_accounts()
+        let account = self
+            .list_accounts()
             .await?
             .into_iter()
             .find(|account| account.email.eq_ignore_ascii_case(&input.email))
-            .ok_or_else(|| crate::Error::Other("аккаунт не найден после сохранения".into()))
+            .ok_or_else(|| crate::Error::Other("аккаунт не найден после сохранения".into()))?;
+        if input.caldav_url.is_some() || input.carddav_url.is_some() {
+            let mut tx = self.begin_write().await?;
+            for (kind, url) in [
+                ("caldav", input.caldav_url.as_deref()),
+                ("carddav", input.carddav_url.as_deref()),
+            ] {
+                remember_dav_base(&mut tx, account.id, kind, url).await?;
+            }
+            tx.commit().await?;
+        }
+        Ok(account)
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<Account>> {
@@ -1020,15 +1032,34 @@ impl Db {
         caldav_url: Option<&str>,
         carddav_url: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.begin_write().await?;
         sqlx::query(
             "UPDATE accounts SET caldav_url=?, carddav_url=?, updated_at=datetime('now') WHERE id=? AND enabled=1",
         )
         .bind(caldav_url)
         .bind(carddav_url)
         .bind(account_id)
-        .execute(&self.write_pool)
+        .execute(&mut *tx)
         .await?;
+        remember_dav_base(&mut tx, account_id, "caldav", caldav_url).await?;
+        remember_dav_base(&mut tx, account_id, "carddav", carddav_url).await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn is_known_dav_base(
+        &self,
+        account_id: i64,
+        kind: &str,
+        url: &str,
+    ) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key=? AND value=?)")
+                .bind(format!("dav_base:{account_id}:{kind}"))
+                .bind(url)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Задать цвет аккаунта (для аватаров писем и сайдбара).
@@ -1140,6 +1171,15 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         if let Some(folder_id) = folder_id {
+            sqlx::query(
+                "UPDATE folder_role_overrides SET folder_id=NULL
+                         WHERE account_id=? AND folder_id=? AND role<>?",
+            )
+            .bind(account_id)
+            .bind(folder_id)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
             let updated = sqlx::query("UPDATE folders SET role=? WHERE id=? AND account_id=?")
                 .bind(role)
                 .bind(folder_id)
@@ -1220,11 +1260,7 @@ impl Db {
             .bind(folder.uidvalidity.map(i64::from))
             .bind(folder.uidnext.map(i64::from))
             .bind(folder.highestmodseq.map(|value| value as i64))
-            .bind(
-                canonical_drafts
-                    && crate::model::infer_folder_role("", &folder.display_name)
-                        == Some(FolderRole::Drafts),
-            )
+            .bind(canonical_drafts)
             .fetch_one(&mut *tx)
             .await?;
             folder_ids.insert(folder.remote_path.as_str(), id);
@@ -5822,7 +5858,12 @@ impl Db {
         let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM mail_rules")
             .fetch_one(&self.pool)
             .await?;
-        if count > 0 {
+        let started: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM storage_meta WHERE key='legacy_rules_import_started')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if count > 0 && !started {
             return Ok(());
         }
         let Some(serialized) = self.setting("mail_rules_ui").await? else {
@@ -5833,6 +5874,8 @@ impl Db {
             return Ok(());
         };
         let mut tx = self.begin_write().await?;
+        sqlx::query("INSERT OR IGNORE INTO storage_meta(key,value) VALUES('legacy_rules_import_started','1')")
+            .execute(&mut *tx).await?;
         let mut complete = true;
         for (sort_order, rule) in rules.into_iter().enumerate() {
             let string = |key: &str| rule.get(key).and_then(|value| value.as_str());
@@ -5908,6 +5951,9 @@ impl Db {
         }
         if complete {
             sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM storage_meta WHERE key='legacy_rules_import_started'")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -7727,6 +7773,20 @@ impl Db {
     }
 }
 
+async fn remember_dav_base(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    kind: &str,
+    url: Option<&str>,
+) -> Result<()> {
+    if let Some(url) = url {
+        crate::service_url::parse(url)?;
+        sqlx::query("INSERT INTO storage_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            .bind(format!("dav_base:{account_id}:{kind}")).bind(url).execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 async fn queued_move_deadline(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ids: &[i64],
@@ -9484,7 +9544,7 @@ async fn clear_stage_result_of_operation(
     Ok(())
 }
 
-async fn infer_missing_folder_role(
+pub(crate) async fn infer_missing_folder_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
     role: &str,

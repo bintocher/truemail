@@ -53,7 +53,7 @@ let composerTextMissing=false;
 let composerFromAccount=null;
 window.rememberComposerFrom=()=>{composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;};
 window.composerFromValue=()=>composerFromAccount==null?'':String(composerFromAccount);
-function resetComposer(){composerGeneration++;composerRequestKey='';draftBeingSent=null;composerTextMissing=false;composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+function resetComposer(){document.getElementById('compCopySubmitted')?.classList.add('hidden');composerGeneration++;composerRequestKey='';draftBeingSent=null;composerTextMissing=false;composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
@@ -1225,7 +1225,10 @@ window.restoreDraftLink=messageId=>{
       if(draftMessageModel.isDraftMessage(full?.meta,coreFolders))link=messageId;
     }catch(error){link=null;}
     if(window.tm?.draftAlreadySubmitted&&(await Promise.resolve(window.tm.draftAlreadySubmitted(messageId)).catch(()=>false))===true){
-      if(generation===composerGeneration){resetComposer();clearSavedLetter();showToast(L('Этот черновик уже поставлен в очередь отправки','This draft has already been queued for sending'));}
+      if(generation===composerGeneration){
+        draftBeingSent=messageId;sentDrafts.add(messageId);
+        showSubmittedEditorNotice();
+      }
       return;
     }
     if(link!==null&&generation===composerGeneration&&draftBeingSent===null)draftBeingSent=link;
@@ -1254,6 +1257,19 @@ function saveLetterOfEditor(){
 // once, whichever button and whichever click.
 let handedOverGeneration=null,handingOverGeneration=null;
 function letterHandedOver(generation){return generation===handedOverGeneration||generation===handingOverGeneration;}
+function showSubmittedEditorNotice(){
+  const status=document.getElementById('composeStatus');
+  status.textContent=L('Этот черновик уже поставлен в очередь. Чтобы отправить правки отдельным письмом, сохраните их как новое письмо.','This draft is already queued. Save your edits as a new message to send them separately.');
+  status.dataset.kind='error';
+  document.getElementById('compCopySubmitted')?.classList.remove('hidden');
+}
+document.getElementById('compCopySubmitted').onclick=()=>{
+  draftBeingSent=null;
+  composerRequestKey='';
+  document.getElementById('compCopySubmitted').classList.add('hidden');
+  document.getElementById('composeStatus').textContent='';
+  scheduleDraftSave();
+};
 document.getElementById('compSend').onclick=async()=>{
   // Крупный файл может ещё дочитываться: без ожидания письмо ушло бы без него,
   // а вложение легло бы в уже очищенный композер. Если за это время открыли
@@ -1262,6 +1278,7 @@ document.getElementById('compSend').onclick=async()=>{
   await settleDraftLink();
   await settleAttachments();
   if(generation!==composerGeneration||letterHandedOver(generation))return;
+  if(sentDrafts.has(draftBeingSent)){showSubmittedEditorNotice();return;}
   let request;
   // S-005: адресаты проверяются до записи операции.
   try{request=composerRequest();}catch(error){showToast(error);return;}
@@ -1297,6 +1314,7 @@ document.getElementById('compSendLater').onclick=async()=>{
     await settleDraftLink();
     await settleAttachments();
     if(generation!==composerGeneration)return;
+    if(sentDrafts.has(draftBeingSent)){showSubmittedEditorNotice();return;}
     const input=document.getElementById('compSendAt'),status=document.getElementById('composeStatus');
     if(input.classList.contains('hidden')){const date=new Date(Date.now()+15*60*1000);date.setSeconds(0,0);input.value=new Date(date.getTime()-date.getTimezoneOffset()*60000).toISOString().slice(0,16);input.min=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,16);input.classList.remove('hidden');input.focus();return;}
     try{

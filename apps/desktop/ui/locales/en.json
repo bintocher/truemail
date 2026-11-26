@@ -114,6 +114,7 @@
   "actionReplyAll": "Reply all",
   "actionSendDraft": "Send",
   "actionEditDraft": "Edit draft",
+  "copySubmittedDraft": "Save as a new message",
   "actMoveToFolder": "Move to folder",
   "actToSpam": "Spam",
   "addAccount": "Add account",

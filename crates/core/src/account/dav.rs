@@ -732,11 +732,35 @@ fn parse_collections(
         backend: "dav-xml".into(),
         message: e.to_string(),
     })?;
+    if doc.root_element().tag_name().name() != "multistatus" {
+        return Err(Error::Other(
+            "Сервер не подтвердил состав коллекций DAV".into(),
+        ));
+    }
     let mut collections = Vec::new();
     for response in doc
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "response")
     {
+        let status_failed = response_status(response)
+            .is_some_and(|status| !successful_dav_status(status))
+            || response
+                .children()
+                .filter(|node| node.tag_name().name() == "propstat")
+                .any(|prop| {
+                    response_status(prop).is_some_and(|status| {
+                        status
+                            .split_ascii_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .is_some_and(|code| code == 403 || code >= 500)
+                    })
+                });
+        if status_failed {
+            return Err(Error::Other(
+                "Сервер не подтвердил состав коллекций DAV".into(),
+            ));
+        }
         if !response
             .descendants()
             .any(|node| node.is_element() && node.tag_name().name() == resource_type)
@@ -944,6 +968,11 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
         backend: "dav-xml".into(),
         message: e.to_string(),
     })?;
+    if doc.root_element().tag_name().name() != "multistatus" {
+        return Err(Error::Other(
+            "Сервер не подтвердил состав коллекции DAV".into(),
+        ));
+    }
     let mut resources = Vec::new();
     for response in doc
         .descendants()

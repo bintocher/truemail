@@ -547,9 +547,10 @@ async fn dav_write(
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        return Err(backend_error(
+        return Err(http_error(
             "dav-write",
-            format!("{url}: HTTP {status}: {body}"),
+            status,
+            format!("HTTP {status}: {body}"),
         ));
     }
     Ok(())
@@ -682,11 +683,86 @@ fn replace_dav_event(original: &str, uid: &str, input: &EventInput) -> Result<St
     if end > calendar_end {
         return Err(invalid());
     }
+    let replacement = if begin == end {
+        replacement.to_owned()
+    } else {
+        keep_unedited_event_fields(&original[begin..end], replacement)
+    };
     Ok(format!(
         "{}{replacement}{}",
         &original[..begin],
         &original[end..]
     ))
+}
+
+fn keep_unedited_event_fields(original: &str, replacement: &str) -> String {
+    let original = original.replace("\r\n ", "").replace("\r\n\t", "");
+    let mut nested = 0;
+    let mut untouched = Vec::new();
+    let mut recurrence = None;
+    for line in original.lines().skip(1) {
+        let key = line
+            .split([':', ';'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if key == "BEGIN" {
+            nested += 1;
+            continue;
+        }
+        if key == "END" {
+            if nested == 0 {
+                break;
+            }
+            nested -= 1;
+            continue;
+        }
+        if nested != 0 {
+            continue;
+        }
+        if key == "RECURRENCE-ID" {
+            recurrence = Some(line);
+            continue;
+        }
+        if !matches!(
+            key.as_str(),
+            "UID"
+                | "DTSTART"
+                | "DTEND"
+                | "DURATION"
+                | "SUMMARY"
+                | "DESCRIPTION"
+                | "LOCATION"
+                | "RRULE"
+                | "EXDATE"
+                | "RDATE"
+                | "X-WR-TIMEZONE"
+                | "TRANSP"
+                | "CLASS"
+                | "CATEGORIES"
+                | "URL"
+                | "ORGANIZER"
+                | "SEQUENCE"
+                | "ATTENDEE"
+                | "DTSTAMP"
+        ) {
+            untouched.push(line);
+        }
+    }
+    let mut fields = replacement
+        .lines()
+        .filter(|line| *line != "END:VEVENT")
+        .map(|line| {
+            if line.starts_with("RECURRENCE-ID") {
+                recurrence.unwrap_or(line)
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>();
+    fields.extend(untouched);
+    fields.extend(["END:VEVENT", ""]);
+    fields.join("\r\n")
 }
 
 #[cfg(test)]

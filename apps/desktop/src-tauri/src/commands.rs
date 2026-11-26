@@ -3583,6 +3583,7 @@ async fn claim_auxiliary_creation(
     account_id: i64,
     kind: &str,
     key: Option<&str>,
+    signature: &str,
 ) -> CmdResult<bool> {
     let Some(key) = key else { return Ok(true) };
     if key.is_empty()
@@ -3595,19 +3596,25 @@ async fn claim_auxiliary_creation(
     }
     let mut tx = core.db.begin_write().await?;
     let insert = sqlx::query(
-        "INSERT OR IGNORE INTO auxiliary_create_requests(account_id,kind,request_key)
-            VALUES(?,?,?)",
+        "INSERT OR IGNORE INTO auxiliary_create_requests(account_id,kind,request_key,request_signature)
+            VALUES(?,?,?,?)",
     )
     .bind(account_id)
     .bind(kind)
     .bind(key)
+    .bind(signature)
     .execute(&mut *tx)
     .await
     .map_err(truemail_core::Error::from)?;
     let owned = insert.rows_affected() == 1;
-    let saved:bool=sqlx::query_scalar("SELECT saved FROM auxiliary_create_requests WHERE account_id=? AND kind=? AND request_key=?")
-        .bind(account_id).bind(kind).bind(key).fetch_one(&mut *tx).await.map_err(truemail_core::Error::from)?;
+    let (owner,data,saved):(i64,String,bool)=sqlx::query_as("SELECT account_id,request_signature,saved FROM auxiliary_create_requests WHERE kind=? AND request_key=?")
+        .bind(kind).bind(key).fetch_one(&mut *tx).await.map_err(truemail_core::Error::from)?;
     tx.commit().await.map_err(truemail_core::Error::from)?;
+    if owner != account_id || data != signature {
+        return Err(api_error(
+            "Предыдущая попытка сохраняла другой вариант. Проверьте её результат в списке записей",
+        ));
+    }
     if !owned && !saved {
         return Err(api_error(
             "Подтверждение предыдущего сохранения ещё не получено. Обновите список и проверьте, появилась ли запись",
@@ -3634,6 +3641,10 @@ async fn record_auxiliary_creation(
                     truemail_core::ErrorKind::AccountConfig
                         | truemail_core::ErrorKind::InvalidCredentials
                         | truemail_core::ErrorKind::NeedsReauth
+                        | truemail_core::ErrorKind::Forbidden
+                ) || matches!(
+                    error.response_code(),
+                    Some(400 | 401 | 403 | 404 | 409 | 412 | 422)
                 ) =>
             {
                 Some(
@@ -3661,10 +3672,31 @@ fn refresh_auxiliary_after_write(
     state: &AppState,
     core: Arc<Core>,
     account: Account,
+    confirmed: bool,
 ) {
     let active = state.syncing_aux.clone();
+    let generation = state.generation.clone();
+    let original = generation.load(std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
-        if !active.lock().await.insert(account.id) {
+        let acquired = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+            loop {
+                {
+                    let mut accounts = active.lock().await;
+                    if generation.load(std::sync::atomic::Ordering::SeqCst) != original {
+                        return false;
+                    }
+                    if accounts.insert(account.id) {
+                        return true;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        })
+        .await;
+        if !matches!(acquired, Ok(true)) {
+            if confirmed {
+                let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+            }
             return;
         }
         let result = refresh_auxiliary(&core, &account).await;
@@ -3675,7 +3707,9 @@ fn refresh_auxiliary_after_write(
             }
             Err(error) => {
                 tracing::warn!(account_id=account.id, message=%error.safe_message(),"запись сохранена, обновить список не удалось");
-                let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+                if confirmed {
+                    let _ = app.emit("truemail-aux-write-sync-warning", account.id);
+                }
             }
         }
     });
@@ -3705,7 +3739,17 @@ pub async fn create_event(
     }
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    if !claim_auxiliary_creation(&core, account_id, "event", request_key.as_deref()).await? {
+    let signature =
+        serde_json::to_string(&(calendar_id, &input)).map_err(truemail_core::Error::from)?;
+    if !claim_auxiliary_creation(
+        &core,
+        account_id,
+        "event",
+        request_key.as_deref(),
+        &signature,
+    )
+    .await?
+    {
         return Ok(());
     }
     let result = core
@@ -3721,9 +3765,10 @@ pub async fn create_event(
             &input,
         )
         .await;
-    record_auxiliary_creation(&core, account_id, "event", request_key.as_deref(), result).await?;
-    refresh_auxiliary_after_write(app, &state, core, account);
-    Ok(())
+    let recorded =
+        record_auxiliary_creation(&core, account_id, "event", request_key.as_deref(), result).await;
+    refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
+    recorded
 }
 
 #[tauri::command]
@@ -3757,7 +3802,7 @@ pub async fn update_event(
             &input,
         )
         .await?;
-    refresh_auxiliary_after_write(app, &state, core, account);
+    refresh_auxiliary_after_write(app, &state, core, account, true);
     Ok(())
 }
 
@@ -3768,8 +3813,8 @@ pub async fn delete_event(
     event_id: i64,
 ) -> CmdResult<()> {
     let core = core(&state).await?;
-    let row: (i64, String, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT c.account_id, c.url, e.remote_url, e.etag
+    let row: (i64, String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT c.account_id, c.url, e.remote_url, e.etag,e.recurrence_id
          FROM events e JOIN calendars c ON c.id=e.calendar_id WHERE e.id=?",
     )
     .bind(event_id)
@@ -3777,6 +3822,11 @@ pub async fn delete_event(
     .await
     .map_err(truemail_core::Error::from)?;
     let account = account_by_id(&core, row.0).await?;
+    if row.4.is_some() && !matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+        return Err(api_error(
+            "Отдельная встреча находится в общей записи серии. Управляйте исключениями из формы серии",
+        ));
+    }
     let remote_url = row.2.as_deref().ok_or_else(|| ApiError {
         message: "У события нет серверного идентификатора".into(),
     })?;
@@ -3856,8 +3906,26 @@ pub async fn create_contact(
 ) -> CmdResult<()> {
     let core = core(&state).await?;
     let account = account_by_id(&core, account_id).await?;
+    let signature = serde_json::to_string(&input).map_err(truemail_core::Error::from)?;
     if !(account.provider == Provider::Gmail || is_dav_capable(&account)) {
-        core.db.save_local_contact(account_id, None, &input).await?;
+        if !claim_auxiliary_creation(
+            &core,
+            account_id,
+            "contact",
+            request_key.as_deref(),
+            &signature,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        let saved = core
+            .db
+            .save_local_contact(account_id, None, &input)
+            .await
+            .map(|_| ());
+        record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), saved)
+            .await?;
         let _ = app.emit("truemail-data-changed", account_id);
         return Ok(());
     }
@@ -3887,7 +3955,18 @@ pub async fn create_contact(
     };
     // Через AccountManager, а не свободной функцией: для Exchange нужны
     // ews_url и username из аккаунта, которых у свободной функции нет.
-    if !claim_auxiliary_creation(&core, account_id, "contact", request_key.as_deref()).await? {
+    if collection.is_none() && !matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+        return Err(api_error("Сначала синхронизируйте адресную книгу"));
+    }
+    if !claim_auxiliary_creation(
+        &core,
+        account_id,
+        "contact",
+        request_key.as_deref(),
+        &signature,
+    )
+    .await?
+    {
         return Ok(());
     }
     let result = core
@@ -3903,9 +3982,11 @@ pub async fn create_contact(
             &input,
         )
         .await;
-    record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), result).await?;
-    refresh_auxiliary_after_write(app, &state, core, account);
-    Ok(())
+    let recorded =
+        record_auxiliary_creation(&core, account_id, "contact", request_key.as_deref(), result)
+            .await;
+    refresh_auxiliary_after_write(app, &state, core, account, recorded.is_ok());
+    recorded
 }
 
 #[tauri::command]
@@ -4086,20 +4167,8 @@ pub async fn move_storage(
         )
         .await);
     }
-    let copy_result = std::fs::copy(source.join("truemail.db"), target.join("truemail.db"))
-        .map(|_| ())
-        .map_err(|e| ApiError {
-            message: format!("Не удалось скопировать базу: {e}"),
-        })
-        .and_then(|_| {
-            if source.join("blobs").exists() {
-                copy_dir(&source.join("blobs"), &target.join("blobs")).map_err(|e| ApiError {
-                    message: format!("Не удалось скопировать вложения: {e}"),
-                })
-            } else {
-                Ok(())
-            }
-        });
+    let copy_result = copy_storage_for_move(&source, &target)
+        .map_err(|error| api_error(format!("Не удалось скопировать хранилище: {error}")));
     if let Err(error) = copy_result {
         return Err(restore_storage_after_error(&app, &state, &source, error).await);
     }
@@ -4124,6 +4193,46 @@ pub async fn move_storage(
     *state.core.write().await = Some(replacement);
     restart_storage_tasks(&app, &state, &target).await;
     Ok(())
+}
+
+fn copy_storage_for_move(
+    source: &std::path::Path,
+    target: &std::path::Path,
+) -> std::io::Result<()> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging = target.join(format!(".truemail-transfer-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&staging)?;
+    let result = (|| {
+        std::fs::copy(source.join("truemail.db"), staging.join("truemail.db"))?;
+        let has_blobs = source.join("blobs").exists();
+        if has_blobs {
+            copy_dir(&source.join("blobs"), &staging.join("blobs"))?;
+        }
+        if target.join("blobs").exists() || target.join("truemail.db").exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "в целевом каталоге появились данные",
+            ));
+        }
+        if has_blobs {
+            std::fs::rename(staging.join("blobs"), target.join("blobs"))?;
+        }
+        if let Err(error) = std::fs::rename(staging.join("truemail.db"), target.join("truemail.db"))
+        {
+            if has_blobs {
+                let _ = std::fs::rename(target.join("blobs"), staging.join("blobs"));
+            }
+            return Err(error);
+        }
+        Ok(())
+    })();
+    // Здесь находится только каталог, созданный этой попыткой. Источник и
+    // существующие файлы, выбранные пользователем, эта очистка не трогает.
+    let _ = std::fs::remove_dir_all(&staging);
+    result
 }
 
 async fn restore_storage_after_error(

@@ -11,8 +11,8 @@ use crate::Result;
 use crate::backend::{OutgoingAttachment, OutgoingMessage};
 use crate::model::*;
 use crate::storage::repo::{
-    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayTarget, queue_takeaway_operation,
-    resolve_role_folder,
+    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayTarget, infer_missing_folder_role,
+    queue_takeaway_operation, resolve_role_folder,
 };
 
 #[derive(sqlx::FromRow)]
@@ -224,6 +224,9 @@ impl Db {
                 ).bind(id).fetch_optional(&mut *tx).await?.ok_or_else(|| {
                     crate::Error::AccountConfig("Черновик больше недоступен. Обновите папку перед отправкой".into())
                 })?;
+                if source.account_id!=account_id {
+                    return Err(crate::Error::AccountConfig("Отправитель должен совпадать с ящиком черновика".into()));
+                }
                 let version=self.draft_version(source.raw_blob_ref.as_deref().ok_or_else(|| {
                     crate::Error::AccountConfig("Сначала загрузите содержимое черновика".into())
                 })?)?;
@@ -246,6 +249,7 @@ impl Db {
                 sqlx::query("INSERT INTO draft_submissions(draft_id,account_id,version,operation_id) VALUES(?,?,?,?)")
                     .bind(id).bind(source.account_id).bind(version).bind(operation_id)
                     .execute(&mut *tx).await?;
+                infer_missing_folder_role(&mut tx,source.account_id,"trash").await?;
                 if let Some((target_id,path))=resolve_role_folder(&mut tx,source.account_id,"trash").await? {
                     let message=TakeawayMessage { id, account_id:source.account_id,folder_id:source.folder_id,
                         uid:source.uid,remote_path:source.remote_path,remote_id:source.remote_id };

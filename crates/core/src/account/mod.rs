@@ -1887,29 +1887,27 @@ impl AccountManager {
         &self,
         account: &Account,
     ) -> Result<(Option<String>, Option<String>)> {
+        let mut caldav_url = self
+            .trusted_saved_dav_base(account, "caldav", account.caldav_url.as_deref())
+            .await?;
+        let mut carddav_url = self
+            .trusted_saved_dav_base(account, "carddav", account.carddav_url.as_deref())
+            .await?;
         if account.provider == Provider::Yandex {
-            let (cal, card) = dav::resolve_yandex_bases(
-                account.caldav_url.as_deref(),
-                account.carddav_url.as_deref(),
-            );
+            let (cal, card) =
+                dav::resolve_yandex_bases(caldav_url.as_deref(), carddav_url.as_deref());
             return Ok((Some(cal), Some(card)));
         }
-        let mut caldav_url = account.caldav_url.clone();
-        let mut carddav_url = account.carddav_url.clone();
         if let Some((_, domain)) = account.email.rsplit_once('@') {
             let origin = format!("https://{domain}");
             if caldav_url.is_none() {
-                caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS)
-                    .await
-                    .filter(|url| crate::service_url::resolve(&origin, url).is_ok());
+                caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS).await;
             }
             if caldav_url.is_none() {
                 caldav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CALDAV).await;
             }
             if carddav_url.is_none() {
-                carddav_url = dav::discover_srv(domain, dav::SRV_CARDDAVS)
-                    .await
-                    .filter(|url| crate::service_url::resolve(&origin, url).is_ok());
+                carddav_url = dav::discover_srv(domain, dav::SRV_CARDDAVS).await;
             }
             if carddav_url.is_none() {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
@@ -1921,6 +1919,31 @@ impl AccountManager {
                 .await?;
         }
         Ok((caldav_url, carddav_url))
+    }
+
+    async fn trusted_saved_dav_base(
+        &self,
+        account: &Account,
+        kind: &str,
+        stored: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(value) = stored.filter(|url| crate::service_url::parse(url).is_ok()) else {
+            return Ok(None);
+        };
+        if self.db.is_known_dav_base(account.id, kind, value).await? {
+            return Ok(Some(value.to_owned()));
+        }
+        let same_domain = account.email.rsplit_once('@').is_some_and(|(_, domain)| {
+            crate::service_url::resolve(&format!("https://{domain}"), value).is_ok()
+        });
+        let yandex_default = if kind == "caldav" {
+            YANDEX_CALDAV_BASE
+        } else {
+            YANDEX_CARDDAV_BASE
+        };
+        let known_yandex = account.provider == Provider::Yandex
+            && crate::service_url::resolve(yandex_default, value).is_ok();
+        Ok((same_domain || known_yandex).then(|| value.to_owned()))
     }
 
     /// Обновить календарь и контакты по CalDAV/CardDAV, не запуская тяжёлую
