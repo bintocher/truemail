@@ -11,8 +11,8 @@ use crate::Result;
 use crate::backend::{OutgoingAttachment, OutgoingMessage};
 use crate::model::*;
 use crate::storage::repo::{
-    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayTarget, infer_missing_folder_role,
-    queue_takeaway_operation, resolve_role_folder,
+    OutboxOperation, TakeawayActor, TakeawayMessage, TakeawayOutcome, TakeawayTarget,
+    infer_missing_folder_role, queue_takeaway_operation, resolve_role_folder,
 };
 
 #[derive(sqlx::FromRow)]
@@ -245,16 +245,22 @@ impl Db {
                 send_at,
             )
             .await?;
+            let mut draft_cleanup_failed=false;
             if let Some((id,source,version))=draft {
                 sqlx::query("INSERT INTO draft_submissions(draft_id,account_id,version,operation_id) VALUES(?,?,?,?)")
                     .bind(id).bind(source.account_id).bind(version).bind(operation_id)
                     .execute(&mut *tx).await?;
                 infer_missing_folder_role(&mut tx,source.account_id,"trash").await?;
+                draft_cleanup_failed=true;
                 if let Some((target_id,path))=resolve_role_folder(&mut tx,source.account_id,"trash").await? {
                     let message=TakeawayMessage { id, account_id:source.account_id,folder_id:source.folder_id,
                         uid:source.uid,remote_path:source.remote_path,remote_id:source.remote_id };
-                    queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
-                        TakeawayActor::Stage,None,0).await?;
+                    if let TakeawayOutcome::Queued(cleanup)=queue_takeaway_operation(&mut tx,&message,&TakeawayTarget::Folder{id:target_id,path},
+                        TakeawayActor::Stage,None,0).await? {
+                        sqlx::query("UPDATE draft_submissions SET cleanup_operation_id=? WHERE operation_id=?")
+                            .bind(cleanup).bind(operation_id).execute(&mut *tx).await?;
+                        draft_cleanup_failed=false;
+                    }
                 }
             }
             tx.commit().await?;
@@ -266,6 +272,7 @@ impl Db {
                 undo_seconds,
                 duplicate: false,
                 draft_recorded: draft_id.is_some(),
+                draft_cleanup_failed,
             })
         }
         .await;
@@ -317,6 +324,7 @@ impl Db {
                 undo_seconds: 0,
                 duplicate: true,
                 draft_recorded,
+                draft_cleanup_failed: false,
             },
         ))
     }
@@ -380,6 +388,7 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() == 1 {
+            release_unsent_draft(&mut tx, operation_id).await?;
             tx.commit().await?;
             return Ok(CancelSendOutcome::Cancelled);
         }
@@ -490,6 +499,22 @@ impl Db {
         // Состояние проверяется тем же изменением, которое удаляет строку:
         // между отдельным чтением и удалением работник успевает захватить
         // операцию, и письмо ушло бы уже без своих больших объектов (S-043).
+        let mut tx = self.begin_write().await?;
+        let status: Option<(String, String)> =
+            sqlx::query_as("SELECT op_kind,status FROM outbox_ops WHERE id=? AND account_id=?")
+                .bind(operation_id)
+                .bind(account_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if status.as_ref().is_some_and(|(kind, status)| {
+            kind == "send"
+                && matches!(
+                    status.as_str(),
+                    "pending" | "retry" | "cancelled" | "failed"
+                )
+        }) {
+            release_unsent_draft(&mut tx, operation_id).await?;
+        }
         let deleted: Option<(String,)> = sqlx::query_as(
             "DELETE FROM outbox_ops
               WHERE id=? AND account_id=? AND op_kind IN ('send','append_sent')
@@ -498,23 +523,18 @@ impl Db {
         )
         .bind(operation_id)
         .bind(account_id)
-        .fetch_optional(&self.write_pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((payload,)) = deleted else {
-            let status: Option<(String,)> =
-                sqlx::query_as("SELECT status FROM outbox_ops WHERE id=? AND account_id=?")
-                    .bind(operation_id)
-                    .bind(account_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
             return Err(crate::Error::Other(
-                match status.as_ref().map(|(value,)| value.as_str()) {
+                match status.as_ref().map(|(_, value)| value.as_str()) {
                     Some(SEND_STATUS_PROCESSING) => "отправка уже началась, удалить письмо нельзя",
                     _ => "операция отправки не найдена",
                 }
                 .into(),
             ));
         };
+        tx.commit().await?;
         for reference in serde_json::from_str::<SendPayload>(&payload)
             .map(|payload| payload.blob_refs())
             .unwrap_or_default()
@@ -787,6 +807,7 @@ impl Db {
                         undo_seconds: 0,
                         duplicate: false,
                         draft_recorded: false,
+                        draft_cleanup_failed: false,
                     },
                 )
                 .collect(),
@@ -842,6 +863,24 @@ impl Db {
             .flat_map(|payload| payload.blob_refs())
             .collect())
     }
+}
+
+async fn release_unsent_draft(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    operation_id: i64,
+) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM outbox_ops WHERE op_kind='move' AND status IN ('pending','retry') AND id IN (
+         SELECT cleanup_operation_id FROM draft_submissions WHERE operation_id=?)",
+    )
+    .bind(operation_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM draft_submissions WHERE operation_id=?")
+        .bind(operation_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Записать операцию отправки и ключ её запроса внутри уже открытой неделимой

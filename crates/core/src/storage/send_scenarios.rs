@@ -81,6 +81,18 @@ async fn a_submitted_draft_keeps_its_send_and_cleanup_in_the_same_transaction() 
         actions,
         vec![("send".into(), None), ("move".into(), Some(draft))]
     );
+    assert_eq!(
+        db.cancel_send_operation(account, queued.operation_id)
+            .await
+            .unwrap(),
+        CancelSendOutcome::Cancelled
+    );
+    assert!(!db.draft_already_submitted(draft).await.unwrap());
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM outbox_ops WHERE op_kind='move'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending, 0);
     db.close().await;
 }
 

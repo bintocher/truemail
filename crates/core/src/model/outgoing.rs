@@ -142,6 +142,8 @@ pub struct SendQueued {
     pub duplicate: bool,
     #[serde(default)]
     pub draft_recorded: bool,
+    #[serde(default)]
+    pub draft_cleanup_failed: bool,
 }
 
 /// Строка раздела "Исходящие". Тело и вложения сюда не попадают: интерфейсу

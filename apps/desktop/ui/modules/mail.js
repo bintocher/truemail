@@ -122,8 +122,9 @@ function folderTitle(folder){
   const roleTitle=names[folder?.role];
   if(roleTitle&&!coreFolders.some(other=>other.id!==folder.id&&other.account_id===folder.account_id&&other.role===folder.role))return roleTitle;
   const name=folder?.display_name||folder?.remote_path||'';
-  if(!folder?.role&&name.toLocaleLowerCase()===names.drafts.toLocaleLowerCase()
-      &&coreFolders.some(other=>other.account_id===folder.account_id&&other.role==='drafts')){
+  const comparable=name.toLocaleLowerCase();
+  if(!folder?.role&&coreFolders.some(other=>other.account_id===folder.account_id&&other.role==='drafts'
+      &&[names.drafts,other.display_name,other.remote_path].some(label=>label?.toLocaleLowerCase()===comparable))){
     return `${name} (${L('обычная папка','custom folder')})`;
   }
   return name;
@@ -793,6 +794,7 @@ async function showMessage(message){
     if(draftMessageModel.isDraftMessage(full?.meta,coreFolders)&&window.tm?.draftAlreadySubmitted){
       Promise.resolve(window.tm.draftAlreadySubmitted(message.id)).then(submitted=>{
         if(submitted===true){window.sentDrafts?.add(message.id);window.refreshToolbarForMessage?.();}
+        if(submitted===false){window.sentDrafts?.delete(message.id);window.refreshToolbarForMessage?.();}
       }).catch(console.error);
     }
     const head=document.createElement('header');head.innerHTML=`<div class="mail-fromline">${L('От:','From:')} <b class="mail-from"></b> <span class="mail-address"></span></div>`;

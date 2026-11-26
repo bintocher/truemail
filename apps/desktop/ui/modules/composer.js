@@ -1141,10 +1141,11 @@ async function discardSentDraft(messageId){
 // stayed in its folder must not be sent a second time.
 const sentDrafts=new Set();
 window.sentDrafts=sentDrafts;
-function draftQueued(messageId,recorded=false){
+function draftQueued(messageId,recorded=false,cleanupFailed=false){
   sentDrafts.add(messageId);
   forgetSentDraft(messageId);
   if(!recorded)discardSentDraft(messageId);
+  else if(cleanupFailed)showToast(L('Письмо в очереди. Исходный черновик остался в папке.','The message is queued. The original draft remains in its folder.'));
 }
 // Drafts that are being read for sending right now.
 const draftsInFlight=new Set();
@@ -1204,7 +1205,7 @@ async function sendDraftMessage(message=activeMessage){
         else showToast(error);
         return;
       }
-      draftQueued(message.id,queued?.draft_recorded);
+      draftQueued(message.id,queued?.draft_recorded,queued?.draft_cleanup_failed);
       return;
     }
     finishDraftInEditor(message,letter.request,problem,letter.textMissing===true);
@@ -1302,7 +1303,7 @@ document.getElementById('compSend').onclick=async()=>{
     resetComposer();showView('mailView');clearSavedLetter();
   }else saveLetterOfEditor();
   showUndoSendCard(queued,request);
-  if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded);
+  if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded,queued?.draft_cleanup_failed);
 };
 document.getElementById('compSendLater').onclick=async()=>{
   const generation=composerGeneration;
@@ -1324,7 +1325,7 @@ document.getElementById('compSendLater').onclick=async()=>{
       const queued=await window.tm.scheduleMessage(composerRequest(),date.toISOString(),sentDraft);
       const id=queued?.operation_id??queued;
       // Taken by the queue: its draft leaves the folder at once.
-      if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded);
+      if(sentDraft!==null)draftQueued(sentDraft,queued?.draft_recorded,queued?.draft_cleanup_failed);
       if(generation===composerGeneration){
         // No other sending of this letter, by either button.
         handedOverGeneration=generation;
