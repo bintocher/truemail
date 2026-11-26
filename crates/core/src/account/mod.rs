@@ -1916,7 +1916,7 @@ impl AccountManager {
         if (caldav_url.is_none() && account.caldav_url.is_some())
             || (carddav_url.is_none() && account.carddav_url.is_some())
         {
-            return Err(Error::Other(
+            return Err(crate::Error::Other(
                 "Не удалось подтвердить сохранённый адрес CalDAV или CardDAV. Проверьте адрес в настройках ящика.".into(),
             ));
         }
