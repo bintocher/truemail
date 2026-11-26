@@ -306,7 +306,7 @@ impl Db {
         offset: i64,
     ) -> Result<Vec<OutboxSendEntry>> {
         let rows: Vec<OutboxSendListRow> = sqlx::query_as(
-            "SELECT o.id, o.account_id, a.email, a.enabled, o.send_origin, o.status, o.payload,
+            "SELECT o.id, o.account_id, a.email, a.enabled, o.send_origin, o.op_kind, o.status, o.payload,
                     o.cancel_until, o.next_attempt_at, o.attempts, o.last_error, o.created_at
                FROM outbox_ops o JOIN accounts a ON a.id=o.account_id
               WHERE o.op_kind IN ('send','append_sent')
@@ -314,7 +314,7 @@ impl Db {
                 -- S-058: служебное письмо программы показывается пользователю
                 -- только тогда, когда с ним что-то не так.
                 AND (coalesce(o.send_origin, 'ordinary') <> 'automatic'
-                     OR o.status IN ('failed','uncertain'))
+                     OR o.status IN ('failed','uncertain') OR o.op_kind='append_sent')
               ORDER BY o.id DESC LIMIT ? OFFSET ?",
         )
         .bind(account_id)
@@ -823,6 +823,7 @@ struct OutboxSendListRow {
     email: String,
     enabled: i64,
     send_origin: Option<String>,
+    op_kind: String,
     status: String,
     payload: String,
     cancel_until: Option<String>,
@@ -859,6 +860,7 @@ impl From<OutboxSendListRow> for OutboxSendEntry {
             origin: row
                 .send_origin
                 .unwrap_or_else(|| SEND_ORIGIN_ORDINARY.to_owned()),
+            op_kind: row.op_kind,
             status: row.status,
             subject,
             to,

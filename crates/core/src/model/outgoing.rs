@@ -153,6 +153,8 @@ pub struct OutboxSendEntry {
     /// (S-029).
     pub account_enabled: bool,
     pub origin: String,
+    #[serde(default)]
+    pub op_kind: String,
     pub status: String,
     pub subject: String,
     pub to: Vec<String>,

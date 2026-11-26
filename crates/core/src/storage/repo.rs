@@ -5363,10 +5363,15 @@ impl Db {
             // out-of-office.md S-048: окончательно отказавший автоответ
             // отправленным не считается. Иначе окно молчания на семь суток
             // закрывало бы адресата, так и не получившего ни одного ответа.
-            sqlx::query("UPDATE out_of_office_replies SET state='failed' WHERE operation_id=?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE out_of_office_replies SET state='failed'
+                         WHERE operation_id=? AND state<>'sent'
+                           AND EXISTS(SELECT 1 FROM outbox_ops WHERE id=? AND op_kind='send')",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -5733,29 +5738,47 @@ impl Db {
             return Ok(());
         };
         let mut tx = self.begin_write().await?;
+        let mut complete = true;
         for (sort_order, rule) in rules.into_iter().enumerate() {
             let string = |key: &str| rule.get(key).and_then(|value| value.as_str());
-            let Some(id) = string("id") else { continue };
-            let Some(name) = string("name") else { continue };
-            let Some(field) = string("field") else {
-                continue;
-            };
-            let Some(operator) = string("operator") else {
-                continue;
-            };
-            let Some(value) = string("value") else {
-                continue;
-            };
-            let Some(action) = string("action") else {
+            let (Some(id), Some(name), Some(field), Some(operator), Some(value), Some(action)) = (
+                string("id"),
+                string("name"),
+                string("field"),
+                string("operator"),
+                string("value"),
+                string("action"),
+            ) else {
+                complete = false;
                 continue;
             };
             if !matches!(field, "sender" | "subject")
                 || !matches!(operator, "contains" | "equals")
                 || !matches!(action, "move" | "archive" | "spam" | "trash")
             {
+                complete = false;
                 continue;
             }
-            sqlx::query(
+            let requested_account = rule.get("account_id").and_then(|value| value.as_i64());
+            let requested_folder = rule.get("folder_id").and_then(|value| value.as_i64());
+            let (account_id, folder_id): (Option<i64>, Option<i64>) = sqlx::query_as(
+                "SELECT (SELECT id FROM accounts WHERE id=?),
+                    (SELECT id FROM folders WHERE id=? AND (? IS NULL OR account_id=?))",
+            )
+            .bind(requested_account)
+            .bind(requested_folder)
+            .bind(requested_account)
+            .bind(requested_account)
+            .fetch_one(&mut *tx)
+            .await?;
+            let enabled = rule
+                .get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true)
+                && (requested_account.is_none() || account_id.is_some())
+                && (action != "move" || folder_id.is_some());
+            let mut rule_tx = sqlx::Acquire::begin(&mut tx).await?;
+            let inserted = sqlx::query(
                 "INSERT OR IGNORE INTO mail_rules(
                     id, name, field, operator, value, account_id, action, folder_id,
                     enabled, progress_message_id, sort_order
@@ -5766,26 +5789,33 @@ impl Db {
             .bind(field)
             .bind(operator)
             .bind(value)
-            .bind(rule.get("account_id").and_then(|value| value.as_i64()))
+            .bind(account_id)
             .bind(action)
-            .bind(rule.get("folder_id").and_then(|value| value.as_i64()))
-            .bind(
-                rule.get("enabled")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(true),
-            )
+            .bind(folder_id)
+            .bind(enabled)
             .bind(
                 rule.get("last_id")
                     .and_then(|value| value.as_i64())
                     .unwrap_or(0),
             )
             .bind(sort_order as i64)
-            .execute(&mut *tx)
-            .await?;
+            .execute(&mut *rule_tx)
+            .await;
+            match inserted {
+                Ok(_) => rule_tx.commit().await?,
+                Err(error) => {
+                    rule_tx.rollback().await?;
+                    complete = false;
+                    tracing::warn!(error = %crate::logging::mask_error_text(&error.to_string()),
+                        "старое правило не загружено");
+                }
+            }
         }
-        sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
-            .execute(&mut *tx)
-            .await?;
+        if complete {
+            sqlx::query("DELETE FROM settings WHERE key='mail_rules_ui'")
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

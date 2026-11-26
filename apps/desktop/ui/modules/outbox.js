@@ -78,7 +78,9 @@ function outboxRowText(entry, lang) {
   const parts = [subject];
   const to = (entry?.to || []).join(', ');
   if (to) parts.push(to);
-  parts.push(sendStatusText(entry?.status, lang));
+  parts.push(entry?.op_kind==='append_sent'
+    ? outboxText(['Письмо доставлено, копия ещё не сохранена в "Отправленных"','Delivered, copy not yet saved in Sent'],lang)
+    : sendStatusText(entry?.status, lang));
   if (entry && entry.account_enabled === false) {
     parts.push(outboxText(['ящик выключен, письмо ждёт его включения', 'the mailbox is off, the message waits for it'], lang));
   }

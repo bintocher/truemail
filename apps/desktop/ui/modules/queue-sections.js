@@ -40,6 +40,7 @@ function renderOutboxList(){
     host.appendChild(empty);return;
   }
   outboxEntries.forEach(entry=>{
+    const sentCopy=entry.op_kind==='append_sent';
     const row=document.createElement('div');row.className='rule-failed-row';
     const text=document.createElement('span');
     text.textContent=window.outboxModel.outboxRowText(entry,queueLang());
@@ -50,7 +51,7 @@ function renderOutboxList(){
       open.onclick=()=>window.restoreCancelledSend?.(entry.account_id,entry.id).then(()=>reloadQueueSections());
       row.appendChild(open);
     }
-    if(['pending','retry'].includes(entry.status)){
+    if(!sentCopy&&['pending','retry'].includes(entry.status)){
       const cancel=document.createElement('button');cancel.type='button';cancel.className='btn sm';
       cancel.textContent=L('Отменить','Cancel');
       cancel.onclick=async()=>{
@@ -64,11 +65,11 @@ function renderOutboxList(){
     }
     if(['uncertain','failed'].includes(entry.status)){
       const retry=document.createElement('button');retry.type='button';retry.className='btn sm';
-      retry.textContent=L('Повторить','Retry');
+      retry.textContent=sentCopy?L('Сохранить копию','Save copy'):L('Повторить','Retry');
       retry.onclick=async()=>{
         // S-051: о возможном втором экземпляре письма у получателя говорится
         // до создания новой попытки.
-        if(entry.status==='uncertain'&&!await confirmAction(L('Итог прошлой передачи неизвестен. Повтор может создать у получателя второй экземпляр письма. Повторить?','The previous attempt ended with an unknown outcome. Retrying may deliver a second copy. Retry?')))return;
+        if(!sentCopy&&entry.status==='uncertain'&&!await confirmAction(L('Итог прошлой передачи неизвестен. Повтор может создать у получателя второй экземпляр письма. Повторить?','The previous attempt ended with an unknown outcome. Retrying may deliver a second copy. Retry?')))return;
         try{await window.tm.retrySend(entry.account_id,entry.id);await reloadQueueSections();}
         catch(error){showToast(error);}
       };
@@ -76,11 +77,14 @@ function renderOutboxList(){
     }
     if(entry.status!=='processing'){
       const remove=document.createElement('button');remove.type='button';remove.className='btn sm';
-      remove.textContent=L('Удалить','Delete');
+      remove.textContent=sentCopy?L('Удалить копию','Delete copy'):L('Удалить','Delete');
       remove.onclick=async()=>{
         // S-043: другой копии письма у программы нет, поэтому удаление
         // спрашивают отдельно.
-        if(!await confirmAction(L('Удалить письмо вместе с вложениями? Другой копии у программы нет.','Delete the message with its attachments? The app has no other copy.')))return;
+        const question=sentCopy
+          ?L('Удалить из очереди копию для папки "Отправленные"?','Remove the copy queued for Sent?')
+          :L('Удалить письмо вместе с вложениями? Другой копии у программы нет.','Delete the message with its attachments? The app has no other copy.');
+        if(!await confirmAction(question))return;
         try{await window.tm.deleteSend(entry.account_id,entry.id);await reloadQueueSections();}
         catch(error){showToast(error);}
       };
