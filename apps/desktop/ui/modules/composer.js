@@ -318,6 +318,16 @@ function showApiError(error,context={}){return logActivity(errorToastItem(error,
 // собственный ключ предмета, и склеиваются только сообщения без действия.
 let activityActionSequence=0;
 function showToast(message,actionLabel,action){if(message&&typeof message==='object')return showApiError(message);return logActivity({level:'info',kind:'notice',accountId:null,text:String(message||''),details:'',action:action?String(actionLabel||'action'):'',actionLabel,hasAction:Boolean(action),callback:action,key:action?`action-${++activityActionSequence}`:null});}
+async function undoQueuedMove(ids){
+  const result=await window.tm.undoMessageAction(ids);
+  await window.reloadCoreData();
+  if(!result?.processing&&!result?.completed)return;
+  const detail=[];
+  if(result.cancelled)detail.push(L(`Отменено: ${result.cancelled}.`,`Cancelled: ${result.cancelled}.`));
+  if(result.processing)detail.push(L(`Перенос уже начался: ${result.processing}.`,`Moves already started: ${result.processing}.`));
+  if(result.completed)detail.push(L('Перенос уже завершён. Откройте папку назначения и переместите письмо обратно.','The move has already finished. Open the destination and move the message back.'));
+  throw new Error(detail.join(' '));
+}
 window.showApiError=showApiError;
 // Одна беда одного ящика - одно сообщение: без этого при каждом проходе
 // счётчик повторов рос до десятков, а нового человеку не сообщалось (issue #77).
@@ -429,7 +439,7 @@ async function performMessageActionForIds(action,ids){if(!ids.length){showToast(
     // Письмо, по которому уже стоит незавершённая операция увода, пропущено
     // ограничением очереди (S-005) - об этом честно говорим вместе с причиной.
     showSkippedMessages(queued);
-    showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),async()=>{await window.tm.undoMessageAction(queued.operation_ids);await window.reloadCoreData();});}catch(error){showToast(error);}}
+    showToast(action==='archive'?L('Письмо перемещено в архив','Message moved to Archive'):action==='spam'?L('Письмо перемещено в спам','Message moved to Spam'):L('Письмо перемещено в корзину','Message moved to Trash'),L('Отменить','Undo'),()=>undoQueuedMove(queued.operation_ids));}catch(error){showToast(error);}}
 window.performMessageActionForIds=performMessageActionForIds;
 /* Пропуски называются причиной: занятое письмо, письмо с отказавшей операцией и
    письмо без единственной папки нужного типа - разные беды (S-005, S-006,

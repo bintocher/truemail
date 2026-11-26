@@ -88,6 +88,13 @@ pub struct FailedOperation {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Default, serde::Serialize)]
+pub struct UndoMoveOutcome {
+    pub cancelled: usize,
+    pub processing: usize,
+    pub completed: usize,
+}
+
 /// Результат сохранения календарей/контактов провайдера: счётчики плюс
 /// смысловые изменения встреч (для будущих уведомлений - показ отдельным
 /// этапом, здесь только вычисляем дельту).
@@ -5223,6 +5230,36 @@ impl Db {
                     .rows_affected() as usize;
         }
         Ok(removed)
+    }
+
+    pub async fn undo_move_operations(&self, operation_ids: &[i64]) -> Result<UndoMoveOutcome> {
+        let mut tx = self.begin_write().await?;
+        let mut outcome = UndoMoveOutcome::default();
+        for id in operation_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM outbox_ops WHERE id=? AND op_kind IN ('move','delete')",
+            )
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            match status.as_deref() {
+                Some("pending" | "retry") => {
+                    sqlx::query("DELETE FROM outbox_ops WHERE id=?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    outcome.cancelled += 1;
+                }
+                Some("processing") => outcome.processing += 1,
+                _ => outcome.completed += 1,
+            }
+        }
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn claim_outbox_operations(

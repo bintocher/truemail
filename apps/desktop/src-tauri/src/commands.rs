@@ -3941,19 +3941,39 @@ pub async fn move_storage(
             message: "В выбранной папке уже есть данные truemail".into(),
         });
     }
+    let current = core(&state).await?;
+    let sending: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM outbox_ops WHERE status='processing' AND op_kind IN ('send','append_sent'))",
+    ).fetch_one(&current.db.pool).await.map_err(truemail_core::Error::from)?;
+    if sending {
+        return Err(api_error(
+            "Дождитесь завершения отправки писем и повторите перенос",
+        ));
+    }
     let old_core = state.core.write().await.take().ok_or_else(|| ApiError {
         message: "Хранилище ещё не создано".into(),
     })?;
     // Порядок важен. wal_checkpoint(TRUNCATE) требует, чтобы читателей не было:
     // сначала закрываем пул чтения, только потом сливаем WAL в основной файл.
     old_core.db.pool.close().await;
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&old_core.db.write_pool)
-        .await
-        .map_err(truemail_core::Error::from)?;
+    let checkpoint = sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&old_core.db.write_pool)
+        .await;
     // Файл БД копируется дальше: writer тоже должен отпустить его, иначе на
     // Windows копирование упрётся в удерживаемый соединением файл.
     old_core.db.write_pool.close().await;
+    if !matches!(checkpoint, Ok((0, _, _))) {
+        let reason = checkpoint
+            .err()
+            .map_or_else(|| "база занята".to_owned(), |error| error.to_string());
+        return Err(restore_storage_after_error(
+            &app,
+            &state,
+            &source,
+            api_error(format!("Не удалось завершить запись в базу: {reason}")),
+        )
+        .await);
+    }
     let copy_result = std::fs::copy(source.join("truemail.db"), target.join("truemail.db"))
         .map(|_| ())
         .map_err(|e| ApiError {
@@ -3969,54 +3989,59 @@ pub async fn move_storage(
             }
         });
     if let Err(error) = copy_result {
-        let restored = Core::bootstrap(source.clone())
-            .await
-            .map_err(|restore| ApiError {
-                message: format!(
-                    "{}; исходное хранилище не открылось: {restore}",
-                    error.safe_message()
-                ),
-            })?;
-        *state.core.write().await = Some(Arc::new(restored));
-        return Err(error);
+        return Err(restore_storage_after_error(&app, &state, &source, error).await);
     }
     let replacement = match Core::bootstrap(target.clone()).await {
         Ok(core) => Arc::new(core),
         Err(error) => {
             // Источник не удалялся: восстанавливаем рабочее ядро на прежнем
             // пути и возвращаем понятную ошибку вместо полурабочего состояния.
-            let restored = Core::bootstrap(source.clone()).await.map_err(|restore| ApiError {
-                message: format!(
-                    "Копия не открылась: {error}. Исходное хранилище также не удалось открыть: {restore}"
-                ),
-            })?;
-            *state.core.write().await = Some(Arc::new(restored));
-            return Err(ApiError {
-                message: format!("Копия не прошла проверку: {error}"),
-            });
+            return Err(restore_storage_after_error(
+                &app,
+                &state,
+                &source,
+                api_error(format!("Копия не прошла проверку: {error}")),
+            )
+            .await);
         }
     };
     if let Err(error) = truemail_core::crypto::store_data_dir(&target) {
-        let restored = Core::bootstrap(source.clone())
-            .await
-            .map_err(|restore| ApiError {
-                message: format!(
-                    "Не удалось сохранить новый путь: {error}; восстановление: {restore}"
-                ),
-            })?;
-        *state.core.write().await = Some(Arc::new(restored));
-        return Err(error.into());
+        replacement.db.close().await;
+        return Err(restore_storage_after_error(&app, &state, &source, error.into()).await);
     }
     *state.core.write().await = Some(replacement);
+    restart_storage_tasks(&app, &state, &target).await;
+    Ok(())
+}
+
+async fn restore_storage_after_error(
+    app: &AppHandle,
+    state: &AppState,
+    source: &std::path::Path,
+    error: ApiError,
+) -> ApiError {
+    match Core::bootstrap(source.to_path_buf()).await {
+        Ok(restored) => {
+            *state.core.write().await = Some(Arc::new(restored));
+            restart_storage_tasks(app, state, source).await;
+            error
+        }
+        Err(restore) => api_error(format!(
+            "{}; исходное хранилище не открылось: {restore}",
+            error.safe_message()
+        )),
+    }
+}
+
+async fn restart_storage_tasks(app: &AppHandle, state: &AppState, path: &std::path::Path) {
     state
         .generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.watching.lock().await.clear();
     let _ = app.emit(
         "truemail-storage-moved",
-        target.to_string_lossy().into_owned(),
+        path.to_string_lossy().into_owned(),
     );
-    Ok(())
 }
 
 #[tauri::command]
@@ -5482,11 +5507,11 @@ pub async fn move_messages_to_folder(
 pub async fn undo_message_action(
     state: State<'_, AppState>,
     operation_ids: Vec<i64>,
-) -> CmdResult<usize> {
+) -> CmdResult<truemail_core::storage::repo::UndoMoveOutcome> {
     Ok(core(&state)
         .await?
         .db
-        .cancel_outbox_operations(&operation_ids)
+        .undo_move_operations(&operation_ids)
         .await?)
 }
 
