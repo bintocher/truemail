@@ -122,22 +122,13 @@ fn client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(90))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|error| backend_error("client", error))
 }
 
 fn validate_session_url(value: &str) -> Result<Url> {
-    let url = Url::parse(value.trim()).map_err(|error| backend_error("session", error))?;
-    let loopback = url
-        .host_str()
-        .is_some_and(|host| matches!(host, "127.0.0.1" | "localhost"));
-    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
-        return Err(Error::AccountConfig(
-            "JMAP Session URL должен использовать HTTPS".into(),
-        ));
-    }
-    Ok(url)
+    crate::service_url::parse(value)
 }
 
 impl JmapBackend {
@@ -149,7 +140,15 @@ impl JmapBackend {
             .send()
             .await
             .map_err(|error| request_error("session", error))?;
-        response_json(response, "session").await
+        let session: Session = response_json(response, "session").await?;
+        for endpoint in [&session.api_url, &session.download_url, &session.upload_url]
+            .into_iter()
+            .chain(session.event_source_url.iter())
+        {
+            crate::service_url::parse(endpoint)?;
+            crate::service_url::resolve(&self.session_url, endpoint)?;
+        }
+        Ok(session)
     }
 
     async fn api(&self, session: &Session, password: &str, calls: Vec<Value>) -> Result<Value> {
@@ -158,7 +157,10 @@ impl JmapBackend {
             using.push(SUBMISSION);
         }
         let response = client()?
-            .post(&session.api_url)
+            .post(crate::service_url::resolve(
+                &self.session_url,
+                &session.api_url,
+            )?)
             .basic_auth(&self.username, Some(password))
             .json(&json!({
                 "using": using,
@@ -418,6 +420,7 @@ impl JmapBackend {
         blob_id: &str,
     ) -> Result<Vec<u8>> {
         let url = expand_download_url(&session.download_url, account_id, blob_id);
+        let url = crate::service_url::resolve(&self.session_url, &url)?;
         let response = client()?
             .get(url)
             .basic_auth(&self.username, Some(password))
@@ -650,6 +653,7 @@ impl JmapBackend {
         let submission_account_id = self.submission_account(&session)?.to_owned();
         let raw = super::smtp::build_message_with_bcc(message)?.formatted();
         let upload_url = expand_upload_url(&session.upload_url, &account_id);
+        let upload_url = crate::service_url::resolve(&self.session_url, &upload_url)?;
         let upload = client()?
             .post(upload_url)
             .basic_auth(&self.username, Some(password))
@@ -935,6 +939,7 @@ impl MailBackend for JmapBackend {
             .replace("{types}", "Email,Mailbox")
             .replace("{closeafter}", "state")
             .replace("{ping}", "30");
+        let url = crate::service_url::resolve(&self.session_url, &url)?;
         let response = client()?
             .get(url)
             .basic_auth(&self.username, Some(credential))

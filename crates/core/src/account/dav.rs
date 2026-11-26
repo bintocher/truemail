@@ -12,7 +12,6 @@ use hickory_resolver::proto::rr::RData;
 use reqwest::{Client, Method, StatusCode};
 use roxmltree::Document;
 use std::collections::{HashMap, HashSet};
-use url::Url;
 
 /// Базовые адреса Яндекса по умолчанию - используются, если на аккаунте не
 /// задан свой caldav_url/carddav_url. Для Яндекса RFC 6764-обнаружение не
@@ -250,6 +249,7 @@ async fn dav_send(
     scheme: DavAuthScheme,
     auth: &DavAuth,
 ) -> Result<DavHttpResponse> {
+    let url = crate::service_url::parse(url)?;
     let request = apply_dav_auth(client.request(method.clone(), url), scheme, auth)
         .header("Depth", depth)
         .header("Content-Type", "application/xml; charset=utf-8")
@@ -337,13 +337,7 @@ async fn dav_request_optional(
 }
 
 fn resolve(base: &str, href: &str) -> Result<String> {
-    Url::parse(base)
-        .and_then(|url| url.join(href))
-        .map(String::from)
-        .map_err(|e| Error::Backend {
-            backend: "dav-url".into(),
-            message: e.to_string(),
-        })
+    crate::service_url::resolve(base, href).map(String::from)
 }
 
 async fn discover_home(
@@ -398,6 +392,7 @@ async fn discover_home(
 pub async fn validate_dav(auth: &DavAuth, caldav_base: &str, carddav_base: &str) -> Result<()> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|e| Error::Backend {
             backend: "dav".into(),
@@ -680,18 +675,40 @@ fn response_parts(xml: &str, data_tag: &str) -> Result<Vec<(String, Option<Strin
             .and_then(|n| n.text())
             .unwrap_or("")
             .to_owned();
-        let etag = response
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "getetag")
-            .and_then(|n| n.text())
-            .map(str::to_owned);
-        if let Some(data) = response
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == data_tag)
-            .and_then(|n| n.text())
+        if href.is_empty()
+            || response_status(response).is_some_and(|status| !successful_dav_status(status))
         {
-            out.push((href, etag, data.to_owned()));
+            return Err(crate::Error::Other(
+                "Сервер вернул ошибку для одного из элементов коллекции".into(),
+            ));
         }
+        let mut properties = response
+            .children()
+            .filter(|node| node.has_tag_name("propstat"))
+            .filter(|node| response_status(*node).is_some_and(successful_dav_status))
+            .flat_map(|node| {
+                node.children()
+                    .filter(|node| node.has_tag_name("prop"))
+                    .flat_map(|prop| prop.children())
+            });
+        let mut etag = None;
+        let mut data = None;
+        for property in &mut properties {
+            if property.has_tag_name("getetag") {
+                etag = property.text().map(str::to_owned);
+            }
+            if property.has_tag_name(data_tag)
+                && data.replace(property.text().unwrap_or("")).is_some()
+            {
+                return Err(crate::Error::Other(
+                    "Сервер вернул элемент коллекции дважды".into(),
+                ));
+            }
+        }
+        let data = data.filter(|value| !value.is_empty()).ok_or_else(|| {
+            crate::Error::Other("Сервер не вернул содержимое одного из элементов коллекции".into())
+        })?;
+        out.push((href, etag, data.to_owned()));
     }
     Ok(out)
 }
@@ -787,6 +804,14 @@ fn response_status<'a, 'input>(response: roxmltree::Node<'a, 'input>) -> Option<
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "status")
         .and_then(|node| node.text())
+}
+
+fn successful_dav_status(status: &str) -> bool {
+    status
+        .split_ascii_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code))
 }
 
 fn parse_sync_collection(xml: &str, collection_url: &str) -> Result<SyncCollectionDelta> {
@@ -924,6 +949,11 @@ fn parse_etag_listing(xml: &str, collection_url: &str) -> Result<Vec<ResourceRef
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "response")
     {
+        if response_status(response).is_some_and(|status| !successful_dav_status(status)) {
+            return Err(Error::Other(
+                "Не удалось подтвердить полный состав коллекции DAV".into(),
+            ));
+        }
         if response
             .descendants()
             .any(|node| node.is_element() && node.tag_name().name() == "collection")
@@ -1139,7 +1169,22 @@ async fn multiget_changed(
     for chunk in resources.chunks(100) {
         let body = multiget_body(kind, chunk);
         let xml = dav_request(client, "REPORT", collection_url, "0", &body, auth).await?;
-        parts.extend(response_parts(&xml, data_tag)?);
+        let mut requested: std::collections::HashSet<_> =
+            chunk.iter().map(|resource| resource.url.as_str()).collect();
+        let received = response_parts(&xml, data_tag)?;
+        for (href, _, _) in &received {
+            if !requested.remove(resolve(collection_url, href)?.as_str()) {
+                return Err(crate::Error::Other(
+                    "Сервер вернул неожиданный или повторный элемент коллекции".into(),
+                ));
+            }
+        }
+        if !requested.is_empty() {
+            return Err(crate::Error::Other(
+                "Не все запрошенные элементы коллекции получены".into(),
+            ));
+        }
+        parts.extend(received);
     }
     Ok(parts)
 }
@@ -1703,6 +1748,7 @@ pub async fn sync_dav_account(
     }
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(45))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|e| Error::Backend {
             backend: "dav".into(),

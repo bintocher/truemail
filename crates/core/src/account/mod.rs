@@ -1888,13 +1888,17 @@ impl AccountManager {
         if let Some((_, domain)) = account.email.rsplit_once('@') {
             let origin = format!("https://{domain}");
             if caldav_url.is_none() {
-                caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS).await;
+                caldav_url = dav::discover_srv(domain, dav::SRV_CALDAVS)
+                    .await
+                    .filter(|url| crate::service_url::resolve(&origin, url).is_ok());
             }
             if caldav_url.is_none() {
                 caldav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CALDAV).await;
             }
             if carddav_url.is_none() {
-                carddav_url = dav::discover_srv(domain, dav::SRV_CARDDAVS).await;
+                carddav_url = dav::discover_srv(domain, dav::SRV_CARDDAVS)
+                    .await
+                    .filter(|url| crate::service_url::resolve(&origin, url).is_ok());
             }
             if carddav_url.is_none() {
                 carddav_url = dav::discover_well_known(&origin, dav::WELL_KNOWN_CARDDAV).await;
@@ -2149,6 +2153,26 @@ impl AccountManager {
 
     /// Создать или изменить событие. Для Exchange - через EWS, для остальных -
     /// прежним путём (Google REST или CalDAV).
+    async fn check_dav_targets(
+        &self,
+        account: &Account,
+        calendar: bool,
+        targets: &[&str],
+    ) -> Result<()> {
+        if matches!(account.provider, Provider::Gmail | Provider::Exchange) {
+            return Ok(());
+        }
+        let (cal, card) = self.resolve_dav_bases(account).await?;
+        let base = if calendar { cal } else { card }.ok_or_else(|| {
+            crate::Error::AccountConfig("Адрес службы календаря или контактов не настроен".into())
+        })?;
+        for target in targets {
+            crate::service_url::parse(target)?;
+            crate::service_url::resolve(&base, target)?;
+        }
+        Ok(())
+    }
+
     pub async fn write_event(
         &self,
         account: &Account,
@@ -2156,6 +2180,10 @@ impl AccountManager {
         remote: RemoteObject<'_>,
         input: &EventInput,
     ) -> Result<()> {
+        let destinations: Vec<_> = std::iter::once(calendar_source)
+            .chain(remote.remote_url)
+            .collect();
+        self.check_dav_targets(account, true, &destinations).await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             let backend = self.ews_backend(account)?;
@@ -2198,6 +2226,8 @@ impl AccountManager {
         remote_url: &str,
         etag: Option<&str>,
     ) -> Result<()> {
+        self.check_dav_targets(account, true, &[calendar_source, remote_url])
+            .await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             return self
@@ -2225,6 +2255,14 @@ impl AccountManager {
         remote: RemoteObject<'_>,
         input: &ContactInput,
     ) -> Result<()> {
+        let destinations: Vec<_> = collection_url
+            .into_iter()
+            .chain(remote.remote_url)
+            .collect();
+        if !destinations.is_empty() {
+            self.check_dav_targets(account, false, &destinations)
+                .await?;
+        }
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             let backend = self.ews_backend(account)?;
@@ -2263,6 +2301,8 @@ impl AccountManager {
         remote_url: &str,
         etag: Option<&str>,
     ) -> Result<()> {
+        self.check_dav_targets(account, false, &[remote_url])
+            .await?;
         let credential = self.auxiliary_credential(account).await?;
         if account.provider == Provider::Exchange {
             return self
@@ -2303,18 +2343,9 @@ impl AccountManager {
         // auxiliary_credential (не oauth_access_token) - Яндекс всегда Oauth2,
         // но остальные DAV-провайдеры (iCloud, Mail.ru, generic) обычно идут
         // по паролю/app-password, и oauth_access_token для них упал бы.
-        let credential = self.auxiliary_credential(account).await?;
         let input = auxiliary::event_to_input(event, attendees.clone());
-        auxiliary::write_event(
-            account.provider,
-            account.auth_kind,
-            &account.email,
-            &credential,
-            calendar_source,
-            remote,
-            &input,
-        )
-        .await?;
+        self.write_event(account, calendar_source, remote, &input)
+            .await?;
         let own = attendees
             .iter()
             .find(|attendee| attendee.email.eq_ignore_ascii_case(&account.email))

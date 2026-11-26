@@ -123,6 +123,7 @@ fn client() -> Result<Client> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(crate::service_url::redirects())
         .build()
         .map_err(|error| backend_error("auxiliary", error.to_string()))
 }
@@ -521,7 +522,8 @@ async fn dav_write(
     create: bool,
 ) -> Result<()> {
     let client = client()?;
-    let mut request = apply_dav_auth(client.request(method, url), auth.scheme, auth);
+    let checked_url = crate::service_url::parse(url)?;
+    let mut request = apply_dav_auth(client.request(method, checked_url), auth.scheme, auth);
     if let Some(content_type) = content_type {
         request = request.header("Content-Type", content_type);
     }
