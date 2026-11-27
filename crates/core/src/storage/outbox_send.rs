@@ -351,6 +351,8 @@ impl Db {
     /// (S-025). Состояние передачи в захват не попадает ни при каком сроке:
     /// иначе аварийное завершение во время передачи отправило бы письмо второй
     /// раз (S-026).
+    /// Новые письма идут раньше свежих повторов. Повтор, готовый больше
+    /// минуты, возвращается в общий порядок, чтобы поток новых писем его не блокировал.
     pub async fn claim_send_operation(&self, account_id: i64) -> Result<Option<OutboxOperation>> {
         let row: Option<OutboxOperationRow> = sqlx::query_as(
             "UPDATE outbox_ops
@@ -360,7 +362,8 @@ impl Db {
                  WHERE account_id=? AND op_kind='send' AND status IN ('pending','retry')
                    AND coalesce(cancel_until, created_at) <= datetime('now')
                    AND coalesce(next_attempt_at, created_at) <= datetime('now')
-                 ORDER BY status='retry', id LIMIT 1)
+                 ORDER BY (status='retry' AND coalesce(next_attempt_at, created_at) > datetime('now','-1 minute')),
+                          id LIMIT 1)
               RETURNING id, account_id, message_id, op_kind, payload, attempts",
         )
         .bind(SEND_LEASE)

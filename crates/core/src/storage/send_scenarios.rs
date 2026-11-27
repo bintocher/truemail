@@ -425,9 +425,22 @@ async fn send_wakeup_waits_for_retry_and_fresh_mail_goes_first() {
         db.claim_send_operation(account).await.unwrap().unwrap().id,
         fresh.operation_id
     );
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now','-2 minutes') WHERE id=?")
+        .bind(delayed.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let another = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
     assert_eq!(
         db.claim_send_operation(account).await.unwrap().unwrap().id,
         delayed.operation_id
+    );
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        another.operation_id
     );
 }
 

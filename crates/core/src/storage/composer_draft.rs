@@ -17,6 +17,26 @@ struct DraftFile {
     data: Option<Vec<u8>>,
 }
 
+impl DraftFile {
+    fn take_contents(&mut self, remaining: usize) -> Result<Option<Vec<u8>>> {
+        let bytes = match (self.base64.take(), self.data.take()) {
+            (Some(encoded), None) if encoded.len() <= remaining.div_ceil(3) * 4 => STANDARD
+                .decode(encoded)
+                .map_err(|_| Error::Other("не удалось прочитать вложение черновика".into()))?,
+            (Some(_), None) => return Err(draft_files_too_large()),
+            (None, Some(bytes)) => bytes,
+            (None, None) => return Ok(None),
+            (Some(_), Some(_)) => {
+                return Err(Error::Other("содержимое вложения указано дважды".into()));
+            }
+        };
+        if bytes.len() > remaining {
+            return Err(draft_files_too_large());
+        }
+        Ok(Some(bytes))
+    }
+}
+
 impl Db {
     pub(super) async fn migrate_composer_draft_files(&self) -> Result<()> {
         let Some(value) = self.setting(COMPOSER_DRAFT_KEY).await? else {
@@ -61,28 +81,39 @@ impl Db {
         let mut wanted = HashSet::new();
         let mut metadata = Vec::with_capacity(files.len());
         let mut remaining = MAX_DRAFT_FILES_BYTES;
-        for file in files {
-            let id = file.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        for mut file in files {
+            let id = file
+                .id
+                .take()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             if !wanted.insert(id.clone()) {
                 return Err(Error::Other("вложение черновика указано дважды".into()));
             }
-            let size = if let Some((_, size)) = existing.get(&id) {
+            let upload = file.take_contents(remaining)?;
+            let size = if let Some((reference, size)) = existing.get(&id) {
+                if let Some(bytes) = upload {
+                    // A missing response can cause an identical upload to be
+                    // repeated. A file identifier must never silently change contents.
+                    let blobs = self.blobs.clone();
+                    let reference = reference.clone();
+                    let identical = tokio::task::spawn_blocking(move || {
+                        blobs.get(&reference).map(|saved| saved == bytes)
+                    })
+                    .await
+                    .map_err(|error| {
+                        Error::Other(format!("не удалось проверить вложение черновика: {error}"))
+                    })??;
+                    if !identical {
+                        return Err(Error::Other(
+                            "содержимое вложения изменилось, прикрепите файл заново".into(),
+                        ));
+                    }
+                }
                 *size as usize
             } else {
-                let bytes = match (file.base64, file.data) {
-                    (Some(encoded), None) if encoded.len() <= remaining.div_ceil(3) * 4 => {
-                        STANDARD.decode(encoded).map_err(|_| {
-                            Error::Other("не удалось прочитать вложение черновика".into())
-                        })?
-                    }
-                    (Some(_), None) => return Err(draft_files_too_large()),
-                    (None, Some(bytes)) => bytes,
-                    _ => return Err(Error::Other("вложение черновика не найдено".into())),
-                };
+                let bytes =
+                    upload.ok_or_else(|| Error::Other("вложение черновика не найдено".into()))?;
                 let size = bytes.len();
-                if size > remaining {
-                    return Err(draft_files_too_large());
-                }
                 let blobs = self.blobs.clone();
                 let reference = tokio::task::spawn_blocking(move || blobs.put(&bytes))
                     .await
@@ -193,6 +224,19 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(missing.is_empty());
         assert_eq!(db.blobs.references().unwrap(), references);
+
+        let mut retry = draft.clone();
+        retry["attachments"][0]["base64"] = json!("YWJj");
+        db.set_setting(COMPOSER_DRAFT_KEY, &retry.to_string())
+            .await
+            .unwrap();
+        retry["attachments"][0]["base64"] = json!("ZGVm");
+        assert!(
+            db.set_setting(COMPOSER_DRAFT_KEY, &retry.to_string())
+                .await
+                .is_err()
+        );
+        assert_eq!(db.composer_draft_file(&id).await.unwrap(), b"abc");
 
         draft["attachments"][0]["id"] = json!("missing");
         assert!(
