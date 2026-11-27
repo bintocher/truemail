@@ -257,7 +257,13 @@ function createUiWindow(options = {}) {
       static revokeObjectURL() {}
     },
     DOMParser: class {
-      parseFromString(html) { return createDocument('<html><head></head><body>'+html+'</body></html>'); }
+      parseFromString(source, type) {
+        if (type !== 'text/html') throw new TypeError('Only HTML parsing is used by the app');
+        const html = String(source);
+        if (/<html(?:\s|>)/i.test(html)) return createDocument(html);
+        if (/<(?:head|body)(?:\s|>)/i.test(html)) return createDocument('<html>'+html+'</html>');
+        return createDocument('<html><head></head><body>'+html+'</body></html>');
+      }
     },
     innerWidth: 1280,
     innerHeight: 800,

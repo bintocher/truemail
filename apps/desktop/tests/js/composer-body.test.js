@@ -211,7 +211,7 @@ test('S-003, S-007: картинка сверх предела письма пр
   await app.ready();
   // Вложение занимает всё письмо, кроме четырёх байтов. Значение важно только
   // размером, поэтому тело вложения не разворачиваем.
-  app.set('composerAttachments', [{filename: 'big.bin', mime_type: 'application/octet-stream', size: MAX_MESSAGE_BYTES - 4, persisted: true}]);
+  app.set('composerAttachments', [{id: 'example-saved-file', filename: 'big.bin', mime_type: 'application/octet-stream', size: MAX_MESSAGE_BYTES - 4, persisted: true}]);
   const edit = typeBody(app, 'Тело', 4);
   const big = new FakeFile('big.png', 'image/png', Buffer.from('12345'));
   const small = new FakeFile('small.png', 'image/png', Buffer.from('6789'));

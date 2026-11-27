@@ -828,7 +828,10 @@ async function showMessage(message){
     const content=document.createElement('div');content.className='mail-body';
     if(full.body_fetched===false){
       const notice=document.createElement('p');notice.className='mail-body-notice';notice.setAttribute('role','status');
-      notice.textContent=L('Содержимое письма не загружено. Проверьте подключение к почте и повторите попытку.','The message body is unavailable. Check your mail connection and try again.');
+      const hasSavedBody=Boolean(full.body_html||full.body_text);
+      notice.textContent=hasSavedBody
+        ? L('Показан сохранённый текст. Скачайте письмо, чтобы получить полное содержимое.','Saved text is shown. Download the message to retrieve the full contents.')
+        : L('Содержимое письма не загружено. Проверьте подключение к почте и повторите попытку.','The message body is unavailable. Check your mail connection and try again.');
       const retry=document.createElement('button');retry.type='button';retry.className='btn sm';
       retry.textContent=L('Скачать письмо','Download message');
       retry.onclick=()=>{if(stillCurrent())showMessage(message);};

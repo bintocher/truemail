@@ -479,11 +479,12 @@ document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMess
 function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.size);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
 /* В общий предел входят вложения и встроенные картинки (S-007, S-018, S-038). */
 let composerAttachmentSequence=0;
-function attachmentForComposer({id,filename,mime_type,size,base64,data}){
+function attachmentForComposer({id,draft_file_id,filename,mime_type,size,base64,data}){
+  const fileId=id||draft_file_id;
   const bytes=data instanceof Uint8Array?data:base64!==undefined?bytesFromBase64(base64):data?Uint8Array.from(data):null;
-  return {id:id||'file-'+Date.now()+'-'+(++composerAttachmentSequence)+'-'+Math.random().toString(36).slice(2),
+  return {id:fileId||'file-'+Date.now()+'-'+(++composerAttachmentSequence)+'-'+Math.random().toString(36).slice(2),
     filename,mime_type:mime_type||'application/octet-stream',size:bytes?.length??size,
-    bytes,persisted:!bytes&&Boolean(id)};
+    bytes,persisted:!bytes&&Boolean(fileId)};
 }
 function addComposerAttachment(item){
   const attachment=attachmentForComposer(item);
@@ -796,7 +797,7 @@ function writeDraft(draft,attachments=[]){
     if(!window.tm?.setSetting)return;
     draft.attachments=attachments.map(item=>{
       const file={id:item.id,filename:item.filename,mime_type:item.mime_type,size:item.size};
-      return item.persisted?file:{...file,base64:base64FromBytes(item.bytes)};
+      return item.persisted?file:{...file,base64:encodeComposerAttachment(item)};
     });
     await window.tm.setSetting('composer_draft',JSON.stringify(draft));
     for(const item of attachments){item.persisted=true;item.bytes=null;}
@@ -821,7 +822,7 @@ async function saveDraftNow(){
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
 compEditEl.addEventListener('input',()=>{composerTextMissing=false;});
 function composerRequest(){const draft=draftPayload(),to=recipientFieldAddresses('compTo'),cc=recipientFieldAddresses('compCc'),bcc=recipientFieldAddresses('compBcc'),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments.map(item=>({
-  filename:item.filename,mime_type:item.mime_type,...(item.persisted?{draft_file_id:item.id}:{base64:base64FromBytes(item.bytes)})
+  filename:item.filename,mime_type:item.mime_type,...(item.persisted?{draft_file_id:item.id}:{base64:encodeComposerAttachment(item)})
 }))};}
 function composerLang(){return wizardLocale==='en'?'en':'ru';}
 /* Карточка окна отмены с обратным отсчётом (S-017, S-018). Срок карточки
@@ -941,7 +942,11 @@ function bytesFromBase64(base64){
   for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
   return bytes;
 }
-function base64FromBytes(bytes){
+function encodeComposerAttachment(item){
+  const {bytes}=item;
+  if(!bytes)throw new Error(L(
+    'Содержимое вложения недоступно. Удалите вложение и прикрепите файл заново: '+item.filename,
+    'Attachment contents are unavailable. Remove and attach the file again: '+item.filename));
   if(typeof bytes.toBase64==='function')return bytes.toBase64();
   const blocks=[];
   for(let offset=0;offset<bytes.length;offset+=24576){
