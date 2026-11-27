@@ -310,7 +310,7 @@ async fn missing_message_file_is_reported_even_after_the_body_was_cached() {
     let unloaded = db.get_message(message).await.unwrap();
     assert!(!unloaded.body_fetched);
     assert_eq!(unloaded.body_text, None);
-    assert_eq!(unloaded.meta.subject.as_deref(), Some("Report"));
+    assert_eq!(unloaded.meta.subject, "Report");
 }
 
 #[tokio::test]
