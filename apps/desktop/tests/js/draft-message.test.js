@@ -89,6 +89,8 @@ test('the reading pane shows the missing-body notice until a retry obtains HTML'
       ? {...fullOf(id), meta:{...LETTERS[id],preview:'краткий текст'}, body_html:null, body_text:null, body_fetched:false}
       : fullOf(id),
   });
+  ui.evaluate(`currentFolderId=2;applyListOptions(true,'Входящие')`);
+  await settle();
   await openLetter(ui, 11);
   assert.match(ui.query('#tbody [role="status"]').textContent, /не загружено/i);
   assert.equal(ui.query('.mail-body-preview').textContent, 'краткий текст');
@@ -107,6 +109,8 @@ test('the reading pane keeps formatted mail and strips external image attributes
     `}),
     imageSenderTrusted: () => false,
   });
+  ui.evaluate(`currentFolderId=2;applyListOptions(true,'Входящие')`);
+  await settle();
   await openLetter(ui, 11);
   const frame = ui.query('.mail-html-frame');
   assert.ok(frame, 'HTML must be rendered in the reading pane');
