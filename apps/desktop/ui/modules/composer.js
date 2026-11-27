@@ -53,7 +53,7 @@ let composerTextMissing=false;
 let composerFromAccount=null;
 window.rememberComposerFrom=()=>{composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;};
 window.composerFromValue=()=>composerFromAccount==null?'':String(composerFromAccount);
-function resetComposer(){document.getElementById('compCopySubmitted')?.classList.add('hidden');composerGeneration++;composerRequestKey='';draftBeingSent=null;composerTextMissing=false;composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
+function resetComposer(){document.getElementById('compCopySubmitted')?.classList.add('hidden');clearTimeout(draftSaveTimer);composerGeneration++;composerRequestKey='';draftBeingSent=null;composerTextMissing=false;composerFromAccount=Number(document.querySelector('.from-sel')?.value)||null;['compTo','compCc','compBcc'].forEach(clearRecipientField);document.getElementById('compSubj').value='';setRecipientFieldVisible('compCc',false);setRecipientFieldVisible('compBcc',false);document.querySelectorAll('.recipient-suggestions').forEach(menu=>menu.classList.remove('open'));compEditEl.innerHTML='';composerAttachments=[];compAtt.innerHTML='';document.getElementById('composeStatus').textContent='';document.getElementById('compSendAt').classList.add('hidden');}
 const signatureCache=new Map();let composerSignatureKind='new';
 async function accountSignatures(accountId,refresh=false){if(!refresh&&signatureCache.has(accountId))return signatureCache.get(accountId);const values=await window.tm.listSignatures(accountId);signatureCache.set(accountId,values);return values;}
 async function applyComposerSignature(kind=composerSignatureKind){composerSignatureKind=kind;compEditEl.querySelector('.composer-signature')?.remove();const accountId=Number(document.querySelector('.from-sel')?.value);if(!accountId)return;try{const signature=(await accountSignatures(accountId)).find(item=>item.kind===kind&&item.enabled&&item.body_html.trim());if(!signature)return;const node=document.createElement('div');node.className='composer-signature';node.innerHTML=signature.body_html;const quote=compEditEl.querySelector('.mail-quote-head');if(quote)compEditEl.insertBefore(node,quote);else compEditEl.appendChild(node);scheduleDraftSave();}catch(error){console.error(error);}}
@@ -477,23 +477,42 @@ document.getElementById('bulkClear').onclick=clearMessageSelection;
 document.getElementById('bulkArchive').onclick=()=>performMessageAction('archive');
 document.getElementById('bulkTrash').onclick=()=>performMessageAction('trash');
 document.getElementById('bulkRead').onclick=async()=>{const ids=[...selectedMessageIds];if(!ids.length)return;try{await window.markMessagesSeen?.(ids.map(id=>messages.find(item=>item.id===id)).filter(Boolean),true);clearMessageSelection();await window.reloadCoreData();showToast(L('Письма отмечены прочитанными','Messages marked as read'));}catch(error){showToast(error);}};
-function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.data.length);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
-/* Потолок на всё письмо разом - вложения и байты встроенных картинок в теле
-   вместе (S-007, S-018, S-038; тот же предел, что и при сборке письма в ядре):
-   WebView держит их в памяти массивами чисел и целиком укладывает в
-   автосохраняемый черновик, поэтому крупное содержимое иначе съедает память
-   интерфейса. */
+function renderComposerAttachment(item){const el=document.createElement('span');el.className='att-mini';el.innerHTML='<i data-i="paperclip"></i><span class="att-name"></span><span class="csub"></span><span class="x">×</span>';el.querySelector('.att-name').textContent=item.filename;el.querySelector('.csub').textContent=formatBytes(item.size);renderIcons(el);el.querySelector('.x').onclick=()=>{composerAttachments=composerAttachments.filter(value=>value!==item);el.remove();scheduleDraftSave();};compAtt.appendChild(el);}
+/* В общий предел входят вложения и встроенные картинки (S-007, S-018, S-038). */
+let composerAttachmentSequence=0;
+function attachmentForComposer({id,filename,mime_type,size,base64,data}){
+  const bytes=data instanceof Uint8Array?data:base64!==undefined?bytesFromBase64(base64):data?Uint8Array.from(data):null;
+  return {id:id||'file-'+Date.now()+'-'+(++composerAttachmentSequence)+'-'+Math.random().toString(36).slice(2),
+    filename,mime_type:mime_type||'application/octet-stream',size:bytes?.length??size,
+    bytes,persisted:!bytes&&Boolean(id)};
+}
+function addComposerAttachment(item){
+  const attachment=attachmentForComposer(item);
+  ensureMessageFits(attachment.size,attachment.filename);
+  composerAttachments.push(attachment);
+  renderComposerAttachment(attachment);
+  scheduleDraftSave();
+}
 function composerBodyImageSources(){return [...compEditEl.querySelectorAll('img')].map(img=>img.getAttribute('src')||'');}
-function composerTotalBytes(){return composerBody.totalMessageBytes(composerAttachments.map(item=>item.data.length),composerBodyImageSources());}
+function composerTotalBytes(){return composerBody.totalMessageBytes(composerAttachments.map(item=>item.size),composerBodyImageSources());}
 function ensureMessageFits(size,filename){
   if(composerBody.fitsMessageLimit(composerTotalBytes(),size))return;
   throw new Error(L(`Не добавлено: ${filename} не помещается, всё письмо вместе не должно превышать ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`,`Not attached: ${filename} does not fit, the whole message together must stay under ${formatBytes(composerBody.MAX_MESSAGE_BYTES)}`));
 }
-async function addCompFile(file,generation=composerGeneration){if(generation!==composerGeneration)return;ensureMessageFits(file.size,file.name||'attachment');const data=Array.from(new Uint8Array(await file.arrayBuffer()));if(generation!==composerGeneration)return;const item={filename:file.name||'attachment',mime_type:file.type||'application/octet-stream',data};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
-/* файл с диска по пути: приходит из меню "Отправить" проводника, читает ядро.
-   Размер оцениваем по длине base64 - до atob, чтобы слишком большой файл не
-   разворачивался в памяти интерфейса ещё раз. */
-async function addCompFilePath(path,generation=composerGeneration){if(generation!==composerGeneration)return;const file=await window.tm.readLocalFile(path);if(generation!==composerGeneration)return;ensureMessageFits(Math.floor(file.base64.length*3/4),file.filename);const binary=atob(file.base64);const bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);const item={filename:file.filename,mime_type:file.mime_type||'application/octet-stream',data:bytes};composerAttachments.push(item);renderComposerAttachment(item);scheduleDraftSave();}
+async function addCompFile(file,generation=composerGeneration){
+  if(generation!==composerGeneration)return;
+  ensureMessageFits(file.size,file.name||'attachment');
+  const data=new Uint8Array(await file.arrayBuffer());
+  if(generation===composerGeneration)addComposerAttachment({filename:file.name||'attachment',mime_type:file.type,data});
+}
+/* Файл, переданный через меню "Отправить" проводника. */
+async function addCompFilePath(path,generation=composerGeneration){
+  if(generation!==composerGeneration)return;
+  const file=await window.tm.readLocalFile(path);
+  if(generation!==composerGeneration)return;
+  ensureMessageFits(decodedSize(file.base64),file.filename);
+  addComposerAttachment(file);
+}
 /* Есть ли в композере что терять: открытое письмо или восстановленный при
    запуске черновик, который лежит в полях ещё до открытия composeView.
    Тело из одних картинок без текста тоже считается непустым (S-012). */
@@ -768,24 +787,43 @@ document.getElementById('linkCancel').onclick=closeLinkDialog;
 document.getElementById('linkApply').onclick=applyLinkDialog;
 document.getElementById('linkOverlay').addEventListener('click',e=>{if(e.target.id==='linkOverlay')closeLinkDialog();});
 document.getElementById('linkHref').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();applyLinkDialog();}});
-let draftSaveTimer=null;
+let draftSaveTimer=null,draftSaveChain=Promise.resolve();
 function typedAddresses(id){return [...recipientModel[id],...splitAddresses(document.getElementById(id).value).map(email=>({name:'',email}))];}
-function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:typedAddresses('compTo'),cc:typedAddresses('compCc'),bcc:typedAddresses('compBcc'),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:composerTextMissing?'':compEditEl.innerText,attachments:composerAttachments,draft_message_id:draftBeingSent,text_missing:composerTextMissing};}
+function draftPayload(){return {account_id:+document.querySelector('.from-sel').value||coreAccounts[0]?.id||0,to:typedAddresses('compTo'),cc:typedAddresses('compCc'),bcc:typedAddresses('compBcc'),subject:document.getElementById('compSubj').value,body_html:compEditEl.innerHTML,body_text:composerTextMissing?'':compEditEl.innerText,draft_message_id:draftBeingSent,text_missing:composerTextMissing};}
+function writeDraft(draft,attachments=[]){
+  // A delayed write cannot restore a draft that was deleted or sent while it ran.
+  const saved=draftSaveChain.then(async()=>{
+    if(!draft)return window.tm?.setSetting('composer_draft','');
+    if(!window.tm?.setSetting)return;
+    draft.attachments=attachments.map(item=>{
+      const file={id:item.id,filename:item.filename,mime_type:item.mime_type,size:item.size};
+      return item.persisted?file:{...file,base64:base64FromBytes(item.bytes)};
+    });
+    await window.tm.setSetting('composer_draft',JSON.stringify(draft));
+    for(const item of attachments){item.persisted=true;item.bytes=null;}
+  });
+  draftSaveChain=saved.catch(()=>{});
+  return saved;
+}
 function scheduleDraftSave(){
   // The letter of a generation already taken by the queue is not saved again.
   if(composerGeneration===handedOverGeneration)return;
   // S-053: письмо изменилось - прежний ключ запроса к нему уже не относится.
   composerRequestKey='';
   clearTimeout(draftSaveTimer);
-  draftSaveTimer=setTimeout(()=>window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload())).catch(console.error),500);
+  draftSaveTimer=setTimeout(()=>saveDraftNow().catch(error=>showToast(error)),500);
 }
-/* Записать черновик немедленно и дождаться подтверждения: отложенная на 500 мс
-   запись не годится там, где следом удаляется единственная долговечная копия
-   письма (S-003, S-042). */
-async function saveDraftNow(){clearTimeout(draftSaveTimer);await window.tm?.setSetting('composer_draft',JSON.stringify(draftPayload()));}
+/* Дождаться записи перед удалением единственной долговечной копии письма
+   (S-003, S-042). */
+async function saveDraftNow(){
+  clearTimeout(draftSaveTimer);
+  await writeDraft(draftPayload(),[...composerAttachments]);
+}
 composerFieldIds.forEach(id=>document.getElementById(id).addEventListener('input',scheduleDraftSave));compEditEl.addEventListener('input',scheduleDraftSave);
 compEditEl.addEventListener('input',()=>{composerTextMissing=false;});
-function composerRequest(){const draft=draftPayload(),to=recipientFieldAddresses('compTo'),cc=recipientFieldAddresses('compCc'),bcc=recipientFieldAddresses('compBcc'),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments};}
+function composerRequest(){const draft=draftPayload(),to=recipientFieldAddresses('compTo'),cc=recipientFieldAddresses('compCc'),bcc=recipientFieldAddresses('compBcc'),invalid=[...to,...cc,...bcc].find(address=>!validAddress(address));if(!to.length&&!cc.length&&!bcc.length)throw new Error(L('Укажите хотя бы одного получателя','Add at least one recipient'));if(invalid)throw new Error(L(`Некорректный адрес: ${invalid}`,`Invalid address: ${invalid}`));return {account_id:draft.account_id,to,cc,bcc,subject:draft.subject,body_text:draft.body_text,body_html:draft.body_html,attachments:composerAttachments.map(item=>({
+  filename:item.filename,mime_type:item.mime_type,...(item.persisted?{draft_file_id:item.id}:{base64:base64FromBytes(item.bytes)})
+}))};}
 function composerLang(){return wizardLocale==='en'?'en':'ru';}
 /* Карточка окна отмены с обратным отсчётом (S-017, S-018). Срок карточки
    определяет срок отмены, а не общий срок исчезновения карточек. */
@@ -858,7 +896,7 @@ function applyCancelledSendToComposer(message){
   setRecipientFieldVisible('compBcc',draft.bcc.length>0);
   document.getElementById('compSubj').value=draft.subject;
   compEditEl.innerHTML=editorSafeHtml(draft.body_html||escapeHtml(draft.body_text).replace(/\n/g,'<br>'));
-  composerAttachments=draft.attachments.map(item=>({filename:item.filename,mime_type:item.mime_type,data:item.data}));
+  composerAttachments=draft.attachments.map(attachmentForComposer);
   compAtt.innerHTML='';composerAttachments.forEach(renderComposerAttachment);
   scheduleDraftSave();
 }
@@ -898,7 +936,20 @@ window.restoreUndoWindows=restoreUndoWindows;
    (draft-message-actions.md). One click never touches the editor: the letter is
    read into a snapshot first, and the editor opens only when the user has to
    finish the letter. */
-function bytesFromBase64(base64){const binary=atob(base64),bytes=new Array(binary.length);for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);return bytes;}
+function bytesFromBase64(base64){
+  if(typeof Uint8Array.fromBase64==='function')return Uint8Array.fromBase64(base64);
+  const binary=atob(base64),bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++)bytes[i]=binary.charCodeAt(i);
+  return bytes;
+}
+function base64FromBytes(bytes){
+  if(typeof bytes.toBase64==='function')return bytes.toBase64();
+  const blocks=[];
+  for(let offset=0;offset<bytes.length;offset+=24576){
+    blocks.push(btoa(String.fromCharCode(...bytes.subarray(offset,offset+24576))));
+  }
+  return blocks.join('');
+}
 // The size of what a base64 text carries, without its padding.
 function decodedSize(base64){const padding=base64.endsWith('==')?2:base64.endsWith('=')?1:0;return Math.floor(base64.length*3/4)-padding;}
 // Parses letter markup into an inert tree: while it is there, nothing in it
@@ -1069,7 +1120,7 @@ async function readDraftLetterParts(full){
     const size=decodedSize(content.base64);
     if(!composerBody.fitsMessageLimit(bytes,size))return {request,problem:letterTooLarge(name)};
     bytes+=size;
-    request.attachments.push({filename:content.filename||name,mime_type:content.mime_type||att.mime_type||'application/octet-stream',data:bytesFromBase64(content.base64)});
+    request.attachments.push({filename:content.filename||name,mime_type:content.mime_type||att.mime_type||'application/octet-stream',base64:content.base64});
   }
   return {request,problem:null};
 }
@@ -1099,7 +1150,8 @@ function applyDraftToComposer(request,textMissing=false){
   document.getElementById('compSubj').value=request.subject||'';
   compEditEl.innerHTML=editorSafeHtml(request.body_html);
   composerTextMissing=textMissing===true;
-  request.attachments.forEach(item=>{composerAttachments.push(item);renderComposerAttachment(item);});
+  composerAttachments=request.attachments.map(attachmentForComposer);
+  composerAttachments.forEach(renderComposerAttachment);
 }
 /* The letter has to be finished by the user: it goes to the editor, unless the
    editor is taken by another letter. */
@@ -1261,7 +1313,7 @@ async function settleDraftLink(){
 // The saved copy of the letter that went out is cleared. A failure to clear it is
 // written to the log: it does not undo the sending.
 function clearSavedLetter(){
-  window.tm.setSetting('composer_draft','').catch(error=>{window.tm?.uiLog?.(`the saved copy of a sent letter was not cleared: ${error?.message||error}`);});
+  writeDraft(null).catch(error=>{window.tm?.uiLog?.(`the saved copy of a sent letter was not cleared: ${error?.message||error}`);});
 }
 // Another letter is in the editor while the queue answers for the old one: the
 // new one is saved at once, so that the copy of the sent one does not come back
@@ -1357,4 +1409,4 @@ document.getElementById('compSendLater').onclick=async()=>{
     }catch(error){if(generation!==composerGeneration)return;status.textContent=window.errorPresentation.errorText(error,{locale:wizardLocale,translations:wizardText});status.dataset.kind='error';}
   }finally{if(handingOverGeneration===generation)handingOverGeneration=null;}
 };
-document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();await window.tm?.setSetting('composer_draft','').catch(console.error);showView('mailView');};
+document.getElementById('compDeleteDraft').onclick=async()=>{resetComposer();showView('mailView');await writeDraft(null).catch(error=>showToast(error));};

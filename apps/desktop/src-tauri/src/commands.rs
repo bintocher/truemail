@@ -897,7 +897,9 @@ pub struct StorageStatus {
 pub struct SendAttachmentRequest {
     filename: String,
     mime_type: String,
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
+    base64: Option<String>,
+    draft_file_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5032,7 +5034,7 @@ pub async fn send_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    let outgoing = outgoing_message(&account, request);
+    let outgoing = outgoing_message(&core.db, &account, request).await?;
     let queued = if let Some(draft_id) = draft_id {
         core.db
             .queue_draft_send(account.id, outgoing, request_key, draft_id, None)
@@ -5382,11 +5384,29 @@ pub async fn clear_recipient_history(
         .await?)
 }
 
-fn outgoing_message(
+async fn outgoing_message(
+    db: &truemail_core::storage::Db,
     account: &Account,
     request: SendMessageRequest,
-) -> truemail_core::backend::OutgoingMessage {
-    truemail_core::backend::OutgoingMessage {
+) -> CmdResult<truemail_core::backend::OutgoingMessage> {
+    use base64::Engine as _;
+    let mut attachments = Vec::with_capacity(request.attachments.len());
+    for item in request.attachments {
+        let data = match (item.data, item.base64, item.draft_file_id) {
+            (Some(bytes), None, None) => bytes,
+            (None, Some(encoded), None) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| api_error("не удалось прочитать вложение письма"))?,
+            (None, None, Some(id)) => db.composer_draft_file(&id).await?,
+            _ => return Err(api_error("не указано содержимое вложения письма")),
+        };
+        attachments.push(truemail_core::backend::OutgoingAttachment {
+            filename: item.filename,
+            mime_type: item.mime_type,
+            data,
+        });
+    }
+    Ok(truemail_core::backend::OutgoingMessage {
         from: account.email.clone(),
         to: request.to,
         cc: request.cc,
@@ -5394,17 +5414,9 @@ fn outgoing_message(
         subject: request.subject,
         body_text: request.body_text,
         body_html: request.body_html,
-        attachments: request
-            .attachments
-            .into_iter()
-            .map(|item| truemail_core::backend::OutgoingAttachment {
-                filename: item.filename,
-                mime_type: item.mime_type,
-                data: item.data,
-            })
-            .collect(),
+        attachments,
         ..Default::default()
-    }
+    })
 }
 
 #[tauri::command]
@@ -5432,7 +5444,7 @@ pub async fn schedule_message(
             message: "Выберите время в будущем".into(),
         });
     }
-    let outgoing = outgoing_message(&account, request);
+    let outgoing = outgoing_message(&core.db, &account, request).await?;
     let scheduled = send_at
         .with_timezone(&chrono::Utc)
         .format("%Y-%m-%d %H:%M:%S")

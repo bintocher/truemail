@@ -565,6 +565,7 @@ impl Db {
             "SELECT blob_ref FROM attachments WHERE blob_ref IS NOT NULL",
             "SELECT vcard_ref FROM contacts WHERE vcard_ref IS NOT NULL",
             "SELECT ical_ref FROM events WHERE ical_ref IS NOT NULL",
+            "SELECT blob_ref FROM composer_draft_files",
         ] {
             let rows: Vec<(String,)> = sqlx::query_as(query).fetch_all(&self.pool).await?;
             referenced.extend(rows.into_iter().map(|row| row.0));
