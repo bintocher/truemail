@@ -279,7 +279,7 @@ fn run() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
-                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
+                .event_format(activity::MaskedEvent::default())
                 .with_writer(std::io::stdout.and(file_appender))
                 .init();
         }
@@ -290,7 +290,7 @@ fn run() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
-                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
+                .event_format(activity::MaskedEvent::default())
                 .init();
             eprintln!(
                 "не удалось создать файловый логгер в {}: {error}; логи будут только в stdout",
@@ -788,6 +788,142 @@ mod command_contract_tests {
             )
             .expect_err("команда должна вернуть ошибку");
             assert_eq!(error["message"], expected, "{cmd}");
+        }
+    }
+
+    // Coverage for the wider catalog complements the executable IPC cases above.
+    #[test]
+    fn registration_and_bridge_keep_the_broader_command_catalog() {
+        const MAIN: &str = include_str!("main.rs");
+        const COMMANDS: &str = include_str!("commands.rs");
+        const BRIDGE: &str = include_str!("../../ui/bridge.js");
+        for command in [
+            "get_message",
+            "send_message",
+            "create_event",
+            "update_event",
+            "delete_event",
+            "respond_to_event",
+            "create_contact",
+            "update_contact",
+            "delete_contact",
+            "message_action",
+            "move_messages_to_folder",
+            "undo_message_action",
+            "check_for_update",
+            "install_update",
+            // S-082: команды правил перечислены явно - список правил, редактор,
+            // изменение порядка и ручной прогон должны быть доступны мосту.
+            "list_mail_rules",
+            "save_mail_rule",
+            "set_mail_rule_enabled",
+            "delete_mail_rule",
+            "reorder_mail_rules",
+            "run_mail_rules",
+            "continue_mail_rule_run",
+            "last_mail_rule_run",
+            "pending_mail_rule_runs",
+            "mail_rule_delete_confirmation",
+            // S-052, S-053, S-014: выход из состояния отказа и предупреждение о
+            // ящике без корзины - такие же обязательные пути, как сам список
+            // правил, и без них правила молча оставляют почту на месте.
+            // blocked-senders.md S-050: блокировка отправителя, управление
+            // списками и уборка уже полученных писем перечислены явно - без
+            // любой из этих команд раздел отправителей перестаёт работать.
+            "list_sender_policies",
+            "preview_sender_policy",
+            "save_sender_policy",
+            "delete_sender_policy",
+            "start_sender_policy_sweep",
+            "continue_sender_policy_sweep",
+            "cancel_sender_policy_sweep",
+            "pending_sender_policy_jobs",
+            // ignore-conversation.md S-051: включение игнорирования, список
+            // переписок и прекращение с возвратом писем.
+            "list_ignored_conversations",
+            "preview_ignore_conversation",
+            "enable_ignore_conversation",
+            "disable_ignore_conversation",
+            "continue_ignore_job",
+            "pending_ignore_jobs",
+            // sweep-by-sender.md S-047: запуск автоочистки, управление её
+            // записями и отмена уборки.
+            "list_sender_sweep_rules",
+            "preview_sender_sweep",
+            "start_sender_sweep",
+            "set_sender_sweep_enabled",
+            "update_sender_sweep_mode",
+            "delete_sender_sweep_rule",
+            "continue_sender_sweep_job",
+            "cancel_sender_sweep_job",
+            "pending_sender_sweep_jobs",
+            "failed_message_operations",
+            "retry_message_operation",
+            "discard_message_operation",
+            "accounts_without_trash",
+            // undo-send.md S-372: без команд очереди отправки раздел
+            // "Исходящие" и сама отмена перестают работать, а письмо остаётся
+            // висеть в очереди без единого действия пользователя.
+            "undo_send_seconds",
+            "set_undo_send_seconds",
+            "list_outbox_sends",
+            "cancel_send",
+            "open_cancelled_send",
+            "delete_send",
+            "retry_send",
+            "startup_send_state",
+            "release_undo_windows",
+            // out-of-office.md S-397: чтение, сохранение и отключение
+            // автоответа вместе с перечнем уже отправленных ответов.
+            "out_of_office",
+            "save_out_of_office",
+            "disable_out_of_office",
+            "list_out_of_office_replies",
+            // recipient-history.md S-334: подсказка получателей и раздел
+            // управления историей.
+            "recipient_candidates",
+            "list_recipient_history",
+            "update_recipient_history",
+            "delete_recipient_history_entry",
+            "clear_recipient_history",
+            "mark_flagged",
+            "set_messages_pinned",
+            "list_pinned_messages",
+            "save_message_task",
+            "get_message_task",
+            "list_message_tasks",
+            "complete_message_task",
+            "reopen_message_task",
+            "delete_message_task",
+            "overdue_message_task_count",
+            "due_task_reminders",
+            "mark_task_reminders_shown",
+            "snooze_task_reminder",
+            // Пределы и сроки настраиваются пользователем: без этих команд
+            // раздел настроек пуст, а интерфейс остаётся без границ полей и
+            // возвращается к собственным числам, которые уже расходились с
+            // ядром.
+            "limit_settings",
+            "set_limit_setting",
+            "list_quick_steps",
+            "save_quick_step",
+            "delete_quick_step",
+            "reorder_quick_steps",
+            "bind_quick_step_slot",
+            "apply_quick_step",
+        ] {
+            assert!(
+                MAIN.contains(&format!("commands::{command}")),
+                "{command} is missing from generate_handler"
+            );
+            assert!(
+                COMMANDS.contains(&format!("fn {command}(")),
+                "{command} implementation is missing"
+            );
+            assert!(
+                BRIDGE.contains(&format!("invoke(\"{command}\"")),
+                "{command} is missing from bridge.js"
+            );
         }
     }
 

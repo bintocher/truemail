@@ -69,100 +69,110 @@ impl Db {
             None => Vec::new(),
         };
 
-        let mut tx = self.begin_write().await?;
-        let existing: Vec<(String, String, i64)> =
-            sqlx::query_as("SELECT id,blob_ref,size FROM composer_draft_files")
-                .fetch_all(&mut *tx)
-                .await?;
-        let existing: HashMap<_, _> = existing
-            .into_iter()
-            .map(|(id, reference, size)| (id, (reference, size)))
-            .collect();
-        let mut wanted = HashSet::new();
-        let mut metadata = Vec::with_capacity(files.len());
-        let mut remaining = MAX_DRAFT_FILES_BYTES;
-        for mut file in files {
-            let id = file
-                .id
-                .take()
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            if !wanted.insert(id.clone()) {
-                return Err(Error::Other("вложение черновика указано дважды".into()));
-            }
-            let upload = file.take_contents(remaining)?;
-            let size = if let Some((reference, size)) = existing.get(&id) {
-                if let Some(bytes) = upload {
-                    // A missing response can cause an identical upload to be
-                    // repeated. A file identifier must never silently change contents.
-                    let blobs = self.blobs.clone();
-                    let reference = reference.clone();
-                    let identical = tokio::task::spawn_blocking(move || {
-                        blobs.get(&reference).map(|saved| saved == bytes)
-                    })
-                    .await
-                    .map_err(|error| {
-                        Error::Other(format!("не удалось проверить вложение черновика: {error}"))
-                    })??;
-                    if !identical {
-                        return Err(Error::Other(
-                            "содержимое вложения изменилось, прикрепите файл заново".into(),
-                        ));
-                    }
+        let mut created = Vec::new();
+        let saved: Result<Vec<String>> = async {
+            let mut tx = self.begin_write().await?;
+            let existing: Vec<(String, String, i64)> =
+                sqlx::query_as("SELECT id,blob_ref,size FROM composer_draft_files")
+                    .fetch_all(&mut *tx)
+                    .await?;
+            let existing: HashMap<_, _> = existing
+                .into_iter()
+                .map(|(id, reference, size)| (id, (reference, size)))
+                .collect();
+            let mut wanted = HashSet::new();
+            let mut metadata = Vec::with_capacity(files.len());
+            let mut remaining = MAX_DRAFT_FILES_BYTES;
+            for mut file in files {
+                let id = file
+                    .id
+                    .take()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                if !wanted.insert(id.clone()) {
+                    return Err(Error::Other("вложение черновика указано дважды".into()));
                 }
-                *size as usize
-            } else {
-                let bytes =
-                    upload.ok_or_else(|| Error::Other("вложение черновика не найдено".into()))?;
-                let size = bytes.len();
-                let blobs = self.blobs.clone();
-                let reference = tokio::task::spawn_blocking(move || blobs.put(&bytes))
-                    .await
-                    .map_err(|error| {
-                        Error::Other(format!("не удалось сохранить вложение черновика: {error}"))
-                    })??;
-                sqlx::query("INSERT INTO composer_draft_files(id,blob_ref,size) VALUES(?,?,?)")
-                    .bind(&id)
-                    .bind(&reference)
-                    .bind(size as i64)
-                    .execute(&mut *tx)
-                    .await?;
-                size
-            };
-            remaining = remaining
-                .checked_sub(size)
-                .ok_or_else(draft_files_too_large)?;
-            metadata.push(
-                json!({"id":id,"filename":file.filename,"mime_type":file.mime_type,"size":size}),
-            );
-        }
-        object.insert("attachments".into(), json!(metadata));
-
-        let mut removed = Vec::new();
-        for (id, (reference, _)) in existing {
-            if !wanted.contains(&id) {
-                sqlx::query("DELETE FROM composer_draft_files WHERE id=?")
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await?;
-                removed.push(reference);
+                let upload = file.take_contents(remaining)?;
+                let size = if let Some((reference, size)) = existing.get(&id) {
+                    if let Some(bytes) = upload {
+                        // A missing response can cause an identical upload to be
+                        // repeated. A file identifier must never silently change contents.
+                        let blobs = self.blobs.clone();
+                        let reference = reference.clone();
+                        let identical = tokio::task::spawn_blocking(move || {
+                            blobs.get(&reference).map(|saved| saved == bytes)
+                        })
+                        .await
+                        .map_err(|error| {
+                            Error::Other(format!("не удалось проверить вложение черновика: {error}"))
+                        })??;
+                        if !identical {
+                            return Err(Error::Other(
+                                "содержимое вложения изменилось, прикрепите файл заново".into(),
+                            ));
+                        }
+                    }
+                    *size as usize
+                } else {
+                    let bytes =
+                        upload.ok_or_else(|| Error::Other("вложение черновика не найдено".into()))?;
+                    let size = bytes.len();
+                    let blobs = self.blobs.clone();
+                    let reference = tokio::task::spawn_blocking(move || blobs.put(&bytes))
+                        .await
+                        .map_err(|error| {
+                            Error::Other(format!("не удалось сохранить вложение черновика: {error}"))
+                        })??;
+                    created.push(reference.clone());
+                    sqlx::query("INSERT INTO composer_draft_files(id,blob_ref,size) VALUES(?,?,?)")
+                        .bind(&id)
+                        .bind(&reference)
+                        .bind(size as i64)
+                        .execute(&mut *tx)
+                        .await?;
+                    size
+                };
+                remaining = remaining
+                    .checked_sub(size)
+                    .ok_or_else(draft_files_too_large)?;
+                metadata.push(
+                    json!({"id":id,"filename":file.filename,"mime_type":file.mime_type,"size":size}),
+                );
             }
+            object.insert("attachments".into(), json!(metadata));
+
+            let mut removed = Vec::new();
+            for (id, (reference, _)) in existing {
+                if !wanted.contains(&id) {
+                    sqlx::query("DELETE FROM composer_draft_files WHERE id=?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    removed.push(reference);
+                }
+            }
+            let value = if value.is_empty() {
+                String::new()
+            } else {
+                draft.to_string()
+            };
+            sqlx::query(
+                "INSERT INTO settings(key,value) VALUES(?,?)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            )
+            .bind(COMPOSER_DRAFT_KEY)
+            .bind(self.encrypt_setting(&value)?)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(removed)
         }
-        let value = if value.is_empty() {
-            String::new()
-        } else {
-            draft.to_string()
-        };
-        sqlx::query(
-            "INSERT INTO settings(key,value) VALUES(?,?)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        )
-        .bind(COMPOSER_DRAFT_KEY)
-        .bind(self.encrypt_setting(&value)?)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        for reference in removed {
-            self.blobs.remove(&reference)?;
+        .await;
+        match saved {
+            Ok(removed) => self.release_mail_blobs(removed).await,
+            Err(error) => {
+                self.release_mail_blobs(created).await;
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -245,6 +255,17 @@ mod tests {
                 .is_err()
         );
         assert_eq!(db.composer_draft_file(&id).await.unwrap(), b"abc");
+
+        let invalid_batch = json!({"attachments":[
+            {"id":"new","filename":"new.txt","base64":"ZGVm"},
+            {"id":"invalid","filename":"invalid.txt","base64":"!!"}
+        ]});
+        assert!(
+            db.set_setting(COMPOSER_DRAFT_KEY, &invalid_batch.to_string())
+                .await
+                .is_err()
+        );
+        assert_eq!(db.blobs.references().unwrap(), references);
 
         db.set_setting(COMPOSER_DRAFT_KEY, "").await.unwrap();
         assert!(db.blobs.references().unwrap().is_empty());

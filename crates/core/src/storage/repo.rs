@@ -557,7 +557,7 @@ impl Db {
 
     /// Database changes are already committed. If cleanup fails, the next
     /// startup can remove the orphan without rolling back the user's action.
-    async fn release_mail_blobs(&self, refs: Vec<String>) {
+    pub(super) async fn release_mail_blobs(&self, refs: Vec<String>) {
         if !refs.is_empty()
             && let Err(error) = self.remove_unreferenced_mail_blobs(refs).await
         {

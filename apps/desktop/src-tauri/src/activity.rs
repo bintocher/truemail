@@ -16,7 +16,13 @@ use tracing_subscriber::fmt::{
 use tracing_subscriber::registry::LookupSpan;
 
 /// Redact complete log events, including their messages, fields and span names.
-pub struct MaskedEvent(pub Format);
+pub struct MaskedEvent(Format);
+
+impl Default for MaskedEvent {
+    fn default() -> Self {
+        Self(tracing_subscriber::fmt::format().with_ansi(false))
+    }
+}
 
 impl<S, N> FormatEvent<S, N> for MaskedEvent
 where
@@ -198,7 +204,7 @@ mod tests {
         let writer = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
-            .event_format(MaskedEvent(tracing_subscriber::fmt::format()))
+            .event_format(MaskedEvent::default())
             .with_writer(move || Buffer(writer.clone()))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
@@ -208,6 +214,7 @@ mod tests {
         let output = buffer.lock().unwrap();
         assert_eq!(event_payload(&output), Some("YWJjZA=="));
         let output = std::str::from_utf8(&output).unwrap();
+        assert!(!output.contains('\x1b'));
         for (original, masked) in [
             ("person@example.test", "p***@example.test"),
             ("copy@example.org", "c***@example.org"),
