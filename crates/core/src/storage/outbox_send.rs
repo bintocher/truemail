@@ -351,6 +351,8 @@ impl Db {
     /// (S-025). Состояние передачи в захват не попадает ни при каком сроке:
     /// иначе аварийное завершение во время передачи отправило бы письмо второй
     /// раз (S-026).
+    /// Новые письма идут раньше свежих повторов. Повтор, готовый больше
+    /// минуты, возвращается в общий порядок, чтобы поток новых писем его не блокировал.
     pub async fn claim_send_operation(&self, account_id: i64) -> Result<Option<OutboxOperation>> {
         let row: Option<OutboxOperationRow> = sqlx::query_as(
             "UPDATE outbox_ops
@@ -360,7 +362,8 @@ impl Db {
                  WHERE account_id=? AND op_kind='send' AND status IN ('pending','retry')
                    AND coalesce(cancel_until, created_at) <= datetime('now')
                    AND coalesce(next_attempt_at, created_at) <= datetime('now')
-                 ORDER BY id LIMIT 1)
+                 ORDER BY (status='retry' AND coalesce(next_attempt_at, created_at) > datetime('now','-1 minute')),
+                          id LIMIT 1)
               RETURNING id, account_id, message_id, op_kind, payload, attempts",
         )
         .bind(SEND_LEASE)
@@ -762,11 +765,13 @@ impl Db {
         self.blobs.get(reference)
     }
 
-    /// Сколько секунд осталось до ближайшего срока отмены этого ящика. Работник
-    /// ждёт этот срок и не опрашивает базу каждую секунду (S-024).
+    /// Сколько секунд до ближайшего письма, для которого закончится и окно
+    /// отмены, и ожидание повтора (S-024).
     pub async fn next_send_wakeup_seconds(&self, account_id: i64) -> Result<Option<i64>> {
         let row: Option<(Option<f64>,)> = sqlx::query_as(
-            "SELECT min((julianday(coalesce(cancel_until, created_at)) - julianday('now')) * 86400.0)
+            "SELECT min((max(julianday(coalesce(cancel_until, created_at)),
+                             julianday(coalesce(next_attempt_at, created_at)))
+                             - julianday('now')) * 86400.0)
                FROM outbox_ops
               WHERE account_id=? AND op_kind='send' AND status IN ('pending','retry')",
         )

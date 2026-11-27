@@ -897,7 +897,9 @@ pub struct StorageStatus {
 pub struct SendAttachmentRequest {
     filename: String,
     mime_type: String,
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
+    base64: Option<String>,
+    draft_file_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4140,10 +4142,10 @@ fn dir_size(path: &std::path::Path) -> u64 {
         .flatten()
         .map(|entry| {
             let path = entry.path();
-            if path.is_dir() {
-                dir_size(&path)
-            } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => dir_size(&path),
+                Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => 0,
             }
         })
         .sum()
@@ -4153,21 +4155,25 @@ fn dir_size(path: &std::path::Path) -> u64 {
 pub async fn storage_status(state: State<'_, AppState>) -> CmdResult<StorageStatus> {
     let _ = core(&state).await?;
     let data_dir = truemail_core::crypto::load_data_dir()?.unwrap_or_else(super::default_data_dir);
-    let database_bytes = ["truemail.db", "truemail.db-wal", "truemail.db-shm"]
-        .iter()
-        .map(|name| {
-            std::fs::metadata(data_dir.join(name))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
-        .sum();
-    let blob_bytes = dir_size(&data_dir.join("blobs"));
-    Ok(StorageStatus {
-        data_dir: data_dir.to_string_lossy().into_owned(),
-        total_bytes: database_bytes + blob_bytes,
-        database_bytes,
-        blob_bytes,
+    tokio::task::spawn_blocking(move || {
+        let database_bytes = ["truemail.db", "truemail.db-wal", "truemail.db-shm"]
+            .iter()
+            .map(|name| {
+                std::fs::metadata(data_dir.join(name))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let blob_bytes = dir_size(&data_dir.join("blobs"));
+        StorageStatus {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            total_bytes: database_bytes + blob_bytes,
+            database_bytes,
+            blob_bytes,
+        }
     })
+    .await
+    .map_err(|error| api_error(format!("не удалось измерить размер хранилища: {error}")))
 }
 
 fn copy_dir(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
@@ -5018,6 +5024,7 @@ pub async fn send_message(
     request_key: Option<String>,
     draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
+    let _storage = state.outbox_work.read().await;
     let core = core(&state).await?;
     let account = core
         .db
@@ -5028,7 +5035,7 @@ pub async fn send_message(
         .ok_or_else(|| ApiError {
             message: "Аккаунт отправителя не найден".into(),
         })?;
-    let outgoing = outgoing_message(&account, request);
+    let outgoing = outgoing_message(&core.db, &account, request).await?;
     let queued = if let Some(draft_id) = draft_id {
         core.db
             .queue_draft_send(account.id, outgoing, request_key, draft_id, None)
@@ -5378,11 +5385,29 @@ pub async fn clear_recipient_history(
         .await?)
 }
 
-fn outgoing_message(
+async fn outgoing_message(
+    db: &truemail_core::storage::Db,
     account: &Account,
     request: SendMessageRequest,
-) -> truemail_core::backend::OutgoingMessage {
-    truemail_core::backend::OutgoingMessage {
+) -> CmdResult<truemail_core::backend::OutgoingMessage> {
+    use base64::Engine as _;
+    let mut attachments = Vec::with_capacity(request.attachments.len());
+    for item in request.attachments {
+        let data = match (item.data, item.base64, item.draft_file_id) {
+            (Some(bytes), None, None) => bytes,
+            (None, Some(encoded), None) => base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| api_error("не удалось прочитать вложение письма"))?,
+            (None, None, Some(id)) => db.composer_draft_file(&id).await?,
+            _ => return Err(api_error("не указано содержимое вложения письма")),
+        };
+        attachments.push(truemail_core::backend::OutgoingAttachment {
+            filename: item.filename,
+            mime_type: item.mime_type,
+            data,
+        });
+    }
+    Ok(truemail_core::backend::OutgoingMessage {
         from: account.email.clone(),
         to: request.to,
         cc: request.cc,
@@ -5390,17 +5415,9 @@ fn outgoing_message(
         subject: request.subject,
         body_text: request.body_text,
         body_html: request.body_html,
-        attachments: request
-            .attachments
-            .into_iter()
-            .map(|item| truemail_core::backend::OutgoingAttachment {
-                filename: item.filename,
-                mime_type: item.mime_type,
-                data: item.data,
-            })
-            .collect(),
+        attachments,
         ..Default::default()
-    }
+    })
 }
 
 #[tauri::command]
@@ -5410,6 +5427,7 @@ pub async fn schedule_message(
     send_at: String,
     draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
+    let _storage = state.outbox_work.read().await;
     let core = core(&state).await?;
     let account = core
         .db
@@ -5428,7 +5446,7 @@ pub async fn schedule_message(
             message: "Выберите время в будущем".into(),
         });
     }
-    let outgoing = outgoing_message(&account, request);
+    let outgoing = outgoing_message(&core.db, &account, request).await?;
     let scheduled = send_at
         .with_timezone(&chrono::Utc)
         .format("%Y-%m-%d %H:%M:%S")
@@ -5839,6 +5857,11 @@ pub async fn all_settings(state: State<'_, AppState>) -> CmdResult<HashMap<Strin
 
 #[tauri::command]
 pub async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> CmdResult<()> {
+    let _storage = if key == "composer_draft" {
+        Some(state.outbox_work.read().await)
+    } else {
+        None
+    };
     Ok(core(&state).await?.db.set_setting(&key, &value).await?)
 }
 

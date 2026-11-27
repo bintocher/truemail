@@ -120,6 +120,56 @@ fn dirs_data_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+fn initial_app_state(log_dir: std::path::PathBuf, pending_attachments: Vec<String>) -> AppState {
+    AppState {
+        log_dir,
+        core: tokio::sync::RwLock::new(None),
+        notify_anchor: Arc::new(std::sync::Mutex::new(
+            commands::NotifyAnchor::platform_default(),
+        )),
+        oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        watching: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
+        api_server: Arc::new(tokio::sync::Mutex::new(None)),
+        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        mail_failures: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        send_wakeup: Arc::new(tokio::sync::Notify::new()),
+        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )),
+        pending_attachments: Arc::new(std::sync::Mutex::new(pending_attachments)),
+        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        pending_update: Arc::new(tokio::sync::Mutex::new(None)),
+        installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        diagnostics_running: std::sync::atomic::AtomicBool::new(false),
+        connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    }
+}
+
+// The message handlers in this list use only managed state, so the same
+// registration runs against the desktop runtime and Tauri's test runtime.
+macro_rules! desktop_invoke_handler {
+    ($($extra:path),* $(,)?) => {
+        tauri::generate_handler![
+            commands::get_message,
+            commands::message_action,
+            commands::move_messages_to_folder,
+            commands::undo_message_action,
+            commands::check_permanent_delete,
+            commands::set_setting,
+            commands::all_settings,
+            $($extra),*
+        ]
+    };
+}
+
 fn main() {
     if let Err(error) = run() {
         show_startup_error(&error);
@@ -229,6 +279,7 @@ fn run() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
+                .event_format(activity::MaskedEvent::default())
                 .with_writer(std::io::stdout.and(file_appender))
                 .init();
         }
@@ -239,6 +290,7 @@ fn run() -> anyhow::Result<()> {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_ansi(false)
+                .event_format(activity::MaskedEvent::default())
                 .init();
             eprintln!(
                 "не удалось создать файловый логгер в {}: {error}; логи будут только в stdout",
@@ -253,36 +305,7 @@ fn run() -> anyhow::Result<()> {
     // (клик по ярлыку, "Отправить" из проводника) открывал бы ту же
     // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
     // работающей программой.
-    let state = AppState {
-        log_dir,
-        core: tokio::sync::RwLock::new(None),
-        notify_anchor: Arc::new(std::sync::Mutex::new(
-            commands::NotifyAnchor::platform_default(),
-        )),
-        oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        watching: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
-        api_server: Arc::new(tokio::sync::Mutex::new(None)),
-        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        mail_failures: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        send_wakeup: Arc::new(tokio::sync::Notify::new()),
-        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashSet::new(),
-        )),
-        pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
-        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        pending_update: Arc::new(tokio::sync::Mutex::new(None)),
-        installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        diagnostics_running: std::sync::atomic::AtomicBool::new(false),
-        connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    };
+    let state = initial_app_state(log_dir, attachment_args(std::env::args()));
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
         // работающему экземпляру и сразу завершается.
@@ -514,7 +537,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(desktop_invoke_handler![
             commands::bootstrap_status,
             commands::initialize_storage,
             commands::export_key_backup,
@@ -545,7 +568,6 @@ fn run() -> anyhow::Result<()> {
             commands::ui_log,
             activity::record_ui_activity,
             activity::read_ui_activity,
-            commands::get_message,
             commands::message_raw,
             commands::export_message_eml,
             commands::unsubscribe_one_click,
@@ -663,18 +685,12 @@ fn run() -> anyhow::Result<()> {
             commands::list_message_templates,
             commands::save_message_template,
             commands::delete_message_template,
-            commands::check_permanent_delete,
-            commands::message_action,
-            commands::move_messages_to_folder,
-            commands::undo_message_action,
             commands::get_setting,
-            commands::set_setting,
             commands::list_keybindings,
             commands::set_keybinding,
             commands::image_sender_trusted,
             commands::fetch_mail_image,
             commands::set_image_sender_trusted,
-            commands::all_settings,
             commands::limit_settings,
             commands::set_limit_setting,
             commands::begin_account_connection,
@@ -713,12 +729,74 @@ fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod command_contract_tests {
-    const MAIN: &str = include_str!("main.rs");
-    const COMMANDS: &str = include_str!("commands.rs");
-    const BRIDGE: &str = include_str!("../../ui/bridge.js");
+    use super::{commands, initial_app_state};
+    use serde_json::json;
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder, mock_context, noop_assets};
+    use tauri::webview::InvokeRequest;
 
     #[test]
-    fn critical_user_flows_are_exposed_by_tauri_and_the_ui_bridge() {
+    fn mail_handlers_deserialize_requests_and_return_command_errors() {
+        let app = mock_builder()
+            .manage(initial_app_state(Default::default(), Vec::new()))
+            .invoke_handler(desktop_invoke_handler![])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        for (cmd, body, expected) in [
+            (
+                "message_action",
+                json!({"messageIds":[],"action":"trash"}),
+                "Не выбрано ни одного письма",
+            ),
+            (
+                "message_action",
+                json!({"messageIds":[12],"action":"unknown"}),
+                "Неизвестное действие с письмом",
+            ),
+            (
+                "move_messages_to_folder",
+                json!({"messageIds":[],"folderId":4}),
+                "Не выбрано ни одного письма",
+            ),
+            (
+                "get_message",
+                json!({"messageId":7}),
+                "Хранилище ещё не создано. Завершите первоначальную настройку.",
+            ),
+        ] {
+            let error = get_ipc_response(
+                &webview,
+                InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: if cfg!(windows) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
+                    body: InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: INVOKE_KEY.into(),
+                },
+            )
+            .expect_err("команда должна вернуть ошибку");
+            assert_eq!(error["message"], expected, "{cmd}");
+        }
+    }
+
+    // Coverage for the wider catalog complements the executable IPC cases above.
+    #[test]
+    fn registration_and_bridge_keep_the_broader_command_catalog() {
+        const MAIN: &str = include_str!("main.rs");
+        const COMMANDS: &str = include_str!("commands.rs");
+        const BRIDGE: &str = include_str!("../../ui/bridge.js");
         for command in [
             "get_message",
             "send_message",
@@ -834,8 +912,9 @@ mod command_contract_tests {
             "bind_quick_step_slot",
             "apply_quick_step",
         ] {
+            let registration = format!("commands::{command},");
             assert!(
-                MAIN.contains(&format!("commands::{command}")),
+                MAIN.lines().any(|line| line.trim() == registration),
                 "{command} is missing from generate_handler"
             );
             assert!(
@@ -851,6 +930,7 @@ mod command_contract_tests {
 
     #[test]
     fn single_instance_is_registered_before_every_other_plugin() {
+        const MAIN: &str = include_str!("main.rs");
         let builder = MAIN
             .find("tauri::Builder::default()")
             .expect("Tauri builder missing");

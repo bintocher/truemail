@@ -73,6 +73,7 @@ document.querySelectorAll('[data-i]').forEach(e=>{const s=ic[e.dataset.i]; if(s)
 
 /* ---------- routing between top views ---------- */
 function showView(id){ document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));
+  if(id==='settingsView')window.refreshStorageStatus?.();
   if(id==='composeView'){const m=document.getElementById('compEdit');if(m){m.focus();}} }
 document.getElementById('toSettings').onclick=()=>{showView('settingsView');};
 document.getElementById('backToMail').onclick=()=>showView('mailView');
@@ -88,8 +89,9 @@ document.getElementById('compClose').onclick=()=>showView('mailView');
 
 /* settings section switching */
 function setSection(id){ document.querySelectorAll('.setnav .sec').forEach(s=>s.classList.toggle('active',s.dataset.set===id));
-  document.querySelectorAll('.setpage').forEach(p=>p.classList.toggle('active',p.id==='set-'+id)); }
-document.querySelectorAll('[data-set]').forEach(el=>el.addEventListener('click',()=>{showView('settingsView');setSection(el.dataset.set);}));
+  document.querySelectorAll('.setpage').forEach(p=>p.classList.toggle('active',p.id==='set-'+id));
+  if(id==='storage')window.refreshStorageStatus?.(); }
+document.querySelectorAll('[data-set]').forEach(el=>el.addEventListener('click',()=>{setSection(el.dataset.set);showView('settingsView');}));
 document.querySelectorAll('[data-openacct]').forEach(el=>el.onclick=()=>setSection('accounts'));
 
 /* ---------- account colors + messages ---------- */

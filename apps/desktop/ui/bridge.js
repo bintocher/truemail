@@ -354,9 +354,13 @@ window.corePageSize = null;
     // Сначала рисуем из того, что осталось в памяти - список появляется сразу,
     // а не через паузу троттлинга перезагрузки.
     window.restoreAfterHidden?.();
+    window.refreshStorageStatus?.();
     if (reloadPending) scheduleReload(0);
   });
-  tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
+  tauri.event?.listen("truemail-data-changed", () => {
+    scheduleReload();
+    window.scheduleStorageStatus?.();
+  }).catch(console.error);
   tauri.event?.listen("truemail-imap-action-rejected", () => {
     showToast(L("Действие с письмом остановлено. Сервер изменил номера писем. Обновите папку и проверьте письмо перед повтором.",
       "An action was stopped because the server changed message identifiers. Refresh the folder and check the message before retrying."));
@@ -384,13 +388,13 @@ window.corePageSize = null;
     const unifiedSources = await window.tm.listUnifiedSources();
     window.coreUnifiedSettings = Object.fromEntries(unifiedSources.map(source=>[source.folder_id,source.included?'1':'0']));
     const messageGroups = await Promise.all(allFolders.map(folder => window.tm.listMessagesPage(folder.id, null, null, window.corePageSize)));
-    const [contacts, calendarData, smartFolders, storage, pinned, overdueTasks] = await Promise.all([
-      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.storageStatus(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount().catch(() => 0),
+    const [contacts, calendarData, smartFolders, pinned, overdueTasks] = await Promise.all([
+      window.tm.listContacts(), window.tm.listCalendarData(), window.tm.listSmartFolders(), window.tm.listPinnedMessages("unified").catch(error=>{showToast(error);return {messages:[],ordinary:[]};}), window.tm.overdueMessageTaskCount().catch(() => 0),
     ]);
     const taskCount = document.getElementById("tasksOverdueCount");
     if (taskCount) taskCount.textContent = overdueTasks > 0 ? String(overdueTasks) : "";
     window.corePinnedMessages = pinned.messages || [];
-    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat().concat(pinned.ordinary || [], window.corePinnedMessages), contacts, calendarData, smartFolders, storage);
+    window.renderCoreAccounts?.(accounts, folders, messageGroups.flat().concat(pinned.ordinary || [], window.corePinnedMessages), contacts, calendarData, smartFolders);
     // Перечень закреплённых читается заново с видом открытого представления:
     // объединённый перечень выше нужен только стартовому набору писем.
     await window.refreshPinnedForView?.(true);

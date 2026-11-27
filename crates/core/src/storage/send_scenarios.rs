@@ -221,7 +221,7 @@ struct FakeBackend {
     /// операция стала дозаписью до обращения к серверу за копией.
     kind_seen_by_append: Mutex<Option<String>>,
     db: Db,
-    sends: Mutex<usize>,
+    sent_messages: Mutex<Vec<OutgoingMessage>>,
 }
 
 impl FakeBackend {
@@ -231,7 +231,7 @@ impl FakeBackend {
             append_fails: false,
             kind_seen_by_append: Mutex::new(None),
             db: db.clone(),
-            sends: Mutex::new(0),
+            sent_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -243,7 +243,7 @@ impl FakeBackend {
     }
 
     fn sends(&self) -> usize {
-        *self.sends.lock().expect("счётчик передач")
+        self.sent_messages.lock().expect("переданные письма").len()
     }
 }
 
@@ -327,8 +327,11 @@ impl MailBackend for FakeBackend {
         unimplemented!("ожидание изменений в сценарии отправки не участвует")
     }
 
-    async fn send(&self, _message: OutgoingMessage, _credential: &str) -> SendResult {
-        *self.sends.lock().expect("счётчик передач") += 1;
+    async fn send(&self, message: OutgoingMessage, _credential: &str) -> SendResult {
+        self.sent_messages
+            .lock()
+            .expect("переданные письма")
+            .push(message);
         match self.answer {
             Answer::FailBeforeHandoff => Err(SendFailure::before_handoff(
                 crate::Error::classified_backend(
@@ -387,6 +390,58 @@ async fn transmit(db: &Db, account_id: i64, email: &str, backend: &FakeBackend) 
         .expect("захват операции")
         .expect("письмо готово к передаче");
     crate::account::transmit_with_backend(db, email, backend, "token", &operation).await
+}
+
+#[tokio::test]
+async fn send_wakeup_waits_for_retry_and_fresh_mail_goes_first() {
+    let db = open_test_db("outbox-retry-wakeup").await;
+    let email = "sender@example.test";
+    let account = seed_account(&db, email).await;
+    let delayed = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        delayed.operation_id
+    );
+    db.defer_send_operation(delayed.operation_id, "network unavailable")
+        .await
+        .unwrap();
+    assert!(db.next_send_wakeup_seconds(account).await.unwrap().unwrap() > 45);
+    assert!(db.claim_send_operation(account).await.unwrap().is_none());
+
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+        .bind(delayed.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let fresh = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(db.next_send_wakeup_seconds(account).await.unwrap(), Some(0));
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        fresh.operation_id
+    );
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now','-2 minutes') WHERE id=?")
+        .bind(delayed.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let another = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        delayed.operation_id
+    );
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        another.operation_id
+    );
 }
 
 /// Окно отмены от начала до конца: письмо принято в очередь, работник его до
@@ -826,13 +881,24 @@ async fn confirmed_send_closes_the_operation_and_records_its_recipients() {
     let account = seed_account(&db, "me@example.test").await;
     let named = OutgoingMessage {
         to: vec!["Борис Борисов <boss@partner.test>".into()],
+        cc: vec!["copy@partner.test".into()],
+        headers: vec![("X-Report-Type".into(), "weekly".into())],
+        message_id: Some("<weekly-report@example.test>".into()),
         ..letter("me@example.test")
     };
-    db.queue_outgoing_send(account, named, SEND_ORIGIN_ORDINARY, None, 0)
+    db.queue_outgoing_send(account, named.clone(), SEND_ORIGIN_ORDINARY, None, 0)
         .await
         .expect("принять письмо в очередь");
     let backend = FakeBackend::new(&db, Answer::SavedOnServer);
     assert_eq!(transmit(&db, account, "me@example.test", &backend).await, 1);
+    {
+        let actual = backend.sent_messages.lock().unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&actual[0]).unwrap(),
+            serde_json::to_value(&named).unwrap()
+        );
+    }
     let (left,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM outbox_ops WHERE op_kind IN ('send','append_sent')")
             .fetch_one(&db.pool)

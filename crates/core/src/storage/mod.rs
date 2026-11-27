@@ -3,6 +3,7 @@
 //! шифруются на уровне приложения.
 
 mod blobs;
+mod composer_draft;
 #[cfg(test)]
 mod concurrency_scenarios;
 pub mod encoded_words;
@@ -189,6 +190,12 @@ impl Db {
             .map_err(migrator_error)?;
         self.encrypt_legacy_settings().await?;
         self.finalize_settings_encryption().await?;
+        if let Err(error) = self.migrate_composer_draft_files().await {
+            tracing::warn!(
+                error_kind = error.code(),
+                "вложения старого черновика оставлены для повторной миграции"
+            );
+        }
         // Пределы читаются до прикладных шагов миграции: уборка служебных
         // записей ниже уже спрашивает сроки хранения.
         self.load_limits().await?;
@@ -330,6 +337,9 @@ impl Db {
 
     /// Зашифровать и записать настройку. Открытое значение в SQLite не попадает.
     pub async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        if key == composer_draft::COMPOSER_DRAFT_KEY {
+            return self.save_composer_draft(value).await;
+        }
         let encrypted = self.encrypt_setting(value)?;
         sqlx::query(
             "INSERT INTO settings(key, value) VALUES(?, ?)
@@ -1419,6 +1429,7 @@ mod tests {
             remote_path: "INBOX".into(),
             display_name: "Inbox".into(),
             role: Some(FolderRole::Inbox),
+            role_inferred: false,
             parent_remote_path: None,
             unread_count: 0,
             total_count: 2,

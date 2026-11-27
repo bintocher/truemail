@@ -1562,6 +1562,7 @@ fn parse_folders(xml: &str) -> Result<Vec<DiscoveredFolder>> {
             remote_path: id.to_owned(),
             display_name: name.to_owned(),
             role: infer_folder_role(name, name),
+            role_inferred: true,
             parent_remote_path,
             unread_count: unread,
             total_count: total,

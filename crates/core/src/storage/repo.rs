@@ -39,8 +39,9 @@ macro_rules! flag_op_changes_flag_sql {
 pub struct QueuedAction {
     pub operation_ids: Vec<i64>,
     pub undo_until: Option<String>,
-    /// Письма, пропущенные из-за уже стоящей по ним операции увода (S-005).
+    /// Письма, для которых действие не поставлено в очередь.
     pub skipped: usize,
+    pub skipped_missing: usize,
     /// Из них письма, которые прямо сейчас переносятся на сервере (S-006).
     pub skipped_busy: usize,
     /// Из них письма с прошлой операцией в состоянии отказа: по ним нужно
@@ -554,6 +555,43 @@ impl Db {
         Ok(())
     }
 
+    /// Check references after settlement of the write transaction. If cleanup
+    /// fails, the startup collector can remove the orphan later.
+    pub(super) async fn release_mail_blobs(&self, refs: Vec<String>) {
+        if !refs.is_empty()
+            && let Err(error) = self.remove_unreferenced_mail_blobs(refs).await
+        {
+            tracing::warn!(
+                error_kind = error.code(),
+                "очистка файлов писем отложена до следующего запуска"
+            );
+        }
+    }
+
+    async fn remove_unreferenced_mail_blobs(&self, refs: Vec<String>) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let outgoing: std::collections::HashSet<_> =
+            self.outgoing_blob_references().await?.into_iter().collect();
+        let unused: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT c.value FROM json_each(?) c
+             WHERE NOT EXISTS(SELECT 1 FROM messages WHERE raw_blob_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM attachments WHERE blob_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM contacts WHERE vcard_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM events WHERE ical_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM composer_draft_files WHERE blob_ref=c.value)",
+        )
+        .bind(serde_json::to_string(&refs)?)
+        .fetch_all(&mut *tx)
+        .await?;
+        for reference in unused {
+            if !outgoing.contains(&reference) {
+                self.blobs.remove(&reference)?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Remove files no longer reachable from SQLite and report broken links.
     /// Run before background synchronization starts, so the reference snapshot
     /// cannot race a writer.
@@ -564,6 +602,7 @@ impl Db {
             "SELECT blob_ref FROM attachments WHERE blob_ref IS NOT NULL",
             "SELECT vcard_ref FROM contacts WHERE vcard_ref IS NOT NULL",
             "SELECT ical_ref FROM events WHERE ical_ref IS NOT NULL",
+            "SELECT blob_ref FROM composer_draft_files",
         ] {
             let rows: Vec<(String,)> = sqlx::query_as(query).fetch_all(&self.pool).await?;
             referenced.extend(rows.into_iter().map(|row| row.0));
@@ -660,9 +699,7 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
-        for reference in refs {
-            self.blobs.remove(&reference)?;
-        }
+        self.release_mail_blobs(refs).await;
         Ok(())
     }
 
@@ -1015,9 +1052,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in refs {
-            self.blobs.remove(&reference)?;
-        }
+        self.release_mail_blobs(refs).await;
         Ok(old.len())
     }
 
@@ -1158,10 +1193,10 @@ impl Db {
     }
 
     pub async fn delete_folder_local(&self, folder_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM folders WHERE id=?")
-            .bind(folder_id)
-            .execute(&self.write_pool)
-            .await?;
+        let mut tx = self.begin_write().await?;
+        let references = remove_discovered_folder(&mut tx, folder_id, &self.limit_set()).await?;
+        tx.commit().await?;
+        self.release_mail_blobs(references).await;
         Ok(())
     }
 
@@ -1176,7 +1211,7 @@ impl Db {
             return Err(crate::Error::Other("неизвестная роль папки".into()));
         }
         let mut tx = self.begin_write().await?;
-        sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
+        sqlx::query("UPDATE folders SET role=NULL,role_source=NULL WHERE account_id=? AND role=?")
             .bind(account_id)
             .bind(role)
             .execute(&mut *tx)
@@ -1191,12 +1226,14 @@ impl Db {
             .bind(role)
             .execute(&mut *tx)
             .await?;
-            let updated = sqlx::query("UPDATE folders SET role=? WHERE id=? AND account_id=?")
-                .bind(role)
-                .bind(folder_id)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await?;
+            let updated = sqlx::query(
+                "UPDATE folders SET role=?,role_source='user' WHERE id=? AND account_id=?",
+            )
+            .bind(role)
+            .bind(folder_id)
+            .bind(account_id)
+            .execute(&mut *tx)
+            .await?;
             if updated.rows_affected() != 1 {
                 return Err(crate::Error::Other("папка аккаунта не найдена".into()));
             }
@@ -1222,13 +1259,42 @@ impl Db {
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
-        let canonical_drafts = folders
-            .iter()
-            .filter(|folder| folder.role == Some(FolderRole::Drafts))
-            .count()
-            == 1;
+        let is_imap: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=? AND backend_kind='imap')",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if is_imap
+            && let Some(inbox) = folders
+                .iter()
+                .find(|folder| folder.remote_path.eq_ignore_ascii_case("INBOX"))
+        {
+            let previous: Option<(i64, String)> = sqlx::query_as(
+                "SELECT id,remote_path FROM folders WHERE account_id=?
+                   AND remote_path='INBOX' COLLATE NOCASE
+                   AND NOT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND remote_path=?)
+                 ORDER BY id LIMIT 1",
+            )
+            .bind(account_id)
+            .bind(account_id)
+            .bind(&inbox.remote_path)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((id, path)) = previous {
+                rename_folder_path(&mut tx, account_id, id, &path, &inbox.remote_path).await?;
+            }
+        }
+        restore_legacy_folder_overrides(&mut tx, account_id, folders, is_imap).await?;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
+            let role_source = role.map(|_| {
+                if folder.role_inferred {
+                    "name"
+                } else {
+                    "server"
+                }
+            });
             if let Some(uidvalidity) = folder.uidvalidity {
                 // После обновления поколения папки эти старые строки нельзя
                 // использовать даже если сверка писем прервётся до удаления.
@@ -1245,13 +1311,12 @@ impl Db {
                 .await?;
             }
             let id: i64 = sqlx::query_scalar(
-                "INSERT INTO folders(account_id, remote_path, display_name, role, unread_count,
+                "INSERT INTO folders(account_id, remote_path, display_name, role, role_source, unread_count,
                                      total_count, pending_uidvalidity, uidnext, highestmodseq)
-                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, remote_path) DO UPDATE SET
                     display_name = excluded.display_name,
-                    role = CASE WHEN ? AND excluded.role IS NULL AND folders.role='drafts'
-                           THEN NULL ELSE coalesce(excluded.role, folders.role) END,
+                    role = excluded.role, role_source = excluded.role_source,
                     parent_id = NULL,
                     unread_count = excluded.unread_count, total_count = excluded.total_count,
                     pending_uidvalidity = CASE WHEN excluded.pending_uidvalidity IS NULL
@@ -1266,22 +1331,32 @@ impl Db {
             .bind(&folder.remote_path)
             .bind(&folder.display_name)
             .bind(role)
+            .bind(role_source)
             .bind(folder.unread_count)
             .bind(folder.total_count)
             .bind(folder.uidvalidity.map(i64::from))
             .bind(folder.uidnext.map(i64::from))
             .bind(folder.highestmodseq.map(|value| value as i64))
-            .bind(canonical_drafts)
             .fetch_one(&mut *tx)
             .await?;
             folder_ids.insert(folder.remote_path.as_str(), id);
         }
         // Resolve parents after upserting every folder, since a parent may arrive after its child.
+        let inbox_id = folder_ids.get("INBOX").or_else(|| {
+            folder_ids
+                .iter()
+                .find_map(|(path, id)| path.eq_ignore_ascii_case("INBOX").then_some(id))
+        });
         for folder in folders {
             if let Some(parent_id) = folder
                 .parent_remote_path
                 .as_deref()
-                .and_then(|path| folder_ids.get(path))
+                .and_then(|path| {
+                    folder_ids
+                        .get(path)
+                        .or_else(|| inbox_id.filter(|_| path.eq_ignore_ascii_case("INBOX")))
+                })
+                .filter(|parent_id| **parent_id != folder_ids[folder.remote_path.as_str()])
             {
                 sqlx::query("UPDATE folders SET parent_id=? WHERE id=?")
                     .bind(parent_id)
@@ -1295,21 +1370,26 @@ impl Db {
                 .bind(account_id)
                 .fetch_all(&mut *tx)
                 .await?;
+        // A mapping is authoritative for the role, including explicit removal.
+        for (role, _) in &overrides {
+            sqlx::query(
+                "UPDATE folders SET role=NULL,role_source=NULL WHERE account_id=? AND role=?",
+            )
+            .bind(account_id)
+            .bind(role)
+            .execute(&mut *tx)
+            .await?;
+        }
         for (role, folder_id) in overrides {
-            if folder_id.is_none() || role == "drafts" {
-                sqlx::query("UPDATE folders SET role=NULL WHERE account_id=? AND role=?")
-                    .bind(account_id)
-                    .bind(&role)
-                    .execute(&mut *tx)
-                    .await?;
-            }
             if let Some(folder_id) = folder_id {
-                sqlx::query("UPDATE folders SET role=? WHERE account_id=? AND id=?")
-                    .bind(role)
-                    .bind(account_id)
-                    .bind(folder_id)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE folders SET role=?,role_source='user' WHERE account_id=? AND id=?",
+                )
+                .bind(role)
+                .bind(account_id)
+                .bind(folder_id)
+                .execute(&mut *tx)
+                .await?;
             }
         }
         tx.commit().await?;
@@ -1481,20 +1561,6 @@ impl Db {
             .collect::<std::collections::HashSet<_>>();
         let limits = self.limit_set();
         let mut tx = self.begin_write().await?;
-        let blob_refs: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT f.id, m.raw_blob_ref
-             FROM folders f JOIN messages m ON m.folder_id=f.id
-             WHERE f.account_id=? AND m.raw_blob_ref IS NOT NULL
-             UNION ALL
-             SELECT f.id, a.blob_ref
-             FROM folders f JOIN messages m ON m.folder_id=f.id
-             JOIN attachments a ON a.message_id=m.id
-             WHERE f.account_id=? AND a.blob_ref IS NOT NULL",
-        )
-        .bind(account_id)
-        .bind(account_id)
-        .fetch_all(&mut *tx)
-        .await?;
         let existing: Vec<(i64, String)> =
             sqlx::query_as("SELECT id, remote_path FROM folders WHERE account_id=?")
                 .bind(account_id)
@@ -1507,34 +1573,12 @@ impl Db {
         if stale_ids.is_empty() {
             return Ok(0);
         }
+        let mut references = Vec::new();
         for id in &stale_ids {
-            sqlx::query("UPDATE folders SET parent_id=NULL WHERE parent_id=? AND account_id=?")
-                .bind(id)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        for id in &stale_ids {
-            let messages: Vec<i64> =
-                sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=?")
-                    .bind(id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            for message_id in messages {
-                preserve_message_traits(&mut tx, message_id, &limits, None).await?;
-            }
-            sqlx::query("DELETE FROM folders WHERE id=? AND account_id=?")
-                .bind(id)
-                .bind(account_id)
-                .execute(&mut *tx)
-                .await?;
+            references.extend(remove_discovered_folder(&mut tx, *id, &limits).await?);
         }
         tx.commit().await?;
-        for (folder_id, reference) in blob_refs {
-            if stale_ids.contains(&folder_id) {
-                let _ = self.blobs.remove(&reference);
-            }
-        }
+        self.release_mail_blobs(references).await;
         Ok(stale_ids.len())
     }
 
@@ -1749,9 +1793,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         Ok(delete_rows.len())
     }
 
@@ -1815,9 +1857,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         Ok(delete_ids.len())
     }
 
@@ -1946,9 +1986,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         tracing::info!(
             account_id,
             deleted = delete_ids.len(),
@@ -3088,9 +3126,8 @@ impl Db {
         {
             let _ = self.blobs.remove(reference);
         }
-        for reference in stale_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(stale_refs.into_iter().collect())
+            .await;
         // Импорт не знает, какая реализация поиска выбрана приложением. Даже
         // SQLite FTS обновляется через единый контракт SearchIndex, поэтому
         // переход на другой индекс не потребует искать прямые SQL-записи.
@@ -4265,6 +4302,9 @@ impl Db {
             .await?;
         // The same rule as the interface: a draft is known by its flag or by its folder.
         let is_draft = meta.flags.draft || folder_role.as_deref() == Some("drafts");
+        let raw_available = raw_ref
+            .as_deref()
+            .is_some_and(|reference| self.blobs.exists(reference));
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
@@ -4286,22 +4326,26 @@ impl Db {
                 has_text_part,
             )) = cached
             {
-                let attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
-                // A parse result stored before parts were marked as embedded is
-                // parsed again below.
-                if attachments.iter().all(|part| part.embedded.is_some()) {
-                    let bcc = if is_draft {
+                let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
+                // Older cache rows are parsed again when the original is available.
+                if !raw_available || attachments.iter().all(|part| part.embedded.is_some()) {
+                    let bcc = if is_draft && raw_available {
                         self.draft_bcc(raw_ref.as_deref()).await?
                     } else {
                         Vec::new()
                     };
+                    if !raw_available {
+                        for part in &mut attachments {
+                            part.fetched = false;
+                        }
+                    }
                     return Ok(MessageFull {
                         meta,
                         body_html,
                         body_text,
                         attachments,
                         bcc,
-                        body_fetched: body_fetched != 0,
+                        body_fetched: body_fetched != 0 && raw_available,
                         has_text_part: has_text_part != 0,
                         has_remote_content: remote != 0,
                         is_newsletter: newsletter != 0,
@@ -4313,10 +4357,18 @@ impl Db {
                 }
             }
         }
-        let raw = raw_ref
+        let raw = match raw_ref
             .as_deref()
+            .filter(|_| raw_available)
             .map(|reference| self.blobs.get(reference))
-            .transpose()?;
+        {
+            Some(Ok(raw)) => Some(raw),
+            Some(Err(crate::Error::Io(error))) if error.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
         let normalized = raw.as_deref().map(encoded_words::join_split_encoded_words);
         let parsed = normalized
             .as_deref()
@@ -4428,7 +4480,7 @@ impl Db {
         let has_remote_content = body_html
             .as_deref()
             .is_some_and(|html| html.contains("http://") || html.contains("https://"));
-        if let Some(reference) = raw_ref.as_deref() {
+        if let Some(reference) = raw_ref.as_deref().filter(|_| raw.is_some()) {
             sqlx::query(
                 "INSERT INTO message_content_cache(
                     message_id, raw_blob_ref, body_html, body_text, attachments_json,
@@ -4471,7 +4523,7 @@ impl Db {
             body_text,
             attachments,
             bcc,
-            body_fetched: body_fetched != 0,
+            body_fetched: body_fetched != 0 && raw.is_some(),
             has_text_part,
             is_newsletter,
             unsubscribe,
@@ -5065,13 +5117,18 @@ impl Db {
         let mut tx = self.begin_write().await?;
         let mut queued = QueuedAction::default();
         for message_id in message_ids {
-            let locator: (i64, i64, i64, String, Option<String>) = sqlx::query_as(
+            let locator: Option<(i64, i64, i64, String, Option<String>)> = sqlx::query_as(
                 "SELECT m.account_id, m.folder_id, m.uid, f.remote_path, m.remote_id
                  FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.id=?",
             )
             .bind(message_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+            let Some(locator) = locator else {
+                queued.skipped += 1;
+                queued.skipped_missing += 1;
+                continue;
+            };
             let message = TakeawayMessage {
                 id: *message_id,
                 account_id: locator.0,
@@ -5126,13 +5183,18 @@ impl Db {
                 .await?;
         let mut queued = QueuedAction::default();
         for message_id in message_ids {
-            let locator: (i64, i64, i64, String, Option<String>) = sqlx::query_as(
+            let locator: Option<(i64, i64, i64, String, Option<String>)> = sqlx::query_as(
                 "SELECT m.account_id, m.folder_id, m.uid, f.remote_path, m.remote_id
                  FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.id=?",
             )
             .bind(message_id)
-            .fetch_one(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+            let Some(locator) = locator else {
+                queued.skipped += 1;
+                queued.skipped_missing += 1;
+                continue;
+            };
             if locator.0 != target.0 {
                 return Err(crate::Error::AccountConfig(
                     "нельзя переместить письмо в папку другого аккаунта".into(),
@@ -9571,6 +9633,85 @@ async fn clear_stage_result_of_operation(
     Ok(())
 }
 
+// Older versions only stored the chosen role. A unique role unrelated to its
+// folder name is kept as a manual choice; name-based guesses are rediscovered.
+async fn restore_legacy_folder_overrides(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    discovered: &[crate::backend::DiscoveredFolder],
+    is_imap: bool,
+) -> Result<()> {
+    let legacy: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, remote_path, display_name, role FROM folders f WHERE account_id=? AND role_source='legacy' AND role IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM folder_role_overrides o WHERE o.account_id=f.account_id AND o.role=f.role)",
+    )
+    .bind(account_id).fetch_all(&mut **tx).await?;
+    let mut candidates = std::collections::HashMap::new();
+    let by_path: std::collections::HashMap<_, _> = discovered
+        .iter()
+        .map(|folder| (folder.remote_path.as_str(), folder))
+        .collect();
+    for (id, path, name, role) in legacy {
+        let historical_path = if is_imap { path.as_str() } else { "" };
+        if let Some(role) = FolderRole::parse(&role)
+            && crate::model::infer_folder_role(historical_path, &name) != Some(role)
+            && by_path
+                .get(path.as_str())
+                .is_some_and(|folder| folder.role.is_none() || folder.role_inferred)
+        {
+            candidates
+                .entry(role.as_str())
+                .and_modify(|id| *id = None)
+                .or_insert(Some(id));
+        }
+    }
+    for (role, id) in candidates {
+        if let Some(id) = id {
+            sqlx::query(
+                "INSERT INTO folder_role_overrides(account_id,role,folder_id) VALUES(?,?,?)",
+            )
+            .bind(account_id)
+            .bind(role)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn remove_discovered_folder(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    folder_id: i64,
+    limits: &LimitSet,
+) -> Result<Vec<String>> {
+    let references = sqlx::query_scalar(
+        "SELECT raw_blob_ref FROM messages WHERE folder_id=? AND raw_blob_ref IS NOT NULL
+         UNION SELECT a.blob_ref FROM attachments a JOIN messages m ON m.id=a.message_id
+            WHERE m.folder_id=? AND a.blob_ref IS NOT NULL",
+    )
+    .bind(folder_id)
+    .bind(folder_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE folders SET parent_id=NULL WHERE parent_id=?")
+        .bind(folder_id)
+        .execute(&mut **tx)
+        .await?;
+    let messages: Vec<i64> = sqlx::query_scalar("SELECT id FROM messages WHERE folder_id=?")
+        .bind(folder_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    for message_id in messages {
+        preserve_message_traits(tx, message_id, limits, None).await?;
+    }
+    sqlx::query("DELETE FROM folders WHERE id=?")
+        .bind(folder_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(references)
+}
+
 pub(crate) async fn infer_missing_folder_role(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
@@ -9605,7 +9746,7 @@ pub(crate) async fn infer_missing_folder_role(
     if let Some((id, _)) = candidates.next()
         && candidates.next().is_none()
     {
-        sqlx::query("UPDATE folders SET role=? WHERE id=? AND role IS NULL")
+        sqlx::query("UPDATE folders SET role=?,role_source='name' WHERE id=? AND role IS NULL")
             .bind(role)
             .bind(id)
             .execute(&mut **tx)
