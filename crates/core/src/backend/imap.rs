@@ -684,14 +684,14 @@ async fn create_folder(
     name: &str,
 ) -> Result<String> {
     let parent = parent_path.filter(|path| !path.is_empty());
-    let delimiter = folder_delimiter(&mut session, parent.unwrap_or("")).await?;
+    let (reported_parent, delimiter) = listed_folder(&mut session, parent.unwrap_or("")).await?;
     let name = validate_folder_name(name, delimiter.as_deref())?;
     let encoded = encode_modified_utf7(name);
-    let target = if let Some(parent) = parent {
+    let target = if parent.is_some() {
         let delimiter = delimiter.ok_or_else(|| {
             Error::AccountConfig("сервер не поддерживает подпапки в этой папке".into())
         })?;
-        format!("{parent}{delimiter}{encoded}")
+        format!("{reported_parent}{delimiter}{encoded}")
     } else {
         encoded
     };
@@ -754,7 +754,7 @@ fn quoted_list_pattern(path: &str) -> Result<String> {
     ))
 }
 
-async fn folder_delimiter(session: &mut OAuthSession, path: &str) -> Result<Option<String>> {
+async fn listed_folder(session: &mut OAuthSession, path: &str) -> Result<(String, Option<String>)> {
     let pattern = (!path.is_empty())
         .then(|| quoted_list_pattern(path))
         .transpose()?;
@@ -767,20 +767,22 @@ async fn folder_delimiter(session: &mut OAuthSession, path: &str) -> Result<Opti
         .map_err(imap_outbox_error)?;
     let entry = entries
         .iter()
-        .find(|entry| {
-            entry.name() == path
-                || (path.eq_ignore_ascii_case("INBOX")
-                    && entry.name().eq_ignore_ascii_case("INBOX"))
-        })
+        .find(|entry| entry.name() == path)
         .or_else(|| {
-            if path.is_empty() {
-                entries.first()
-            } else {
-                None
-            }
+            // A single result for an exact, non-wildcard query can report a
+            // canonical spelling. Never guess among several matching folders.
+            let [entry] = entries.as_slice() else {
+                return None;
+            };
+            (path.is_empty()
+                || (!path.contains(['%', '*']) && entry.name().eq_ignore_ascii_case(path)))
+            .then_some(entry)
         })
         .ok_or_else(|| Error::AccountConfig("сервер не подтвердил путь папки".into()))?;
-    Ok(entry.delimiter().map(str::to_owned))
+    Ok((
+        entry.name().to_owned(),
+        entry.delimiter().map(str::to_owned),
+    ))
 }
 
 async fn rename_folder(
@@ -788,7 +790,12 @@ async fn rename_folder(
     remote_path: &str,
     new_name: &str,
 ) -> Result<String> {
-    let delimiter = folder_delimiter(&mut session, remote_path).await?;
+    if remote_path.eq_ignore_ascii_case("INBOX") {
+        return Err(Error::AccountConfig(
+            "системную папку нельзя переименовать".into(),
+        ));
+    }
+    let (remote_path, delimiter) = listed_folder(&mut session, remote_path).await?;
     let delimiter = delimiter.as_deref();
     let name = validate_folder_name(new_name, delimiter)?;
     let prefix_len = delimiter
@@ -804,7 +811,7 @@ async fn rename_folder(
         encode_modified_utf7(name)
     );
     session
-        .rename(remote_path, &target)
+        .rename(&remote_path, &target)
         .await
         .map_err(|error| Error::Backend {
             backend: "imap-rename".into(),
@@ -838,11 +845,17 @@ pub(crate) async fn delete_password_folder(
 }
 
 async fn delete_folder(mut session: OAuthSession, remote_path: &str) -> Result<()> {
+    if remote_path.eq_ignore_ascii_case("INBOX") {
+        return Err(Error::AccountConfig(
+            "системную папку нельзя удалить".into(),
+        ));
+    }
+    let (remote_path, delimiter) = listed_folder(&mut session, remote_path).await?;
     tracing::info!(remote_path, "imap-delete: запрос удаления папки");
 
     // Yandex refuses to delete a folder with children. Match the real path
     // prefix because LIST interprets wildcard characters even inside quotes.
-    if let Some(delimiter) = folder_delimiter(&mut session, remote_path).await? {
+    if let Some(delimiter) = delimiter {
         let prefix = format!("{remote_path}{delimiter}");
         let child_pattern = quoted_list_pattern(&format!("{prefix}*"))?;
         let children: Vec<Name> = session
@@ -868,7 +881,7 @@ async fn delete_folder(mut session: OAuthSession, remote_path: &str) -> Result<(
     }
 
     // Шаг 3: собственно удаление.
-    let result = session.delete(remote_path).await;
+    let result = session.delete(&remote_path).await;
     match &result {
         Ok(()) => tracing::info!(remote_path, "imap-delete: папка удалена"),
         Err(error) => tracing::error!(
