@@ -56,15 +56,15 @@ impl Db {
     }
 
     pub(super) async fn save_composer_draft(&self, value: &str) -> Result<()> {
-        let mut draft: Value = if value.is_empty() {
+        let draft: Value = if value.is_empty() {
             json!({})
         } else {
             serde_json::from_str(value)?
         };
-        let object = draft
-            .as_object_mut()
-            .ok_or_else(|| Error::Other("недопустимый формат черновика".into()))?;
-        let files: Vec<DraftFile> = match object.remove("attachments") {
+        let Value::Object(mut draft) = draft else {
+            return Err(Error::Other("недопустимый формат черновика".into()));
+        };
+        let files: Vec<DraftFile> = match draft.remove("attachments") {
             Some(files) => serde_json::from_value(files)?,
             None => Vec::new(),
         };
@@ -138,7 +138,7 @@ impl Db {
                     json!({"id":id,"filename":file.filename,"mime_type":file.mime_type,"size":size}),
                 );
             }
-            object.insert("attachments".into(), json!(metadata));
+            draft.insert("attachments".into(), json!(metadata));
 
             let mut removed = Vec::new();
             for (id, (reference, _)) in existing {
@@ -153,7 +153,7 @@ impl Db {
             let value = if value.is_empty() {
                 String::new()
             } else {
-                draft.to_string()
+                Value::Object(draft).to_string()
             };
             sqlx::query(
                 "INSERT INTO settings(key,value) VALUES(?,?)
