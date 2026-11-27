@@ -98,6 +98,7 @@ async fn changed_uidvalidity_rebinds_failed_action_without_an_automatic_retry() 
         remote_path: "INBOX".into(),
         display_name: "INBOX".into(),
         role: Some(FolderRole::Inbox),
+        role_inferred: false,
         parent_remote_path: None,
         unread_count: 1,
         total_count: 1,

@@ -457,6 +457,7 @@ function showSkippedMessages(queued){
   const parts=[];
   if(queued.skipped_busy)parts.push(L(`уже переносятся: ${queued.skipped_busy}`,`already being moved: ${queued.skipped_busy}`));
   if(queued.skipped_failed)parts.push(L(`ждут решения после отказа: ${queued.skipped_failed}`,`waiting for your decision after a failure: ${queued.skipped_failed}`));
+  if(queued.skipped_missing)parts.push(L(`письма уже отсутствуют: ${queued.skipped_missing}`,`messages no longer available: ${queued.skipped_missing}`));
   if(queued.skipped_no_folder)parts.push(L(`нет единственной папки нужного типа: ${queued.skipped_no_folder}`,`no single folder of the required type: ${queued.skipped_no_folder}`));
   const reason=parts.length?` (${parts.join(', ')})`:'';
   showToast(L(`Пропущено писем: ${queued.skipped}${reason}`,`Messages skipped: ${queued.skipped}${reason}`));

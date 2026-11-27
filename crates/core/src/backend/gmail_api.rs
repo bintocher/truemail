@@ -627,6 +627,7 @@ pub async fn discover_folders(access_token: &str) -> Result<Vec<DiscoveredFolder
         .filter(visible_label)
         .map(|label| DiscoveredFolder {
             role: role(&label.id),
+            role_inferred: false,
             remote_path: label.id,
             display_name: label.name,
             parent_remote_path: None,
@@ -646,6 +647,7 @@ pub async fn discover_folders(access_token: &str) -> Result<Vec<DiscoveredFolder
             remote_path: "ALL".into(),
             display_name: "All Mail".into(),
             role: Some(FolderRole::Archive),
+            role_inferred: false,
             parent_remote_path: None,
             unread_count: 0,
             total_count: 0,

@@ -1419,6 +1419,7 @@ mod tests {
             remote_path: "INBOX".into(),
             display_name: "Inbox".into(),
             role: Some(FolderRole::Inbox),
+            role_inferred: false,
             parent_remote_path: None,
             unread_count: 0,
             total_count: 2,
