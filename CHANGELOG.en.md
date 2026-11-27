@@ -7,6 +7,21 @@ versions use Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-11-27
+
+### Messages and drafts
+
+- If a message could not be downloaded, the reading pane explains the problem and offers a retry. Previously saved text remains available.
+- Local draft attachments are kept in separate encrypted files. Editing the subject or body saves references to the files.
+- Batch moves and deletions skip messages that are already gone. The remaining messages are processed, and the app reports how many were skipped.
+
+### Sending, folders and storage
+
+- The sending queue respects retry times. New messages go ahead of recent retries, and overdue retries keep their place in the queue.
+- Manually assigned folder roles take priority. IMAP renames use the server's hierarchy delimiter, and the folder tree handles variations in INBOX casing.
+- Local deletion of a parent folder keeps its subfolders until the next server check. Folder reconciliation keeps files still needed by surviving messages.
+- Storage size is measured in the storage settings. Email addresses are masked in plain-text logs.
+
 ## [0.3.9] - 2026-11-26
 
 ### Drafts and messages
