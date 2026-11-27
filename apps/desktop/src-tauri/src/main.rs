@@ -120,6 +120,56 @@ fn dirs_data_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+fn initial_app_state(log_dir: std::path::PathBuf, pending_attachments: Vec<String>) -> AppState {
+    AppState {
+        log_dir,
+        core: tokio::sync::RwLock::new(None),
+        notify_anchor: Arc::new(std::sync::Mutex::new(
+            commands::NotifyAnchor::platform_default(),
+        )),
+        oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        watching: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
+        api_server: Arc::new(tokio::sync::Mutex::new(None)),
+        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        mail_failures: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        send_wakeup: Arc::new(tokio::sync::Notify::new()),
+        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
+            std::collections::HashSet::new(),
+        )),
+        pending_attachments: Arc::new(std::sync::Mutex::new(pending_attachments)),
+        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        pending_update: Arc::new(tokio::sync::Mutex::new(None)),
+        installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        diagnostics_running: std::sync::atomic::AtomicBool::new(false),
+        connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    }
+}
+
+// The message handlers in this list use only managed state, so the same
+// registration runs against the desktop runtime and Tauri's test runtime.
+macro_rules! desktop_invoke_handler {
+    ($($extra:path),* $(,)?) => {
+        tauri::generate_handler![
+            commands::get_message,
+            commands::message_action,
+            commands::move_messages_to_folder,
+            commands::undo_message_action,
+            commands::check_permanent_delete,
+            commands::set_setting,
+            commands::all_settings,
+            $($extra),*
+        ]
+    };
+}
+
 fn main() {
     if let Err(error) = run() {
         show_startup_error(&error);
@@ -255,36 +305,7 @@ fn run() -> anyhow::Result<()> {
     // (клик по ярлыку, "Отправить" из проводника) открывал бы ту же
     // SQLCipher-базу и гонял миграции со сборкой мусора параллельно с
     // работающей программой.
-    let state = AppState {
-        log_dir,
-        core: tokio::sync::RwLock::new(None),
-        notify_anchor: Arc::new(std::sync::Mutex::new(
-            commands::NotifyAnchor::platform_default(),
-        )),
-        oauth: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        syncing: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        syncing_aux: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        watching: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        quitting: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        reminders_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        outbox_work: Arc::new(tokio::sync::RwLock::new(())),
-        api_server: Arc::new(tokio::sync::Mutex::new(None)),
-        shortcut_actions: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
-        notified_messages: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        mail_failures: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-        send_wakeup: Arc::new(tokio::sync::Notify::new()),
-        notified_calendar_changes: Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashSet::new(),
-        )),
-        pending_attachments: Arc::new(std::sync::Mutex::new(attachment_args(std::env::args()))),
-        allowed_attachments: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-        pending_update: Arc::new(tokio::sync::Mutex::new(None)),
-        installing_update: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        diagnostics_running: std::sync::atomic::AtomicBool::new(false),
-        connecting_addresses: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-        oauth_waits: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    };
+    let state = initial_app_state(log_dir, attachment_args(std::env::args()));
     tauri::Builder::default()
         // Должен быть первым плагином: второй процесс передаёт аргументы уже
         // работающему экземпляру и сразу завершается.
@@ -516,7 +537,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(desktop_invoke_handler![
             commands::bootstrap_status,
             commands::initialize_storage,
             commands::export_key_backup,
@@ -547,7 +568,6 @@ fn run() -> anyhow::Result<()> {
             commands::ui_log,
             activity::record_ui_activity,
             activity::read_ui_activity,
-            commands::get_message,
             commands::message_raw,
             commands::export_message_eml,
             commands::unsubscribe_one_click,
@@ -665,18 +685,12 @@ fn run() -> anyhow::Result<()> {
             commands::list_message_templates,
             commands::save_message_template,
             commands::delete_message_template,
-            commands::check_permanent_delete,
-            commands::message_action,
-            commands::move_messages_to_folder,
-            commands::undo_message_action,
             commands::get_setting,
-            commands::set_setting,
             commands::list_keybindings,
             commands::set_keybinding,
             commands::image_sender_trusted,
             commands::fetch_mail_image,
             commands::set_image_sender_trusted,
-            commands::all_settings,
             commands::limit_settings,
             commands::set_limit_setting,
             commands::begin_account_connection,
@@ -715,144 +729,72 @@ fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod command_contract_tests {
-    const MAIN: &str = include_str!("main.rs");
-    const COMMANDS: &str = include_str!("commands.rs");
-    const BRIDGE: &str = include_str!("../../ui/bridge.js");
+    use super::{commands, initial_app_state};
+    use serde_json::json;
+    use tauri::ipc::{CallbackFn, InvokeBody};
+    use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder, mock_context, noop_assets};
+    use tauri::webview::InvokeRequest;
 
     #[test]
-    fn critical_user_flows_are_exposed_by_tauri_and_the_ui_bridge() {
-        for command in [
-            "get_message",
-            "send_message",
-            "create_event",
-            "update_event",
-            "delete_event",
-            "respond_to_event",
-            "create_contact",
-            "update_contact",
-            "delete_contact",
-            "message_action",
-            "move_messages_to_folder",
-            "undo_message_action",
-            "check_for_update",
-            "install_update",
-            // S-082: команды правил перечислены явно - список правил, редактор,
-            // изменение порядка и ручной прогон должны быть доступны мосту.
-            "list_mail_rules",
-            "save_mail_rule",
-            "set_mail_rule_enabled",
-            "delete_mail_rule",
-            "reorder_mail_rules",
-            "run_mail_rules",
-            "continue_mail_rule_run",
-            "last_mail_rule_run",
-            "pending_mail_rule_runs",
-            "mail_rule_delete_confirmation",
-            // S-052, S-053, S-014: выход из состояния отказа и предупреждение о
-            // ящике без корзины - такие же обязательные пути, как сам список
-            // правил, и без них правила молча оставляют почту на месте.
-            // blocked-senders.md S-050: блокировка отправителя, управление
-            // списками и уборка уже полученных писем перечислены явно - без
-            // любой из этих команд раздел отправителей перестаёт работать.
-            "list_sender_policies",
-            "preview_sender_policy",
-            "save_sender_policy",
-            "delete_sender_policy",
-            "start_sender_policy_sweep",
-            "continue_sender_policy_sweep",
-            "cancel_sender_policy_sweep",
-            "pending_sender_policy_jobs",
-            // ignore-conversation.md S-051: включение игнорирования, список
-            // переписок и прекращение с возвратом писем.
-            "list_ignored_conversations",
-            "preview_ignore_conversation",
-            "enable_ignore_conversation",
-            "disable_ignore_conversation",
-            "continue_ignore_job",
-            "pending_ignore_jobs",
-            // sweep-by-sender.md S-047: запуск автоочистки, управление её
-            // записями и отмена уборки.
-            "list_sender_sweep_rules",
-            "preview_sender_sweep",
-            "start_sender_sweep",
-            "set_sender_sweep_enabled",
-            "update_sender_sweep_mode",
-            "delete_sender_sweep_rule",
-            "continue_sender_sweep_job",
-            "cancel_sender_sweep_job",
-            "pending_sender_sweep_jobs",
-            "failed_message_operations",
-            "retry_message_operation",
-            "discard_message_operation",
-            "accounts_without_trash",
-            // undo-send.md S-372: без команд очереди отправки раздел
-            // "Исходящие" и сама отмена перестают работать, а письмо остаётся
-            // висеть в очереди без единого действия пользователя.
-            "undo_send_seconds",
-            "set_undo_send_seconds",
-            "list_outbox_sends",
-            "cancel_send",
-            "open_cancelled_send",
-            "delete_send",
-            "retry_send",
-            "startup_send_state",
-            "release_undo_windows",
-            // out-of-office.md S-397: чтение, сохранение и отключение
-            // автоответа вместе с перечнем уже отправленных ответов.
-            "out_of_office",
-            "save_out_of_office",
-            "disable_out_of_office",
-            "list_out_of_office_replies",
-            // recipient-history.md S-334: подсказка получателей и раздел
-            // управления историей.
-            "recipient_candidates",
-            "list_recipient_history",
-            "update_recipient_history",
-            "delete_recipient_history_entry",
-            "clear_recipient_history",
-            "mark_flagged",
-            "set_messages_pinned",
-            "list_pinned_messages",
-            "save_message_task",
-            "get_message_task",
-            "list_message_tasks",
-            "complete_message_task",
-            "reopen_message_task",
-            "delete_message_task",
-            "overdue_message_task_count",
-            "due_task_reminders",
-            "mark_task_reminders_shown",
-            "snooze_task_reminder",
-            // Пределы и сроки настраиваются пользователем: без этих команд
-            // раздел настроек пуст, а интерфейс остаётся без границ полей и
-            // возвращается к собственным числам, которые уже расходились с
-            // ядром.
-            "limit_settings",
-            "set_limit_setting",
-            "list_quick_steps",
-            "save_quick_step",
-            "delete_quick_step",
-            "reorder_quick_steps",
-            "bind_quick_step_slot",
-            "apply_quick_step",
+    fn mail_handlers_deserialize_requests_and_return_command_errors() {
+        let app = mock_builder()
+            .manage(initial_app_state(Default::default(), Vec::new()))
+            .invoke_handler(desktop_invoke_handler![])
+            .build(mock_context(noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+
+        for (cmd, body, expected) in [
+            (
+                "message_action",
+                json!({"messageIds":[],"action":"trash"}),
+                "Не выбрано ни одного письма",
+            ),
+            (
+                "message_action",
+                json!({"messageIds":[12],"action":"unknown"}),
+                "Неизвестное действие с письмом",
+            ),
+            (
+                "move_messages_to_folder",
+                json!({"messageIds":[],"folderId":4}),
+                "Не выбрано ни одного письма",
+            ),
+            (
+                "get_message",
+                json!({"messageId":7}),
+                "Хранилище ещё не создано. Завершите первоначальную настройку.",
+            ),
         ] {
-            assert!(
-                MAIN.contains(&format!("commands::{command}")),
-                "{command} is missing from generate_handler"
-            );
-            assert!(
-                COMMANDS.contains(&format!("fn {command}(")),
-                "{command} implementation is missing"
-            );
-            assert!(
-                BRIDGE.contains(&format!("invoke(\"{command}\"")),
-                "{command} is missing from bridge.js"
-            );
+            let error = get_ipc_response(
+                &webview,
+                InvokeRequest {
+                    cmd: cmd.into(),
+                    callback: CallbackFn(0),
+                    error: CallbackFn(1),
+                    url: if cfg!(windows) {
+                        "http://tauri.localhost"
+                    } else {
+                        "tauri://localhost"
+                    }
+                    .parse()
+                    .unwrap(),
+                    body: InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: INVOKE_KEY.into(),
+                },
+            )
+            .err()
+            .expect("команда должна вернуть ошибку");
+            assert_eq!(error["message"], expected, "{cmd}");
         }
     }
 
     #[test]
     fn single_instance_is_registered_before_every_other_plugin() {
+        const MAIN: &str = include_str!("main.rs");
         let builder = MAIN
             .find("tauri::Builder::default()")
             .expect("Tauri builder missing");

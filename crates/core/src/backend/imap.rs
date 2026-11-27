@@ -772,6 +772,13 @@ async fn folder_delimiter(session: &mut OAuthSession, path: &str) -> Result<Opti
                 || (path.eq_ignore_ascii_case("INBOX")
                     && entry.name().eq_ignore_ascii_case("INBOX"))
         })
+        .or_else(|| {
+            if path.is_empty() {
+                entries.first()
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| Error::AccountConfig("сервер не подтвердил путь папки".into()))?;
     Ok(entry.delimiter().map(str::to_owned))
 }

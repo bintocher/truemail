@@ -252,7 +252,13 @@ function createUiWindow(options = {}) {
     },
     btoa: value => Buffer.from(String(value), 'binary').toString('base64'),
     Buffer,
-    URL: {createObjectURL: () => 'blob:stub', revokeObjectURL: () => {}},
+    URL: class extends URL {
+      static createObjectURL() { return 'blob:stub'; }
+      static revokeObjectURL() {}
+    },
+    DOMParser: class {
+      parseFromString(html) { return createDocument('<html><head></head><body>'+html+'</body></html>'); }
+    },
     innerWidth: 1280,
     innerHeight: 800,
     devicePixelRatio: 1,

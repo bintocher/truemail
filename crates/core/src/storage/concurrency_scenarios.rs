@@ -16,6 +16,8 @@ use super::repo::test_storage::{TestDb, open_test_db};
 use crate::backend::DiscoveredMessage;
 use crate::backend::OutgoingMessage;
 use crate::model::*;
+use std::sync::Arc;
+use tokio::sync::Barrier;
 
 async fn seed_account(db: &Db, email: &str) -> i64 {
     sqlx::query_as::<_, (i64,)>(
@@ -119,9 +121,14 @@ async fn two_confirmations_of_one_snapshot_start_a_single_sweep() {
     let (first_db, second_db) = ((*db).clone(), (*db).clone());
     let (first_input, second_input) = (input.clone(), input.clone());
     let (first_key, second_key) = (preview.snapshot_key.clone(), preview.snapshot_key.clone());
-    let first =
-        tokio::spawn(async move { first_db.start_sender_sweep(first_input, &first_key).await });
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_db.start_sender_sweep(first_input, &first_key).await
+    });
     let second = tokio::spawn(async move {
+        barrier.wait().await;
         second_db
             .start_sender_sweep(second_input, &second_key)
             .await
@@ -187,8 +194,16 @@ async fn a_send_operation_is_claimed_by_exactly_one_worker() {
         .expect("принять письмо в очередь");
 
     let (first_db, second_db) = ((*db).clone(), (*db).clone());
-    let first = tokio::spawn(async move { first_db.claim_send_operation(account).await });
-    let second = tokio::spawn(async move { second_db.claim_send_operation(account).await });
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_db.claim_send_operation(account).await
+    });
+    let second = tokio::spawn(async move {
+        barrier.wait().await;
+        second_db.claim_send_operation(account).await
+    });
     let (first, second) = tokio::join!(first, second);
     let claimed: Vec<i64> = [
         first.expect("первый работник"),
@@ -262,8 +277,16 @@ async fn two_stage_passes_take_one_message_away_once() {
         .expect("синхронизация принесла письмо");
 
     let (first_db, second_db) = ((*db).clone(), (*db).clone());
-    let first = tokio::spawn(async move { first_db.process_sync_batch_stages().await });
-    let second = tokio::spawn(async move { second_db.process_sync_batch_stages().await });
+    let barrier = Arc::new(Barrier::new(2));
+    let first_barrier = barrier.clone();
+    let first = tokio::spawn(async move {
+        first_barrier.wait().await;
+        first_db.process_sync_batch_stages().await
+    });
+    let second = tokio::spawn(async move {
+        barrier.wait().await;
+        second_db.process_sync_batch_stages().await
+    });
     let (first, second) = tokio::join!(first, second);
     let applied = [
         first.expect("первый проход"),

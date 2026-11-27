@@ -221,7 +221,7 @@ struct FakeBackend {
     /// операция стала дозаписью до обращения к серверу за копией.
     kind_seen_by_append: Mutex<Option<String>>,
     db: Db,
-    sends: Mutex<usize>,
+    sent_messages: Mutex<Vec<OutgoingMessage>>,
 }
 
 impl FakeBackend {
@@ -231,7 +231,7 @@ impl FakeBackend {
             append_fails: false,
             kind_seen_by_append: Mutex::new(None),
             db: db.clone(),
-            sends: Mutex::new(0),
+            sent_messages: Mutex::new(Vec::new()),
         }
     }
 
@@ -243,7 +243,7 @@ impl FakeBackend {
     }
 
     fn sends(&self) -> usize {
-        *self.sends.lock().expect("счётчик передач")
+        self.sent_messages.lock().expect("переданные письма").len()
     }
 }
 
@@ -327,8 +327,11 @@ impl MailBackend for FakeBackend {
         unimplemented!("ожидание изменений в сценарии отправки не участвует")
     }
 
-    async fn send(&self, _message: OutgoingMessage, _credential: &str) -> SendResult {
-        *self.sends.lock().expect("счётчик передач") += 1;
+    async fn send(&self, message: OutgoingMessage, _credential: &str) -> SendResult {
+        self.sent_messages
+            .lock()
+            .expect("переданные письма")
+            .push(message);
         match self.answer {
             Answer::FailBeforeHandoff => Err(SendFailure::before_handoff(
                 crate::Error::classified_backend(
@@ -865,13 +868,24 @@ async fn confirmed_send_closes_the_operation_and_records_its_recipients() {
     let account = seed_account(&db, "me@example.test").await;
     let named = OutgoingMessage {
         to: vec!["Борис Борисов <boss@partner.test>".into()],
+        cc: vec!["copy@partner.test".into()],
+        headers: vec![("X-Report-Type".into(), "weekly".into())],
+        message_id: Some("<weekly-report@example.test>".into()),
         ..letter("me@example.test")
     };
-    db.queue_outgoing_send(account, named, SEND_ORIGIN_ORDINARY, None, 0)
+    db.queue_outgoing_send(account, named.clone(), SEND_ORIGIN_ORDINARY, None, 0)
         .await
         .expect("принять письмо в очередь");
     let backend = FakeBackend::new(&db, Answer::SavedOnServer);
     assert_eq!(transmit(&db, account, "me@example.test", &backend).await, 1);
+    {
+        let actual = backend.sent_messages.lock().unwrap();
+        assert_eq!(actual.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&actual[0]).unwrap(),
+            serde_json::to_value(&named).unwrap()
+        );
+    }
     let (left,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM outbox_ops WHERE op_kind IN ('send','append_sent')")
             .fetch_one(&db.pool)

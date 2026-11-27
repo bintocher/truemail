@@ -1370,15 +1370,13 @@ impl Db {
                 .bind(account_id)
                 .fetch_all(&mut *tx)
                 .await?;
-        // Apply all removals before assigning a role to its selected folder.
-        for (role, folder_id) in &overrides {
+        // A mapping is authoritative for the role, including explicit removal.
+        for (role, _) in &overrides {
             sqlx::query(
-                "UPDATE folders SET role=NULL,role_source=NULL WHERE account_id=? AND role=?
-                 AND (? OR role_source='name')",
+                "UPDATE folders SET role=NULL,role_source=NULL WHERE account_id=? AND role=?",
             )
             .bind(account_id)
             .bind(role)
-            .bind(folder_id.is_none() || role == "drafts")
             .execute(&mut *tx)
             .await?;
         }

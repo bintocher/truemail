@@ -82,6 +82,59 @@ const openListMenu = (ui, id) => {
   return menuActions(ui);
 };
 
+test('the reading pane shows the missing-body notice until a retry obtains HTML', async () => {
+  let requests = 0;
+  const ui = await openMail({
+    getMessage: id => ++requests === 1
+      ? {...fullOf(id), meta:{...LETTERS[id],preview:'краткий текст'}, body_html:null, body_text:null, body_fetched:false}
+      : fullOf(id),
+  });
+  await openLetter(ui, 11);
+  assert.match(ui.query('#tbody [role="status"]').textContent, /не загружено/i);
+  assert.equal(ui.query('.mail-body-preview').textContent, 'краткий текст');
+  ui.query('#tbody .mail-body button').click();
+  await settle();
+  assert.equal(requests, 2);
+  assert.equal(ui.query('#tbody [role="status"]'), null);
+  assert.match(ui.query('.mail-html-frame').srcdoc, /<p>Текст письма<\/p>/);
+});
+
+test('the reading pane keeps formatted mail and strips external image attributes before display', async () => {
+  const ui = await openMail({
+    getMessage: id => ({...fullOf(id),body_html:`
+      <p><strong>Текст письма</strong><a href="https://example.test/?utm_source=test&article=1">Статья</a></p>
+      <img src="//example.test/remote.png" alt="Фото">
+    `}),
+    imageSenderTrusted: () => false,
+  });
+  await openLetter(ui, 11);
+  const frame = ui.query('.mail-html-frame');
+  assert.ok(frame, 'HTML must be rendered in the reading pane');
+  assert.match(frame.srcdoc, /<strong>Текст письма<\/strong>/);
+  assert.match(frame.srcdoc, /href="https:\/\/example\.test\/\?article=1"/);
+  assert.doesNotMatch(frame.srcdoc, /remote\.png|utm_source/);
+  assert.match(ui.query('.mail-body .blocked').textContent, /заблокированы/i);
+  assert.equal(ui.callsOf('fetchMailImage').length, 0);
+});
+
+test('changing the text sends an attachment to storage only once', async () => {
+  const ui = await openMail();
+  await ui.evaluate("addComposerAttachment({filename:'report.txt',mime_type:'text/plain',data:[97,98,99]}); saveDraftNow()");
+  await ui.evaluate("document.getElementById('compSubj').value='Новая тема'; saveDraftNow()");
+  const saves = ui.callsOf('setSetting').filter(call => call.args[0] === 'composer_draft');
+  const [first,second] = saves.map(call => JSON.parse(call.args[1]));
+  assert.equal(first.attachments[0].base64, 'YWJj');
+  assert.equal(second.subject, 'Новая тема');
+  assert.deepEqual(second.attachments[0], {
+    id:first.attachments[0].id,filename:'report.txt',mime_type:'text/plain',size:3
+  });
+  ui.evaluate("setRecipients('compTo',['mate@example.test']);");
+  await ui.byId('compSend').onclick();
+  assert.deepEqual({...sent(ui)[0].attachments[0]}, {
+    draft_file_id:first.attachments[0].id,filename:'report.txt',mime_type:'text/plain'
+  });
+});
+
 test('a draft opens in the writing form without sending and New keeps the edits', async () => {
   const ui = await openMail();
   await openLetter(ui, 21);
