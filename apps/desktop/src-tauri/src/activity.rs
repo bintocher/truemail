@@ -9,6 +9,33 @@ use std::path::Path;
 use tauri::State;
 use truemail_core::{crypto::StorageCrypto, diagnostics::read_capped_line};
 
+use tracing_subscriber::fmt::{
+    FmtContext,
+    format::{Format, FormatEvent, FormatFields, Writer},
+};
+use tracing_subscriber::registry::LookupSpan;
+
+/// Redact complete log events, including their messages, fields and span names.
+pub struct MaskedEvent(pub Format);
+
+impl<S, N> FormatEvent<S, N> for MaskedEvent
+where
+    S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let mut complete = String::new();
+        self.0
+            .format_event(ctx, Writer::new(&mut complete), event)?;
+        writer.write_str(&truemail_core::logging::mask_error_text(&complete))
+    }
+}
+
 pub const LOG_DAYS: u64 = 7;
 const LOG_PREFIX: &str = "truemail.log.";
 const RECORD_PREFIX: &str = " truemail::activity: ui_activity ";
@@ -150,7 +177,7 @@ pub async fn read_ui_activity(
 
 #[cfg(test)]
 mod tests {
-    use super::{event_payload, write_event};
+    use super::{MaskedEvent, event_payload, write_event};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
 
@@ -171,11 +198,23 @@ mod tests {
         let writer = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
+            .event_format(MaskedEvent(tracing_subscriber::fmt::format()))
             .with_writer(move || Buffer(writer.clone()))
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             write_event("network_unavailable", "error", "YWJjZA==");
+            tracing::warn!(recipient = "person@example.test", error = ?String::from("550 <copy@example.org>"), "Rejected bcc@example.com");
         });
-        assert_eq!(event_payload(&buffer.lock().unwrap()), Some("YWJjZA=="));
+        let output = buffer.lock().unwrap();
+        assert_eq!(event_payload(&output), Some("YWJjZA=="));
+        let output = std::str::from_utf8(&output).unwrap();
+        for (original, masked) in [
+            ("person@example.test", "p***@example.test"),
+            ("copy@example.org", "c***@example.org"),
+            ("bcc@example.com", "b***@example.com"),
+        ] {
+            assert!(!output.contains(original));
+            assert!(output.contains(masked));
+        }
     }
 }

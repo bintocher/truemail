@@ -389,6 +389,45 @@ async fn transmit(db: &Db, account_id: i64, email: &str, backend: &FakeBackend) 
     crate::account::transmit_with_backend(db, email, backend, "token", &operation).await
 }
 
+#[tokio::test]
+async fn send_wakeup_waits_for_retry_and_fresh_mail_goes_first() {
+    let db = open_test_db("outbox-retry-wakeup").await;
+    let email = "sender@example.test";
+    let account = seed_account(&db, email).await;
+    let delayed = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        delayed.operation_id
+    );
+    db.defer_send_operation(delayed.operation_id, "network unavailable")
+        .await
+        .unwrap();
+    assert!(db.next_send_wakeup_seconds(account).await.unwrap().unwrap() > 45);
+    assert!(db.claim_send_operation(account).await.unwrap().is_none());
+
+    sqlx::query("UPDATE outbox_ops SET next_attempt_at=datetime('now') WHERE id=?")
+        .bind(delayed.operation_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let fresh = db
+        .queue_outgoing_send(account, letter(email), SEND_ORIGIN_AUTOMATIC, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(db.next_send_wakeup_seconds(account).await.unwrap(), Some(0));
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        fresh.operation_id
+    );
+    assert_eq!(
+        db.claim_send_operation(account).await.unwrap().unwrap().id,
+        delayed.operation_id
+    );
+}
+
 /// Окно отмены от начала до конца: письмо принято в очередь, работник его до
 /// срока не берёт, пользователь отменяет, и письмо возвращается целиком - с
 /// адресатами, скрытой копией, оформленным телом и вложением

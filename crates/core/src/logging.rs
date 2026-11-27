@@ -36,12 +36,23 @@ pub fn mask_email(email: &str) -> String {
 pub fn mask_error_text(text: &str) -> String {
     static ADDRESS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let address = ADDRESS.get_or_init(|| {
-        regex::Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-            .expect("статический шаблон адреса")
+        regex::Regex::new(concat!(
+            r#"(?P<local>\\?"(?:\\.|[^"\\\r\n])*?\\?"|[\p{L}\p{N}\p{M}.!#$%&'*+/=?^_`{|}~\-]+)@"#,
+            r"(?P<domain>[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}\-]*[\p{L}\p{N}\p{M}])?",
+            r"(?:\.[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}\-]*[\p{L}\p{N}\p{M}])?)*",
+            r"|\[(?:(?i:IPv6):)?[0-9a-fA-F:.]+\])",
+        ))
+        .expect("статический шаблон адреса")
     });
     address
         .replace_all(text, |found: &regex::Captures<'_>| {
-            mask_email(found.get(0).map_or("", |value| value.as_str()))
+            let local = found.name("local").expect("локальная часть").as_str();
+            let domain = found.name("domain").expect("домен").as_str();
+            let first = local.trim_start_matches(['\\', '"']).chars().next();
+            match first {
+                Some(ch) if ch != '*' => format!("{ch}***@{domain}"),
+                _ => format!("***@{domain}"),
+            }
         })
         .into_owned()
 }
@@ -81,6 +92,19 @@ mod tests {
                 "550 5.1.1 b***@example.test, c***@example.test unknown",
             ),
             ("connection reset", "connection reset"),
+            ("письмо имя+метка@пример.рф.", "письмо и***@пример.рф."),
+            (
+                r#"550 <"user name"@example.test>"#,
+                "550 <u***@example.test>",
+            ),
+            (
+                r#"550 <\"user name\"@example.test>"#,
+                "550 <u***@example.test>",
+            ),
+            (
+                "550 o'connor@host, a***@example.test",
+                "550 o***@host, a***@example.test",
+            ),
         ];
         for (source, expected) in cases {
             assert_eq!(mask_error_text(source), expected, "текст: {source}");
