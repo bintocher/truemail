@@ -786,8 +786,7 @@ mod command_contract_tests {
                     invoke_key: INVOKE_KEY.into(),
                 },
             )
-            .err()
-            .expect("команда должна вернуть ошибку");
+            .expect_err("команда должна вернуть ошибку");
             assert_eq!(error["message"], expected, "{cmd}");
         }
     }
