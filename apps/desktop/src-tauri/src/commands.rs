@@ -5024,6 +5024,7 @@ pub async fn send_message(
     request_key: Option<String>,
     draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
+    let _storage = state.outbox_work.read().await;
     let core = core(&state).await?;
     let account = core
         .db
@@ -5426,6 +5427,7 @@ pub async fn schedule_message(
     send_at: String,
     draft_id: Option<i64>,
 ) -> CmdResult<truemail_core::model::SendQueued> {
+    let _storage = state.outbox_work.read().await;
     let core = core(&state).await?;
     let account = core
         .db
@@ -5855,6 +5857,11 @@ pub async fn all_settings(state: State<'_, AppState>) -> CmdResult<HashMap<Strin
 
 #[tauri::command]
 pub async fn set_setting(state: State<'_, AppState>, key: String, value: String) -> CmdResult<()> {
+    let _storage = if key == "composer_draft" {
+        Some(state.outbox_work.read().await)
+    } else {
+        None
+    };
     Ok(core(&state).await?.db.set_setting(&key, &value).await?)
 }
 
