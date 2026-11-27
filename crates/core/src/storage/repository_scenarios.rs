@@ -224,9 +224,16 @@ async fn legacy_role_unrelated_to_folder_name_survives_discovery() {
         .execute(&db.write_pool)
         .await
         .unwrap();
+    let inferred_id = seed_folder(&db, account, "Work|Trash", Some("trash")).await;
+    sqlx::query("UPDATE folders SET display_name='Old name',role_source='legacy' WHERE id=?")
+        .bind(inferred_id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
     let folders = [
         discovered_folder("Work", "Work", None),
         discovered_folder("Work|Outgoing", "Outgoing", Some("Work")),
+        discovered_folder("Work|Trash", "Old name", Some("Work")),
     ];
     db.save_discovered_folders(account, &folders).await.unwrap();
     assert_eq!(db.folder(id).await.unwrap().role, Some(FolderRole::Sent));
@@ -236,6 +243,7 @@ async fn legacy_role_unrelated_to_folder_name_survives_discovery() {
         .await
         .unwrap();
     assert_eq!(source, "user");
+    assert_eq!(db.folder(inferred_id).await.unwrap().role, None);
 }
 
 #[tokio::test]

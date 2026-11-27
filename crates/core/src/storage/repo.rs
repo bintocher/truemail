@@ -555,8 +555,8 @@ impl Db {
         Ok(())
     }
 
-    /// Database changes are already committed. If cleanup fails, the next
-    /// startup can remove the orphan without rolling back the user's action.
+    /// Check references after settlement of the write transaction. If cleanup
+    /// fails, the startup collector can remove the orphan later.
     pub(super) async fn release_mail_blobs(&self, refs: Vec<String>) {
         if !refs.is_empty()
             && let Err(error) = self.remove_unreferenced_mail_blobs(refs).await
@@ -1285,7 +1285,7 @@ impl Db {
                 rename_folder_path(&mut tx, account_id, id, &path, &inbox.remote_path).await?;
             }
         }
-        restore_legacy_folder_overrides(&mut tx, account_id, folders).await?;
+        restore_legacy_folder_overrides(&mut tx, account_id, folders, is_imap).await?;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
             let role_source = role.map(|_| {
@@ -9639,9 +9639,10 @@ async fn restore_legacy_folder_overrides(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     account_id: i64,
     discovered: &[crate::backend::DiscoveredFolder],
+    is_imap: bool,
 ) -> Result<()> {
     let legacy: Vec<(i64, String, String, String)> = sqlx::query_as(
-        "SELECT id, remote_path, display_name, role FROM folders f WHERE account_id=? AND role_source='legacy'
+        "SELECT id, remote_path, display_name, role FROM folders f WHERE account_id=? AND role_source='legacy' AND role IS NOT NULL
            AND NOT EXISTS(SELECT 1 FROM folder_role_overrides o WHERE o.account_id=f.account_id AND o.role=f.role)",
     )
     .bind(account_id).fetch_all(&mut **tx).await?;
@@ -9651,8 +9652,9 @@ async fn restore_legacy_folder_overrides(
         .map(|folder| (folder.remote_path.as_str(), folder))
         .collect();
     for (id, path, name, role) in legacy {
+        let historical_path = if is_imap { path.as_str() } else { "" };
         if let Some(role) = FolderRole::parse(&role)
-            && crate::model::infer_folder_role("", &name) != Some(role)
+            && crate::model::infer_folder_role(historical_path, &name) != Some(role)
             && by_path
                 .get(path.as_str())
                 .is_some_and(|folder| folder.role.is_none() || folder.role_inferred)

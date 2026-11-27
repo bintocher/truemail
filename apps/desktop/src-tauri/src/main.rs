@@ -912,8 +912,9 @@ mod command_contract_tests {
             "bind_quick_step_slot",
             "apply_quick_step",
         ] {
+            let registration = format!("commands::{command},");
             assert!(
-                MAIN.contains(&format!("commands::{command}")),
+                MAIN.lines().any(|line| line.trim() == registration),
                 "{command} is missing from generate_handler"
             );
             assert!(
