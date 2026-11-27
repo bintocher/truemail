@@ -393,6 +393,7 @@ window.handleSyncState=function(state){
       ? [state.mail_synced?'mail':null,state.auxiliary_synced?'auxiliary':null].filter(Boolean)
       : [scope]
     : [];
+  if(completed.includes('mail'))window.refreshStorageStatus?.(true);
   for(const completedScope of completed){
     if(!currentSyncOutcome(state,completedScope))continue;
     settleSyncAction(state,completedScope);

@@ -4140,10 +4140,10 @@ fn dir_size(path: &std::path::Path) -> u64 {
         .flatten()
         .map(|entry| {
             let path = entry.path();
-            if path.is_dir() {
-                dir_size(&path)
-            } else {
-                entry.metadata().map(|m| m.len()).unwrap_or(0)
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => dir_size(&path),
+                Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => 0,
             }
         })
         .sum()
@@ -4153,21 +4153,25 @@ fn dir_size(path: &std::path::Path) -> u64 {
 pub async fn storage_status(state: State<'_, AppState>) -> CmdResult<StorageStatus> {
     let _ = core(&state).await?;
     let data_dir = truemail_core::crypto::load_data_dir()?.unwrap_or_else(super::default_data_dir);
-    let database_bytes = ["truemail.db", "truemail.db-wal", "truemail.db-shm"]
-        .iter()
-        .map(|name| {
-            std::fs::metadata(data_dir.join(name))
-                .map(|m| m.len())
-                .unwrap_or(0)
-        })
-        .sum();
-    let blob_bytes = dir_size(&data_dir.join("blobs"));
-    Ok(StorageStatus {
-        data_dir: data_dir.to_string_lossy().into_owned(),
-        total_bytes: database_bytes + blob_bytes,
-        database_bytes,
-        blob_bytes,
+    tokio::task::spawn_blocking(move || {
+        let database_bytes = ["truemail.db", "truemail.db-wal", "truemail.db-shm"]
+            .iter()
+            .map(|name| {
+                std::fs::metadata(data_dir.join(name))
+                    .map(|m| m.len())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let blob_bytes = dir_size(&data_dir.join("blobs"));
+        StorageStatus {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            total_bytes: database_bytes + blob_bytes,
+            database_bytes,
+            blob_bytes,
+        }
     })
+    .await
+    .map_err(|error| api_error(format!("не удалось измерить размер хранилища: {error}")))
 }
 
 fn copy_dir(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {

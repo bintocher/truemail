@@ -4248,6 +4248,7 @@ impl Db {
             .await?;
         // The same rule as the interface: a draft is known by its flag or by its folder.
         let is_draft = meta.flags.draft || folder_role.as_deref() == Some("drafts");
+        let raw_ref = raw_ref.filter(|reference| self.blobs.exists(reference));
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
@@ -4296,10 +4297,17 @@ impl Db {
                 }
             }
         }
-        let raw = raw_ref
+        let raw = match raw_ref
             .as_deref()
             .map(|reference| self.blobs.get(reference))
-            .transpose()?;
+        {
+            Some(Ok(raw)) => Some(raw),
+            Some(Err(crate::Error::Io(error))) if error.kind() == std::io::ErrorKind::NotFound => {
+                None
+            }
+            Some(Err(error)) => return Err(error),
+            None => None,
+        };
         let normalized = raw.as_deref().map(encoded_words::join_split_encoded_words);
         let parsed = normalized
             .as_deref()
@@ -4411,7 +4419,7 @@ impl Db {
         let has_remote_content = body_html
             .as_deref()
             .is_some_and(|html| html.contains("http://") || html.contains("https://"));
-        if let Some(reference) = raw_ref.as_deref() {
+        if let Some(reference) = raw_ref.as_deref().filter(|_| raw.is_some()) {
             sqlx::query(
                 "INSERT INTO message_content_cache(
                     message_id, raw_blob_ref, body_html, body_text, attachments_json,
@@ -4454,7 +4462,7 @@ impl Db {
             body_text,
             attachments,
             bcc,
-            body_fetched: body_fetched != 0,
+            body_fetched: body_fetched != 0 && raw.is_some(),
             has_text_part,
             is_newsletter,
             unsubscribe,

@@ -276,6 +276,20 @@ document.getElementById('pwSubmit').onclick=async()=>{
   }
 };
 
+let storageStatusRequest=null;
+window.refreshStorageStatus=async function(changed=false){
+  if(!document.querySelector('#settingsView.active #set-storage.active')||!window.tm?.storageStatus)return;
+  if(storageStatusRequest){
+    if(!changed)return storageStatusRequest;
+    await storageStatusRequest;
+    return window.refreshStorageStatus();
+  }
+  storageStatusRequest=window.tm.storageStatus()
+    .then(applyStorageStatus)
+    .catch(error=>{if(document.querySelector('#settingsView.active #set-storage.active'))showToast(error);})
+    .finally(()=>{storageStatusRequest=null;});
+  return storageStatusRequest;
+};
 function applyStorageStatus(storage){document.querySelector('.storage-big').textContent=formatBytes(storage.total_bytes);const path=document.querySelector('#set-storage .d.mono');if(path)path.textContent=storage.data_dir;document.querySelector('.storage-sub').textContent=`${wizardLocale==='en'?'database':'база'} ${formatBytes(storage.database_bytes)} · ${wizardLocale==='en'?'files':'файлы'} ${formatBytes(storage.blob_bytes)}`;const measured=Math.max(1,(storage.database_bytes||0)+(storage.blob_bytes||0));const db=document.querySelector('.usebar .seg-db'),blob=document.querySelector('.usebar .seg-blob');if(db)db.style.width=`${100*(storage.database_bytes||0)/measured}%`;if(blob)blob.style.width=`${100*(storage.blob_bytes||0)/measured}%`;}
 
 const filterMenu=document.getElementById('filterMenu'),sortMenu=document.getElementById('sortMenu'),filterButton=document.getElementById('filterBtn'),sortButton=document.getElementById('sortBtn');
@@ -378,7 +392,7 @@ document.getElementById('apiAuditRefresh').onclick=refreshApiSettings;
 document.getElementById('apiAuditClear').onclick=async()=>{if(await confirmAction(L('Очистить журнал вызовов API?','Clear the API call log?'))){await window.tm.clearApiAudit();await refreshApiSettings();}};
 
 function confirmAction(message){return new Promise(resolve=>{const overlay=document.createElement('div');overlay.className='overlay open';const modal=document.createElement('div');modal.className='modal compact-modal';const body=document.createElement('div');body.className='mb';body.textContent=message;const foot=document.createElement('div');foot.className='mf';const ok=document.createElement('button');ok.className='btn primary';ok.textContent=L('Продолжить','Continue');const cancel=document.createElement('button');cancel.className='btn confirm-cancel';cancel.textContent=L('Отмена','Cancel');const done=value=>{overlay.remove();resolve(value);};ok.onclick=()=>done(true);cancel.onclick=()=>done(false);overlay.onclick=e=>{if(e.target===overlay)done(false);};foot.append(ok,cancel);modal.append(body,foot);overlay.appendChild(modal);document.body.appendChild(overlay);cancel.focus();});}
-document.getElementById('openDataDir').onclick=()=>window.tm?.openDataDir().catch(error=>showToast(error));document.getElementById('changeDataDir').onclick=async()=>{try{const current=document.querySelector('#set-storage .d.mono').textContent,chosen=await window.tm.chooseDataDir(current);if(chosen){await window.tm.moveStorage(chosen);showToast(L('Данные перенесены, новый путь уже используется.','Data moved, the new path is now in use.'));document.querySelector('#set-storage .d.mono').textContent=chosen;}}catch(error){showToast(error);}};document.querySelectorAll('[data-clear]').forEach(button=>button.onclick=async()=>{if(!await confirmAction(L('Очистить загруженное содержимое писем? Его можно будет снова загрузить с сервера.','Clear downloaded mail content? It can be downloaded again from the server.')))return;try{await window.tm.clearLocalData(button.dataset.clear);await window.reloadCoreData();showToast(L('Локальные данные очищены','Local data cleared'));}catch(error){showToast(error);}});
+document.getElementById('openDataDir').onclick=()=>window.tm?.openDataDir().catch(error=>showToast(error));document.getElementById('changeDataDir').onclick=async()=>{try{const current=document.querySelector('#set-storage .d.mono').textContent,chosen=await window.tm.chooseDataDir(current);if(chosen){await window.tm.moveStorage(chosen);showToast(L('Данные перенесены, новый путь уже используется.','Data moved, the new path is now in use.'));document.querySelector('#set-storage .d.mono').textContent=chosen;await window.refreshStorageStatus(true);}}catch(error){showToast(error);}};document.querySelectorAll('[data-clear]').forEach(button=>button.onclick=async()=>{if(!await confirmAction(L('Очистить загруженное содержимое писем? Его можно будет снова загрузить с сервера.','Clear downloaded mail content? It can be downloaded again from the server.')))return;try{await window.tm.clearLocalData(button.dataset.clear);await Promise.all([window.reloadCoreData(),window.refreshStorageStatus(true)]);showToast(L('Локальные данные очищены','Local data cleared'));}catch(error){showToast(error);}});
 // Сбор диагностики (specs/diagnostics-bundle.md). Список категорий и текст
 // предупреждения статичны (S-014) - хранятся в diagnostics-categories.js,
 // отдельная команда ядра для показа диалога не нужна.

@@ -289,6 +289,31 @@ async fn folder_reconciliation_keeps_a_file_shared_by_surviving_mail() {
 }
 
 #[tokio::test]
+async fn missing_message_file_is_reported_even_after_the_body_was_cached() {
+    let db = open_test_db("repo-missing-cached-body").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let inbox = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    let message = seed_message(&db, account, inbox, 1, "Report").await;
+    let reference = db
+        .blobs
+        .put(b"Subject: Report\r\n\r\nComplete report")
+        .unwrap();
+    sqlx::query("UPDATE messages SET raw_blob_ref=?,body_fetched=1 WHERE id=?")
+        .bind(&reference)
+        .bind(message)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    assert!(db.get_message(message).await.unwrap().body_fetched);
+    db.blobs.remove(&reference).unwrap();
+
+    let unloaded = db.get_message(message).await.unwrap();
+    assert!(!unloaded.body_fetched);
+    assert_eq!(unloaded.body_text, None);
+    assert_eq!(unloaded.meta.subject.as_deref(), Some("Report"));
+}
+
+#[tokio::test]
 async fn group_actions_queue_surviving_messages_and_count_missing_ones() {
     let db = open_test_db("repo-missing-group-action").await;
     let account = seed_account(&db, "repo@example.test").await;

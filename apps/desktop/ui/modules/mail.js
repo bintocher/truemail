@@ -825,7 +825,24 @@ async function showMessage(message){
     // строка "Кому" остаётся исходной, и без этой строки два ящика неразличимы.
     const mailboxLine=buildMailboxLine(full.meta.account_id);if(mailboxLine)head.appendChild(mailboxLine);
     const labelLine=buildLabelLine(full.meta,message);if(labelLine)head.appendChild(labelLine);
-    const content=document.createElement('div');content.className='mail-body';if(full.body_html)await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);else{content.classList.add('plain');content.textContent=full.body_text||full.meta.preview||'';}
+    const content=document.createElement('div');content.className='mail-body';
+    if(full.body_fetched===false){
+      const notice=document.createElement('p');notice.className='mail-body-notice';notice.setAttribute('role','status');
+      notice.textContent=L('Содержимое письма не загружено. Проверьте подключение к почте и повторите попытку.','The message body is unavailable. Check your mail connection and try again.');
+      const retry=document.createElement('button');retry.type='button';retry.className='btn sm';
+      retry.textContent=L('Скачать письмо','Download message');
+      retry.onclick=()=>{if(stillCurrent())showMessage(message);};
+      content.append(notice,retry);
+      if(full.meta.preview){
+        const preview=document.createElement('p');preview.className='mail-body-preview';
+        preview.textContent=full.meta.preview;
+        content.appendChild(preview);
+      }
+    }else if(full.body_html){
+      await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);
+    }else{
+      content.classList.add('plain');content.textContent=full.body_text||'';
+    }
     // Отрисовка тела тоже ждёт (проверка доверия отправителю для картинок), и за
     // это время выбор мог смениться - к панели и к отметке прочтения переходим
     // только для актуального письма (S-002, S-003).
@@ -1079,7 +1096,7 @@ window.refreshAccountSyncIndicator=function(accountId){
   if(header&&account)renderAccountSyncBadge(header,account);
 };
 
-window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[],storage=null){
+window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],contacts=[],calendarData={calendars:[],events:[]},savedSmartFolders=[]){
   const previousFolder=currentFolderId,previousTag=currentTagName,previousMessageId=activeMessage?.id,navScroll=document.querySelector('.nav')?.scrollTop||0,messageScroll=msgsEl.scrollTop;let previousSmart=currentSmartIndex;
   // Якорь списка снимаем здесь, до clearDemoData: сразу за ним прокрутка
   // обнуляется, и якорь всегда указывал бы на первое письмо. Между
@@ -1174,7 +1191,6 @@ window.renderCoreAccounts=function(accounts,foldersByAccount,loadedMessages=[],c
   renderContacts(contacts);
   renderCalendarData(calendarData);
   renderAccountSettings(accounts,foldersByAccount,calendarData.calendars||[]);
-  if(storage)applyStorageStatus(storage);
   if(Object.keys(uiCatalog).length)applyUiCatalog(uiCatalog);
   requestAnimationFrame(()=>{const nav=document.querySelector('.nav');if(nav)nav.scrollTop=navScroll;
     // Положение списка держим по верхнему видимому письму: вставленные сверху
