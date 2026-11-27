@@ -228,8 +228,8 @@ fn run() -> anyhow::Result<()> {
         Ok(file_appender) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
                 .with_ansi(false)
+                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
                 .with_writer(std::io::stdout.and(file_appender))
                 .init();
         }
@@ -239,8 +239,8 @@ fn run() -> anyhow::Result<()> {
             // не роняем запуск, а продолжаем писать хотя бы в stdout.
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
-                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
                 .with_ansi(false)
+                .event_format(activity::MaskedEvent(tracing_subscriber::fmt::format()))
                 .init();
             eprintln!(
                 "не удалось создать файловый логгер в {}: {error}; логи будут только в stdout",
