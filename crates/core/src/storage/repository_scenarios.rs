@@ -215,6 +215,52 @@ async fn missing_parent_does_not_remove_a_discovered_child_or_its_message() {
 }
 
 #[tokio::test]
+async fn legacy_role_unrelated_to_folder_name_survives_discovery() {
+    let db = open_test_db("repo-manual-legacy-role").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let id = seed_folder(&db, account, "Work|Outgoing", Some("sent")).await;
+    sqlx::query("UPDATE folders SET display_name='Outgoing',role_source='legacy' WHERE id=?")
+        .bind(id)
+        .execute(&db.write_pool)
+        .await
+        .unwrap();
+    let folders = [
+        discovered_folder("Work", "Work", None),
+        discovered_folder("Work|Outgoing", "Outgoing", Some("Work")),
+    ];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    assert_eq!(db.folder(id).await.unwrap().role, Some(FolderRole::Sent));
+    let source: String = sqlx::query_scalar("SELECT role_source FROM folders WHERE id=?")
+        .bind(id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(source, "user");
+}
+
+#[tokio::test]
+async fn changed_spelling_of_imap_inbox_retains_the_original_folder() {
+    let db = open_test_db("repo-rename-inbox-case").await;
+    let account = seed_account(&db, "repo@example.test").await;
+    let id = seed_folder(&db, account, "INBOX", Some("inbox")).await;
+    db.set_folder_role(account, "inbox", Some(id))
+        .await
+        .unwrap();
+    let message_id = seed_message(&db, account, id, 1, "Report").await;
+    let folders = [discovered_folder("Inbox", "Inbox", None)];
+    db.save_discovered_folders(account, &folders).await.unwrap();
+    assert_eq!(
+        db.reconcile_discovered_folders(account, &folders)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(db.folder(id).await.unwrap().remote_path, "Inbox");
+    assert_eq!(db.folder(id).await.unwrap().role, Some(FolderRole::Inbox));
+    assert_eq!(db.get_message(message_id).await.unwrap().meta.folder_id, id);
+}
+
+#[tokio::test]
 async fn inbox_parent_matches_ignoring_case_but_other_parents_do_not() {
     let db = open_test_db("repo-folder-inbox-parent").await;
     let account = seed_account(&db, "repo@example.test").await;
@@ -309,7 +355,10 @@ async fn missing_message_file_is_reported_even_after_the_body_was_cached() {
 
     let unloaded = db.get_message(message).await.unwrap();
     assert!(!unloaded.body_fetched);
-    assert_eq!(unloaded.body_text, None);
+    assert_eq!(
+        unloaded.body_text.as_deref().map(str::trim),
+        Some("Complete report")
+    );
     assert_eq!(unloaded.meta.subject, "Report");
 }
 

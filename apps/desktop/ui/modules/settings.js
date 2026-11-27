@@ -276,9 +276,17 @@ document.getElementById('pwSubmit').onclick=async()=>{
   }
 };
 
-let storageStatusRequest=null;
+let storageStatusRequest=null,storageStatusTimer=null;
+function storageSettingsVisible(){return !document.hidden&&document.querySelector('#settingsView.active #set-storage.active');}
+window.scheduleStorageStatus=function(){
+  if(storageStatusTimer!==null||!storageSettingsVisible())return;
+  storageStatusTimer=setTimeout(()=>{
+    storageStatusTimer=null;
+    window.refreshStorageStatus(true);
+  },5000);
+};
 window.refreshStorageStatus=async function(changed=false){
-  if(!document.querySelector('#settingsView.active #set-storage.active')||!window.tm?.storageStatus)return;
+  if(!storageSettingsVisible()||!window.tm?.storageStatus)return;
   if(storageStatusRequest){
     if(!changed)return storageStatusRequest;
     await storageStatusRequest;
@@ -286,7 +294,7 @@ window.refreshStorageStatus=async function(changed=false){
   }
   storageStatusRequest=window.tm.storageStatus()
     .then(applyStorageStatus)
-    .catch(error=>{if(document.querySelector('#settingsView.active #set-storage.active'))showToast(error);})
+    .catch(error=>{if(storageSettingsVisible())showToast(error);})
     .finally(()=>{storageStatusRequest=null;});
   return storageStatusRequest;
 };

@@ -91,7 +91,7 @@ document.getElementById('compClose').onclick=()=>showView('mailView');
 function setSection(id){ document.querySelectorAll('.setnav .sec').forEach(s=>s.classList.toggle('active',s.dataset.set===id));
   document.querySelectorAll('.setpage').forEach(p=>p.classList.toggle('active',p.id==='set-'+id));
   if(id==='storage')window.refreshStorageStatus?.(); }
-document.querySelectorAll('[data-set]').forEach(el=>el.addEventListener('click',()=>{showView('settingsView');setSection(el.dataset.set);}));
+document.querySelectorAll('[data-set]').forEach(el=>el.addEventListener('click',()=>{setSection(el.dataset.set);showView('settingsView');}));
 document.querySelectorAll('[data-openacct]').forEach(el=>el.onclick=()=>setSection('accounts'));
 
 /* ---------- account colors + messages ---------- */

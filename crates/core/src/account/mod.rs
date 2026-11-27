@@ -2645,12 +2645,9 @@ impl AccountManager {
     pub async fn check_permanent_delete(&self, ids: &[i64]) -> Result<()> {
         let mut account_ids = std::collections::HashSet::new();
         for &id in ids {
-            let locator = self.db.message_fetch_locator(id).await?.ok_or_else(|| {
-                crate::Error::Other(
-                    "Письмо больше недоступно. Обновите список перед удалением.".into(),
-                )
-            })?;
-            account_ids.insert(locator.account_id);
+            if let Some(locator) = self.db.message_fetch_locator(id).await? {
+                account_ids.insert(locator.account_id);
+            }
         }
         for account in self.db.list_accounts().await? {
             if !account_ids.contains(&account.id) {

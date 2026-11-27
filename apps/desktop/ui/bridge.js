@@ -354,9 +354,13 @@ window.corePageSize = null;
     // Сначала рисуем из того, что осталось в памяти - список появляется сразу,
     // а не через паузу троттлинга перезагрузки.
     window.restoreAfterHidden?.();
+    window.refreshStorageStatus?.();
     if (reloadPending) scheduleReload(0);
   });
-  tauri.event?.listen("truemail-data-changed", () => scheduleReload()).catch(console.error);
+  tauri.event?.listen("truemail-data-changed", () => {
+    scheduleReload();
+    window.scheduleStorageStatus?.();
+  }).catch(console.error);
   tauri.event?.listen("truemail-imap-action-rejected", () => {
     showToast(L("Действие с письмом остановлено. Сервер изменил номера писем. Обновите папку и проверьте письмо перед повтором.",
       "An action was stopped because the server changed message identifiers. Refresh the folder and check the message before retrying."));

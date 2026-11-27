@@ -833,15 +833,18 @@ async function showMessage(message){
       retry.textContent=L('Скачать письмо','Download message');
       retry.onclick=()=>{if(stillCurrent())showMessage(message);};
       content.append(notice,retry);
-      if(full.meta.preview){
+      if(!full.body_html&&!full.body_text&&full.meta.preview){
         const preview=document.createElement('p');preview.className='mail-body-preview';
         preview.textContent=full.meta.preview;
         content.appendChild(preview);
       }
-    }else if(full.body_html){
+    }
+    if(full.body_html){
       await renderHtmlMessage(content,full.body_html,full.meta.from?.email,stillCurrent);
-    }else{
-      content.classList.add('plain');content.textContent=full.body_text||'';
+    }else if(full.body_fetched!==false||full.body_text){
+      const text=document.createElement('div');text.className='mail-plain-text';
+      text.textContent=full.body_text||full.meta.preview||'';
+      content.appendChild(text);
     }
     // Отрисовка тела тоже ждёт (проверка доверия отправителю для картинок), и за
     // это время выбор мог смениться - к панели и к отметке прочтения переходим

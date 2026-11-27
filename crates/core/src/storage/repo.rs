@@ -555,6 +555,43 @@ impl Db {
         Ok(())
     }
 
+    /// Database changes are already committed. If cleanup fails, the next
+    /// startup can remove the orphan without rolling back the user's action.
+    async fn release_mail_blobs(&self, refs: Vec<String>) {
+        if !refs.is_empty()
+            && let Err(error) = self.remove_unreferenced_mail_blobs(refs).await
+        {
+            tracing::warn!(
+                error_kind = error.code(),
+                "очистка файлов писем отложена до следующего запуска"
+            );
+        }
+    }
+
+    async fn remove_unreferenced_mail_blobs(&self, refs: Vec<String>) -> Result<()> {
+        let mut tx = self.begin_write().await?;
+        let outgoing: std::collections::HashSet<_> =
+            self.outgoing_blob_references().await?.into_iter().collect();
+        let unused: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT c.value FROM json_each(?) c
+             WHERE NOT EXISTS(SELECT 1 FROM messages WHERE raw_blob_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM attachments WHERE blob_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM contacts WHERE vcard_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM events WHERE ical_ref=c.value)
+               AND NOT EXISTS(SELECT 1 FROM composer_draft_files WHERE blob_ref=c.value)",
+        )
+        .bind(serde_json::to_string(&refs)?)
+        .fetch_all(&mut *tx)
+        .await?;
+        for reference in unused {
+            if !outgoing.contains(&reference) {
+                self.blobs.remove(&reference)?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Remove files no longer reachable from SQLite and report broken links.
     /// Run before background synchronization starts, so the reference snapshot
     /// cannot race a writer.
@@ -662,9 +699,7 @@ impl Db {
             .await?;
         }
         tx.commit().await?;
-        for reference in refs {
-            self.blobs.remove(&reference)?;
-        }
+        self.release_mail_blobs(refs).await;
         Ok(())
     }
 
@@ -1017,9 +1052,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in refs {
-            self.blobs.remove(&reference)?;
-        }
+        self.release_mail_blobs(refs).await;
         Ok(old.len())
     }
 
@@ -1161,8 +1194,9 @@ impl Db {
 
     pub async fn delete_folder_local(&self, folder_id: i64) -> Result<()> {
         let mut tx = self.begin_write().await?;
-        remove_discovered_folder(&mut tx, folder_id, &self.limit_set()).await?;
+        let references = remove_discovered_folder(&mut tx, folder_id, &self.limit_set()).await?;
         tx.commit().await?;
+        self.release_mail_blobs(references).await;
         Ok(())
     }
 
@@ -1225,6 +1259,33 @@ impl Db {
     ) -> Result<()> {
         let mut tx = self.begin_write().await?;
         let mut folder_ids = std::collections::HashMap::with_capacity(folders.len());
+        let is_imap: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=? AND backend_kind='imap')",
+        )
+        .bind(account_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if is_imap
+            && let Some(inbox) = folders
+                .iter()
+                .find(|folder| folder.remote_path.eq_ignore_ascii_case("INBOX"))
+        {
+            let previous: Option<(i64, String)> = sqlx::query_as(
+                "SELECT id,remote_path FROM folders WHERE account_id=?
+                   AND remote_path='INBOX' COLLATE NOCASE
+                   AND NOT EXISTS(SELECT 1 FROM folders WHERE account_id=? AND remote_path=?)
+                 ORDER BY id LIMIT 1",
+            )
+            .bind(account_id)
+            .bind(account_id)
+            .bind(&inbox.remote_path)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((id, path)) = previous {
+                rename_folder_path(&mut tx, account_id, id, &path, &inbox.remote_path).await?;
+            }
+        }
+        restore_legacy_folder_overrides(&mut tx, account_id, folders).await?;
         for folder in folders {
             let role = folder.role.map(FolderRole::as_str);
             let role_source = role.map(|_| {
@@ -1514,11 +1575,12 @@ impl Db {
         if stale_ids.is_empty() {
             return Ok(0);
         }
+        let mut references = Vec::new();
         for id in &stale_ids {
-            remove_discovered_folder(&mut tx, *id, &limits).await?;
+            references.extend(remove_discovered_folder(&mut tx, *id, &limits).await?);
         }
         tx.commit().await?;
-        // The startup collector checks every reference before removing files.
+        self.release_mail_blobs(references).await;
         Ok(stale_ids.len())
     }
 
@@ -1733,9 +1795,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         Ok(delete_rows.len())
     }
 
@@ -1799,9 +1859,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         Ok(delete_ids.len())
     }
 
@@ -1930,9 +1988,7 @@ impl Db {
                 .await?;
         }
         tx.commit().await?;
-        for reference in blob_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(blob_refs).await;
         tracing::info!(
             account_id,
             deleted = delete_ids.len(),
@@ -3072,9 +3128,8 @@ impl Db {
         {
             let _ = self.blobs.remove(reference);
         }
-        for reference in stale_refs {
-            let _ = self.blobs.remove(&reference);
-        }
+        self.release_mail_blobs(stale_refs.into_iter().collect())
+            .await;
         // Импорт не знает, какая реализация поиска выбрана приложением. Даже
         // SQLite FTS обновляется через единый контракт SearchIndex, поэтому
         // переход на другой индекс не потребует искать прямые SQL-записи.
@@ -4249,7 +4304,9 @@ impl Db {
             .await?;
         // The same rule as the interface: a draft is known by its flag or by its folder.
         let is_draft = meta.flags.draft || folder_role.as_deref() == Some("drafts");
-        let raw_ref = raw_ref.filter(|reference| self.blobs.exists(reference));
+        let raw_available = raw_ref
+            .as_deref()
+            .is_some_and(|reference| self.blobs.exists(reference));
         if let Some(reference) = raw_ref.as_deref() {
             let cached: Option<MessageContentCacheRow> = sqlx::query_as(
                 "SELECT body_html, body_text, attachments_json, has_remote_content,
@@ -4271,22 +4328,26 @@ impl Db {
                 has_text_part,
             )) = cached
             {
-                let attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
-                // A parse result stored before parts were marked as embedded is
-                // parsed again below.
-                if attachments.iter().all(|part| part.embedded.is_some()) {
-                    let bcc = if is_draft {
+                let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments)?;
+                // Older cache rows are parsed again when the original is available.
+                if !raw_available || attachments.iter().all(|part| part.embedded.is_some()) {
+                    let bcc = if is_draft && raw_available {
                         self.draft_bcc(raw_ref.as_deref()).await?
                     } else {
                         Vec::new()
                     };
+                    if !raw_available {
+                        for part in &mut attachments {
+                            part.fetched = false;
+                        }
+                    }
                     return Ok(MessageFull {
                         meta,
                         body_html,
                         body_text,
                         attachments,
                         bcc,
-                        body_fetched: body_fetched != 0,
+                        body_fetched: body_fetched != 0 && raw_available,
                         has_text_part: has_text_part != 0,
                         has_remote_content: remote != 0,
                         is_newsletter: newsletter != 0,
@@ -4300,6 +4361,7 @@ impl Db {
         }
         let raw = match raw_ref
             .as_deref()
+            .filter(|_| raw_available)
             .map(|reference| self.blobs.get(reference))
         {
             Some(Ok(raw)) => Some(raw),
@@ -9573,11 +9635,65 @@ async fn clear_stage_result_of_operation(
     Ok(())
 }
 
+// Older versions only stored the chosen role. A unique role unrelated to its
+// folder name is kept as a manual choice; name-based guesses are rediscovered.
+async fn restore_legacy_folder_overrides(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    account_id: i64,
+    discovered: &[crate::backend::DiscoveredFolder],
+) -> Result<()> {
+    let legacy: Vec<(i64, String, String, String)> = sqlx::query_as(
+        "SELECT id, remote_path, display_name, role FROM folders f WHERE account_id=? AND role_source='legacy'
+           AND NOT EXISTS(SELECT 1 FROM folder_role_overrides o WHERE o.account_id=f.account_id AND o.role=f.role)",
+    )
+    .bind(account_id).fetch_all(&mut **tx).await?;
+    let mut candidates = std::collections::HashMap::new();
+    let by_path: std::collections::HashMap<_, _> = discovered
+        .iter()
+        .map(|folder| (folder.remote_path.as_str(), folder))
+        .collect();
+    for (id, path, name, role) in legacy {
+        if let Some(role) = FolderRole::parse(&role)
+            && crate::model::infer_folder_role("", &name) != Some(role)
+            && by_path
+                .get(path.as_str())
+                .is_some_and(|folder| folder.role.is_none() || folder.role_inferred)
+        {
+            candidates
+                .entry(role.as_str())
+                .and_modify(|id| *id = None)
+                .or_insert(Some(id));
+        }
+    }
+    for (role, id) in candidates {
+        if let Some(id) = id {
+            sqlx::query(
+                "INSERT INTO folder_role_overrides(account_id,role,folder_id) VALUES(?,?,?)",
+            )
+            .bind(account_id)
+            .bind(role)
+            .bind(id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn remove_discovered_folder(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     folder_id: i64,
     limits: &LimitSet,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let references = sqlx::query_scalar(
+        "SELECT raw_blob_ref FROM messages WHERE folder_id=? AND raw_blob_ref IS NOT NULL
+         UNION SELECT a.blob_ref FROM attachments a JOIN messages m ON m.id=a.message_id
+            WHERE m.folder_id=? AND a.blob_ref IS NOT NULL",
+    )
+    .bind(folder_id)
+    .bind(folder_id)
+    .fetch_all(&mut **tx)
+    .await?;
     sqlx::query("UPDATE folders SET parent_id=NULL WHERE parent_id=?")
         .bind(folder_id)
         .execute(&mut **tx)
@@ -9593,7 +9709,7 @@ async fn remove_discovered_folder(
         .bind(folder_id)
         .execute(&mut **tx)
         .await?;
-    Ok(())
+    Ok(references)
 }
 
 pub(crate) async fn infer_missing_folder_role(

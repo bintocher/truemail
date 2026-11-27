@@ -744,9 +744,22 @@ fn validate_folder_name<'a>(name: &'a str, delimiter: Option<&str>) -> Result<&'
     Ok(trimmed)
 }
 
+fn quoted_list_pattern(path: &str) -> Result<String> {
+    if path.contains(['\0', '\r', '\n']) {
+        return Err(Error::AccountConfig("недопустимое имя папки".into()));
+    }
+    Ok(format!(
+        "\"{}\"",
+        path.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
 async fn folder_delimiter(session: &mut OAuthSession, path: &str) -> Result<Option<String>> {
+    let pattern = (!path.is_empty())
+        .then(|| quoted_list_pattern(path))
+        .transpose()?;
     let entries = session
-        .list(Some(""), Some(path))
+        .list(Some(""), pattern.as_deref())
         .await
         .map_err(imap_outbox_error)?
         .try_collect::<Vec<_>>()
@@ -820,70 +833,31 @@ pub(crate) async fn delete_password_folder(
 async fn delete_folder(mut session: OAuthSession, remote_path: &str) -> Result<()> {
     tracing::info!(remote_path, "imap-delete: запрос удаления папки");
 
-    // Шаг 1: узнаём разделитель иерархии для этой папки (у Яндекса это '|').
-    let self_entries: Vec<Name> = session
-        .list(Some(""), Some(remote_path))
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-delete-list".into(),
-            message: error.to_string(),
-        })?
-        .try_collect()
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-delete-list".into(),
-            message: error.to_string(),
-        })?;
-    for entry in &self_entries {
-        tracing::debug!(
-            name = entry.name(),
-            delimiter = entry.delimiter().unwrap_or("?"),
-            attributes = ?entry.attributes(),
-            "imap-delete: цель"
-        );
-    }
-    if self_entries.is_empty() {
-        tracing::warn!(
-            remote_path,
-            "imap-delete: папка не найдена на сервере (LIST пуст)"
-        );
-    }
-    let delimiter = self_entries
-        .iter()
-        .find_map(|entry| entry.delimiter())
-        .unwrap_or("|")
-        .to_string();
-
-    // Шаг 2: ищем подпапки. Яндекс отказывает в DELETE, если у папки есть дети.
-    let child_pattern = format!("{remote_path}{delimiter}*");
-    let children: Vec<Name> = session
-        .list(Some(""), Some(&child_pattern))
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-delete-list".into(),
-            message: error.to_string(),
-        })?
-        .try_collect()
-        .await
-        .map_err(|error| Error::Backend {
-            backend: "imap-delete-list".into(),
-            message: error.to_string(),
-        })?;
-    let child_names: Vec<&str> = children.iter().map(Name::name).collect();
-    tracing::info!(
-        remote_path,
-        delimiter = delimiter.as_str(),
-        child_count = children.len(),
-        children = ?child_names,
-        "imap-delete: проверка подпапок перед удалением"
-    );
-    if !children.is_empty() {
-        let _ = session.logout().await;
-        return Err(Error::AccountConfig(format!(
-            "у папки есть вложенные подпапки ({}), сначала удалите или перенесите их: {}",
-            children.len(),
-            child_names.join(", ")
-        )));
+    // Yandex refuses to delete a folder with children. Match the real path
+    // prefix because LIST interprets wildcard characters even inside quotes.
+    if let Some(delimiter) = folder_delimiter(&mut session, remote_path).await? {
+        let prefix = format!("{remote_path}{delimiter}");
+        let child_pattern = quoted_list_pattern(&format!("{prefix}*"))?;
+        let children: Vec<Name> = session
+            .list(Some(""), Some(&child_pattern))
+            .await
+            .map_err(imap_outbox_error)?
+            .try_collect()
+            .await
+            .map_err(imap_outbox_error)?;
+        let child_names: Vec<_> = children
+            .iter()
+            .map(Name::name)
+            .filter(|name| name.starts_with(&prefix))
+            .collect();
+        if !child_names.is_empty() {
+            let _ = session.logout().await;
+            return Err(Error::AccountConfig(format!(
+                "у папки есть вложенные подпапки ({}), сначала удалите или перенесите их: {}",
+                child_names.len(),
+                child_names.join(", ")
+            )));
+        }
     }
 
     // Шаг 3: собственно удаление.
