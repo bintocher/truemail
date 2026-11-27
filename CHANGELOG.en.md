@@ -11,7 +11,7 @@ versions use Semantic Versioning.
 
 ### Messages and drafts
 
-- If a message could not be downloaded, the reading pane explains the problem and offers a retry. Previously saved text remains available.
+- If a message could not be downloaded, the reading pane shows a notice and offers a retry. Previously saved text remains available.
 - Local draft attachments are kept in separate encrypted files. Editing the subject or body saves references to the files.
 - Batch moves and deletions skip messages that are already gone. The remaining messages are processed, and the app reports how many were skipped.
 
